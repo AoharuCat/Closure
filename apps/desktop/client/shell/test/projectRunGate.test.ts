@@ -83,8 +83,15 @@ vi.mock('../main/ipc/toolExecution', () => ({ handleToolExecute: vi.fn() }));
 vi.mock('../main/ipc/modelGatewayIpc', () => ({
   handleGenerateText: vi.fn(),
   handleGenerateTextStream: vi.fn(),
+  // 09-01 附件 B3：agentIpc 现额外 import resolveModel（agentImageParts 内核装配）——
+  // 工厂 mock 同步被引出的全部导出（缺即 vitest 假红）。
+  resolveModel: vi.fn(),
 }));
-vi.mock('../main/ipc/configIpc', () => ({ readTaskModelSlots: vi.fn(() => undefined) }));
+vi.mock('../main/ipc/configIpc', () => ({
+  readTaskModelSlots: vi.fn(() => undefined),
+  // visionAnalysis/agentImageParts 经 agentIpc 入图（readModelConfigFromDisk 被 import）。
+  readModelConfigFromDisk: vi.fn(() => ({ keys: [] })),
+}));
 
 import { registerAgentIpc, acquireProjectRun, getProjectActiveRuns, reconcileStaleProjectRuns, CHAIN_RUN_LEASE_ID } from '../main/ipc/agentIpc';
 import { normalizeProjectKey } from '../main/ipc/pathGuard';

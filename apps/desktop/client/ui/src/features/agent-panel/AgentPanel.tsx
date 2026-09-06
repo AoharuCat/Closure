@@ -17,10 +17,32 @@ import { deriveChildActivity } from './messageGrouping';
 import type { ParticipationGear } from '@orison/shared-contracts';
 import { deriveSessionBadge, type SessionBadgeState } from '../../shared/store/agentEvents';
 import { compactAgentSession } from '../../shared/api/agent';
+import { INBOX_UPLOAD_EXTENSIONS } from '../../shared/api/inboxAttachments';
+// 09-01 B4（dogfood #45）：drop 图片分支接管——白名单与 canvas 预检压缩同源（单源常量）。
+// CR-003a：识图转述进度订阅收口在 api 层（boundary rule——组件不直碰 window.orisonDesktop）。
+import { CHAT_IMAGE_EXT_RE, subscribeImageRelayProgress } from '../../shared/api/chatImages';
 import { useToastStore } from '../../shared/store/toastStore';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 
 type PanelView = 'chat' | 'history' | 'settings';
+
+// 09-01 A4（R1.3/AC4）：拖拽分流正则——文档白名单单源 = A3 的 INBOX_UPLOAD_EXTENSIONS
+//（shell 侧 importFiles 同表强制，renderer 只做分流不做安全闸）。
+const INBOX_DOC_RE = new RegExp(
+  `(${INBOX_UPLOAD_EXTENSIONS.map((ext) => ext.replace('.', '\\.')).join('|')})$`,
+  'i',
+);
+// 图片白名单 = B4 预检压缩同表（CHAT_IMAGE_EXT_RE 单源——drop 分流与压缩拒收零漂移）。
+const DROP_IMAGE_RE = CHAT_IMAGE_EXT_RE;
+
+/**
+ * CR-003a（决议 a）：识图转述进度条——shell generate 缝每图转述开始/完成各广播一次
+ * `image-relay-progress`（{current, total}，全窗无会话定向），此处订阅显示「正在识图
+ * 转述 i/N」。末帧（current===total）后 ~2s 自动消隐（简化实现：不区分「本轮结束」与
+ * 「还有下一轮」——下一帧到达即续期）；直传 / 缓存全命中 / 无图场景 shell 不发事件，
+ * 天然零显示。
+ */
+const IMAGE_RELAY_CLEAR_DELAY_MS = 2000;
 
 export function AgentPanel() {
   const {
@@ -33,6 +55,7 @@ export function AgentPanel() {
     agentParticipationGear, setAgentParticipationGear,
     agentSessions,
     resolvedAuthorProfilePatches, resolvedSettingMdPatches,
+    uploadInboxFiles, uploadChatImages,
   } = useAppStore(useShallow((s) => ({
     agentMessages: s.agentMessages,
     activeSessionRunning: s.activeSessionRunning,
@@ -53,6 +76,8 @@ export function AgentPanel() {
     // dogfood R2 #25：suggest 档审阅卡钉底收集的 resolved 侧输入。
     resolvedAuthorProfilePatches: s.resolvedAuthorProfilePatches,
     resolvedSettingMdPatches: s.resolvedSettingMdPatches,
+    uploadInboxFiles: s.uploadInboxFiles,
+    uploadChatImages: s.uploadChatImages,
   })));
 
   const { t } = useI18n(resolvedLocale);
@@ -61,6 +86,41 @@ export function AgentPanel() {
   // 全屏态的历史细栏（dogfood 2026-08-21）：expanded 时历史钮开/关左侧 rail 快速切换
   // 会话（聊天不被顶掉）；docked 态维持整面视图切换。
   const [historyRailOpen, setHistoryRailOpen] = useState(false);
+  // 09-01 A4（R1.3/AC4）：拖入悬停视觉反馈态（dragleave 抖动处理 mirror AssetsPanel——
+  // dragging 态 + onDragLeave 无条件清，子元素间穿行由高频 dragover 重新置位兜住）。
+  const [dropzoneDragging, setDropzoneDragging] = useState(false);
+
+  // ── CR-003a（决议 a）：识图转述进度条订阅（image-relay-progress 全窗广播消费）──
+  const [imageRelayProgress, setImageRelayProgress] = useState<{ current: number; total: number } | null>(null);
+  const relayClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    // 桥缺席/旧 mock 桥无此方法（测试环境）→ null = 无订阅无显示。
+    const off = subscribeImageRelayProgress((p) => {
+      if (
+        !p || typeof p.current !== 'number' || typeof p.total !== 'number'
+        || !Number.isFinite(p.current) || !Number.isFinite(p.total) || p.total <= 0
+      ) return;
+      if (relayClearTimerRef.current !== null) {
+        clearTimeout(relayClearTimerRef.current);
+        relayClearTimerRef.current = null;
+      }
+      setImageRelayProgress({ current: p.current, total: p.total });
+      if (p.current >= p.total) {
+        // 末帧短驻留后自动消隐（~2s；下一帧到达时上方 clearTimeout 续期）。
+        relayClearTimerRef.current = setTimeout(() => {
+          relayClearTimerRef.current = null;
+          setImageRelayProgress(null);
+        }, IMAGE_RELAY_CLEAR_DELAY_MS);
+      }
+    });
+    return () => {
+      if (relayClearTimerRef.current !== null) {
+        clearTimeout(relayClearTimerRef.current);
+        relayClearTimerRef.current = null;
+      }
+      off?.();
+    };
+  }, []);
   // dogfood T1 Stage 3 D3：新建会话**不再中断**在途 run（弹窗退役——切走后 run 进后台，
   // 徽标 + 停止钮接岗）。新建只重置视图。
 
@@ -146,6 +206,48 @@ export function AgentPanel() {
   useEffect(() => {
     if (agentExpanded && view === 'history') setView('chat');
   }, [agentExpanded, view]);
+
+  // ── 09-01 A4（R1.3/AC4）：对话框拖拽进件（文档分支）──
+  // 判据 = dataTransfer.files 非空才处理——内部拖拽（章卡/大纲条目/结构槽位等）的
+  // files 恒空，天然过滤；preventDefault/stopPropagation 只在 files 非空时做，不碰
+  // 既有拖拽交互（不 preventDefault 的 dragover 在真浏览器本就不触发 drop）。
+  const hasDropFiles = (e: React.DragEvent<HTMLDivElement>): boolean =>
+    (e.dataTransfer?.files?.length ?? 0) > 0;
+
+  const handleDropzoneDragOver = (e: React.DragEvent<HTMLDivElement>) => {
+    if (!hasDropFiles(e)) return;
+    e.preventDefault(); // 允许 drop（否则 Electron 窗口内默认行为是打开文件）
+    e.stopPropagation();
+    setDropzoneDragging(true);
+  };
+
+  const handleDropzoneDragLeave = () => setDropzoneDragging(false);
+
+  const handleDropzoneDrop = (e: React.DragEvent<HTMLDivElement>) => {
+    if (!hasDropFiles(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setDropzoneDragging(false);
+    // 扩展名三分流（design §1.1）：文档白名单 → 与按钮上传同路径同结果（AC4）——
+    // pathForFile 换绝对路径 + importFiles 白名单 + resolve 挂载全在 A3 action 内。
+    const files = Array.from(e.dataTransfer.files);
+    const docs = files.filter((f) => INBOX_DOC_RE.test(f.name));
+    const images = files.filter((f) => DROP_IMAGE_RE.test(f.name));
+    const rejected = files.filter((f) => !INBOX_DOC_RE.test(f.name) && !DROP_IMAGE_RE.test(f.name));
+    if (rejected.length > 0) {
+      showToast(
+        t('agent.dropzoneRejected', { names: rejected.slice(0, 5).map((f) => f.name).join('、') }),
+        'warning',
+        5000,
+      );
+    }
+    if (images.length > 0) {
+      // 09-01 B4（R2.1 / dogfood #45）：图片分支接管——与选择器按钮/粘贴同一 action
+      //（canvas 预检压缩 → inbox/images/ 落盘 → image 附件指针挂载）。
+      void uploadChatImages(images);
+    }
+    if (docs.length > 0) void uploadInboxFiles(docs);
+  };
 
   const badgeText = (badge: SessionBadgeState): string =>
     badge === 'running' ? t('agent.badgeRunning')
@@ -281,7 +383,14 @@ export function AgentPanel() {
         ) : view === 'settings' ? (
           <AgentSettings onClose={() => setView('chat')} />
         ) : (
-          <div className="agent-panel-main">
+          // 09-01 A4/B4（R1.3/AC4 + R2.1）：消息+输入容器层 = 拖拽 drop zone——文档与
+          // 图片双分支同 zone 分流（images 分流已由 B4 落地，见 handleDropzoneDrop）。
+          <div
+            className={`agent-panel-main${dropzoneDragging ? ' agent-panel-main--dragging' : ''}`}
+            onDragOver={handleDropzoneDragOver}
+            onDragLeave={handleDropzoneDragLeave}
+            onDrop={handleDropzoneDrop}
+          >
             {/* Story 3.5: active batch strip — gear + scene progress, straight from
                 the latest batch metadata. No active batch → nothing rendered. */}
             {activeBatch && activeBatchProgress && (
@@ -293,6 +402,21 @@ export function AgentPanel() {
                   {t('agent.batchProgressScenes', { done: activeBatchProgress.done, total: activeBatchProgress.total })}
                   {' · '}
                   {t(gearLabelKey(activeBatchProgress.gear))}
+                </span>
+              </div>
+            )}
+            {/* CR-003a（决议 a）：识图转述进度条——多图串行转述的运行相位可见性（直传/
+                缓存全命中不发事件，天然零显示）；末帧 ~2s 自动消隐。 */}
+            {imageRelayProgress && (
+              <div className="agent-relay-progress" role="status">
+                <span className="material-symbols-outlined agent-relay-progress-icon" aria-hidden="true">
+                  progress_activity
+                </span>
+                <span className="agent-relay-progress-text">
+                  {t('agent.imageRelayProgress', {
+                    current: imageRelayProgress.current,
+                    total: imageRelayProgress.total,
+                  })}
                 </span>
               </div>
             )}

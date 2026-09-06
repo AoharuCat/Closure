@@ -1,0 +1,196 @@
+# 「手艺」页（E10.2b W5，独立左导航页）i18n 全词表。
+# 文案中文化纪律（mirror materials.yaml）：zh 界面零英文术语露出；键名（代码标识符，
+# = 契约字段原样）不受限。
+# 权威词表源：大类 13 = contracts/closure-craft-card.ts CRAFT_CARD_CATEGORIES（受控封闭）；
+# 状态/rank/phase = 契约枚举原样。
+craft:
+  title: "手艺"
+  # ── 四 tab（mockup 定稿）──
+  tabs:
+    queue: "待阅队列"
+    all: "全部卡"
+    rejected: "废弃区"
+    terms: "词表管理"
+  # ── 状态徽章（craftCardStatusSchema 三态）──
+  status:
+    pending_review: "待审"
+    verified: "已核"
+    rejected: "驳回"
+  # ── 徽章 ──
+  badge:
+    stale: "讲法待复核"
+    staleHint: "来源材料变更/校对/删除——{count} 条讲法待复核（卡状态不动）"
+    dispute: "分歧"
+    disputeHint: "多来源讲法语义相反——保留分歧不裁决，可按 rank 过滤"
+    mergeCandidate: "重复候选"
+  # ── 置信三档（mockup 修订拍板：不显示原始小数——分界 W6 校准；原值进 tooltip）──
+  confidence:
+    low: "低置信"
+    mid: "中置信"
+    high: "高置信"
+    tooltip: "AI 置信 {value}"
+  # ── 大类（受控 13 类 = CRAFT_CARD_CATEGORIES 短名；gloss 详 contracts 注释）──
+  category:
+    qingxu: "情绪手法"
+    xinxicha: "信息差"
+    fubi: "伏笔"
+    qiaoduan: "桥段"
+    jiegou: "结构"
+    huoke: "获客漏斗"
+    qidaigan: "期待感管理"
+    jiegoudafa: "结构打法"
+    zaogeng: "造梗与互动"
+    shijieguan: "世界观容纳度"
+    manzu: "满足感分层"
+    renshe: "人设"
+    sucai: "素材"
+  # ── 讲法 rank 三档（Wikidata preferred/normal/deprecated）──
+  rank:
+    approved: "认可"
+    normal: "正常"
+    rejected: "不认可"
+  # ── 蒸馏运行相位（craftDistillPhaseSchema）──
+  phase:
+    extracting: "切条中"
+    categorizing: "归类中"
+    dedup: "去重中"
+    landing: "落卡中"
+  # ── 统计头（card-list + term-list 聚合）──
+  stats:
+    pending: "待审 {count}"
+    verified: "已核 {count}"
+    rejected: "驳回 {count}"
+    pendingTerms: "待并词目 {count}"
+    dispute: "分歧 {count}"
+  # ── 通用列表态 ──
+  list:
+    loading: "加载中…"
+    error: "加载失败：{message}"
+    empty: "还没有手艺卡——到材料页对讲义/访谈触发蒸馏"
+  # ── 队列（视图 1）──
+  queue:
+    unlinkedMaterial: "未关联材料"
+    groupCount: "{count} 卡"
+    empty: "队列已清空——待审/分歧/待复核卡与并排任务都会出现在这里"
+  # ── 废弃区（视图 3）──
+  rejected:
+    empty: "废弃区为空——驳回的卡保留在这里可救回"
+  # ── 卡详情 + 编辑（视图 2）──
+  card:
+    back: "返回列表"
+    verify: "标记已核"
+    reject: "驳回"
+    rejectConfirm: "确认驳回"
+    rejectReasonLabel: "驳回理由（可选，废弃区回看）"
+    rejectReasonShown: "驳回理由：{reason}"
+    recover: "救回"
+    title: "招式名"
+    term: "词目（大类随词目自动跟随）"
+    disputeToggle: "分歧标记"
+    disputeOn: "分歧（点击取消）"
+    disputeOff: "无分歧（点击标记）"
+    tags: "标签"
+    tagPlaceholder: "添加标签…"
+    tagAdd: "添加"
+    tagRemove: "移除标签 {tag}"
+    condensed: "主张（保义浓缩）"
+    points: "操作要点（每行一条）"
+    scenarios: "适用场景（每行一条）"
+    counterexamples: "反例（每行一条）"
+    listFieldPlaceholder: "每行一条，留空即无"
+    teachingCount: "{count} 讲法"
+    teachings: "讲法（{count}）"
+    unknownAuthor: "作者未知"
+    # 来源徽章（E10.3b W6 拆书落卡 additive）：originKind=decon_instance 讲法标来源书名；
+    # 教程主张（默认/absent）不显示徽章。
+    originDecon: "拆书实例《{book}》"
+    originDeconNoTitle: "拆书实例"
+    staleHint: "来源材料已变更/校对/删除——引文快照仍有效，锚点可能漂移"
+    anchorJump: "打开原文定位"
+    anchorHint: "段落 {para} · 字符 {chars}（材料派生 .md 基面）"
+    anchorOpened: "已打开材料原文（段落 {para}）"
+    anchorMissing: "材料或派生 .md 不存在（已删除？）——引文快照仍保留在卡上"
+    anchorOpenFailed: "打开原文失败"
+    anchorPathCopied: "全局库材料路径已复制，请用系统编辑器打开：{path}"
+  # ── 标签过滤（R10 人审侧标签面）──
+  tagFilterHint: "点击按此标签过滤"
+  # ── 并排对比（视图 3——merge review）──
+  merge:
+    title: "并排对比"
+    pendingTitle: "并排待决（{count}）"
+    rowTitle: "重复候选主张"
+    newClaim: "新主张"
+    existing: "既有卡"
+    similarity: "相似度 {value}"
+    similarityHint: "embedding 余弦相似度（纯代码测量值）——≥0.98 自动并入已发生，此为 0.85–0.98 人审档"
+    # LLM 分歧预判（CR-2b-D1——disputeHint 可选键二态：在场=判定成功，缺席=不可用）
+    disputePredicted: "LLM 预判语义相反：{reason}"
+    noDispute: "LLM 判定无分歧"
+    disputeUnavailable: "分歧判定不可用（蒸馏时 LLM 判定失败）"
+    # 既有卡已删（CR-2b-8——错误态替代永久转圈，并入不可行引导分立/驳回）
+    existingGone: "既有卡已被删除——无法并入。请在左侧核对新主张后改判「分立」（新建卡）或「驳回」。"
+    merge: "并入"
+    independent: "分立"
+    dismiss: "驳回"
+    reviewGone: "该并排任务已裁决或不存在"
+  # ── 词表管理（待并词表）──
+  terms:
+    pendingTitle: "待并词目（{count}）"
+    pendingEmpty: "没有待并词目——AI 词表外命中的提案会出现在这里"
+    approve: "核准"
+    merge: "归并"
+    mergeTargetPlaceholder: "归并到…"
+    allTitle: "全部词目（{count}）"
+    mergedInto: "已归并 → {target}"
+    pendingSuffix: "（待并）"
+  # ── 蒸馏（材料页联动 + 手艺页运行条/批量入口共用）──
+  distill:
+    run: "蒸馏"
+    jump: "查看手艺卡"
+    idleBadge: "未蒸馏"
+    pendingBadge: "蒸馏排队中"
+    runningBadge: "{phase}·{elapsed}"
+    runningTooltip: "{phase}·已耗时 {elapsed}"
+    # done「产出 N」语义（CR-2b-11——新建卡 + 自动并入讲法合计，不虚称「N 卡」）
+    doneBadge: "已蒸馏·产出 {count}"
+    # 台账 stats + 产出分解（CR-2b-10——AC1「落库可见」tooltip 面；error 非空加注行）
+    doneTooltip: "新建 {newCards} 卡 · 自动并入 {mergedAuto} 讲法"
+    doneTooltipStats: "台账：主张 {claims} · 落锚 {anchored} · 无锚弃 {droppedNoAnchor} · 坏形弃 {droppedMalformed} · 归类弃 {droppedNoCategory}"
+    doneErrorNote: "备注：{note}"
+    failedBadge: "蒸馏失败·点击重试"
+    deletedBadge: "材料已删"
+    notDistillable: "材料未就绪（pending/failed 不可蒸馏）"
+    queuedToast: "已加入蒸馏队列"
+    failedToast: "蒸馏入队失败：{message}"
+    # 批量蒸馏入口（CR-2b-20——手艺页队列头；distill-status 清单驱动）
+    batchHead: "批量蒸馏"
+    batchCount: "{count} 份待蒸馏"
+    batchRun: "批量蒸馏未蒸馏材料"
+    batchRunHint: "把 {count} 份未蒸馏/蒸馏失败的材料加入队列（运行相位见上方运行条）"
+    batchEmpty: "没有可蒸馏的材料（材料未就绪，或均已蒸馏/蒸馏进行中）"
+    batchQueuedToast: "已批量入队 {count} 份材料"
+    skip:
+      not-found: "材料不存在"
+      not-ready: "材料未就绪（pending/failed 不可蒸馏）"
+      already-running: "蒸馏进行中"
+      hash-unchanged: "已蒸馏且原件未变——跳过"
+  # ── 动作 ──
+  action:
+    refresh: "刷新"
+  # ── toast ──
+  toast:
+    saved: "已保存"
+    savedDowngraded: "已保存——已核卡编辑后回到待审"
+    saveFailed: "保存失败：{message}"
+    reviewFailed: "操作失败：{message}"
+    verified: "已核——该卡已进入检索面"
+    rejected: "已驳回——卡保留在废弃区可救回"
+    recovered: "已救回——卡回到待审"
+    rankSaved: "讲法 rank 已更新（不改卡状态）"
+    mergeMerged: "已并入——讲法挂到既有卡（回待审）"
+    mergeIndependent: "已分立——新建卡（待审）"
+    mergeDismissed: "已驳回该主张（留痕）"
+    mergeFailed: "裁决失败：{message}"
+    termApproved: "词目「{name}」已核准"
+    termMerged: "词目「{name}」已归并——{count} 张卡改挂目标词目"
+    termFailed: "词表操作失败：{message}"

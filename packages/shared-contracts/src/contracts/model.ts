@@ -208,6 +208,13 @@ export type ResolvedModel = {
   thinkingKind?: ThinkingKind;
   /** Registry-derived official limits (thinking adapters task). Optional — see modelLimitsSchema. */
   limits?: ModelLimits;
+  /**
+   * Registry 派生的主模型图片输入能力（agent 附件 B1/R2.4，第三轮 registry 派生
+   * additive，mirror thinkingKind/limits）。`true` = 该家族确定支持图片输入（b64
+   * 直传）；ABSENT = 未验证（不等于不支持）——图片走 visionModel 转述安全路径，绝不
+   * 盲发主模型（中转站静默剥 image part = 幻觉红线，见 visionModel 注释同哲学）。
+   */
+  vision?: boolean;
 };
 
 // ── Model registry types ──
@@ -220,6 +227,8 @@ export type ModelRegistryEntry = {
   thinking?: ThinkingKind;
   /** Official limits for this family — absent = unknown (guardrail fallback). */
   limits?: ModelLimits;
+  /** 图片输入能力 — `true` 仅限确定性多模态家族；ABSENT = 未验证（≠不支持），走 visionModel 转述安全路径。 */
+  vision?: boolean;
 };
 
 export type ModelRegistry = {

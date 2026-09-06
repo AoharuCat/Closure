@@ -41,6 +41,21 @@ export const COMPACTION_TRIGGER_TOKENS = CONTEXT_WINDOW * COMPACTION_TRIGGER_RAT
 export const COMPACTION_TARGET_TOKENS = CONTEXT_WINDOW * COMPACTION_TARGET_RATIO;
 
 /**
+ * 每图固定 token 预算（task 09-01 B 波 R2.3b / 复查 M2，2026-09-01）：
+ * `estimateMessagesTokens` 对 `m.images` 逐图加算——image parts 不在 content 字符串
+ * 里，缺预算会系统性低估实际载荷。三处口径一并修复：①红线/投影判定
+ * （shouldTriggerCompaction / isProjectionOverflow——vision 直传 + 小窗模型可实际
+ * 超载而估算说装得下）；②校准环（loop.ts updateCalibrationRatio——「估算(无图) vs
+ * 实际 usage(含图)」会把 ratio 系统性抬高 → 贴过图的会话后续**纯文本轮**过早压缩）；
+ * ③summarizer 决策（contextManager 压缩判定同口径）。
+ *
+ * 量级依据：归一后（shell 5MB 闸 / 长边 1568）Claude 图像 token ≈ w×h/750 的保守
+ * 上界取 2,500；非 Claude 家族按同口径近似。固定预算而非逐图尺寸计算——估算器是
+ * 纯启发式不读图（范式判据：不解析图片字节）。
+ */
+export const IMAGE_TOKEN_BUDGET = 2_500;
+
+/**
  * Fast token estimation using character-based heuristic.
  * Mixed CJK/Latin text averages ~1 token per 3.5 characters.
  * Calibrated at runtime via actual usage feedback from the API.
@@ -71,6 +86,11 @@ export function estimateMessagesTokens(messages: SessionMessage[]): number {
       for (const tr of msg.toolResults) {
         total += estimateTokens(tr.output) + 10;
       }
+    }
+    // task 09-01 B 波（R2.3b / 复查 M2）：image parts 逐图固定预算（常量注释见
+    // IMAGE_TOKEN_BUDGET——三处口径：红线/投影判定、校准环、summarizer）。
+    if (msg.images && msg.images.length > 0) {
+      total += msg.images.length * IMAGE_TOKEN_BUDGET;
     }
     total += 4; // per-message framing overhead
   }

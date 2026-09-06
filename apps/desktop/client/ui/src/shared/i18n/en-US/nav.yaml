@@ -16,6 +16,14 @@ nav:
   structure: "Structure"
   # Setting page (08-30 asset cards visualization): browse/edit 8 card types + setting docs entry.
   setting: "Codex"
+  # Materials page (Story 10.1 ingestion base): materials library management (project ↔ global).
+  materials: "Materials"
+  # Craft page (E10.2b distillation pipeline): craft-card review surface
+  # (queue / card edit / side-by-side / rejected bin / vocabulary).
+  craft: "Craft"
+  # Book-study page (E10.3b deconstruction pipeline): study session surface
+  # (progress / review gates / output reading / style export).
+  decon: "Book Study"
   explorer: "Explorer"
   search: "Search"
   settings: "Settings"

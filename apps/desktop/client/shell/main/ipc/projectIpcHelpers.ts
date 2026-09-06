@@ -13,7 +13,12 @@ export type FileEntry = {
 /** Max entries per directory level to prevent memory blow-up on huge repos. */
 const MAX_ENTRIES_PER_DIR = 500;
 
-export const ALLOWED_IMAGE_DIRS = new Set(['temp/images/generation', 'assets/images']);
+/**
+ * `project:save-base64-image` 落盘目录白名单。`inbox/images` = Agent 对话图片附件
+ * （task 09-01 B 波 R2.3——用户可见、持久、可删的附件落位，与 .orison/research-media
+ * 研究中间产物正交，不统一）。
+ */
+export const ALLOWED_IMAGE_DIRS = new Set(['temp/images/generation', 'assets/images', 'inbox/images']);
 
 const MIME_EXT: Record<string, string> = {
   'image/png': '.png',

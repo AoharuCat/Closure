@@ -343,6 +343,25 @@ export type MessageRole = 'system' | 'user' | 'assistant' | 'tool';
 
 export type RetentionPriority = 'critical' | 'normal' | 'compressible';
 
+/**
+ * 消息携带图片的指针形态（task 09-01 B 波 R2.3 / dogfood #45）：path = 项目相对路径
+ * （`inbox/images/<file>`，字节已落盘）；b64hash = 落盘字节 sha256 指纹（shell 转述
+ * 缓存 key）；name = 展示名（附件 label）。**不内嵌 b64**——jsonl 防膨胀 + agent 零
+ * FS（ADR-2），指针→字节的解析/归一/vision 路由收在 shell generate 缝。
+ */
+export interface SessionImagePointer {
+  path: string;
+  b64hash: string;
+  name: string;
+  /**
+   * 指针所在项目根（session.projectPath，CR-001 决议 b / BMad CR 2026-09-01）：随线上
+   * image part 透出，shell generate 缝据它**精确定位**读盘项目根（免注册库多候选扫描
+   * 与跨项目同名歧义）。additive optional——旧消息无此字段缺省，shell 回落既有 fallback
+   *（注册库候选根扫描 + b64hash 指纹消歧）。
+   */
+  projectPath?: string;
+}
+
 export interface SessionMessage {
   id: string;
   role: MessageRole;
@@ -386,6 +405,13 @@ export interface SessionMessage {
   batchId?: string;
   /** progress=批量中过程消息 / report=锚点收尾全景（end_batch 后同 turn 消息盖 report）。 */
   batchKind?: BatchKind;
+  /**
+   * Chat 图片附件指针（task 09-01 B 波 R2.3 / dogfood #45）：createUserMessage 从
+   * image 附件提取；messagesToPayload 组 user 消息时按此出 image parts（指针形态）。
+   * additive optional——旧消息无字段读回 undefined 零迁移（jsonl 形态守卫只查 role，
+   * 读回天然兼容，persistence 无需改）。指针不内嵌 b64：见 {@link SessionImagePointer}。
+   */
+  images?: SessionImagePointer[];
 }
 
 export interface ToolCall {

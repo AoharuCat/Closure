@@ -312,6 +312,19 @@ describe('parse_document — docx local-first', () => {
     const result = await failing(ctx({ filePath: writeFile('bad.docx', Buffer.from('garbage')) }));
     expect(result.output).toContain('DOCX 解析失败');
   });
+
+  it('docx 空文本（trim 后无内容）→ parse-failed 拒（CR-014：不产空文本派生）', async () => {
+    // 防 sha256('') 跨文件伪命中：两份不同的空文本文档哈希相同，会误复用彼此的
+    // 描述/派生身份（09-01 inbox 附件 CR patch）。
+    const empty = createParseDocumentHandler({
+      loadConfig: () => UNCONFIGURED,
+      extractPdf: async () => TEXT_PDF,
+      extractDocx: async () => '  \n\t ',
+    });
+    const result = await empty(ctx({ filePath: writeFile('blank.docx', Buffer.from('docx-bytes')) }));
+    expect(result.output).toContain('文档无可提取文本');
+    expect(result.metadata).toMatchObject({ error: '文档无可提取文本', kind: 'docx' });
+  });
 });
 
 // ── Capping ──
@@ -344,10 +357,16 @@ describe('parse_document — failure paths', () => {
 
   it('unsupported extension → friendly with the supported list', async () => {
     const { h } = handler();
-    const result = await h(ctx({ filePath: writeFile('book.epub', Buffer.from('zip')) }));
+    const result = await h(ctx({ filePath: writeFile('sheet.xlsx', Buffer.from('xlsx')) }));
     expect(result.output).toContain('不支持的文档格式');
-    expect(result.output).toContain('PDF / DOCX / TXT / MD');
-    expect(result.output).toContain('EPUB 暂不支持');
+    expect(result.output).toContain('PDF / DOCX / TXT / MD / EPUB');
+  });
+
+  it('corrupt epub → structured parse-failed degrade（Story 10.1 Wave B：epub 已支持，坏档不冒充成功）', async () => {
+    const { h } = handler();
+    const result = await h(ctx({ filePath: writeFile('bad.epub', Buffer.from('not a zip')) }));
+    expect(result.output).toContain('EPUB 解析失败');
+    expect(result.output).toContain('已损坏或加密');
   });
 
   it('path escape THROWS (mirror imageHandlers pattern B — not a graceful case)', async () => {

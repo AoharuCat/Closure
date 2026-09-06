@@ -64,6 +64,9 @@ const QUERY_CRAFT_DESCRIPTION = [
   '检索全局 craft 参考库（爽点/金手指/题材playbook/桥段/节奏/力量/pattern/角色设计），返回相关 craft 文档供写作参考。',
   '混合检索：关键词 + 语义向量 + RRF + rerank。',
   formatCraftTypeVocab(),
+  // E10.2b W4.2（R10 自由标签）：命中里的手艺卡块带「标签: #…」行（标签发现机制——用着
+  // 用着就习得可用标签面）；tags 参数即用这些自由标签过滤（任一命中即召回，OR 语义）。
+  '命中包含「手艺卡」块（经验蒸馏的条目级写作手艺：主张+操作要点+适用场景+反例+多来源讲法），块尾「标签: #…」行是该卡的自由标签——用 tags 参数按标签检索，任一命中即召回，可与 query/craft_type 组合。',
 ].join('\n');
 
 export function registerBuiltinTools() {
@@ -488,9 +491,12 @@ export function registerBuiltinTools() {
     id: 'query_craft',
     description: QUERY_CRAFT_DESCRIPTION,
     parameters: z.object({
-      query: z.string().describe('自然语言查询，如「爽点设计」「金手指限制」「都市题材套路」'),
+      query: z.string().describe('自然语言查询，如「爽点设计」「金手指限制」「都市题材套路」；与 tags 同用时作精化，tags-only 浏览可留空'),
       craft_type: z.string().optional().describe(
         'craft 类型过滤（见描述中的 craft_type 词表，或自建新类）；不填则全类型',
+      ),
+      tags: z.array(z.string().min(1)).optional().describe(
+        '自由标签过滤（手艺卡标签，任一命中即召回 OR 语义；可用标签看命中手艺卡块的「标签: #…」行，可传 # 前缀以外的裸标签值）',
       ),
       k: z.number().int().positive().optional().describe('返回文档数（默认 10）'),
     }),

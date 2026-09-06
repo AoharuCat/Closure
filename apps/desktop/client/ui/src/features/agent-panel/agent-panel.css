@@ -132,6 +132,35 @@
   text-overflow: ellipsis;
 }
 
+/* ── 09-01 CR-003a（决议 a）：识图转述进度条（批处理 banner 的轻量变体）── */
+.agent-relay-progress {
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs);
+  padding: var(--space-2xs) var(--space-lg);
+  background: var(--accent-soft);
+  border-bottom: 1px solid var(--outline-variant);
+  flex-shrink: 0;
+}
+.agent-relay-progress-icon {
+  font-size: var(--text-md);
+  color: var(--accent-strong);
+  animation: agent-spin 1.2s linear infinite;
+}
+.agent-relay-progress-text {
+  font-size: var(--text-2xs);
+  color: var(--accent-strong);
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+@media (prefers-reduced-motion: reduce) {
+  .agent-relay-progress-icon {
+    animation: none;
+  }
+}
+
 /* ── Messages ── */
 
 .agent-messages {
@@ -2203,6 +2232,91 @@
   color: var(--error);
 }
 
+/* ── 09-01 A3：inbox 附件上传 chip（uploading/parsing/error 状态机）── */
+
+/* 隐藏的上传 file input（attach 菜单「上传文件…」触发）。 */
+.agent-upload-file-input {
+  display: none;
+}
+
+.agent-attachment-chip-upload {
+  font-weight: 500;
+}
+
+/* 解析中图标旋转（复用 agent-spin；reduced-motion 常亮，同 tool-call-live 惯例）。 */
+.agent-upload-spin {
+  animation: agent-spin 1.2s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .agent-upload-spin {
+    animation: none;
+  }
+}
+
+.agent-upload-state-text {
+  color: var(--on-surface-variant);
+  font-weight: 400;
+}
+
+/* error 态（扫描件 PDF / 解析失败）：红边指引态，可移除（AC3）。 */
+.agent-attachment-chip-upload.is-error {
+  background: var(--error-bg);
+  color: var(--error);
+  border: 1px solid var(--error);
+}
+
+/* ── 09-01 B4（dogfood #45）：chat 图片附件 chip（缩略图直显，R2.6）── */
+
+/* 缩略图 chip：左图右文，缩略图小方定尺寸（object-fit cover，不随长图变形）。 */
+.agent-attachment-chip-image {
+  padding: 0.1rem 0.4rem 0.1rem 0.15rem;
+}
+
+.agent-attachment-chip-image.is-error {
+  background: var(--error-bg);
+  color: var(--error);
+  border: 1px solid var(--error);
+}
+
+.agent-attachment-chip-thumb {
+  display: block;
+  flex: none;
+  width: 1.5rem;
+  height: 1.5rem;
+  object-fit: cover;
+  border-radius: var(--radius-sm);
+}
+
+/* 气泡 references 的 image 缩略图（乐观消息 dataUrl 直显 / 重载会话盘读还原）。 */
+.agent-msg-image-thumb {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.15rem;
+  border-radius: var(--radius-sm);
+  background: var(--chip-bg);
+}
+
+.agent-msg-image-thumb img {
+  display: block;
+  max-width: 200px;
+  max-height: 150px;
+  border-radius: var(--radius-sm);
+  object-fit: contain;
+}
+
+.agent-msg-image-thumb-loading,
+.agent-msg-image-thumb-fallback {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.25rem 0.4rem;
+  font-size: 0.66rem;
+  font-weight: 400;
+  color: var(--on-surface-variant);
+}
+
 .agent-input-toolbar-left {
   display: flex;
   align-items: center;
@@ -3824,4 +3938,10 @@
   padding: var(--space-2xs) var(--space-sm) var(--space-xs);
   color: var(--on-surface-variant);
   font-size: var(--text-xs);
+}
+
+/* ── 09-01 A4（R1.3/AC4）：拖入悬停视觉反馈（mirror assets-panel--dragging 先例）── */
+.agent-panel-main--dragging {
+  outline: 2px dashed var(--accent);
+  outline-offset: -4px;
 }

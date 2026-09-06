@@ -26,6 +26,13 @@ const AssetsPanel = lazy(() => import('../../features/assets/AssetsPanel').then(
 const StructurePage = lazy(() => import('../../features/structure/StructurePage').then((m) => ({ default: m.StructurePage })));
 // 「设定」页（task 08-30-asset-cards-visualization A1）：asset_cards 设定卡浏览/编辑。
 const SettingPage = lazy(() => import('../../features/setting/SettingPage').then((m) => ({ default: m.SettingPage })));
+// 「材料」页（Story 10.1 Wave D，D7）：摄取基座材料库管理面（scope 切换/列表/删除四清/
+// 重摄取/批量拖入/provenance 后补）。
+const MaterialsPage = lazy(() => import('../../features/materials/MaterialsPage').then((m) => ({ default: m.MaterialsPage })));
+// 「手艺」页（E10.2b W5）：经验文档蒸馏人审面——队列/卡编辑/并排对比/废弃区/词表管理。
+const CraftPage = lazy(() => import('../../features/craft/CraftPage').then((m) => ({ default: m.CraftPage })));
+// 「拆书」页（E10.3b W6）：小说拆解管线面——新建拆解/进度 + 人审闸门/产出阅读/风格导出。
+const DeconPage = lazy(() => import('../../features/decon/DeconPage').then((m) => ({ default: m.DeconPage })));
 const FileTabBar = lazy(() => import('../../features/editor/FileTabBar').then((m) => ({ default: m.FileTabBar })));
 const FileEditor = lazy(() => import('../../features/editor/FileEditor').then((m) => ({ default: m.FileEditor })));
 const SplitFileEditor = lazy(() => import('../../features/editor/SplitFileEditor').then((m) => ({ default: m.SplitFileEditor })));
@@ -138,6 +145,9 @@ export function WorkspaceLayout() {
       case 'assets': return <div className="workspace-panel-content"><AssetsPanel /></div>;
       case 'structure': return <div className="workspace-panel-content"><StructurePage /></div>;
       case 'setting': return <div className="workspace-panel-content"><SettingPage /></div>;
+      case 'materials': return <div className="workspace-panel-content"><MaterialsPage /></div>;
+      case 'craft': return <div className="workspace-panel-content"><CraftPage /></div>;
+      case 'decon': return <div className="workspace-panel-content"><DeconPage /></div>;
       default: return <div className="workspace-panel-content"><OverviewPage /></div>;
     }
   };

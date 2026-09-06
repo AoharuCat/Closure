@@ -7,6 +7,8 @@ import { watchProject, unwatchProject } from '../fs/projectWatcher';
 import { startAssetCardsWatcher, stopAssetCardsWatcher } from '../db/assetCardsWatcher';
 import { startSettingMdWatcher, stopSettingMdWatcher } from '../db/settingMdWatcher';
 import { startChapterChunkWatcher, stopChapterChunkWatcher } from '../db/chapterChunkWatcher';
+import { startProjectMaterialWatcher, stopProjectMaterialWatcher } from '../db/materialWatcher';
+import { backfillProjectMaterials } from '../db/materialIndexer';
 import { reindexAssetCards } from '../db/assetCardsIndexer';
 import { reindexAllSettingMd } from '../db/settingMdIndexer';
 import { rebuildChapterChunks } from '../db/chapterChunkIndexer';
@@ -196,6 +198,19 @@ export function registerProjectIpc() {
         );
       });
     }
+    // Story 10.1 Wave C（F-10）：项目车道 materials/ watcher——同生命周期（started here,
+    // stopped in project:unwatch + will-quit, mirror 三先例旁）。Backfill（F-16）：开项目
+    // 扫描 materials/ 候选——未登记原件完整摄取（解析→分章→派生 .md→登记→索引），已登记
+    // 且派生新鲜走 mtime 快路零解析；orphan 清扫删外部移除的原件行。Fire-and-forget +
+    // SILENT（进度/材料页计数归 Wave D）；项目未注册 → backfill 内部跳过（watcher 在注册
+    // 后的事件里自愈，mirror chapterChunk 语义）。
+    startProjectMaterialWatcher(projectDir);
+    void backfillProjectMaterials(projectDir).catch((err) => {
+      getLogger().warn(
+        { err: err instanceof Error ? err.message : String(err), projectDir },
+        'material open-project backfill failed - continuing',
+      );
+    });
   });
 
   ipcMain.handle('project:unwatch', async () => {
@@ -209,5 +224,8 @@ export function registerProjectIpc() {
     // Story 8.3: stop the chapter chunk watcher too (same lifecycle - mirror
     // stopSettingMdWatcher).
     stopChapterChunkWatcher();
+    // Story 10.1: stop the project material watcher too (same lifecycle - mirror
+    // stopChapterChunkWatcher; 泄漏守卫：清 debounce timer + pending 集)。
+    stopProjectMaterialWatcher();
   });
 }

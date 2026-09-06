@@ -53,15 +53,22 @@ export type CraftHit = z.infer<typeof craftHitSchema>;
  * `query_craft` agent tool input (Story 2.1; mirrors `closureStoryQuerySchema`).
  *
  * Deliberately has NO `projectId`: the craft KB is global. The shell handler
- * calls `searchCraft(query, {craftType, k})` directly with no project scope.
+ * calls `searchCraft(query, {craftType, tags, k})` directly with no project scope.
  *
  * `k` is CLAMPED to [1, 50] (same rationale as closureStoryQuerySchema): a bad
  * LLM param can never produce an unbounded SQLite `LIMIT` or an empty result,
  * and never crashes the tool call (handler "never throws" contract).
+ *
+ * `tags`（E10.2b W4.2 / R10 自由标签检索）：手艺卡自由标签过滤——**任一命中即召回**
+ * （OR 语义），可与 query/craft_type 组合；query 为空 + tags 在场 = 纯标签浏览（handler
+ * 放行、searchCraft 走结构化过滤路径）。可用标签来自命中渲染的「标签: #…」行（标签
+ * 发现机制）。与 craft_type 刻意同形：open string 数组非封闭枚举——标签是自由 facet
+ * （R10 红线：只约束类目不约束标签）。
  */
 export const closureCraftQuerySchema = z.object({
   query: z.string().default(''),
   craft_type: z.string().optional(),
+  tags: z.array(z.string().min(1)).optional(),
   k: z.number().int().default(10).transform((v) => Math.max(1, Math.min(50, v))),
 });
 

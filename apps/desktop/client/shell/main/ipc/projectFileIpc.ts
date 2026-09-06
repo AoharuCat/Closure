@@ -164,7 +164,13 @@ export function registerProjectFileIpc(): void {
    * renderer cannot bulk-exfiltrate arbitrary files via import-then-read. */
   ipcMain.handle(
     'project:import-files',
-    async (_, projectDir: string, targetRelDir: string, sourcePaths: string[]) => {
+    async (
+      _,
+      projectDir: string,
+      targetRelDir: string,
+      sourcePaths: string[],
+      allowedExtensions?: string[],
+    ) => {
       assertSafePath(projectDir);
       const destDir = targetRelDir && targetRelDir !== '/'
         ? buildProjectPath(projectDir, targetRelDir)
@@ -172,16 +178,49 @@ export function registerProjectFileIpc(): void {
       assertWithinProject(projectDir, destDir);
       if (!existsSync(destDir)) mkdirSync(destDir, { recursive: true });
 
-      if (!Array.isArray(sourcePaths)) return [];
+      // 附件任务 A1（design §1.1 / R1.5）：可选扩展名白名单——白名单在 shell 侧强制，
+      // 不信 renderer 过滤。additive：不传（含空数组/非数组）= 完全不启用，既有文件树
+      // 拖入路径行为零变化；传入非空数组时按 basename 扩展名（小写 + 补前导点归一，
+      // '.MD'/'md' 均归一为 '.md'）校验。
+      const extWhitelist =
+        Array.isArray(allowedExtensions) && allowedExtensions.length > 0
+          ? new Set(
+              allowedExtensions.map((ext) => {
+                const normalized = String(ext).trim().toLowerCase();
+                return normalized.startsWith('.') ? normalized : `.${normalized}`;
+              }),
+            )
+          : null;
+
+      if (!Array.isArray(sourcePaths)) {
+        return extWhitelist ? { imported: [], rejected: [] } : [];
+      }
+      const imported: string[] = [];
+      const rejected: string[] = [];
       // Cap batch size to limit abuse if renderer is compromised.
       const batch = sourcePaths.slice(0, MAX_IMPORT_BATCH);
+      // CR-018（09-01 CR patch）：附件路径（allowedExtensions 启用）下批量溢出不再
+      // 静默丢弃——列入 rejected 带原因（AC2 明确提示）；不传参的文件树老路径静默
+      // 切片语义零变化。
+      if (extWhitelist) {
+        for (const src of sourcePaths.slice(MAX_IMPORT_BATCH)) {
+          const name = path.basename(String(src));
+          if (name) rejected.push(`${name} (超过单批 ${MAX_IMPORT_BATCH} 个上限)`);
+        }
+      }
 
-      const imported: string[] = [];
       for (const src of batch) {
         if (!isImportableSourcePath(src)) continue;
         if (!existsSync(src)) continue;
         const baseName = path.basename(src);
         if (shouldSkipImport(baseName)) continue;
+        if (extWhitelist && !extWhitelist.has(path.extname(baseName).toLowerCase())) {
+          // 部分成功语义（与现 multi 行为一致）：非白名单条目拒收——不拷入、不触发
+          // file:changed，文件名列入 rejected 回报 renderer 供明确提示（AC2：inbox/
+          // 无残留）；其余合法文件照常处理。
+          rejected.push(baseName);
+          continue;
+        }
         const dest = uniquePath(destDir, baseName);
         assertWithinProject(projectDir, dest);
         if (isManagedProjectDocumentPath(dest)) continue;
@@ -192,7 +231,13 @@ export function registerProjectFileIpc(): void {
             if (isSensitiveImportSource(src)) continue;
             cpSync(src, dest, { recursive: true });
           } else {
-            if (stats.size > MAX_IMPORT_FILE_BYTES) continue;
+            if (stats.size > MAX_IMPORT_FILE_BYTES) {
+              // CR-018（09-01 CR patch）：附件路径（allowedExtensions 启用）下大小
+              // 拒收明确提示——列入 rejected 带原因（AC2）；不传参的文件树老路径
+              // 静默跳过语义零变化。
+              if (extWhitelist) rejected.push(`${baseName} (超过 50MB 上限)`);
+              continue;
+            }
             if (isSensitiveImportSource(src)) continue;
             copyFileSync(src, dest);
           }
@@ -203,7 +248,11 @@ export function registerProjectFileIpc(): void {
           // Skip individual files that fail to copy; continue with the rest.
         }
       }
-      return imported;
+      // 返回形态按白名单启用与否分流（additive）：不启用 = string[]（既有契约逐字节
+      // 一致，现有 preload/文件树消费方零漂移）；启用 = { imported, rejected }——
+      // rejected 含扩展名拒收（裸文件名）与大小/批量拒收（`文件名 (原因)` 带原因，
+      // CR-018）；敏感路径等其余闸的静默跳过语义不变，不混入 rejected。
+      return extWhitelist ? { imported, rejected } : imported;
     },
   );
 
@@ -350,7 +399,7 @@ export function registerProjectFileIpc(): void {
     return existsSync(fullPath);
   });
 
-  ipcMain.handle('project:save-base64-image', async (_, projectDir: string, input: SaveBase64ImageInput) => {
+  ipcMain.handle('project:save-base64-image', async (_, projectDir: string, input: SaveBase64ImageInput & { notify?: boolean }) => {
     assertSafePath(projectDir);
     if (!ALLOWED_IMAGE_DIRS.has(input.directory)) {
       throw new Error('Invalid image directory');
@@ -363,6 +412,13 @@ export function registerProjectFileIpc(): void {
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 
     atomicWriteFileSync(fullPath, Buffer.from(input.b64Json, 'base64'));
+    // 09-01 附件 B 波（R2.3/复查 M4）：additive `notify` ——chat 进件路径传 true 时落盘后
+    // 显式广播 file:changed（文件树/字数刷新确定性到达，不赌平台 watcher 差异）。默认
+    // 不开：现有消费者（AssetsPanel 拖入、ImageGenEditor 生成图）自带重载/无需事件，无差别
+    // 加事件会白触发资产页全量重载。刻意不用 image:created ——同白触发问题（design §2.1）。
+    if (input.notify === true) {
+      notifyUI({ type: 'file:changed', projectPath: projectDir, path: `/${relativePath}` });
+    }
     return { relativePath, fullPath, fileName };
   });
 
@@ -399,7 +455,15 @@ export function registerProjectFileIpc(): void {
       const files: string[] = [];
       const collect = (list: typeof entries) => {
         for (const e of list) {
-          if (e.isDir && e.children) { collect(e.children); continue; }
+          if (e.isDir && e.children) {
+            // 附件任务 A1（design D-H / 复查 M5）：字数概览语义 = 项目产出（章节/设定
+            // 文档），inbox/ 是对话框上传的外部参考材料——10 万字大纲进 inbox 不应把
+            // 项目总字数顶 +10 万（file:changed 驱动的自动刷新还会放大）。根级 inbox
+            // 目录整棵剪枝；前导斜杠锚定，其他位置同名目录（如 资料/inbox）与根级
+            // 同名文件（inbox.md）不受影响。
+            if (e.path === '/inbox' || e.path.startsWith('/inbox/')) continue;
+            collect(e.children); continue;
+          }
           if (!/\.(md|txt)$/i.test(e.name)) continue;
           files.push(path.join(projectDir, e.path.replace(/^\//, '')));
         }

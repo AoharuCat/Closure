@@ -36,6 +36,9 @@
 @import "../../features/structure/structure.css";
 @import "../../features/world-state/world-state.css";
 @import "../../features/setting/setting.css";
+@import "../../features/materials/materials.css";
+@import "../../features/craft/craft.css";
+@import "../../features/decon/decon.css";
 
 /* ── Reset ── */
 #root {

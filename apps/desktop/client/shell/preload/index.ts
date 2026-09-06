@@ -17,6 +17,15 @@ import type {
   ModelConfig,
   ModelRef,
   OrisonDesktopApi,
+  // 09-01 A3：inbox 附件三通道 canonical 契约类型（type-only，零 runtime 内联——
+  // preload sandbox 纪律见下方 WORLD_CHANGED_CHANNEL 注释）。
+  ParseInboxDocInput,
+  ParseInboxDocResult,
+  ResolveInboxAttachmentInput,
+  ResolveInboxAttachmentResult,
+  StoreAttachmentDescriptionInput,
+  StoreAttachmentDescriptionResult,
+  ImportFilesResult,
   ProjectLifecycleResult,
   ProjectMutationResult,
   ProjectSearchResult,
@@ -58,6 +67,71 @@ import type {
   WorldSliceDetailRequest,
   WorldSubjectDetail,
   WorldSubjectDetailRequest,
+  // Story 10.1 Wave D：材料库管理面契约类型（type-only 零 runtime 内联——sandbox 纪律
+  // 见下方 WORLD_CHANGED_CHANNEL 注释与 channels 深导入）。
+  MaterialChangedEvent,
+  MaterialDeleteResult,
+  MaterialDetail,
+  MaterialProvenancePatchInput,
+  MaterialProvenancePatchResult,
+  // E10.2a：materials:update-name 契约类型（type-only 零 runtime 内联）。
+  MaterialUpdateNameInput,
+  MaterialUpdateNameResult,
+  MaterialReingestResult,
+  MaterialsImportInput,
+  MaterialsImportResult,
+  MaterialsListInput,
+  MaterialSummary,
+  // E10.2b（task 09-05）W3：蒸馏管线契约类型（type-only 零 runtime 内联——同上 sandbox 纪律）。
+  CraftDistillRunInput,
+  CraftDistillProgressEvent,
+  CraftDistillRunResult,
+  CraftDistillStatusInput,
+  CraftDistillLedger,
+  // E10.2b（task 09-05）W5：手艺卡人审面九通道契约类型（type-only 零 runtime 内联——载荷
+  // 契约单源 shared-contracts ipc.ts「E10.2b Wave 1」段）。
+  CraftCard,
+  CraftCardListInput,
+  CraftCardPatchInput,
+  CraftCardPatchResult,
+  CraftCardReviewInput,
+  CraftCardReviewResult,
+  CraftCardSummary,
+  CraftMergeReview,
+  CraftMergeReviewListInput,
+  CraftMergeReviewResolveInput,
+  CraftMergeReviewResolveResult,
+  CraftTerm,
+  CraftTermApproveResult,
+  CraftTermListInput,
+  CraftTermMergeInput,
+  CraftTermMergeResult,
+  // E10.3a（task 09-05）W6：拆解管线控制面契约类型（type-only 零 runtime 内联——载荷契约
+  // 单源 shared-contracts ipc.ts「E10.3a W6」段）。
+  DeconCreateInput,
+  DeconCreateResult,
+  DeconStartInput,
+  DeconStartResult,
+  DeconJobIdInput,
+  DeconTransitionResult,
+  DeconDeleteResult,
+  DeconJobDetail,
+  DeconListInput,
+  DeconJob,
+  DeconProgressEvent,
+  // E10.3b（task 09-05）W3b：人审闸门确认通道契约类型（type-only 零 runtime 内联）。
+  DeconApproveReviewInput,
+  DeconApproveReviewResult,
+  // E10.3b（task 09-05）W5：读面 + 风格导出通道契约类型（type-only 零 runtime 内联）。
+  DeconProductsInput,
+  DeconProductsResult,
+  DeconReportsInput,
+  DeconReportsResult,
+  DeconExportStyleInput,
+  DeconExportStyleResult,
+  // E10.3b（task 09-05）W7 小补③：stale 确认重跑通道契约类型（type-only 零 runtime 内联）。
+  DeconConfirmRerunInput,
+  DeconConfirmRerunResult,
 } from '@orison/shared-contracts';
 // 推送通道名单源常量（BMad CR #8）：preload 与 shell 发射器（worldNotify）共同引用
 // shared-contracts WORLD_CHANGED_CHANNEL，禁硬编码。**深导入 zod-free 叶子模块**
@@ -65,6 +139,11 @@ import type {
 // 内联进 preload bundle——sandbox preload 随即整崩、window.orisonDesktop 消失、
 // 全 app IPC 静默哑掉。叶子路径只内联常量本体。守卫：shell test preload-sandbox-imports。
 import { WORLD_CHANGED_CHANNEL } from '@orison/shared-contracts/contracts/channels';
+// Story 10.1 Wave D：material:changed 推送通道常量（同上 zod-free 叶子深导入纪律）。
+import { MATERIAL_CHANGED_CHANNEL } from '@orison/shared-contracts/contracts/channels';
+import { CRAFT_DISTILL_PROGRESS_CHANNEL } from '@orison/shared-contracts/contracts/channels';
+// E10.3a（task 09-05）W6：decon:progress 推送通道常量（同上 zod-free 叶子深导入纪律）。
+import { DECON_PROGRESS_CHANNEL } from '@orison/shared-contracts/contracts/channels';
 
 /**
  * dogfood R2 #92：world:changed 订阅的 callback → 包装 listener 映射（BMad CR #7+#105：WeakMap →
@@ -78,6 +157,12 @@ const worldChangedListeners = new Map<
   (event: WorldChangedEvent) => void,
   (_e: unknown, event: WorldChangedEvent) => void
 >();
+
+/**
+ * A 波 09-01（inbox 附件）三通道：canonical 载荷类型已落 shared-contracts ipc.ts
+ * （A3 契约补条目），本地镜像段（`ok: boolean` 宽形态）退役——直接以契约类型暴露，
+ * 方法并入下方主对象（键面不变，securitySurface 白名单零漂移）。
+ */
 
 export const exposedDesktopApi = {
   pickProjectDirectory: () => ipcRenderer.invoke('project:pick-directory'),
@@ -248,11 +333,22 @@ export const exposedDesktopApi = {
     ipcRenderer.invoke('project:move-file', projectDir, fromRelativePath, toRelativePath) as Promise<string>,
   deleteProjectFile: (projectDir: string, relativePath: string) =>
     ipcRenderer.invoke('project:delete-file', projectDir, relativePath) as Promise<boolean>,
-  // Drag-drop import of external OS files into the project tree
-  importFiles: (projectDir: string, targetRelDir: string, sourcePaths: string[]) =>
-    ipcRenderer.invoke('project:import-files', projectDir, targetRelDir, sourcePaths) as Promise<string[]>,
+  // Drag-drop import of external OS files into the project tree.
+  // 09-01 A1 additive: allowedExtensions 白名单转发（shell 侧强制，非白名单拒收部分成功）。
+  importFiles: (projectDir: string, targetRelDir: string, sourcePaths: string[], allowedExtensions?: string[]) =>
+    ipcRenderer.invoke('project:import-files', projectDir, targetRelDir, sourcePaths, allowedExtensions) as Promise<string[] | ImportFilesResult>,
   // Resolve the absolute path of a dropped File (Electron 32+ removed File.path)
   pathForFile: (file: File) => webUtils.getPathForFile(file),
+  // A 波 09-01：inbox 附件三通道（canonical 契约类型 shared-contracts ipc.ts）。
+  // parseInboxDoc：上传进件即预解析（docx/pdf 派生 .md 落盘 + file:changed；txt/md
+  // preview-only）；resolveInboxAttachment：挂附件协议（哈希身份 exact/similar/fresh）；
+  // storeAttachmentDescription：fresh 描述生成完毕回写 sidecar。
+  parseInboxDoc: (input: ParseInboxDocInput) =>
+    ipcRenderer.invoke('project:parse-inbox-doc', input) as Promise<ParseInboxDocResult>,
+  resolveInboxAttachment: (input: ResolveInboxAttachmentInput) =>
+    ipcRenderer.invoke('project:resolve-inbox-attachment', input) as Promise<ResolveInboxAttachmentResult>,
+  storeAttachmentDescription: (input: StoreAttachmentDescriptionInput) =>
+    ipcRenderer.invoke('project:store-attachment-description', input) as Promise<StoreAttachmentDescriptionResult>,
   // Filesystem watcher for external-change auto-refresh
   watchProject: (projectDir: string) =>
     ipcRenderer.invoke('project:watch', projectDir) as Promise<void>,
@@ -322,6 +418,116 @@ export const exposedDesktopApi = {
       worldChangedListeners.delete(callback);
     }
   },
+  // ── Story 10.1 Wave D：材料库管理面（六 invoke + material:changed 推送订阅）──
+  listMaterials: (input: MaterialsListInput) =>
+    ipcRenderer.invoke('materials:list', input) as Promise<MaterialSummary[]>,
+  getMaterial: (input: { materialId: string }) =>
+    ipcRenderer.invoke('materials:get', input) as Promise<MaterialDetail | null>,
+  deleteMaterial: (input: { materialId: string }) =>
+    ipcRenderer.invoke('materials:delete', input) as Promise<MaterialDeleteResult>,
+  reingestMaterial: (input: { materialId: string }) =>
+    ipcRenderer.invoke('materials:reingest', input) as Promise<MaterialReingestResult>,
+  importMaterials: (input: MaterialsImportInput) =>
+    ipcRenderer.invoke('materials:import', input) as Promise<MaterialsImportResult>,
+  updateMaterialProvenance: (input: MaterialProvenancePatchInput) =>
+    ipcRenderer.invoke('materials:update-provenance', input) as Promise<MaterialProvenancePatchResult>,
+  // E10.2a（design §3.1）：材料显示名（视频标题）编辑——name 列 display 面，materialId 路径
+  // 身份不变；落库后 material:changed（reason='name-updated'）驱动列表名刷新。
+  updateMaterialName: (input: MaterialUpdateNameInput) =>
+    ipcRenderer.invoke('materials:update-name', input) as Promise<MaterialUpdateNameResult>,
+  // material:changed 推送订阅（材料变更全窗广播，mirror onToolEvent 订阅纪律——返回退订
+  // 函数只移除本监听器注册的 listener，绝不 removeAllListeners）。
+  onMaterialChanged: (callback: (event: MaterialChangedEvent) => void) => {
+    const listener = (_e: unknown, event: MaterialChangedEvent) => callback(event);
+    ipcRenderer.on(MATERIAL_CHANGED_CHANNEL, listener);
+    return () => { ipcRenderer.removeListener(MATERIAL_CHANGED_CHANNEL, listener); };
+  },
+  // ── E10.2b（task 09-05）W3：蒸馏管线（两 invoke——craft:distill-progress 订阅面归 W5.5 UI 事件刷新）──
+  // 批量入队蒸馏（后台执行；跳过项逐份回报原因；相位/终态经 craft:distill-progress 推送）。
+  craftDistillRun: (input: CraftDistillRunInput) =>
+    ipcRenderer.invoke('craft:distill-run', input) as Promise<CraftDistillRunResult>,
+  // 材料蒸馏台账查询（省略 materialIds = 全部行——材料页/手艺页徽章取数面）。
+  craftDistillStatus: (input: CraftDistillStatusInput) =>
+    ipcRenderer.invoke('craft:distill-status', input) as Promise<CraftDistillLedger[]>,
+  // ── E10.2b（task 09-05）W5：手艺卡人审面（九 invoke——队列/卡编辑/并排对比/词表视图）──
+  // 手艺卡队列（过滤 AND 组合 + tags OR + 置信排序；返回摘要行——teachings 剥离投影）。
+  craftCardList: (input: CraftCardListInput) =>
+    ipcRenderer.invoke('craft:card-list', input) as Promise<CraftCardSummary[]>,
+  // 取整卡（claim 四件套全文 + 讲法数组；未知 id → null）。
+  craftCardGet: (input: { cardId: string }) =>
+    ipcRenderer.invoke('craft:card-get', input) as Promise<CraftCard | null>,
+  // 卡内容编辑（编辑即降级执行点——verified 卡 patch 后回 pending_review）。
+  craftCardPatch: (input: CraftCardPatchInput) =>
+    ipcRenderer.invoke('craft:card-patch', input) as Promise<CraftCardPatchResult>,
+  // 人审状态机动作（verify/reject/recover）+ 讲法级 rank 改。
+  craftCardReview: (input: CraftCardReviewInput) =>
+    ipcRenderer.invoke('craft:card-review', input) as Promise<CraftCardReviewResult>,
+  // 并排任务队列（默认仅待审；includeResolved 含已裁决审计回看）。
+  craftMergeReviewList: (input: CraftMergeReviewListInput) =>
+    ipcRenderer.invoke('craft:merge-review-list', input) as Promise<CraftMergeReview[]>,
+  // 三动作裁决（merge/independent/dismiss；已裁决再 resolve = invalid-state）。
+  craftMergeReviewResolve: (input: CraftMergeReviewResolveInput) =>
+    ipcRenderer.invoke('craft:merge-review-resolve', input) as Promise<CraftMergeReviewResolveResult>,
+  // 词目清单（UI 补全 chips / 待并词表视图；含 pending）。
+  craftTermList: (input: CraftTermListInput) =>
+    ipcRenderer.invoke('craft:term-list', input) as Promise<CraftTerm[]>,
+  // 核准待并词目（pending → active）。
+  craftTermApprove: (input: { termId: string }) =>
+    ipcRenderer.invoke('craft:term-approve', input) as Promise<CraftTermApproveResult>,
+  // 归并词目（卡改挂 + category 跟随；movedCardCount = 改挂卡数）。
+  craftTermMerge: (input: CraftTermMergeInput) =>
+    ipcRenderer.invoke('craft:term-merge', input) as Promise<CraftTermMergeResult>,
+  // W5.5 合流缝补：蒸馏进度订阅（mirror onMaterialChanged 形态——channel 常量深导入 zod-free
+  // 叶子，返回退订函数；UI craftSlice 事件刷新三件套消费）。
+  onCraftDistillProgress: (callback: (event: CraftDistillProgressEvent) => void) => {
+    const listener = (_e: unknown, event: CraftDistillProgressEvent) => callback(event);
+    ipcRenderer.on(CRAFT_DISTILL_PROGRESS_CHANNEL, listener);
+    return () => { ipcRenderer.removeListener(CRAFT_DISTILL_PROGRESS_CHANNEL, listener); };
+  },
+  // ── E10.3a（task 09-05）W6：拆解管线控制面（七 invoke + decon:progress 订阅——拆书页 UI 归 child B）──
+  // 创建拆解会话（P0 落库——材料就绪门 + 在途守卫 + 双指纹快照 + P1 继承；回执带成本预估）。
+  deconCreate: (input: DeconCreateInput) =>
+    ipcRenderer.invoke('decon:create', input) as Promise<DeconCreateResult>,
+  // 启动/续跑（后台执行即回；capped 续跑的调预算面在 budget 字段；进度经 decon:progress 推送）。
+  deconStart: (input: DeconStartInput) =>
+    ipcRenderer.invoke('decon:start', input) as Promise<DeconStartResult>,
+  // 暂停（优雅中断——章边界感知停，断点行保留）。
+  deconPause: (input: DeconJobIdInput) =>
+    ipcRenderer.invoke('decon:pause', input) as Promise<DeconTransitionResult>,
+  // 取消（终态；重拆走新 job）。
+  deconCancel: (input: DeconJobIdInput) =>
+    ipcRenderer.invoke('decon:cancel', input) as Promise<DeconTransitionResult>,
+  // 删除会话（job + pass_state + canon per-job 级联；事实层三表材料级保留）。
+  deconDelete: (input: DeconJobIdInput) =>
+    ipcRenderer.invoke('decon:delete', input) as Promise<DeconDeleteResult>,
+  // 会话详情（人审取数面：断点行 + canon 六域 + 词典 + 实体；stale 时产物面为空）。
+  deconGet: (input: DeconJobIdInput) =>
+    ipcRenderer.invoke('decon:get', input) as Promise<DeconJobDetail | null>,
+  // 会话清单（省略 materialId = 全部）。
+  deconList: (input: DeconListInput) =>
+    ipcRenderer.invoke('decon:list', input) as Promise<DeconJob[]>,
+  // 人审闸门确认（decon:approve-review——pending → approved 后经 start 续跑，台账零重付）。
+  deconApproveReview: (input: DeconApproveReviewInput) =>
+    ipcRenderer.invoke('decon:approve-review', input) as Promise<DeconApproveReviewResult>,
+  // product 读面（decon:products——craft 闸门卡/产出阅读取数；stale freshness 门同 get 纪律）。
+  deconProducts: (input: DeconProductsInput) =>
+    ipcRenderer.invoke('decon:products', input) as Promise<DeconProductsResult>,
+  // report 读面（decon:reports——列表只回 meta；带 kind+unit 单取全文）。
+  deconReports: (input: DeconReportsInput) =>
+    ipcRenderer.invoke('decon:reports', input) as Promise<DeconReportsResult>,
+  // 风格卡导出（decon:export-style——p4:style payload 合并写目标项目 settings/style.md）。
+  deconExportStyle: (input: DeconExportStyleInput) =>
+    ipcRenderer.invoke('decon:export-style', input) as Promise<DeconExportStyleResult>,
+  // stale 确认重跑（decon:confirm-rerun——刷新双指纹 + 复位派生产物后自动 start 续跑）。
+  deconConfirmRerun: (input: DeconConfirmRerunInput) =>
+    ipcRenderer.invoke('decon:confirm-rerun', input) as Promise<DeconConfirmRerunResult>,
+  // 拆解进度订阅（mirror onCraftDistillProgress 形态——channel 常量深导入 zod-free 叶子，
+  // 返回退订函数只移除本监听器；事件 best-effort 可丢，读侧兜底 decon:get）。
+  onDeconProgress: (callback: (event: DeconProgressEvent) => void) => {
+    const listener = (_e: unknown, event: DeconProgressEvent) => callback(event);
+    ipcRenderer.on(DECON_PROGRESS_CHANNEL, listener);
+    return () => { ipcRenderer.removeListener(DECON_PROGRESS_CHANNEL, listener); };
+  },
   // Logging
   openLogsDir: () => ipcRenderer.invoke('log:open-dir') as Promise<string>,
   writeLog: (payload: { level: 'debug' | 'info' | 'warn' | 'error' | 'fatal'; message: string; meta?: Record<string, unknown> }) =>
@@ -386,6 +592,14 @@ export const exposedDesktopApi = {
     const listener = (_e: unknown, event: { type: string; data: unknown }) => callback(event);
     ipcRenderer.on('agent:stream-event', listener);
     return () => { ipcRenderer.removeListener('agent:stream-event', listener); };
+  },
+  // 09-01 CR-003a（决议 a）：识图转述进度订阅（shell agentIpc 全窗 webContents.send 广播，
+  // 多图串行转述全程可见）。形态 mirror onUpdateEvent / onToolEvent——返回退订函数，只移除
+  // 本监听器注册的 listener，绝不 removeAllListeners。
+  onImageRelayProgress: (callback: (progress: { current: number; total: number }) => void) => {
+    const listener = (_e: unknown, progress: { current: number; total: number }) => callback(progress);
+    ipcRenderer.on('image-relay-progress', listener);
+    return () => { ipcRenderer.removeListener('image-relay-progress', listener); };
   },
   resolveAgentConfirmation: (sessionId: string, callId: string, approved: boolean) =>
     ipcRenderer.invoke('agent:resolve-confirmation', sessionId, callId, approved),

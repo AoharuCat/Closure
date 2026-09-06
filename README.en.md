@@ -72,17 +72,21 @@ On top of OrisonSpace's writing-IDE base, Closure rebuilt the generation pipelin
 - **Structure workbench** — a single structure page overviewing the whole book: causal skeleton and arrangement workbench, two linked zones; the chapter axis is banded by volume and a minimap supports long-form navigation; emotion and pacing curves can be toggled on as overlays over the structure graph (foreshadowing overlay planned); **isomorphic lockstep** — select an element in either zone and the associated cards highlight in sync, so tracing one thread across zones takes no flipping back and forth
 - **Information-gap control** — records what each character knows and what the reader knows. Review catches holes like "a character said something they couldn't know" or "a planted foreshadow was never revealed," while the author's deliberate concealments and delays are not false-flagged
 - **World-event system** — after each chapter is written, five kinds of changes (physical, cognitive, emotional, relational, factional) are extracted from the prose and merged into world-state snapshots that advance with the plot. The key is that the ledgers come in two layers: **factual truth** and **what the reader knows right now** are recorded separately — the gap between them is your foreshadow inventory; what should have been planted but wasn't, what should have been revealed but wasn't, the system can see. When a later chapter starts, who knows what right now and where each relationship stands enters the writer's context automatically
+- **World-state panel** — a "World" entry in the sidebar: a reading surface organized around world events, with three zoom levels (overview / point in time / entity) that refresh in real time as chapters are written — check "what the world looks like right now" anytime
 - **Engineered emotion loop** — set the target emotion for a scene before writing it; once written, automatically check whether the emotion actually landed, and bounce it back for revision if it didn't
 - **Write-chapter chain** — the full flow of writing one chapter: intent is dialogued, the director checks settings, context is assembled, the writer drafts, a checkpoint pauses for your review, review and revision run, and after the chapter lands it comes back to report. Every step pauses for a human; the steering wheel stays in your hands
 - **Two-layer orchestration architecture** — the strategic layer is the commander in the dialog (you in the loop, redirecting anytime); the tactical layer is a node chain with explicit contracts (dependencies never dropped, artifact flow never relies on prompts implicitly carrying it); chain segments bring only summaries back to the dialog — internal process never eats your context; checkpoints can pause, resume, and rerun after edits
 - **Two-phase writer drafting** — the writer doesn't generate in one breath: it first self-checks for context gaps, lists an investigation checklist, and only starts writing after the researcher verifies every item. When the context budget runs out, pruning follows a degradation ladder — the story skeleton, the full-book table of contents, and queryable pointers are never pruned
 - **Web research** — check sources before writing: multiple search providers configurable (Tavily / Bocha / AnySearch; keys stored locally only). The researcher searches, the director verifies — anything contradicting existing settings gets bounced back for you to clarify, and research results settle into the workbench as cards. Useful for checking canon when writing fanfic, or industry details when writing urban fiction
+- **Dialog attachments** — upload documents and images right in the writing dialog: txt / docx / pdf files are parsed into readable text automatically, and images go to a vision-capable model (recognition progress visible in real time) — hand over reference material on the spot
 - **Meaning-preserving revision** — every AI edit is presented as a word-level diff: what changed, and whether the original meaning drifted — verifiable at a glance
 - **Never lost at a million words** — chapter summaries, integrity checks, and mention ledgers; even at a million words, it still remembers who said what in which chapter
 - **Ripple propagation** — changed a setting in chapter 3? The system traces forward along the narrative dependency graph and automatically marks which downstream chapters and threads are affected and what kind of impact it is — the bill for changing settings never goes unrecorded
 - **De-AI-flavor** — embeds the [llmlint](https://github.com/notnotype/llmlint) static engine: hundreds of rules scanning purely locally at zero cost to catch "AI tone"; paired with the Lint panel and the revision loop to clear findings one by one
 - **Style cards** — paste a passage from a novel you admire, and a sub-agent analyzes it into a style card stored in the project (with the original excerpt); the writer, refiner, and planner all reference it afterwards. Without a style card, everything works as usual
 - **Craft knowledge base (craft KB)** — a built-in knowledge base of writing methodology: craft entries, source anchoring, grouping by topic; the writer, director, and reviewer can all consult and cite it; seed content ships with the app, and you can extend it yourself
+- **Materials library** — bulk-import novels, scripts, and subtitles you have read (txt / docx / pdf / epub / srt / ass / vtt and other common formats): chapter structure is detected automatically and a full-text index is built; every material carries quality badges and provenance — one shared corpus for writing and deconstruction
+- **Book-deconstruction engine** — pick an imported book and run a tiered deconstruction: factual canon (worldview / characters / factions), reading notes, chapter critiques, fine-grained annotations, and style features are produced layer by layer, with human review gates at the key points; style analysis exports as a style card, and writing experience distills into craft cards — see clearly why someone's writing works, then learn from it
 - **Two-layer review** — free pure-code rules run first; drafts with zero findings pass straight through; only flagged drafts go to the model for detailed review (six groups: consistency, narrative features, promise fulfillment, cognitive state, emotion landing, setting contracts). Two disciplines: **every finding must cite the original text** — no evidence, no opinion; and **false positives are preferred over misses** — the review layer is never allowed a "fake pass"
 - **Tiered model routing** — planning, prose writing, review, research, style analysis, and every other stage can each be assigned a different model and tier: the strongest model for prose, cheap models for chores; each stage's thinking depth (reasoning effort) is also individually adjustable — cost goes where it counts
 - **Creative decision records** — major creative choices are archived like architecture decision records (why it was decided this way, what the alternatives were); review uses them to check whether later chapters betray the promises you made
@@ -199,15 +203,16 @@ Download installers from [GitHub Releases](../../releases):
 - [x] Two-layer review funnel
 - [x] Task-based model routing and thinking controls
 - [x] Style cards and style-passage dialog
+- [x] World-state panel (world-event viewer UI)
+- [x] Book-deconstruction engine (universal ingestion, experience distillation, novel teardown)
 
 ### In Progress
 
 - [ ] Full-pipeline field testing in real creative work (second round of realistic chapters wrapping up)
-- [ ] World-event data viewer UI
 
 ### Planned
 
-- [ ] Book-deconstruction engine: universal ingestion, experience-doc pipeline, novel teardown, online ecosystem
+- [ ] Book-deconstruction online ecosystem
 - [ ] Craft assistance engine (engineering the craft methodology)
 - [ ] Structured knowledge base + hybrid retrieval (design finalized: FTS5 + vectors + rerank)
 - [ ] Full style learning (statistical-fingerprint interaction, style refinement, multi-POV voice comparison)
@@ -215,7 +220,6 @@ Download installers from [GitHub Releases](../../releases):
 - [ ] Foreshadowing visualization panel (foreshadow registry, review, and tracking chain are ready; the structure-page overlay and management UI are next)
 - [ ] Worldline system
 - [ ] Character-card visualization (relationship graph, character radar, and other graphical views)
-- [ ] Custom wallpaper (app background image + adjustable mask opacity)
 - [ ] Fanfic creation pipeline (full original-work understanding, character portrayals, anchors, controlled deviation, OOC review) — one of this project's founding motivations; it will be done
 - [ ] Existing-work import / export enhancements / usage statistics
 

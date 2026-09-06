@@ -120,3 +120,188 @@ describe('ipc-provider 流式缝（dogfood T1 Stage 1）', () => {
     expect('reasoning' in (assistantPayload ?? {})).toBe(false); // 不回传（r3：各协议格式不一）
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// task 09-01 B 波 B2（R2.3 / dogfood #45）：user 消息带 images 指针 → payload
+// content 组 text + image parts。**线上是指针形态非 b64**（agent 零 FS，ADR-2——
+// 指针→字节/归一/vision 路由收在 shell generate 缝，B3 resolveImageParts 改写）；
+// 无 images 旧消息走原 else 纯字符串（回归锁）。经公开 generate 缝行为级断言。
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('ipc-provider user images parts（B2 R2.3）', () => {
+  it('user 消息带 images → content 为 parts 数组：首位 text part + 逐图 image part（指针形态，非 b64）', async () => {
+    const seam = installSeam(async () => ({ text: 'ok', finishReason: 'stop' }));
+    const messages: SessionMessage[] = [
+      {
+        id: 'u1',
+        role: 'user',
+        content: '[图片引用 · 截图1.png] (path: inbox/images/2026-09-01-a1.png)\n---\n这张图里是什么',
+        images: [{ path: 'inbox/images/2026-09-01-a1.png', b64hash: 'sha256-abc', name: '截图1.png' }],
+        createdAt: 1,
+      },
+    ];
+
+    await generate(messages, 'SYS', [], SIGNAL);
+
+    const payloadMessages = seam.mock.calls[0][0].request.messages as Array<Record<string, unknown>>;
+    // payload[0] 是 system 前言；user 消息在 [1]。
+    const userPayload = payloadMessages[1];
+    expect(userPayload).toBeDefined();
+    expect(userPayload.role).toBe('user');
+    expect(userPayload.content).toEqual([
+      { type: 'text', text: '[图片引用 · 截图1.png] (path: inbox/images/2026-09-01-a1.png)\n---\n这张图里是什么' },
+      { type: 'image', image: { path: 'inbox/images/2026-09-01-a1.png', b64hash: 'sha256-abc' } },
+    ]);
+    // CR-001b：无 projectPath 的指针（旧消息/缺省）→ part 键**缺席**（ABSENT 非 undefined，
+    // 与既有 wire 形态逐字节一致——shell agentImageParts 老消息回落 fallback 面不扩）。
+    const firstParts = userPayload.content as Array<{ type: string; image?: Record<string, unknown> }>;
+    expect('projectPath' in firstParts[1]!.image!).toBe(false);
+  });
+
+  // CR-001 决议 b（BMad CR 2026-09-01）：线上 image part 形态钉死
+  // `{type:'image', image:{path, b64hash, projectPath?}}`——projectPath（指针所在项目根）
+  // 有则带，shell 据此精确定位读盘根；字段名/层级与 shell agentImageParts 消费形态逐字对齐。
+  it('CR-001b：images 带 projectPath → wire part 形态钉死 {type:image, image:{path, b64hash, projectPath}}', async () => {
+    const seam = installSeam(async () => ({ text: 'ok', finishReason: 'stop' }));
+    const messages: SessionMessage[] = [
+      {
+        id: 'u1',
+        role: 'user',
+        content: '看图',
+        images: [{ path: 'inbox/images/a.png', b64hash: 'h1', name: 'a', projectPath: 'C:/proj/alpha' }],
+        createdAt: 1,
+      },
+    ];
+
+    await generate(messages, 'SYS', [], SIGNAL);
+
+    const userPayload = (seam.mock.calls[0][0].request.messages as Array<Record<string, unknown>>)[1];
+    expect(userPayload.content).toEqual([
+      { type: 'text', text: '看图' },
+      { type: 'image', image: { path: 'inbox/images/a.png', b64hash: 'h1', projectPath: 'C:/proj/alpha' } },
+    ]);
+  });
+
+  it('CR-001b：同载荷混合——带/不带 projectPath 的指针逐图独立判定（presence 条件展开）', async () => {
+    const seam = installSeam(async () => ({ text: 'ok', finishReason: 'stop' }));
+    const messages: SessionMessage[] = [
+      {
+        id: 'u1',
+        role: 'user',
+        content: '对比',
+        images: [
+          { path: 'inbox/images/a.png', b64hash: 'h1', name: 'a', projectPath: 'C:/proj/alpha' },
+          { path: 'inbox/images/b.png', b64hash: 'h2', name: 'b' }, // 旧消息缺省形态
+        ],
+        createdAt: 1,
+      },
+    ];
+
+    await generate(messages, 'SYS', [], SIGNAL);
+
+    const userPayload = (seam.mock.calls[0][0].request.messages as Array<Record<string, unknown>>)[1];
+    const parts = userPayload.content as Array<{ type: string; image?: Record<string, unknown> }>;
+    expect(parts[1]!.image).toEqual({ path: 'inbox/images/a.png', b64hash: 'h1', projectPath: 'C:/proj/alpha' });
+    expect(parts[2]!.image).toEqual({ path: 'inbox/images/b.png', b64hash: 'h2' });
+    expect('projectPath' in parts[2]!.image!).toBe(false); // 键缺席非 undefined
+  });
+
+  it('多图：parts = [text, image, image]，与 images 数组同序；wire 不带 name（展示名只落盘侧）', async () => {
+    const seam = installSeam(async () => ({ text: 'ok', finishReason: 'stop' }));
+    const messages: SessionMessage[] = [
+      {
+        id: 'u1',
+        role: 'user',
+        content: '这两张对比一下',
+        images: [
+          { path: 'inbox/images/a.png', b64hash: 'h1', name: '图一' },
+          { path: 'inbox/images/b.png', b64hash: 'h2', name: '图二' },
+        ],
+        createdAt: 1,
+      },
+    ];
+
+    await generate(messages, 'SYS', [], SIGNAL);
+
+    const userPayload = (seam.mock.calls[0][0].request.messages as Array<Record<string, unknown>>)[1];
+    expect(userPayload.content).toEqual([
+      { type: 'text', text: '这两张对比一下' },
+      { type: 'image', image: { path: 'inbox/images/a.png', b64hash: 'h1' } },
+      { type: 'image', image: { path: 'inbox/images/b.png', b64hash: 'h2' } },
+    ]);
+  });
+
+  it('images 空数组 → content 仍为纯字符串（与无字段消息逐字节一致，不产 [text] 单元素数组）', async () => {
+    const seam = installSeam(async () => ({ text: 'ok', finishReason: 'stop' }));
+    const messages: SessionMessage[] = [
+      { id: 'u1', role: 'user', content: '纯文本', images: [], createdAt: 1 },
+    ];
+
+    await generate(messages, 'SYS', [], SIGNAL);
+
+    const userPayload = (seam.mock.calls[0][0].request.messages as Array<Record<string, unknown>>)[1];
+    expect(userPayload.content).toBe('纯文本');
+  });
+
+  it('无 images 的旧 user 消息 → 原路径纯字符串回归（含 pinned/summary 前言注入区同为纯字符串）', async () => {
+    const seam = installSeam(async () => ({ text: 'ok', finishReason: 'stop' }));
+    const messages: SessionMessage[] = [
+      { id: 'u1', role: 'user', content: 'hi', createdAt: 1 },
+      { id: 'a1', role: 'assistant', content: '回答', createdAt: 2 },
+      { id: 'u2', role: 'user', content: '继续', createdAt: 3 },
+    ];
+
+    await generate(messages, 'SYS', [], SIGNAL, {}, {
+      enablePromptCache: false,
+      pinnedContent: 'pinned',
+      compactedSummary: 'summary',
+    });
+
+    const payloadMessages = seam.mock.calls[0][0].request.messages as Array<Record<string, unknown>>;
+    // system + pinned(user/assistant) + summary(user/assistant) + u1 + a1 + u2 = 8 条。
+    expect(payloadMessages).toHaveLength(8);
+    for (const entry of payloadMessages) {
+      expect(typeof entry.content).toBe('string'); // 全部纯字符串，无 parts 混入
+    }
+    expect(payloadMessages[5]).toEqual({ role: 'user', content: 'hi' });
+    expect(payloadMessages[7]).toEqual({ role: 'user', content: '继续' });
+  });
+
+  it('混合历史：带图 user 与无图 user 并存——各自走对应分支（parts / 纯字符串）', async () => {
+    const seam = installSeam(async () => ({ text: 'ok', finishReason: 'stop' }));
+    const messages: SessionMessage[] = [
+      {
+        id: 'u1',
+        role: 'user',
+        content: '看图',
+        images: [{ path: 'inbox/images/x.png', b64hash: 'hx', name: 'x' }],
+        createdAt: 1,
+      },
+      { id: 'a1', role: 'assistant', content: '好的', createdAt: 2 },
+      { id: 'u2', role: 'user', content: '再问一句', createdAt: 3 },
+    ];
+
+    await generate(messages, 'SYS', [], SIGNAL);
+
+    const payloadMessages = seam.mock.calls[0][0].request.messages as Array<Record<string, unknown>>;
+    expect(Array.isArray(payloadMessages[1].content)).toBe(true); // 带图 → parts
+    expect(payloadMessages[3].content).toBe('再问一句'); // 无图 → 原路径
+  });
+
+  it('buildImagesParts 纯函数：首位恒为 text part，其后逐图一枚 image part（指针序保持）；CR-001b 逐图条件展开 projectPath', async () => {
+    const { buildImagesParts } = await import('../src/provider/ipc-provider');
+    const parts = buildImagesParts('正文', [
+      { path: 'inbox/images/1.png', b64hash: 'b1', name: '一', projectPath: 'C:/proj/alpha' },
+      { path: 'inbox/images/2.png', b64hash: 'b2', name: '二' }, // 无字段（旧消息形态）
+    ]);
+    expect(parts).toEqual([
+      { type: 'text', text: '正文' },
+      { type: 'image', image: { path: 'inbox/images/1.png', b64hash: 'b1', projectPath: 'C:/proj/alpha' } },
+      { type: 'image', image: { path: 'inbox/images/2.png', b64hash: 'b2' } },
+    ]);
+    // 无字段指针：键缺席（ABSENT 非 undefined——jsonl/wire 均不产字段）。
+    const imageParts = parts.filter((p): p is Extract<typeof p, { type: 'image' }> => p.type === 'image');
+    expect('projectPath' in imageParts[1]!.image).toBe(false);
+    expect(imageParts[1]!.image.projectPath).toBeUndefined();
+  });
+});

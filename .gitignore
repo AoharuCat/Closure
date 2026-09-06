@@ -37,7 +37,11 @@ logs/
 .DS_Store
 .worktrees/
 .omc/
-.claude/
+# .claude/ 整体本地；例外：Closure 自有 workflow skill（Phase 2.3 强制 gate，无 installer 兜底）随仓版本化；其余（装机 skill / settings.local）维持本地
+.claude/*
+!.claude/skills
+.claude/skills/*
+!.claude/skills/closure-code-review/
 
 # ── Local working drafts (plans / reviews / specs) — not version-controlled ──
 .scratch/

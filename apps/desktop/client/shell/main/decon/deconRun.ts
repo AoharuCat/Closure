@@ -1,0 +1,238 @@
+import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import type { DeconCost, DeconJob, Material } from '@orison/shared-contracts';
+import { getDeconJob, upsertDeconJob, upsertDeconPassState } from '../db/closure-decon';
+import { DECON_CHARS_PER_TOKEN } from './deconBudget';
+import { transitionDeconJob } from './deconJob';
+import { derivedRelPathForMaterial, getGlobalMaterialsRoot } from '../db/materialIndexer';
+import { getProjectById } from '../db/projectRepository';
+
+// ── E10.3a（task 09-05）W3/W4：拆解管线 pass 模块共用运行面 ──
+//
+// child A design「管线本体」清单外的实施细节文件：p1Dictionary / p1Extract（W5 的 p1Aggregate /
+// p2Canon 同面可复用）共用的——派生 .md 读取、token 估算、job 运行门、pass 落库小助手。
+// 不改 W2 已落地的 deconJob.ts 状态面（其私有 readDerivedTextFor / STALE_NOTE 不动——本文件
+// 第四处 mirror，lineage 见 readDeconDerivedTextFor 注记）。
+//
+// 范式判据（parent design §9「全局」行）：本文件全部纯代码（fs 读 / 算数 / 状态查询），零语义判断。
+//
+// expected_downstream_consumers:
+// - W3 p1Dictionary / W4 p1Extract（LLM 调用前预算估算 + 派生基面读取 + pass 落库）。
+// - W5 p1Aggregate / p2Canon（同面复用）。
+// - W6 deconIpc（runDeconPassSequence 在途注册 + cost 回写单源）+ materialIpc
+//   （materials:delete 在途管线取消握手）。
+
+// 在途管线注册表住叶子模块 deconInflight.ts（本文件与 deconJob 双向消费——住任一侧成环）；
+// 此处 re-export 保消费面导入路径稳定。
+export {
+  cancelInflightDeconPipeline,
+  isDeconPipelineInflight,
+  registerInflightDeconPipeline,
+  type DeconPipelineHandle,
+} from './deconInflight';
+
+/** 错误消息归一（mirror craftDistillPipeline errMsg——三处 lineage）。 */
+export function deconErrMsg(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/** 内容 sha256 指纹（`sha256:<64hex>`——deconJob.sha256Content 同式，第四处 mirror）。 */
+export function sha256DeconContent(content: string): string {
+  return `sha256:${createHash('sha256').update(content, 'utf-8').digest('hex')}`;
+}
+
+/** stale 挂起 note（deconJob.STALE_NOTE 同文 mirror——W2 私有常量不动，W3+ 用本单源）。 */
+export const DECON_STALE_NOTE = '材料双指纹失配（原件或派生 .md 已变更）——锚点整体漂移，须确认重跑';
+
+function projectMaterialsRootDir(projectId: string): string | null {
+  const record = getProjectById(projectId);
+  const projectPath = record?.path;
+  if (typeof projectPath !== 'string' || projectPath.length === 0) return null;
+  return path.join(path.resolve(projectPath), 'materials');
+}
+
+/**
+ * 派生 .md 读取（BOM strip + CRLF→LF 归一）。lineage：craftDistillPipeline.readDerivedTextForMaterial
+ * → deconJob.readDerivedTextFor → 本函数（同式第四处 mirror——锚定基面归一单源，改归一逻辑四处同步）。
+ * 测试经 deps.readDerivedText 注入绕过 fs（零文件依赖）。
+ */
+export function readDeconDerivedTextFor(material: Material): string | null {
+  const derivedRel = derivedRelPathForMaterial(material);
+  if (derivedRel === null) return null;
+  const root =
+    material.scope === 'global'
+      ? getGlobalMaterialsRoot()
+      : material.projectId !== null
+        ? projectMaterialsRootDir(material.projectId)
+        : null;
+  if (root === null) return null;
+  try {
+    const raw = readFileSync(path.join(root, derivedRel), 'utf-8');
+    const stripped = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
+    return stripped.replace(/\r\n?/g, '\n');
+  } catch {
+    return null;
+  }
+}
+
+// ── token 估算（预算门 / cost 累计两用——DECON_CHARS_PER_TOKEN 中文推测值单源）──
+
+/**
+ * LLM 调用**前**预算估算（wouldExceedDeconBudget 的 nextCallTokens）：输入按字符折算 + 输出按
+ * maxTokens 上界（保守——宁早 cap 不漏烧）。与 actualDeconCallTokens 分离：估算用于门，实际用于记账。
+ */
+export function estimateDeconCallTokens(system: string | undefined, user: string, maxTokens: number): number {
+  return Math.ceil(((system ?? '').length + user.length) / DECON_CHARS_PER_TOKEN) + maxTokens;
+}
+
+/** LLM 调用**后**实际记账估算（seam 不回 usage——按输入+输出字符折算，诚实近似）。 */
+export function actualDeconCallTokens(system: string | undefined, user: string, outText: string): number {
+  return Math.ceil(((system ?? '').length + user.length + outText.length) / DECON_CHARS_PER_TOKEN);
+}
+
+/** provider usage 透传面（seam 返回——CR-13：GenerationUsage 形状，缺省字段全可选）。 */
+export interface DeconUsageLike {
+  promptTokens?: number;
+  completionTokens?: number;
+  totalTokens?: number;
+}
+
+/**
+ * 实际记账 tokens 解析（CR-13）：provider usage 有真值用真值（estimated=false）；缺失回退字符
+ * 近似（estimated=true——cost_json 诚实标注近似笔）。usage.totalTokens 优先，否则
+ * prompt+completion 合计（全缺回退近似）。
+ */
+export function resolveDeconActualTokens(
+  system: string | undefined,
+  user: string,
+  outText: string,
+  usage?: DeconUsageLike,
+): { tokens: number; estimated: boolean } {
+  const total =
+    usage?.totalTokens ??
+    (typeof usage?.promptTokens === 'number' && typeof usage?.completionTokens === 'number'
+      ? usage.promptTokens + usage.completionTokens
+      : undefined);
+  if (typeof total === 'number' && total > 0) return { tokens: Math.round(total), estimated: false };
+  return { tokens: actualDeconCallTokens(system, user, outText), estimated: true };
+}
+
+// ── cost 回写单源（CR-1：杀 `?? job` 复活路径——四处调用面共用）──
+
+/** cost 回写中止哨兵：job 行已删（在途 delete/materials:delete 级联）——调用链静默退出不复活。 */
+export class DeconJobGoneError extends Error {
+  constructor(jobId: string) {
+    super(`拆解会话 ${jobId} 已删除——cost 回写中止（不复活行）`);
+    this.name = 'DeconJobGoneError';
+  }
+}
+
+/**
+ * cost 回写单源：**重读现值行**拍平写入（await 窗口内翻态不被旧快照复活）；行不存在（已删）
+ * → 抛 DeconJobGoneError（runDeconPassSequence catch 静默退出）——**不做 upsert**（`?? job`
+ * 兜底会把已删 job 整行复活，CR-1 红线）。
+ */
+export function writeDeconCost(jobId: string, fallbackJob: DeconJob, cost: DeconCost, updatedAt: string): void {
+  const current = getDeconJob(jobId);
+  if (current === null) throw new DeconJobGoneError(jobId);
+  upsertDeconJob({ ...current, cost, updatedAt });
+}
+
+// ── job 运行门 + 边界判别（CR-7：paused/cancelled 显式三态）+ pass 落库小助手 ──
+
+/** 运行门/边界停走判别（显式停因——runner 映射各自结果态，progress 事件如实报）。 */
+export type DeconRunGateStop = 'paused' | 'cancelled' | 'stale' | 'not-found' | 'invalid-status';
+
+export type DeconRunGate =
+  | { ok: true; job: DeconJob }
+  | { ok: false; stop: DeconRunGateStop; message: string };
+
+/**
+ * pass 执行面 job 门：存在 + running（start/resume 后获得）。停因显式判别（CR-7）：
+ * - `paused`：用户暂停（映射 'paused' 结果——事件面不误报 failed）。
+ * - `cancelled`：终态取消。
+ * - `not-found`：job 已删（在途 delete 级联——映射 'cancelled' 静默停，不复活不转移）。
+ * - `stale`：双指纹失配已被翻态。
+ * - `invalid-status`：capped/failed/pending 等（须先 start/retry/调预算）。
+ */
+export function loadRunningDeconJob(jobId: string): DeconRunGate {
+  const job = getDeconJob(jobId);
+  if (job === null) return { ok: false, stop: 'not-found', message: `拆解会话 ${jobId} 不存在（或已删除）` };
+  if (job.status === 'running') return { ok: true, job };
+  if (job.status === 'paused') {
+    return { ok: false, stop: 'paused', message: '会话已暂停——须先 start/resume 再执行 pass' };
+  }
+  if (job.status === 'cancelled') {
+    return { ok: false, stop: 'cancelled', message: '会话已取消（终态）——重拆走新 job' };
+  }
+  if (job.status === 'stale') {
+    return { ok: false, stop: 'stale', message: DECON_STALE_NOTE };
+  }
+  return {
+    ok: false,
+    stop: 'invalid-status',
+    message: `会话状态 ${job.status} 非 running——pass 执行面须先 start/resume（capped 先调预算）`,
+  };
+}
+
+/** 章域边界停走判别结果（各 runner 的中断韧性面——CR-7 如实映射）。 */
+export type DeconBoundaryStop =
+  | { status: 'paused' }
+  | { status: 'cancelled' }
+  | { status: 'stale'; message: string }
+  | { status: 'failed'; message: string };
+
+/**
+ * 边界停走判别（章/域边界调用——job 状态被外部翻态即停）：
+ * - null = running 照跑。
+ * - paused / cancelled / stale：如实映射（旧实现一律误报 'paused'——CR-7 修正）。
+ * - 行已删（在途 delete 级联）→ cancelled **静默停**（不转移不复活——转移会在已删行上报错）。
+ * - 其余翻态（capped/failed/done 等）→ failed 如实停（状态已非 running，不再二次转移）。
+ */
+export function checkDeconRunBoundary(jobId: string): DeconBoundaryStop | null {
+  const live = getDeconJob(jobId);
+  if (live === null) return { status: 'cancelled' };
+  if (live.status === 'running') return null;
+  if (live.status === 'paused') return { status: 'paused' };
+  if (live.status === 'cancelled') return { status: 'cancelled' };
+  if (live.status === 'stale') return { status: 'stale', message: DECON_STALE_NOTE };
+  return { status: 'failed', message: `会话状态被外部翻为 ${live.status}——pass 序列停止` };
+}
+
+/** pass 状态行写入（status/outputRef/outputHash 组装单源——调用方只给差异字段）。 */
+export function writeDeconPassState(
+  jobId: string,
+  pass: string,
+  unit: string,
+  status: 'running' | 'done' | 'failed' | 'capped',
+  output: { outputRef: string; outputHash: string } | null,
+  updatedAt: string,
+): void {
+  upsertDeconPassState({
+    jobId,
+    pass,
+    unit,
+    status,
+    outputRef: output === null ? null : output.outputRef,
+    outputHash: output === null ? null : output.outputHash,
+    updatedAt,
+  });
+}
+
+/**
+ * unit 失败落库（pass_state failed + job fail 转移——两写同面，W6/编排重入按 failed unit 重做）。
+ * belt（CR-1）：job 行已删（在途 delete 竞态）→ 双写均跳过（不复活行/不留孤儿 pass_state）。
+ */
+export function failDeconUnit(jobId: string, pass: string, unit: string, message: string, updatedAt: string): void {
+  if (getDeconJob(jobId) === null) return;
+  writeDeconPassState(jobId, pass, unit, 'failed', null, updatedAt);
+  transitionDeconJob(jobId, 'fail', message);
+}
+
+/** unit 预算挂起落库（pass_state capped + job cap 转移——诚实挂起家族纪律，不烧 token）。同上 belt。 */
+export function capDeconUnit(jobId: string, pass: string, unit: string, note: string, updatedAt: string): void {
+  if (getDeconJob(jobId) === null) return;
+  writeDeconPassState(jobId, pass, unit, 'capped', null, updatedAt);
+  transitionDeconJob(jobId, 'cap', note);
+}

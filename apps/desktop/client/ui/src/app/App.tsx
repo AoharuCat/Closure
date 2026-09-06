@@ -18,6 +18,14 @@ export function App() {
   const subscribeUpdateEvents = useAppStore((s) => s.subscribeUpdateEvents);
   // 世界状态面板（#92）：world:changed 事件订阅与 update 事件同组织——App 引导期一次挂。
   const subscribeWorldEvents = useAppStore((s) => s.subscribeWorldEvents);
+  // 「材料」页（Story 10.1 Wave D）：material:changed 事件订阅同组织——App 引导期一次挂。
+  const subscribeMaterialEvents = useAppStore((s) => s.subscribeMaterialEvents);
+  // 「手艺」页（E10.2b W5）：craft:distill-progress 事件订阅同组织——手艺页 + 材料页蒸馏
+  // 徽章两消费面共享（全局库跨项目，事件刷新三件套见 craftSlice）。
+  const subscribeCraftEvents = useAppStore((s) => s.subscribeCraftEvents);
+  // 「拆书」页（E10.3b W6）：decon:progress 事件订阅同组织——拆书页单消费面（事件刷新
+  // 三件套见 deconSlice；机器级 job 不随项目切换清）。
+  const subscribeDeconEvents = useAppStore((s) => s.subscribeDeconEvents);
   const restoreLastProject = useAppStore((s) => s.restoreLastProject);
   // #92 事件门控配套：面板可见性通知——worldStateSlice 的事件响应以 activeSidebarPanel
   // === 'world' 门控（面板关闭不重拉），关→开边沿由 onWorldPanelVisibility force 重拉
@@ -25,6 +33,19 @@ export function App() {
   const activeSidebarPanel = useAppStore((s) => s.activeSidebarPanel);
   const onWorldPanelVisibility = useAppStore((s) => s.onWorldPanelVisibility);
   const worldPanelVisible = activeSidebarPanel === 'world';
+  // 材料页同款门控配套（Story 10.1 Wave D）：activePage === 'materials' 门控 + 关→开
+  // force 补偿（material:changed 事件刷新三件套的读侧兜底）。
+  const activePage = useAppStore((s) => s.activePage);
+  const onMaterialsPageVisibility = useAppStore((s) => s.onMaterialsPageVisibility);
+  const materialsPageVisible = activePage === 'materials';
+  // 手艺面同款门控配套（E10.2b W5）：craft:distill-progress 的两消费面 = 手艺页 + 材料页
+  // （材料页蒸馏徽章在跑）——任一可见即接收；关→开 force 补偿。
+  const onCraftSurfacesVisibility = useAppStore((s) => s.onCraftSurfacesVisibility);
+  const craftSurfacesVisible = activePage === 'craft' || activePage === 'materials';
+  // 拆书面同款门控配套（E10.3b W6）：activePage === 'decon' 门控 + 关→开 force 补偿
+  // （decon:progress 事件刷新三件套的读侧兜底）。
+  const onDeconPageVisibility = useAppStore((s) => s.onDeconPageVisibility);
+  const deconPageVisible = activePage === 'decon';
   // 08-25 全窗口壁纸（唯一背景层，不分区）：url 空不渲染。08-29 滑杆化：可调磨砂
   // （wallpaperFrostBlur 0–50px 打壁纸层自身；0 = 关，层不带 filter/transform）。
   const wallpaperUrl = useAppStore((s) => s.wallpaperUrl);
@@ -44,11 +65,26 @@ export function App() {
     restoreLastProject();
     subscribeUpdateEvents();
     subscribeWorldEvents();
-  }, [loadUserPreferences, loadModelConfig, loadAppVersion, restoreLastProject, subscribeUpdateEvents, subscribeWorldEvents]);
+    subscribeMaterialEvents();
+    subscribeCraftEvents();
+    subscribeDeconEvents();
+  }, [loadUserPreferences, loadModelConfig, loadAppVersion, restoreLastProject, subscribeUpdateEvents, subscribeWorldEvents, subscribeMaterialEvents, subscribeCraftEvents, subscribeDeconEvents]);
 
   useEffect(() => {
     onWorldPanelVisibility(worldPanelVisible);
   }, [worldPanelVisible, onWorldPanelVisibility]);
+
+  useEffect(() => {
+    onMaterialsPageVisibility(materialsPageVisible);
+  }, [materialsPageVisible, onMaterialsPageVisibility]);
+
+  useEffect(() => {
+    onCraftSurfacesVisibility(craftSurfacesVisible);
+  }, [craftSurfacesVisible, onCraftSurfacesVisibility]);
+
+  useEffect(() => {
+    onDeconPageVisibility(deconPageVisible);
+  }, [deconPageVisible, onDeconPageVisibility]);
 
   return (
     <>

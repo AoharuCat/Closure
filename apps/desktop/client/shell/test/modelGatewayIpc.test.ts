@@ -452,6 +452,44 @@ describe('resolveModel thinking/limits assembly (08-25)', () => {
   });
 });
 
+// B1 附件（R2.4，09-01）：resolveModel 的 registry 派生 vision 布尔——第三轮同型 additive
+//（mirror thinkingKind/limits 两轮验证的写法）。true = 确定性多模态（图片 b64 直传）；
+// ABSENT = 未验证（≠不支持），B3 的 generate 缝按 ABSENT 走 visionModel 转述安全路径。
+describe('resolveModel vision assembly (B1)', () => {
+  const KEY: ApiKeyEntry = {
+    id: 'key_vision',
+    name: 'Vision relay',
+    protocol: 'openai-compatible',
+    apiKey: 'sk-vision',
+    baseUrl: 'https://relay.example.com/v1',
+    models: [
+      { id: 'gpt-4o-mini', alias: 'GPT 4o mini', capability: 'text', enabled: true },
+      { id: 'qwen2.5-vl-72b-instruct', alias: 'Qwen VL', capability: 'text', enabled: true },
+      { id: 'Pro/GLM/glm-4.5v', alias: 'GLM 4.5V', capability: 'text', enabled: true },
+      { id: 'qwen-max', alias: 'Qwen Max', capability: 'text', enabled: true },
+    ],
+  };
+  const CONFIG: ModelConfig = { keys: [KEY] };
+
+  it('vision 家族条目 → vision: true 挂到 ResolvedModel', () => {
+    const resolved = resolveModel({ keyId: 'key_vision', modelId: 'gpt-4o-mini' }, CONFIG);
+    expect(resolved.vision).toBe(true);
+    // qwen*vl* 新模式（置于 qwen-* 之前的 specific entry）。
+    expect(resolveModel({ keyId: 'key_vision', modelId: 'qwen2.5-vl-72b-instruct' }, CONFIG).vision).toBe(true);
+  });
+
+  it('vision 与 thinking 双标记家族 + basename 二轮匹配携带 vision（glm-4.5v）', () => {
+    const resolved = resolveModel({ keyId: 'key_vision', modelId: 'Pro/GLM/glm-4.5v' }, CONFIG);
+    expect(resolved.vision).toBe(true);
+    expect(resolved.thinkingKind).toBe('glm-forced-basic');
+  });
+
+  it('未标家族 → vision 键 ABSENT（≠undefined 值；转述安全路径语义）', () => {
+    const resolved = resolveModel({ keyId: 'key_vision', modelId: 'qwen-max' }, CONFIG);
+    expect('vision' in resolved).toBe(false);
+  });
+});
+
 // resolveEmbeddingModel takes an optional ModelConfig so it is unit-testable
 // without disk I/O — these tests pass configs directly and never seed the keys
 // dir, so they run under plain vitest (no better-sqlite3 ABI concern).

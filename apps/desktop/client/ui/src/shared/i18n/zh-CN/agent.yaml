@@ -219,6 +219,37 @@ agent:
   attachChapter: "章节"
   attachFile: "已打开文件"
   removeAttachment: "移除"
+  # 09-01 A3（inbox 附件上传）：上传 section + chip 状态机 + inbox 材料段（R1.1/R1.2b/R1.8）。
+  attachUpload: "上传"
+  attachUploadFile: "上传文件…"
+  attachInbox: "inbox 材料"
+  uploadStateUploading: "上传中…"
+  uploadStateParsing: "解析中…"
+  uploadStateError: "解析失败——可移除后重试，或换用支持的格式（TXT / MD / DOCX / PDF）。"
+  uploadStateErrorScanned: "扫描件 PDF 无法解析——请在设置「研究与视觉」配置文档解析端点（MinerU / docling，带 OCR 能力），或将 PDF 页面截图交给识图模型识别；原件已保留在 inbox/。"
+  # CR-018：importFiles 拒收三档文案（toast 与 chip tooltip 同 tier 文案域；裸名=扩展名
+  # 拒收回落，带原因形态见 shell projectFileIpc 定型尾缀）。
+  uploadRejectedFormat: "已拒收不支持的文件：{names}（支持 TXT / MD / DOCX / PDF）"
+  uploadRejectedTooLarge: "已拒收超过 50MB 上限的文件：{names}"
+  uploadRejectedBatchLimit: "已拒收超过单批 100 个上限的文件：{names}"
+  uploadStateErrorRejectedFormat: "上传被拒——文件格式不支持（支持 TXT / MD / DOCX / PDF），可移除后换用支持的格式。"
+  uploadStateErrorRejectedSize: "上传被拒——超过 50MB 上限，请换用更小的文件。"
+  uploadStateErrorRejectedBatch: "上传被拒——单批最多 100 个文件，请分批上传。"
+  # 09-01 A4/B4（R1.3/AC4 + R2.1）：对话框拖拽进件——文档走上传路径、图片走 chat 图片
+  # 三入口同款 action（非白名单 toast 拒收；ready 态条目不渲染 chip，故无 ready 文案键）。
+  # CR-020：拒收文案补「或图片」——与实际接受面（文档白名单 + 图片白名单）一致。
+  dropzoneRejected: "已拒收不支持的文件：{names}（可拖入 TXT / MD / DOCX / PDF 文档，或图片 PNG / JPG / WEBP / GIF）"
+  # 09-01 B4（chat 图片附件 / dogfood #45）：上传图片入口 + 图片 chip 状态文案 + 气泡缩略图。
+  attachUploadImage: "上传图片…"
+  uploadImageStateUploading: "处理中…"
+  uploadImageStateError: "图片处理失败——可移除后重试。"
+  uploadImageStateErrorType: "不支持的图片格式（支持 PNG / JPG / WEBP / GIF；SVG / HEIC 请先转为 PNG）"
+  uploadImageStateErrorTooLarge: "图片过大：两档压缩后仍超过 10MB，请换用更小的图片"
+  imageThumbLoading: "图片加载中…"
+  imageThumbLoadFailed: "图片无法加载（文件可能已被移动或删除）"
+  # CR-003a（决议 a）：识图转述进度条——多图串行转述的运行相位可见性（直传/缓存全
+  # 命中不发事件，天然零显示）。
+  imageRelayProgress: "正在识图转述 {current}/{total}"
   mcp: "MCP"
   loading: "加载中..."
   passageReview: "选段改写"

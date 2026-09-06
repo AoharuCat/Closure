@@ -29,6 +29,9 @@ import { createLintSlice, type LintSlice } from './lintSlice';
 import { createStyleInputSlice, type StyleInputSlice } from './styleInputSlice';
 import { createWorldStateSlice, type WorldStateSlice } from './worldStateSlice';
 import { createSettingSlice, type SettingSlice } from './settingSlice';
+import { createMaterialsSlice, type MaterialsSlice } from './materialsSlice';
+import { createCraftSlice, type CraftSlice } from './craftSlice';
+import { createDeconSlice, type DeconSlice } from './deconSlice';
 import { installProjectSubscription } from './projectSubscription';
 import { initAgentEvents } from './agentEvents';
 
@@ -64,7 +67,10 @@ type AppState = ProjectSlice &
   LintSlice &
   StyleInputSlice &
   WorldStateSlice &
-  SettingSlice;
+  SettingSlice &
+  MaterialsSlice &
+  CraftSlice &
+  DeconSlice;
 
 export const useAppStore = create<AppState>()((...a) => ({
   ...createProjectSlice(...a),
@@ -97,6 +103,9 @@ export const useAppStore = create<AppState>()((...a) => ({
   ...createStyleInputSlice(...a),
   ...createWorldStateSlice(...a),
   ...createSettingSlice(...a),
+  ...createMaterialsSlice(...a),
+  ...createCraftSlice(...a),
+  ...createDeconSlice(...a),
 }));
 
 installProjectSubscription(useAppStore);

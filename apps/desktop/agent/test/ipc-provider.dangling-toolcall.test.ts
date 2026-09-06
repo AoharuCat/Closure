@@ -271,4 +271,34 @@ describe('ipc-provider 悬空 toolCall 兜底 stub（dogfood R2 findings #4）',
       debugSpy.mockRestore();
     }
   });
+
+  // task 09-01 B2（R2.3）组合核对：悬空扫描（只认 assistant/toolCalls 与 tool/toolResults）
+  // 对 user.images 字段无感知——带图 user 消息在场时 stub 照常注入，user 消息形态不被触碰。
+  it('B2 组合：带图 user 消息 + 悬空 assistant toolCall → stub 照常注入，image parts 消息形态不动', async () => {
+    const messages: SessionMessage[] = [
+      {
+        id: 'u1',
+        role: 'user',
+        content: '看图',
+        images: [{ path: 'inbox/images/z.png', b64hash: 'hz', name: 'z' }],
+        createdAt: 1,
+      },
+      {
+        id: 'a1',
+        role: 'assistant',
+        content: '调用工具',
+        toolCalls: [{ id: 'c1', name: 'analyze_image', arguments: '{"imagePath":"inbox/images/z.png"}' }],
+        createdAt: 2,
+      },
+    ];
+
+    const payload = await payloadOf(messages);
+
+    // 悬空 toolCall 照常合成 stub（紧随 assistant）。
+    const assistantIdx = payload.findIndex((m) => m.role === 'assistant');
+    expect(payload[assistantIdx + 1]).toMatchObject({ role: 'tool', toolCallId: 'c1', content: STUB_CONTENT });
+    // user 消息仍为 text+image parts（未被扫描/组货路径改写）。
+    expect(Array.isArray(payload[1].content)).toBe(true);
+    expect((payload[1].content as Array<Record<string, unknown>>).some((p) => p.type === 'image')).toBe(true);
+  });
 });

@@ -1,4 +1,9 @@
 import { z } from 'zod';
+// Story 10.1 Wave D：material:changed 推送通道常量 re-export（shell 发射器
+// materialNotify 与 preload 订阅面共同引用的名单源；preload 侧经 channels 叶子深导入
+// 取值——本 re-export 供 shell barrel 消费，mirror world-panel 对 WORLD_CHANGED_CHANNEL
+// 的 re-export 先例）。E10.2b Wave 1：craft:distill-progress 推送通道常量同款 re-export。
+export { CRAFT_DISTILL_PROGRESS_CHANNEL, DECON_PROGRESS_CHANNEL, MATERIAL_CHANGED_CHANNEL } from './contracts/channels';
 import type {
   EmbeddingRequest,
   EmbeddingResponse,
@@ -38,6 +43,47 @@ import type {
   WorldSubjectDetail,
   WorldSubjectDetailRequest,
 } from './contracts/world-panel';
+import type {
+  Material,
+  MaterialChapterConfidence,
+  MaterialChapterMethod,
+  MaterialFormat,
+  MaterialStatus,
+} from './contracts/material';
+import type {
+  CraftCard,
+  CraftCardCategory,
+  CraftCardStatus,
+  CraftTerm,
+  CraftTermStatus,
+  CraftTeachingRank,
+} from './contracts/closure-craft-card';
+import type {
+  CraftDistillLedger,
+  CraftDistillPhase,
+  CraftDistillStatus,
+  CraftMergeReview,
+  CraftMergeReviewAction,
+} from './contracts/closure-craft-distill';
+// E10.3a（task 09-05）W6：拆解管线控制面载荷契约（job/pass 状态/canon/dictionary/entity
+// 类型单源 contracts/closure-decon.ts——type-only 零 runtime 内联，preload sandbox 纪律同上）。
+// E10.3b（task 09-05）W1 增补：product/report/review 三表行与维度/枚举类型同源。
+import type {
+  DeconCanonEntry,
+  DeconDictionary,
+  DeconEntity,
+  DeconJob,
+  DeconJobStatus,
+  DeconP1Inheritance,
+  DeconPassState,
+  DeconProductRow,
+  DeconReportKind,
+  DeconReportMeta,
+  DeconReportRow,
+  DeconReviewCheckpoint,
+  DeconReviewRow,
+  DeconTier,
+} from './contracts/closure-decon';
 
 export const desktopIpcSchema = z.object({
   channel: z.enum([
@@ -67,6 +113,11 @@ export const desktopIpcSchema = z.object({
     'project:move-file',
     'project:delete-file',
     'project:import-files',
+    // 09-01 A 波（inbox 附件）三通道——handler 收在 shell parseDocumentHandlers.ts 同文件
+    // （共享解析内核），preload 经 canonical 类型暴露（A3 契约补条目）。
+    'project:parse-inbox-doc',
+    'project:resolve-inbox-attachment',
+    'project:store-attachment-description',
     'project:search',
     'project:watch',
     'project:unwatch',
@@ -126,6 +177,55 @@ export const desktopIpcSchema = z.object({
     'world:overview',
     'world:slice-detail',
     'world:subject-detail',
+    // Story 10.1 Wave D：材料库管理面（list/get/delete/reingest/import/update-provenance）。
+    // material:changed 推送事件不进 enum（push 通道同 world:changed 先例，名单源
+    // contracts/channels.ts MATERIAL_CHANGED_CHANNEL）。
+    'materials:list',
+    'materials:get',
+    'materials:delete',
+    'materials:reingest',
+    'materials:import',
+    'materials:update-provenance',
+    // E10.2a：材料显示名编辑（视频标题等——name 列，materialId 路径身份不变，design §3.1）。
+    'materials:update-name',
+    // E10.2b Wave 1（task 09-05）：手艺卡/蒸馏管线管理面（11 invoke）。craft:distill-progress
+    // 推送事件不进 enum（push 通道同 material:changed 先例，名单源 contracts/channels.ts
+    // CRAFT_DISTILL_PROGRESS_CHANNEL）。OrisonDesktopApi 接口方法 + preload + shell handler
+    // 三层同步的其余两层归 W4/W5 waves 落地——本 wave 只落契约（apps/ 面禁改，此刻补接口
+    // 方法会破 shell exposedDesktopApi satisfies OrisonDesktopApi 的 typecheck）。
+    'craft:distill-run',
+    'craft:card-list',
+    'craft:card-get',
+    'craft:card-patch',
+    'craft:card-review',
+    'craft:merge-review-list',
+    'craft:merge-review-resolve',
+    'craft:term-list',
+    'craft:term-approve',
+    'craft:term-merge',
+    'craft:distill-status',
+    // E10.3a（task 09-05）W6：拆解管线控制面（七 invoke——child A P0-P2 + 断点底座的通道族；
+    // canon 浏览/reports/approve/export-style 等消费面通道归 child B 增补）。decon:progress
+    // 推送事件不进 enum（push 通道同 material:changed 先例，名单源 contracts/channels.ts
+    // DECON_PROGRESS_CHANNEL）。
+    'decon:create',
+    'decon:start',
+    'decon:pause',
+    'decon:cancel',
+    'decon:delete',
+    'decon:get',
+    'decon:list',
+    // E10.3b（task 09-05）W1：拆解消费面四通道（products/reports 读侧 + 人审闸门确认 +
+    // 风格卡导出）。OrisonDesktopApi 接口方法 + preload + shell handler 三层同步的其余两层
+    // 归 W3b/W5/W6 waves 落地——本 wave 只落契约（补接口方法会破 shell exposedDesktopApi
+    // satisfies OrisonDesktopApi 的 typecheck，E10.2b W1 同款注记）。
+    'decon:products',
+    'decon:reports',
+    'decon:approve-review',
+    'decon:export-style',
+    // E10.3b（task 09-05）W7 小补③：stale 确认重跑通道（A 的 confirmDeconRerun 落库函数的
+    // IPC 化——刷新双指纹 + 复位派生产物后自动 start 续跑，替代「删除后重拆」引导）。
+    'decon:confirm-rerun',
     'agent:create-session',
     'agent:get-session',
     'agent:set-session-mode',
@@ -994,6 +1094,124 @@ export type OrisonDesktopApi = {
   onWorldChanged(callback: (event: WorldChangedEvent) => void): () => void;
   /** 显式退订单个监听器（removeListener 本监听器，绝不 removeAllListeners）。 */
   offWorldChanged(callback: (event: WorldChangedEvent) => void): void;
+  // ── Story 10.1 Wave D：材料库管理面（六 invoke + material:changed 推送订阅）──
+  /** 材料清单（scope 车道；Material 裁剪摘要行——列表/徽章/表单字段）。 */
+  listMaterials(input: MaterialsListInput): Promise<MaterialSummary[]>;
+  /** 全行材料详情 + 派生/原件绝对路径（打开派生 .md 校对入口 / reveal 用）。 */
+  getMaterial(input: { materialId: string }): Promise<MaterialDetail | null>;
+  /**
+   * 删除材料（D8 四清：原件 + 派生 .md + 登记行 + 双车道 chunk 行；删除前 .orison/history
+   * 快照兜底）。确认弹窗归 UI，IPC 层不二次确认。
+   */
+  deleteMaterial(input: { materialId: string }): Promise<MaterialDeleteResult>;
+  /** 重摄取（registerMaterial 完整管线入 per-scope 串行队列，回执 outcome）。 */
+  reingestMaterial(input: { materialId: string }): Promise<MaterialReingestResult>;
+  /**
+   * 批量拖入导入（外部绝对路径 → 拷入 materials/ 根 + 逐份登记；≤250/批 + 50MB/件
+   * shell 侧强制；拒收分类回报〔MaterialImportRejectionKind 六档——格式/超大/超批量/
+   * stem 冲突/敏感源/源缺失〕+ failed（拷入成功摄取失败，watcher 自愈））。
+   */
+  importMaterials(input: MaterialsImportInput): Promise<MaterialsImportResult>;
+  /**
+   * provenance 后补（F-05 六字段表单：medium/tier/author/lang/originDate/description——字段
+   * 缺省不动，nullable 字段显式 null = 清空；upsertMaterialRow 的 COALESCE 防重摄取清除）。
+   */
+  updateMaterialProvenance(input: MaterialProvenancePatchInput): Promise<MaterialProvenancePatchResult>;
+  /**
+   * 材料显示名编辑（E10.2a，design §3.1）：name 列更新（materialId 路径身份不变），落库后
+   * 广播 material:changed（reason='name-updated'——列表名刷新既有事件面）。校验 trim + 非空 +
+   * ≤ MATERIAL_NAME_MAX_CHARS，非法 → {ok:false, error:'invalid-input'}（模式 A）。
+   */
+  updateMaterialName(input: MaterialUpdateNameInput): Promise<MaterialUpdateNameResult>;
+  /**
+   * 订阅 `material:changed` 推送（材料变更全窗广播，mirror onWorldChanged——返回退订
+   * 函数，只移除本监听器，绝不 removeAllListeners）。
+   */
+  onMaterialChanged(callback: (event: MaterialChangedEvent) => void): () => void;
+  // ── E10.2b（task 09-05）W3：蒸馏管线面（两 invoke；card/term/merge-review 九通道三层同步
+  //    归 W5 落地〔见下方 W5 段〕；craft:distill-progress 订阅面随 W5.5 UI 事件刷新接线）──
+  /**
+   * 批量入队蒸馏（craft:distill-run——后台执行即回；跳过项逐份回报原因
+   * not-found/not-ready/already-running/hash-unchanged；相位/终态经 craft:distill-progress 推送）。
+   */
+  craftDistillRun(input: CraftDistillRunInput): Promise<CraftDistillRunResult>;
+  /** 蒸馏进度订阅（W5.5 合流缝补——mirror onMaterialChanged 形态，返回退订函数）。 */
+  onCraftDistillProgress(callback: (event: CraftDistillProgressEvent) => void): () => void;
+  /** 材料蒸馏台账查询（craft:distill-status——省略 materialIds = 全部行；徽章取数面）。 */
+  craftDistillStatus(input: CraftDistillStatusInput): Promise<CraftDistillLedger[]>;
+  // ── E10.2b（task 09-05）W5：手艺卡人审面（card/term/merge-review 九 invoke——载荷契约
+  //    见下方「E10.2b Wave 1」段单源；craft:distill-progress 订阅面归 W5.5 UI 事件刷新接线）──
+  /** 手艺卡队列（craft:card-list——全字段可选 AND + tags OR + 置信排序；返回摘要行）。 */
+  craftCardList(input: CraftCardListInput): Promise<CraftCardSummary[]>;
+  /** 取整卡（craft:card-get——claim 四件套全文 + 讲法数组；未知 id → null）。 */
+  craftCardGet(input: { cardId: string }): Promise<CraftCard | null>;
+  /**
+   * 卡内容编辑（craft:card-patch——**编辑即降级执行点**：任何实际写库 → status 回
+   * pending_review + entry 检索行删）。rejected 卡 = `rejected-card`（须先 recover）。
+   */
+  craftCardPatch(input: CraftCardPatchInput): Promise<CraftCardPatchResult>;
+  /** 人审状态机动作 + 讲法 rank 改级（craft:card-review——verify/reject/recover；非法转换 = `invalid-state`）。 */
+  craftCardReview(input: CraftCardReviewInput): Promise<CraftCardReviewResult>;
+  /** 并排任务队列（craft:merge-review-list——默认仅待审 resolution=null）。 */
+  craftMergeReviewList(input: CraftMergeReviewListInput): Promise<CraftMergeReview[]>;
+  /** 三动作裁决（craft:merge-review-resolve——merge/independent/dismiss；已裁决再 resolve = `invalid-state`）。 */
+  craftMergeReviewResolve(input: CraftMergeReviewResolveInput): Promise<CraftMergeReviewResolveResult>;
+  /** 词目清单（craft:term-list——UI 补全 chips / 待并词表视图；含 pending）。 */
+  craftTermList(input: CraftTermListInput): Promise<CraftTerm[]>;
+  /** 核准待并词目（craft:term-approve——pending → active；非 pending = `invalid-state`）。 */
+  craftTermApprove(input: { termId: string }): Promise<CraftTermApproveResult>;
+  /** 归并词目（craft:term-merge——卡改挂 + category 跟随 + entry 检索行重写；movedCardCount = 改挂卡数）。 */
+  craftTermMerge(input: CraftTermMergeInput): Promise<CraftTermMergeResult>;
+  // ── E10.3a（task 09-05）W6：拆解管线控制面（七 invoke + decon:progress 订阅——载荷契约
+  //    见下方「E10.3a W6」段单源；拆书页 UI 归 child B）──
+  /** 创建拆解会话（decon:create——P0 落库：材料就绪门 + 在途守卫 + 双指纹快照 + P1 继承；回执带成本预估）。 */
+  deconCreate(input: DeconCreateInput): Promise<DeconCreateResult>;
+  /**
+   * 启动/续跑（decon:start——后台执行即回，进度经 decon:progress 推送）。capped 续跑的调预算
+   * 面在 `budget` 字段（start 前生效——retry 语义）；done/running 幂等 no-op。
+   */
+  deconStart(input: DeconStartInput): Promise<DeconStartResult>;
+  /** 暂停（decon:pause——优雅中断，章边界感知停，state 行保留）。 */
+  deconPause(input: DeconJobIdInput): Promise<DeconTransitionResult>;
+  /** 取消（decon:cancel——终态；重拆走新 job）。 */
+  deconCancel(input: DeconJobIdInput): Promise<DeconTransitionResult>;
+  /** 删除会话（decon:delete——job + pass_state + canon per-job 级联；事实层三表材料级保留 F-07）。 */
+  deconDelete(input: DeconJobIdInput): Promise<DeconDeleteResult>;
+  /** 会话详情（decon:get——人审取数面：断点行 + canon 六域 + 词典 + 实体；stale 时产物面为空）。 */
+  deconGet(input: DeconJobIdInput): Promise<DeconJobDetail | null>;
+  /** 会话清单（decon:list——省略 materialId = 全部）。 */
+  deconList(input: DeconListInput): Promise<DeconJob[]>;
+  /**
+   * 人审闸门确认（decon:approve-review——E10.3b 拍板①）：review 行 pending → approved 后
+   * 经 start 续跑（台账 skip 已 done pass 零重付）。invalid-state = 闸门行非 pending。
+   */
+  deconApproveReview(input: DeconApproveReviewInput): Promise<DeconApproveReviewResult>;
+  /**
+   * product 读面（decon:products——E10.3b W5）：craft 闸门卡 / 产出阅读的 findings 投影取数
+   * 通道（按 pass/passStem 前缀/unit 过滤控体量——CR-8：'p4' 茎匹配全部 p4:<dim>，含
+   * p4:style，排除逻辑留 UI）。stale/cancelled → fresh=false + 空集。
+   */
+  deconProducts(input: DeconProductsInput): Promise<DeconProductsResult>;
+  /**
+   * 报告读面（decon:reports——E10.3b W5）：省略 unit = meta 列表（不带全文）；带 kind+unit =
+   * 单取全文行。坏 kind 串 → error='invalid-input' 显式拒收（CR-24）。stale freshness 门同
+   * decon:get 纪律。
+   */
+  deconReports(input: DeconReportsInput): Promise<DeconReportsResult>;
+  /**
+   * 风格维导出（decon:export-style——E10.3b W5）：p4:style 结构化 payload merge 写目标项目
+   * settings/style.md（语义键替换/手写节保留/无卡新建）。writtenSections = 实际写入的节。
+   * 写前确认与无项目禁用提示归 UI。
+   */
+  deconExportStyle(input: DeconExportStyleInput): Promise<DeconExportStyleResult>;
+  /**
+   * stale 确认重跑（decon:confirm-rerun——E10.3b W7 小补③）：刷新双指纹为材料现值 + 复位
+   * 派生 pass 台账与产物（canon/product/report + 闸门复位 pending）后**自动 start 续跑**
+   * （材料级 P1 同新指纹产物命中则零重付）。material-not-found = 材料已删（只剩 delete 出路）。
+   */
+  deconConfirmRerun(input: DeconConfirmRerunInput): Promise<DeconConfirmRerunResult>;
+  /** 拆解进度订阅（mirror onCraftDistillProgress 形态，返回退订函数只移除本监听器）。 */
+  onDeconProgress(callback: (event: DeconProgressEvent) => void): () => void;
   runStorySync(payload: RunStorySyncPayload): Promise<RunStorySyncResult>;
   loadUserPreferences(): Promise<UserPreferencesConfig>;
   saveUserPreferences(config: UserPreferencesConfig): Promise<void>;
@@ -1028,7 +1246,25 @@ export type OrisonDesktopApi = {
   saveBase64Image(projectDir: string, input: SaveBase64ImageInput): Promise<SavedImageFile>;
   moveProjectFile(projectDir: string, fromRelativePath: string, toRelativePath: string): Promise<string>;
   deleteProjectFile(projectDir: string, relativePath: string): Promise<boolean>;
-  importFiles(projectDir: string, targetRelDir: string, sourcePaths: string[]): Promise<string[]>;
+  // Drag-drop import of external OS files into the project tree.
+  // 09-01 A1 additive: a non-empty `allowedExtensions` whitelist (lowercase,
+  // leading dot normalized) rejects non-matching entries in the shell (partial
+  // success — legal files still copy) and switches the return shape to
+  // ImportFilesResult; absent / empty keeps the legacy string[] behavior.
+  importFiles(
+    projectDir: string,
+    targetRelDir: string,
+    sourcePaths: string[],
+    allowedExtensions?: string[],
+  ): Promise<string[] | ImportFilesResult>;
+  // 09-01 A3：inbox 附件三通道（canonical 载荷类型见上方 A 波分段；shell handler 单源
+  // parseDocumentHandlers.ts，preload 经本契约类型暴露）。
+  /** 上传进件即预解析：docx/pdf 解析出派生 .md 落盘（+ file:changed），txt/md preview-only。 */
+  parseInboxDoc(input: ParseInboxDocInput): Promise<ParseInboxDocResult>;
+  /** 挂附件协议（R1.2c）：mtime 重解析 → 内容哈希 → exact/similar/fresh 三态 + 描述复用。 */
+  resolveInboxAttachment(input: ResolveInboxAttachmentInput): Promise<ResolveInboxAttachmentResult>;
+  /** fresh 描述生成完毕回写 sidecar（哈希/sample 由 shell 现算，不信任 renderer 传入）。 */
+  storeAttachmentDescription(input: StoreAttachmentDescriptionInput): Promise<StoreAttachmentDescriptionResult>;
   pathForFile(file: File): string;
   watchProject(projectDir: string): Promise<void>;
   unwatchProject(): Promise<void>;
@@ -1111,6 +1347,14 @@ export type OrisonDesktopApi = {
   >;
   streamAgentMessage(input: { sessionId: string; content: string; attachments?: unknown[] }): Promise<StreamAgentMessageResult>;
   onAgentStreamEvent(callback: (event: { type: string; data: unknown }) => void): () => void;
+  /**
+   * 09-01 CR-003a（决议 a）：识图转述进度推送订阅（channel `image-relay-progress`，shell
+   * generate 缝全窗广播）。载荷 `{current, total}`——current = 正在转述图在本载荷指针图
+   * 串行处理序中的 1-based 位次，total = 本载荷指针图总数；每图转述开始/完成各发一次。
+   * 直传路 / 缓存全命中 / 无图场景不发送（天然零显示）。返回退订函数（mirror onToolEvent
+   * 订阅纪律——只移除本监听器，绝不 removeAllListeners）。
+   */
+  onImageRelayProgress(callback: (progress: { current: number; total: number }) => void): () => void;
   resolveAgentConfirmation(sessionId: string, callId: string, approved: boolean): Promise<unknown>;
   listAgentSkills(projectPath: string): Promise<unknown>;
   executeAgentSkill(sessionId: string, skillName: string, request?: unknown): Promise<unknown>;
@@ -1262,8 +1506,19 @@ export type FileTreeEntry = {
 export type SaveBase64ImageInput = {
   b64Json: string;
   mimeType: string;
-  directory: 'temp/images/generation' | 'assets/images';
+  /**
+   * `inbox/images` = Agent 对话图片附件落位（task 09-01 B 波 R2.3——用户可见、持久、
+   * 可删；与 temp 生成图 / assets 资产图正交，不互转）。shell handler 已支持（B3 落
+   * ALLOWED_IMAGE_DIRS + notify 参数），此处仅补齐契约字面量。
+   */
+  directory: 'temp/images/generation' | 'assets/images' | 'inbox/images';
   fileName?: string;
+  /**
+   * 09-01 B4：落盘后显式广播 `file:changed`（chat 进件路径传 true——文件树即时可见，
+   * 不赌平台 watcher 差异）。默认不开：既有消费者（AssetsPanel 拖入 / ImageGenEditor）
+   * 自带重载，无差别事件会白触发资产页全量重载（design §2.1 / 复查 M4）。
+   */
+  notify?: boolean;
 };
 
 export type SavedImageFile = {
@@ -1277,6 +1532,781 @@ export type BinaryFilePayload = {
   base64: string;
   mimeType: string;
 };
+
+/* ── A 波 09-01（task 09-01-agent-chat-attachments）：inbox 附件上传 IPC 载荷契约 ──
+ *
+ * canonical 类型源在此（OrisonDesktopApi 的三方法 + importFiles 白名单扩参）；shell
+ * handler 侧形态单源在 `main/ipc/toolHandlers/parseDocumentHandlers.ts`（三通道）与
+ * `main/ipc/projectFileIpc.ts`（import-files）——手动 keep-in-sync（mirror contracts/
+ * attachment.ts 契约惯例），preload/index.ts 经本模块类型暴露（本地镜像段已并回）。 */
+
+/**
+ * `project:import-files` 传入非空 `allowedExtensions` 白名单时的返回形态（A1 additive）。
+ * 不传 / 空数组 = 旧行为，返回 `string[]`（既有文件树拖入消费方零漂移）。
+ */
+export type ImportFilesResult = {
+  /** 拷入成功的文件（项目相对路径，带前导 `/`——与旧 string[] 形态一致）。 */
+  imported: string[];
+  /** 拒收条目（未拷入、不触发 file:changed）。两种形态（CR-018）：扩展名白名单拒收 =
+   *  裸文件名；大小超限 / 批量溢出 = `文件名 (原因)` 带原因后缀（附件路径下 AC2 明确
+   *  提示，UI 文案按原因细分）。敏感路径等其余闸维持静默跳过，不混入 rejected。 */
+  rejected: string[];
+};
+
+/**
+ * 解析通道标签（mirror shell `parseDocumentHandlers.ts` 的 `ParseDocVia`，手动
+ * keep-in-sync——shell 侧后续迁 shared-contracts 单源时的落点即此处）。
+ */
+export type ParseDocVia =
+  | 'endpoint-mineru'
+  | 'endpoint-docling'
+  | 'endpoint-custom'
+  | 'builtin-pdfjs'
+  | 'builtin-mammoth'
+  | 'direct-read';
+
+export interface ParseInboxDocInput {
+  projectPath: string;
+  /** inbox 内项目相对路径（docx/pdf 预解析派生 .md；txt/md preview-only）。 */
+  filePath: string;
+}
+
+export type ParseInboxDocResult =
+  | { ok: true; markdownPath: string; preview: string; via: ParseDocVia; notes: string[] }
+  | { ok: false; error: string; kind?: 'scanned' };
+
+export interface ResolveInboxAttachmentInput {
+  projectPath: string;
+  filePath: string;
+}
+
+export type ResolveInboxAttachmentResult =
+  | {
+      ok: true;
+      /** `sha256:<hex>`——内容身份（派生 .md 优先，txt/md 原件；R1.2c）。 */
+      contentHash: string;
+      /** 原件 mtime（epoch ms）——附件携带 fileMtime 供 staleness 判定。 */
+      mtime: number;
+      preview: string;
+      /** 命中缓存的描述（exact/similar 命中时在）；fresh 未生成时缺省。 */
+      description?: string;
+      /** 描述生成时间（epoch ms）＝sidecar 条目 generatedAt。 */
+      describedAt?: number;
+      /** 附件指针指向的材料路径（docx/pdf = 派生 .md；txt/md = 原件）。 */
+      derivedPath: string;
+      /** 命中形态：exact 精确哈希（零 LLM）/ similar shingle ≥80%（零 LLM）/ false fresh。 */
+      reused: 'exact' | 'similar' | false;
+      /** 解析备注透传（CR-010）：非 UTF-8 转换提示 / 端点降级备注等——preview 被编码
+       *  检测抑制为空时 UI 靠它说明原因（转换引导可达）。无备注时省略。 */
+      notes?: string[];
+    }
+  | { ok: false; error: string; kind?: 'scanned' };
+
+export interface StoreAttachmentDescriptionInput {
+  projectPath: string;
+  filePath: string;
+  /** LLM 生成的一句话定性（UI 侧生成完毕后回写 sidecar 落缓存）。 */
+  description: string;
+  /** 描述生成时所见文件 mtime（= resolve 返回的 mtime，CR-013 TOCTOU 守卫）：shell
+   *  比对现盘 mtime 更新则拒绝回写——防过期描述挂到新内容哈希、staleness 判定恒假。
+   *  缺省 = 守卫不启用（additive，旧调用方零影响）。 */
+  capturedMtime?: number;
+}
+
+export type StoreAttachmentDescriptionResult =
+  | { ok: true; contentHash: string }
+  | { ok: false; error: string };
+
+/* ── Story 10.1 Wave D（E10.1 摄取基座）：材料库管理面 IPC 载荷契约 ──
+ *
+ * 六 invoke 通道（shell handler 单源 `main/ipc/materialIpc.ts`）+ material:changed 推送
+ * 事件（通道名单源 contracts/channels.ts MATERIAL_CHANGED_CHANNEL，不进 desktopIpcSchema
+ * enum——push 同 world:changed 先例）。错误一律模式 A（判别联合 + 稳定 error code，
+ * 不向 renderer 抛）。
+ *
+ * expected_downstream_consumers:
+ * - ui 材料 页 + materialsSlice（list/import/delete/reingest/provenance 表单消费面）。
+ * - 10.2/10.3 管线后续接入时经 materials:list/get 取材料清单与章界（本面为管理面，
+ *   检索消费走 query_craft/query_story 天然含材料 chunk，design §7 消费缝）。 */
+
+/**
+ * `materials:list` 入参。scope='project' 时 projectId 必填（registry 5 位 id，mirror
+ * worldIpc 直查形态——读参数全绑定无路径安全面）；scope='global' 全局车道（~/.orison/
+ * materials/，机器级）。
+ */
+export interface MaterialsListInput {
+  scope: 'project' | 'global';
+  projectId?: string;
+}
+
+/**
+ * 材料行摘要（materials:list 返回行——Material 裁剪投影：剥 chapters/chunkSpans 大数组，
+ * 保留列表/徽章/表单所需字段。UI 全行详情走 materials:get）。
+ */
+export type MaterialSummary = {
+  materialId: string;
+  scope: 'project' | 'global';
+  projectId: string | null;
+  kind: string;
+  name: string;
+  format: MaterialFormat;
+  /**
+   * provenance.medium（来源类别徽章；开放词表——未知值**原样呈现不推测**，不归「其他」，
+   * mirror MaterialRow.mediumLabel 实现：i18n 键回落时显示原文）。
+   */
+  medium: string;
+  /** provenance.tier（三级来源，10.4 预留）。 */
+  tier: 'original' | 'community' | 'criticism' | 'unspecified';
+  author: string | null;
+  lang: string | null;
+  originDate: string | null;
+  /** 原件路径（相对各自车道根，schema 约定）。 */
+  sourcePath: string;
+  status: MaterialStatus;
+  charCount: number;
+  /** 章界计数 + 分章结论（章状态徽章与置信呈现）。 */
+  chapterCount: number;
+  chapterMethod: MaterialChapterMethod;
+  chapterConfidence: MaterialChapterConfidence;
+  /** 质量徽章信号（AC8 诚实标注：扫描版 / 非 UTF-8 乱码嫌疑）。 */
+  scanned: boolean;
+  nonUtf8: boolean;
+  /** 解析备注（端点降级 / LLM 兜底挂起原因等，tooltip 呈现）。 */
+  parseNotes: string[];
+  /** 摄取完成时刻（ISO；列表时间列）。 */
+  ingestedAt: string;
+};
+
+/** `materials:get` 返回：全行 Material + 派生/原件绝对路径（打开派生 .md / reveal 用）。 */
+export type MaterialDetail = {
+  material: Material;
+  /** 派生 .md 绝对路径（车道根 + .derived/ 镜像布局）；路径不可解析时 null。 */
+  derivedAbsPath: string | null;
+  /** 原件绝对路径；路径不可解析时 null。 */
+  sourceAbsPath: string | null;
+};
+
+/** `materials:delete` 结果（D8 四清：原件 + 派生 .md + 登记行 + 双车道 chunk 行）。 */
+export type MaterialDeleteResult =
+  | { ok: true; removedSourceFile: boolean; removedDerivedFile: boolean }
+  | { ok: false; error: 'not-found' | 'invalid-input' | 'operation-failed'; message?: string };
+
+/** `materials:reingest` 结果（registerMaterial 入 per-scope 串行队列执行完毕回执）。 */
+export type MaterialReingestResult =
+  | { ok: true; outcome: 'registered' | 'reused' | 'orphaned'; materialId: string }
+  | { ok: false; error: 'not-found' | 'unregistered' | 'invalid-input' | 'operation-failed'; message?: string };
+
+/**
+ * `materials:import` 入参。批量拖入的外部文件绝对路径（≤250/批 + 50MB/件 shell 侧强制，
+ * AC7 独立上限〔F-06〕）；scope='project' 时 projectId 必填（车道根解析）。
+ */
+export interface MaterialsImportInput {
+  scope: 'project' | 'global';
+  projectId?: string;
+  absolutePaths: string[];
+}
+
+/**
+ * 批量导入拒收分类（machine-readable 档位——UI 按档分文案，zh/en materials.yaml
+ * `import.rejectedKind.*` 键集与之对拍）。前三档 = 容量/格式闸（mirror materialIngest
+ * `MATERIAL_REJECTION_KINDS`）；CR-001/CR-011 细化三档（真实原因可见，不塞进
+ * unsupported-format）：
+ * - `stem-conflict`：同车道/同批内同 stem 异扩展（`foo.txt` + `foo.md`——派生 .md 镜像
+ *   `.derived/<stem>.md` 同路径互覆写，后到者拒收）。
+ * - `sensitive`：源在敏感目录（realpath 解析 symlink/junction 后命中）。
+ * - `missing`：源 stat 失败/已消失（拖拽列表与拷入之间的 TOCTOU）。
+ */
+export type MaterialImportRejectionKind =
+  | 'unsupported-format'
+  | 'too-large'
+  | 'batch-overflow'
+  | 'stem-conflict'
+  | 'sensitive'
+  | 'missing';
+
+export type MaterialImportRejectedItem = {
+  /** 原文件名（拒收回报对位）。 */
+  name: string;
+  kind: MaterialImportRejectionKind;
+};
+
+/** 拷入成功且登记完成的条目（outcome 语义同 RegisterMaterialResult）。 */
+export type MaterialImportedItem = {
+  name: string;
+  /** materials 根内相对路径（posix）。 */
+  relPath: string;
+  materialId: string | null;
+  outcome: 'registered' | 'reused' | 'orphaned';
+};
+
+/**
+ * `materials:import` 结果（部分成功语义）。`failed` = 拷入成功但摄取失败（解析/坏档/
+ * 扫描件——文件已在 materials/，watcher/backfill 会自愈重试，非拒收档）。
+ */
+export type MaterialsImportResult =
+  | {
+      ok: true;
+      imported: MaterialImportedItem[];
+      rejected: MaterialImportRejectedItem[];
+      failed: Array<{ name: string; relPath: string; reason: string }>;
+    }
+  | { ok: false; error: 'invalid-input' | 'unregistered' | 'operation-failed'; message?: string };
+
+/**
+ * `materials:update-provenance` 入参（F-05 UI 后补面）。六字段表单（E10.2a += 简介
+ * `description`，多行）——**字段缺省 = 不动**（partial patch 语义）；author/lang/originDate/
+ * description 显式 null = 清空（可撤销后补；description 空串在 handler 归一为 null，同型）。
+ * medium 开放受控词表（非空字符串）；tier 三级来源枚举。
+ */
+export interface MaterialProvenancePatchInput {
+  materialId: string;
+  patch: {
+    medium?: string;
+    tier?: 'original' | 'community' | 'criticism' | 'unspecified';
+    author?: string | null;
+    lang?: string | null;
+    originDate?: string | null;
+    /** 简介（E10.2a，design §3.2）：空串 → null 归一（同 author 三字段语义）。 */
+    description?: string | null;
+  };
+}
+
+export type MaterialProvenancePatchResult =
+  | { ok: true; material: Material }
+  | { ok: false; error: 'not-found' | 'invalid-input' | 'invalid-patch' | 'operation-failed'; message?: string };
+
+/**
+ * `materials:update-name` 入参（E10.2a，design §3.1）。材料显示名（视频标题等）编辑——name
+ * 是 display 列，materialId 路径身份不受影响（重命名不影响幂等/锚定）。校验语义：trim + 非空
+ * + 长度 ≤ MATERIAL_NAME_MAX_CHARS（handler 侧强制，越界/空白 → `invalid-input`，模式 A）。
+ */
+export interface MaterialUpdateNameInput {
+  materialId: string;
+  name: string;
+}
+
+/** 材料显示名长度上限（design §3.1；UI maxlength 与 handler 校验单源）。 */
+export const MATERIAL_NAME_MAX_CHARS = 200;
+
+/** `materials:update-name` 结果（模式 A；成功回完整 Material——列表名/表单基线刷新用）。 */
+export type MaterialUpdateNameResult =
+  | { ok: true; material: Material }
+  | { ok: false; error: 'not-found' | 'invalid-input' | 'operation-failed'; message?: string };
+
+/**
+ * `material:changed` 推送事件载荷（shell materialNotify 全窗广播，best-effort——事件可丢，
+ * 读侧兜底 = 材料页打开边沿 force 重拉）。reason：imported（批量导入逐份）/ reingested /
+ * deleted / provenance-updated / name-updated（E10.2a 显示名编辑——列表名刷新）/ reindexed
+ * （watcher .derived 变更路由，预埋）。
+ */
+export type MaterialChangedEvent = {
+  scope: 'project' | 'global';
+  /** project 车道 registry projectId（事件过滤用；global 车道 null）。 */
+  projectId?: string | null;
+  materialId?: string;
+  reason: 'imported' | 'reingested' | 'deleted' | 'provenance-updated' | 'name-updated' | 'reindexed';
+};
+
+/* ── E10.2b Wave 1（task 09-05）：经验文档蒸馏管线 IPC 载荷契约（手艺卡/词表/台账管理面）──
+ *
+ * 11 invoke 通道（载荷契约本块单源；shell handler + preload + OrisonDesktopApi 接口方法
+ * 归 W3-W5 waves 三层同步落地）。错误一律模式 A（判别联合 + 稳定 error code，不向
+ * renderer 抛——mirror 材料管理面）；读面 plain 返回（mirror materials:list/get）：
+ * - craft:card-list → CraftCardSummary[]；craft:card-get → CraftCard | null。
+ * - craft:merge-review-list → CraftMergeReview[]；craft:term-list → CraftTerm[]。
+ * - craft:distill-status → CraftDistillLedger[]。
+ * 领域 schema 单源在 contracts/closure-craft-card.ts + contracts/closure-craft-distill.ts。
+ *
+ * expected_downstream_consumers:
+ * - W5 手艺页（队列/卡编辑/并排对比/废弃区）+ 材料页联动（蒸馏按钮/台账徽章/N 卡跳转）。
+ * - W3 蒸馏编排（distill-run 入队 / distill-status 台账 / progress 事件发射）。 */
+
+/** `craft:distill-run` 入参（批量队列——按材料触发，材料页/手艺页入口）。 */
+export interface CraftDistillRunInput {
+  materialIds: string[];
+}
+
+/**
+ * distill-run 跳过原因（机器可读档位——UI 分文案）：
+ * - `not-ready`：pending/failed 材料不可蒸（ready/low-confidence 可蒸——章界挂起与
+ *   蒸馏正交，F-09 语义）。
+ * - `hash-unchanged`：双 hash 门控命中（已蒸馏且原件未变——材料级幂等，AC7）。
+ */
+export type CraftDistillSkipReason = 'not-found' | 'not-ready' | 'already-running' | 'hash-unchanged';
+
+/** `craft:distill-run` 结果（模式 A；部分成功语义——跳过项逐份回报原因）。 */
+export type CraftDistillRunResult =
+  | {
+      ok: true;
+      queued: string[];
+      skipped: Array<{ materialId: string; reason: CraftDistillSkipReason }>;
+    }
+  | { ok: false; error: 'invalid-input' | 'operation-failed'; message?: string };
+
+/** 队列排序（默认 confidence-asc——低置信排前，R5 人审负担控制）。 */
+export type CraftCardSort = 'confidence-asc' | 'updated-desc' | 'created-desc';
+
+/** `craft:card-list` 入参（队列过滤——全字段可选 AND 组合，tags 内 OR；返回摘要行）。 */
+export interface CraftCardListInput {
+  status?: CraftCardStatus;
+  category?: CraftCardCategory;
+  termId?: string;
+  /** 自由标签过滤（**任一命中即召回** OR 语义——R10 人审侧 chips 点击过滤）。 */
+  tags?: string[];
+  /** 按来源材料过滤（按文档分批分组键，R5）。 */
+  materialId?: string;
+  sort?: CraftCardSort;
+}
+
+/**
+ * 手艺卡摘要行（craft:card-list 返回——CraftCard 裁剪投影：剥 teachings 大数组保
+ * 计数/来源，mirror MaterialSummary 投影纪律；四件套全文/讲法/锚点走 card-get）。
+ */
+export type CraftCardSummary = {
+  cardId: string;
+  category: CraftCardCategory;
+  termId: string;
+  /** 词目名（join 词目表；词目行缺失防御性 null——UI 回退显示 termId）。 */
+  termName: string | null;
+  title: string;
+  /** claim.condensed（队列预览——保义浓缩首面）。 */
+  condensed: string;
+  tags: string[];
+  status: CraftCardStatus;
+  dispute: boolean;
+  confidence: number;
+  /** 讲法计数 + stale 复核计数（队列徽章——stale 讲法不降级卡但进队列）。 */
+  teachingCount: number;
+  staleTeachingCount: number;
+  /** 讲法来源材料（按材料分批分组键——去重合并后可多来源）。 */
+  materialIds: string[];
+  rejectReason: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+/** claim 四件套 per-field patch（卡编辑轻量表单 blur 落盘的最小粒度）。 */
+export interface CraftCardClaimPatch {
+  condensed?: string;
+  points?: string[];
+  scenarios?: string[];
+  counterexamples?: string[];
+}
+
+/**
+ * `craft:card-patch` 入参（**编辑即降级执行点**——内容字段任何实际写库 → status 回
+ * pending_review，uniform 人改也回待审，R5）。F-15：**无 category 字段**——大类恒
+ * 跟随 term.category 单源（词目归并时自动改）。rejected 卡 patch = `rejected-card`
+ * 错误（编辑入口禁用，必须先 recover 救回）。
+ */
+export interface CraftCardPatchInput {
+  cardId: string;
+  patch: {
+    title?: string;
+    /** 词目改挂（category 随新 term 自动改）。 */
+    termId?: string;
+    claim?: CraftCardClaimPatch;
+    /** 自由标签整组替换（chips 增删净结果——R10 人审可改标签）。 */
+    tags?: string[];
+    /** 分歧标记人审确认/取消（LLM 判 + 人审确认——R4）。 */
+    dispute?: boolean;
+  };
+}
+
+/** `craft:card-patch` 结果（成功回完整卡——表单基线/降级反馈刷新用）。 */
+export type CraftCardPatchResult =
+  | { ok: true; card: CraftCard }
+  | {
+      ok: false;
+      error: 'not-found' | 'invalid-input' | 'rejected-card' | 'operation-failed';
+      message?: string;
+    };
+
+/** 卡状态机动作（转换表权威描述见 contracts/closure-craft-card.ts craftCardSchema JSDoc）。 */
+export type CraftCardReviewAction = 'verify' | 'reject' | 'recover';
+
+/**
+ * `craft:card-review` 入参（人审状态机动作 + 讲法级 rank 改级；`action` 与
+ * `teachingRank` 至少其一——都缺省 = `invalid-input`）：
+ * - action 省略 = 仅改讲法 rank 不动卡状态（rank 是讲法级状态，**不触发卡降级**——
+ *   与内容编辑〔降级〕和人审状态动作〔不降级〕都正交）。
+ * - reject 带理由（废弃区回看）；recover 救回 rejected 卡（编辑入口解锁）。
+ * - 非法转换（如 verified 卡 recover）= `invalid-state`。
+ */
+export interface CraftCardReviewInput {
+  cardId: string;
+  action?: CraftCardReviewAction;
+  /** action='reject' 时的驳回理由。 */
+  rejectReason?: string;
+  /** 讲法级 rank 改级（approved = 人审显式认可——AI 蒸馏产恒 normal 起板）。 */
+  teachingRank?: {
+    teachingId: string;
+    rank: CraftTeachingRank;
+    /** 差异备注/不认可理由（rank='rejected' 时建议带）。 */
+    note?: string;
+  };
+}
+
+/** `craft:card-review` 结果（成功回完整卡——状态徽章/rank 控件刷新用）。 */
+export type CraftCardReviewResult =
+  | { ok: true; card: CraftCard }
+  | {
+      ok: false;
+      error: 'not-found' | 'invalid-input' | 'invalid-state' | 'operation-failed';
+      message?: string;
+    };
+
+/** `craft:merge-review-list` 入参（并排任务队列——默认只回待审）。 */
+export interface CraftMergeReviewListInput {
+  /** 含已裁决记录（审计回看）；缺省 = 仅待审（resolution=null）。 */
+  includeResolved?: boolean;
+}
+
+/**
+ * `craft:merge-review-resolve` 入参（三动作裁决——AC3 专属用例；已裁决记录再 resolve =
+ * `invalid-state`）。merge/independent 产物卡回 pending_review（编辑即降级同族——
+ * 裁决产物必须再过人审 verify 才进检索面）。
+ */
+export interface CraftMergeReviewResolveInput {
+  reviewId: string;
+  action: CraftMergeReviewAction;
+  note?: string;
+}
+
+/** `craft:merge-review-resolve` 结果（产物卡 id 供 UI toast/跳转）。 */
+export type CraftMergeReviewResolveResult =
+  | {
+      ok: true;
+      review: CraftMergeReview;
+      /** action='merge'：讲法挂入的目标卡 id（= existingCardId）。 */
+      mergedIntoCardId?: string;
+      /** action='independent'：新建卡 id。 */
+      createdCardId?: string;
+    }
+  | {
+      ok: false;
+      error: 'not-found' | 'invalid-input' | 'invalid-state' | 'operation-failed';
+      message?: string;
+    };
+
+/** `craft:term-list` 入参（词目清单——UI 补全 chips / 待并词表视图；含 pending）。 */
+export interface CraftTermListInput {
+  status?: CraftTermStatus;
+  category?: CraftCardCategory;
+}
+
+/**
+ * `craft:term-approve` 结果（pending → active；核准已 active/merged 词目 = `invalid-state`）。
+ * W5 补 `'invalid-input'`（坏 termId 形态——W1 基座漏列，其余写通道均含此码，additive 补齐）。
+ */
+export type CraftTermApproveResult =
+  | { ok: true; term: CraftTerm }
+  | { ok: false; error: 'not-found' | 'invalid-input' | 'invalid-state' | 'operation-failed'; message?: string };
+
+/**
+ * `craft:term-merge` 入参（归并：source 词目 → merged 留痕；挂它的卡 termId 改指目标 +
+ * category 随目标自动改 + entry 检索行重写）。`mergeIntoTermId` 须存在且 ≠ `termId`
+ * （否则 `invalid-input`）。
+ */
+export interface CraftTermMergeInput {
+  termId: string;
+  mergeIntoTermId: string;
+}
+
+/** `craft:term-merge` 结果（movedCardCount = 改挂卡数——UI 反馈「N 张卡已改挂」）。 */
+export type CraftTermMergeResult =
+  | { ok: true; term: CraftTerm; movedCardCount: number }
+  | {
+      ok: false;
+      error: 'not-found' | 'invalid-input' | 'invalid-state' | 'operation-failed';
+      message?: string;
+    };
+
+/** `craft:distill-status` 入参（材料台账查询——省略 materialIds = 全部台账行）。 */
+export interface CraftDistillStatusInput {
+  materialIds?: string[];
+}
+
+/**
+ * `craft:distill-progress` 推送事件载荷（相位 + 耗时 + materialId——运行阶段可见性
+ * 硬要求；shell 相位切换/周期发射，best-effort 可丢，读侧兜底 = distill-status 拉取）。
+ * 终态（done/failed）事件驱动队列/台账徽章即时刷新（phase=null）。
+ */
+export type CraftDistillProgressEvent = {
+  materialId: string;
+  status: CraftDistillStatus;
+  /** 运行相位（status='running' 时非 null；终态 null）。 */
+  phase: CraftDistillPhase | null;
+  /** 本材料蒸馏累计耗时（ms）。 */
+  elapsedMs: number;
+  /** status='failed' 时的失败原因。 */
+  error?: string;
+};
+
+// ── E10.3a（task 09-05）W6：拆解管线控制面载荷（七 invoke + decon:progress 推送）──
+//
+// 变更面（模式 A——预期内用户失败判别联合不抛 renderer，mirror 材料管理面）；job/pass/canon
+// 行类型单源 contracts/closure-decon.ts（本段只定义 IPC 入参/回执形状）。
+
+/** 拆解预算 IPC 入参形态（deconBudgetSchema 的输入面——perPass 可选缺省空表）。 */
+export interface DeconBudgetInput {
+  /** 总 token 上限（null = 无上限跑完为止）。 */
+  totalTokens: number | null;
+  /** per-pass 茎追加上限（键 = pass 茎，如 'p1b'）。 */
+  perPass?: Record<string, number>;
+}
+
+/** `decon:create` 入参（P0 会话建立——材料 × 档位 × 维度子集 + 可选预算）。 */
+export interface DeconCreateInput {
+  materialId: string;
+  tier: DeconTier;
+  /**
+   * 维度子集（成员枚举权威 = `DECON_DIMENSIONS` 13 项目录〔12 手艺维 + 风格维 style〕，
+   * parent design §6.0 矩阵）。档位约束（**拍板②实况**——与 shell `validateDeconDimensions`
+   * 单源同义，CR-27 注释同步）：coarse → dims ⊆ {style}（风格维粗拆档也允许勾选，可省）；
+   * fine → 手艺维 1-3 个 + style 可选不计入；deep → 全 12 手艺维必含 + style 可选。
+   */
+  dimensions?: string[];
+  budget?: DeconBudgetInput;
+  /**
+   * 人审闸门开关（E10.3b 拍板①——默认开）：缺省/true → 三 checkpoint 行 status='pending'
+   * （到点暂停等确认）；false → status='off'（配置即行零改 A job 表）。additive 字段——
+   * 旧调用方不传 = 默认开。
+   */
+  reviewCheckpoints?: boolean;
+}
+
+/** 成本预估回执（启动前呈现面——estimateDeconCost 纯函数计算，P1 已有产物时打折 F-07）。 */
+export interface DeconEstimateIpc {
+  totalTokens: number;
+  /** per-pass 键 = pass 全值（'p1a'/'p1b'/'p4:<dim>'/'p5:book_reading'…）。 */
+  byPass: Record<string, number>;
+}
+
+/** `decon:create` 结果（模式 A；inflight-exists 带在途 job id 供跳转）。inheritedP1 = P1 三 pass 各自旗标（CR-17——部分继承合法）。 */
+export type DeconCreateResult =
+  | { ok: true; job: DeconJob; inheritedP1: DeconP1Inheritance; estimate: DeconEstimateIpc }
+  | {
+      ok: false;
+      error:
+        | 'invalid-input'
+        | 'material-not-found'
+        | 'material-not-ready'
+        | 'derived-unreadable'
+        | 'inflight-exists'
+        | 'invalid-dimensions'
+        | 'operation-failed';
+      inflightJobId?: string;
+      message: string;
+    };
+
+/** `decon:start` 入参（capped-hold 重入的调预算面：budget 在 start 前生效）。 */
+export interface DeconStartInput {
+  jobId: string;
+  budget?: DeconBudgetInput;
+}
+
+/** `decon:start` 结果（noop = 已 running/已 done——在途管线/既有结果是权威，不重跑）。 */
+export type DeconStartResult =
+  | { ok: true; job: DeconJob; noop: boolean }
+  | {
+      ok: false;
+      error: 'not-found' | 'stale-fingerprints' | 'invalid-state' | 'invalid-input' | 'operation-failed';
+      job?: DeconJob;
+      message: string;
+    };
+
+/** `decon:pause` / `decon:cancel` / `decon:delete` / `decon:get` 入参。 */
+export interface DeconJobIdInput {
+  jobId: string;
+}
+
+/** `decon:pause` / `decon:cancel` 结果。 */
+export type DeconTransitionResult =
+  | { ok: true; job: DeconJob }
+  | { ok: false; error: 'not-found' | 'invalid-state' | 'invalid-input'; message: string };
+
+/** `decon:delete` 结果（事实层三表材料级保留——F-07 跨 job 复用键控）。 */
+export type DeconDeleteResult =
+  | { ok: true }
+  | { ok: false; error: 'not-found' | 'invalid-input' | 'operation-failed'; message?: string };
+
+/**
+ * `decon:get` 返回（人审取数面：断点行 + canon 六域 + 词典 + 聚合实体——child A prd「IPC 可查
+ * 词典/canon 数据」的落点）。`fresh=false`（双指纹失配 → job 已翻 stale **或** job 已取消——
+ * 两种态产物面均为空：stale 产物不静默供给下游〔F-02 读侧半边〕；cancelled 终态无消费面）
+ * 时产物字段为空集，`freshReason` 标明原因。
+ *
+ * `entities` 为 mentions 截断投影（CR-9：首 N + 末 N 章 + 总数——千章级 mentions 不整面
+ * 灌 renderer；全量走 db 消费面）。
+ */
+export interface DeconJobDetail {
+  job: DeconJob;
+  passStates: DeconPassState[];
+  fresh: boolean;
+  /** fresh=false 的原因（fresh=true 时缺省）。 */
+  freshReason?: 'stale' | 'cancelled';
+  canon: DeconCanonEntry[];
+  dictionary: DeconDictionary | null;
+  entities: DeconEntityIpc[];
+  /**
+   * 人审闸门行（E10.3b additive——create 时初始化三行）。stale/cancelled 态**仍回**：off
+   * 是用户常设配置、UI 区分「等审暂停」与「用户暂停」靠 review 行（pending = 等审）。
+   */
+  reviews?: DeconReviewRow[];
+  /** 报告计数（E10.3b additive——kind → 行数；产出阅读 tab 徽标 / 导出入口可见性判据）。stale/cancelled 时空表。 */
+  reportCounts?: Record<string, number>;
+}
+
+/** decon:get 实体行（mentions 截断投影——CR-9）。 */
+export type DeconEntityIpc = DeconEntity & {
+  /** mentions 总章数（截断时 > mentions.length）。 */
+  mentionsTotal: number;
+  /** mentions 是否被截断（首 N + 末 N）。 */
+  mentionsTruncated: boolean;
+};
+
+/** `decon:list` 入参（省略 materialId = 全部 job）。 */
+export interface DeconListInput {
+  materialId?: string;
+}
+
+/**
+ * `decon:progress` 推送事件载荷（运行阶段可见性硬要求；pass 相位 + 终态）。shell 在 pass
+ * 边界/终态发射（P1b 另逐章发 running——CR-8 千章级小时静默防线），best-effort 可丢——读侧
+ * 兜底 = decon:get 拉取（事件可丢是设计内行为）。
+ */
+export type DeconProgressEvent = {
+  jobId: string;
+  status: DeconJobStatus;
+  /** 当前 pass（status='running' 时非 null；终态/中断 null）。 */
+  pass: string | null;
+  /** 当前 unit（章号/域名/单行哨兵——pass 内细粒度，可缺省）。 */
+  unit?: string | null;
+  /** 距管线启动的毫秒数（CR-8 运行相位可见——耗时面；管线发的事件恒带）。 */
+  elapsedMs?: number;
+  /** capped/failed 的诚实挂起原因。 */
+  error?: string;
+  /**
+   * 软提示注记（CR-10——与 `error` 分立的常规预期态通道）：如闸门暂停的「待人工确认」。
+   * `error` 只留给真失败（capped/failed 的挂起原因）；预期内的暂停/提示走 `note`，不污染
+   * 诊断面。additive 可选字段——旧消费者不读不受影响。
+   */
+  note?: string;
+};
+
+// ── E10.3b（task 09-05）W1：拆解消费面载荷（products/reports/approve-review/export-style）──
+//
+// 变更面模式 A 同上。**读侧 freshness 门**（同 decon:get 纪律——F-02 读侧半边）：job=stale /
+// cancelled 时不供给产物面（漂移锚点的 findings/报告不静默喂下游）。行类型单源
+// contracts/closure-decon.ts（本段只定义 IPC 入参/回执形状）。
+
+/** `decon:products` 入参（product 读面——craft 闸门卡 / 产出阅读的取数通道；按 pass 过滤控体量）。 */
+export interface DeconProductsInput {
+  jobId: string;
+  /** pass 全值过滤（'p3a' / 'p4:huoke'…；缺省 = 全部 product 行）。 */
+  pass?: string;
+  /**
+   * pass 前缀过滤（CR-8——壳面前缀语义）：命中条件 = `pass.startsWith(passStem)`。'p4' 匹配
+   * 全部 `p4:<dim>`（**含 p4:style——风格维排除逻辑留在 UI 消费面**，通道层不做维内裁剪）；
+   * 'p3' 匹配 p3a/p3b。与 `pass` 同传时两过滤叠加（AND——精确 + 前缀）；缺省 = 不过滤。
+   */
+  passStem?: string;
+  /** unit 过滤（'3' / 'arc:1'…；缺省 = 该范围全 unit）。 */
+  unit?: string;
+}
+
+/** `decon:products` 结果（stale/cancelled → fresh=false 且 products 空集）。 */
+export interface DeconProductsResult {
+  fresh: boolean;
+  freshReason?: 'stale' | 'cancelled';
+  products: DeconProductRow[];
+}
+
+/**
+ * `decon:reports` 入参：省略 unit = **列表**（只回 meta——大书章评数百行不整面灌 renderer）；
+ * 带 kind + unit = **单取**（回全文行）。stale freshness 门同上。**坏 kind 串显式拒收**
+ * （CR-24——kind 存在但不在枚举内 → `error='invalid-input'`，不静默降级全列表）。
+ */
+export interface DeconReportsInput {
+  jobId: string;
+  kind?: DeconReportKind;
+  unit?: string;
+}
+
+/**
+ * `decon:reports` 结果：`report !== null` = 单取形态（列表调用方忽略 list）；否则 list 形态
+ * （单取调用方忽略 list——未命中时 report=null）。stale/cancelled → fresh=false + 双空。
+ * `error='invalid-input'`（CR-24 additive 可选字段）= kind 串坏被显式拒收（list/report 双空
+ * + message 说明——正常路径缺省，旧消费者不读不受影响）。
+ */
+export interface DeconReportsResult {
+  fresh: boolean;
+  freshReason?: 'stale' | 'cancelled';
+  /** 入参拒收面（kind 串坏——CR-24；正常路径缺省）。 */
+  error?: 'invalid-input';
+  /** error 面的说明文案（正常路径缺省）。 */
+  message?: string;
+  list: DeconReportMeta[];
+  report: DeconReportRow | null;
+}
+
+/** `decon:approve-review` 入参（闸门确认——approved 后 start 续跑，台账 skip 已 done pass 零重付）。 */
+export interface DeconApproveReviewInput {
+  jobId: string;
+  checkpoint: DeconReviewCheckpoint;
+}
+
+/** `decon:approve-review` 结果（invalid-state = 闸门行非 pending——已确认/已关）。 */
+export type DeconApproveReviewResult =
+  | { ok: true; review: DeconReviewRow }
+  | { ok: false; error: 'not-found' | 'invalid-input' | 'invalid-state'; message: string };
+
+/**
+ * `decon:export-style` 入参（风格维 p4:style 结构化 payload → 合并写目标项目
+ * settings/style.md：parseStyleSections 按语义键替换识别节、保留未识别/手写节与卡头、无卡
+ * 标准 14 节新建；withProjectLock + atomicWrite 落盘；写前确认与无项目禁用提示归 UI）。
+ * projectId = 操作时项目上下文（目标绑定——全局车道材料自身无项目归属）。
+ */
+export interface DeconExportStyleInput {
+  jobId: string;
+  projectId: string;
+}
+
+/** `decon:export-style` 结果（writtenSections = 实际写入的节语义键列表；style-payload-missing = p4:style 未产出）。 */
+export type DeconExportStyleResult =
+  | { ok: true; writtenSections: string[] }
+  | {
+      ok: false;
+      error:
+        | 'not-found'
+        | 'invalid-input'
+        | 'style-payload-missing'
+        | 'project-not-found'
+        | 'operation-failed';
+      message: string;
+    };
+
+// ── E10.3b（task 09-05）W7 小补③：stale 确认重跑通道（decon:confirm-rerun）──
+
+/** `decon:confirm-rerun` 入参（stale 态专用——非 stale 态 invalid-state）。 */
+export interface DeconConfirmRerunInput {
+  jobId: string;
+}
+
+/**
+ * `decon:confirm-rerun` 结果：ok = 确认成功且续跑已派发（job pending→running，后台管线
+ * 重入）。invalid-state = 非 stale 态（须先经 decon:get 读侧翻 stale）或续跑被拒（确认已
+ * 落）；material-not-found = 材料已删（无重跑基面，只剩 delete 出路）。
+ */
+export type DeconConfirmRerunResult =
+  | { ok: true; job: DeconJob }
+  | {
+      ok: false;
+      error: 'not-found' | 'invalid-state' | 'material-not-found' | 'invalid-input';
+      job?: DeconJob;
+      message: string;
+    };
 
 /* ── Task persistence types ── */
 

@@ -8,6 +8,10 @@ import type { AgentMode, AgentBehaviorMode } from '../../shared/store/types';
 import type { StructurePattern } from '@orison/shared-contracts';
 import type { Attachment } from '../../shared/types/attachment';
 import { readAssetsDirectory, type DirEntry } from '../../shared/api/assets';
+import { INBOX_UPLOAD_ACCEPT, listInboxFiles } from '../../shared/api/inboxAttachments';
+// 09-01 B4（dogfood #45）：chat 图片进件三入口（选择器按钮 / 剪贴板粘贴 / AgentPanel
+// drop zone 后接线）统一走 uploadChatImages；accept 面与压缩白名单同源。
+import { CHAT_IMAGE_ACCEPT } from '../../shared/api/chatImages';
 import { AgentConfirmCard } from './AgentConfirmCard';
 import { AgentPassageResolveCard } from './AgentPassageResolveCard';
 
@@ -73,6 +77,7 @@ export function AgentInput() {
     hasToolConfirm, hasPassageResolve,
     chapters, openFiles,
     pendingAttachments, addAttachment, removeAttachment,
+    attachmentUploadStates, uploadInboxFiles, uploadChatImages, attachInboxMaterial, removeAttachmentUpload,
     projectPath,
     draftPreset,
     consumeDraft,
@@ -100,6 +105,11 @@ export function AgentInput() {
     pendingAttachments: s.pendingAttachments,
     addAttachment: s.addAttachment,
     removeAttachment: s.removeAttachment,
+    attachmentUploadStates: s.attachmentUploadStates,
+    uploadInboxFiles: s.uploadInboxFiles,
+    uploadChatImages: s.uploadChatImages,
+    attachInboxMaterial: s.attachInboxMaterial,
+    removeAttachmentUpload: s.removeAttachmentUpload,
     projectPath: s.currentProject?.path,
     draftPreset: s.draftPreset,
     consumeDraft: s.consumeDraft,
@@ -115,8 +125,20 @@ export function AgentInput() {
   const [text, setText] = useState('');
   const [showAttachMenu, setShowAttachMenu] = useState(false);
   const [assetImages, setAssetImages] = useState<{ name: string; rel: string }[]>([]);
+  // 09-01 A3（R1.8）：attach 菜单「inbox 材料」段数据（懒加载，mirror 资产图片段）。
+  const [inboxFiles, setInboxFiles] = useState<{ name: string; rel: string }[]>([]);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const attachMenuRef = useRef<HTMLDivElement>(null);
+  const uploadInputRef = useRef<HTMLInputElement>(null);
+  // 09-01 B4：图片上传隐藏 input（与 A3 文档 input 并列，accept 面取白名单）。
+  const imageUploadInputRef = useRef<HTMLInputElement>(null);
+
+  // 09-01 A3：上传/解析在途 → Send 禁用（design §1.2——parsing 转圈可见，大 PDF 走
+  // 端点最长 120s 属可接受等待；description 异步生成不参与门控，preview 兜底）。
+  const uploadChips = Object.entries(attachmentUploadStates).filter(([, entry]) => entry.state !== 'ready');
+  const uploadsInFlight = uploadChips.some(
+    ([, entry]) => entry.state === 'uploading' || entry.state === 'parsing',
+  );
 
   // 用户拖拽放大的输入框高度（dogfood 2026-08-21：原 auto-grow 硬顶 160px 无放大选项；
   // 次日改顶边拖拽条——原生右下角 resize 在底部停靠布局里底边被钉死，拖下反而向上长，
@@ -142,6 +164,18 @@ export function AgentInput() {
       } catch {
         if (!cancelled) setAssetImages([]);
       }
+    })();
+    return () => { cancelled = true; };
+  }, [showAttachMenu, projectPath]);
+
+  // 09-01 A3（R1.8/AC6i）：inbox 材料懒加载——已上传材料列出可再次挂附件（新会话
+  // 复用长寿命材料的主入口；哈希命中路径零 LLM 调用）。
+  useEffect(() => {
+    if (!showAttachMenu || !projectPath) return;
+    let cancelled = false;
+    void (async () => {
+      const files = await listInboxFiles(projectPath);
+      if (!cancelled) setInboxFiles(files);
     })();
     return () => { cancelled = true; };
   }, [showAttachMenu, projectPath]);
@@ -212,12 +246,14 @@ export function AgentInput() {
 
   const handleSend = useCallback(() => {
     const trimmed = text.trim();
-    if (!trimmed || inputBusy) return;
+    // 09-01 A3：上传/解析在途禁发（chip 转圈可见；error 态不拦——错误 chip 非附件，
+    // 可移除，发送时随状态机整体清场）。
+    if (!trimmed || inputBusy || uploadsInFlight) return;
 
     // Attachments are passed structurally by sendAgentMessage; no text flattening.
     setText('');
     sendAgentMessage(trimmed);
-  }, [text, inputBusy, sendAgentMessage]);
+  }, [text, inputBusy, uploadsInFlight, sendAgentMessage]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -231,13 +267,144 @@ export function AgentInput() {
     setShowAttachMenu(false);
   };
 
+  // ── 09-01 A3：上传入口（R1.1，design D-A 隐藏 input[type=file]）──
+
+  const handleUploadChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files ?? []);
+    // 允许重复选同一文件（value 复位——否则二次选同名文件不触发 onChange）。
+    e.target.value = '';
+    if (files.length === 0) return;
+    setShowAttachMenu(false);
+    void uploadInboxFiles(files);
+  };
+
+  const handleAttachInboxMaterial = (rel: string, name: string) => {
+    setShowAttachMenu(false);
+    void attachInboxMaterial(rel, name);
+  };
+
+  // ── 09-01 B4（R2.1 / dogfood #45）：图片进件——选择器按钮 + 剪贴板粘贴两入口 ──
+  //（AgentPanel drop zone 图片分支同走 uploadChatImages，由 drop handler 接线。）
+
+  const handleImageUploadChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files ?? []);
+    // 允许重复选同一文件（value 复位——否则二次选同名文件不触发 onChange）。
+    e.target.value = '';
+    if (files.length === 0) return;
+    setShowAttachMenu(false);
+    void uploadChatImages(files);
+  };
+
+  /**
+   * 剪贴板粘贴（截图流，唯一净新增通道）：`clipboardData.items` 过
+   * `kind==='file' && type image/*` → getAsFile 进件；**纯文本粘贴路径零影响**（无图
+   * file 项时不 preventDefault，原生文本粘贴照旧——回归锁死）。同一截图部分系统会以
+   * 多 item 形态重复列出——按 name|type|size 去重。
+   *
+   * CR-021：图片项存在时**也不再 preventDefault**——放行浏览器默认文本粘贴（图文混排
+   * 源的 text/plain 表示照常落入输入框，图片照旧进附件）。纯截图（无 text/plain）默认
+   * 粘贴本就不插入任何内容，零重复表示。
+   */
+  const handlePaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const items = Array.from(e.clipboardData?.items ?? []);
+    const imageFiles: File[] = [];
+    const seen = new Set<string>();
+    for (const item of items) {
+      if (item.kind !== 'file' || !item.type.startsWith('image/')) continue;
+      const file = item.getAsFile?.();
+      if (!file) continue;
+      const key = `${file.name}|${file.type}|${file.size}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      imageFiles.push(file);
+    }
+    if (imageFiles.length === 0) return;
+    void uploadChatImages(imageFiles);
+  };
+
   return (
     <div className="agent-input-area">
       {hasToolConfirm && <AgentConfirmCard />}
       {hasPassageResolve && <AgentPassageResolveCard />}
 
-      {pendingAttachments.length > 0 && (
+      {(pendingAttachments.length > 0 || uploadChips.length > 0) && (
         <div className="agent-input-attachments">
+          {uploadChips.map(([uploadId, entry]) => {
+            // 09-01 A3：上传/解析/错误态 chip（in-flight 附件对象尚不存在，chip 由
+            // attachmentUploadStates 渲染；error 显指引 + 可移除，AC3；ready 条目在
+            // pendingAttachments 侧渲染，不双份）。
+            // 09-01 B4：variant=image 分支——缩略图直显（压缩完成即挂 thumbDataUrl）+
+            // 图专用状态/拒收文案（非白名单 / 压不动超限 / 解码失败三档）。
+            if (entry.variant === 'image') {
+              const imgError = entry.state === 'error';
+              const imgTitle = imgError
+                ? entry.errorKind === 'too-large'
+                  ? t('agent.uploadImageStateErrorTooLarge')
+                  : entry.errorKind === 'not-image'
+                    ? t('agent.uploadImageStateErrorType')
+                    : t('agent.uploadImageStateError')
+                : t('agent.uploadImageStateUploading');
+              return (
+                <span
+                  key={`img-${uploadId}`}
+                  className={`agent-attachment-chip agent-attachment-chip-image${imgError ? ' is-error' : ''}`}
+                  title={imgTitle}
+                >
+                  {entry.thumbDataUrl ? (
+                    <img className="agent-attachment-chip-thumb" src={entry.thumbDataUrl} alt={entry.label} />
+                  ) : (
+                    <span
+                      className={`material-symbols-outlined${!imgError ? ' agent-upload-spin' : ''}`}
+                      style={{ fontSize: '0.7rem' }}
+                    >
+                      {imgError ? 'error' : 'progress_activity'}
+                    </span>
+                  )}
+                  {entry.label}
+                  {!imgError && <span className="agent-upload-state-text">{t('agent.uploadImageStateUploading')}</span>}
+                  <button type="button" className="agent-attachment-remove" onClick={() => removeAttachmentUpload(uploadId)}>
+                    <span className="material-symbols-outlined">close</span>
+                  </button>
+                </span>
+              );
+            }
+            const isError = entry.state === 'error';
+            const stateLabel = isError
+              ? t('agent.uploadStateError')
+              : entry.state === 'uploading'
+                ? t('agent.uploadStateUploading')
+                : t('agent.uploadStateParsing');
+            // CR-018：error tooltip 按 errorKind 分流——scanned 扫描件指引 / 拒收三档
+            //（扩展名 / 超 50MB / 超单批，与 toast 同 tier 文案域）/ 其余通用解析失败。
+            const errorTitle = entry.errorKind === 'scanned'
+              ? t('agent.uploadStateErrorScanned')
+              : entry.errorKind === 'rejected-format'
+                ? t('agent.uploadStateErrorRejectedFormat')
+                : entry.errorKind === 'rejected-size'
+                  ? t('agent.uploadStateErrorRejectedSize')
+                  : entry.errorKind === 'rejected-batch'
+                    ? t('agent.uploadStateErrorRejectedBatch')
+                    : t('agent.uploadStateError');
+            return (
+              <span
+                key={`inbox-${uploadId}`}
+                className={`agent-attachment-chip agent-attachment-chip-upload${isError ? ' is-error' : ''}`}
+                title={isError ? errorTitle : stateLabel}
+              >
+                <span
+                  className={`material-symbols-outlined${!isError ? ' agent-upload-spin' : ''}`}
+                  style={{ fontSize: '0.7rem' }}
+                >
+                  {isError ? 'error' : entry.state === 'uploading' ? 'upload' : 'progress_activity'}
+                </span>
+                {entry.label}
+                <span className="agent-upload-state-text">{isError ? '' : stateLabel}</span>
+                <button type="button" className="agent-attachment-remove" onClick={() => removeAttachmentUpload(uploadId)}>
+                  <span className="material-symbols-outlined">close</span>
+                </button>
+              </span>
+            );
+          })}
           {pendingAttachments.map((att) => {
             if (att.type === 'selection') {
               // Render selections as a quoted preview. The quote marks are added
@@ -259,8 +426,30 @@ export function AgentInput() {
                 </span>
               );
             }
+            // 09-01 B4（R2.6）：ready 图片附件 chip——缩略图直显（ready 条目随迁移保留
+            // thumbDataUrl，经 attachmentUploadStates 查；发送时随状态机整体清场）。
+            if (att.type === 'image') {
+              const thumb = attachmentUploadStates[att.id]?.thumbDataUrl;
+              return (
+                <span key={`image-${att.id}`} className="agent-attachment-chip agent-attachment-chip-image" title={att.label}>
+                  {thumb ? (
+                    <img className="agent-attachment-chip-thumb" src={thumb} alt={att.label} />
+                  ) : (
+                    <span className="material-symbols-outlined" style={{ fontSize: '0.7rem' }}>image</span>
+                  )}
+                  {att.label}
+                  <button type="button" className="agent-attachment-remove" onClick={() => removeAttachment(att.id)}>
+                    <span className="material-symbols-outlined">close</span>
+                  </button>
+                </span>
+              );
+            }
+            // CR-010②：resolve 解析备注（非 UTF-8 转换提示 / 端点降级备注等）随 ready
+            // 条目携带——chip tooltip 消费；无备注（既有 file 附件/章/选段）无 title，
+            // 渲染零变化。
+            const resolveNote = att.type === 'file' ? attachmentUploadStates[att.id]?.note : undefined;
             return (
-              <span key={`${att.type}-${att.id}`} className="agent-attachment-chip">
+              <span key={`${att.type}-${att.id}`} className="agent-attachment-chip" title={resolveNote}>
                 <span className="material-symbols-outlined" style={{ fontSize: '0.7rem' }}>
                   {att.type === 'chapter' ? 'description' : 'insert_drive_file'}
                 </span>
@@ -286,6 +475,62 @@ export function AgentInput() {
           </button>
           {showAttachMenu && (
             <div className="agent-attach-menu" ref={attachMenuRef}>
+              {/* 09-01 A3（R1.1）：上传 section——外部文案大纲拷入 inbox/ 后挂附件
+                  （docx/pdf 预解析派生 .md；扫描件 chip error 态给指引）。 */}
+              <div className="agent-attach-section-title">{t('agent.attachUpload')}</div>
+              <button
+                type="button"
+                className="agent-attach-item"
+                onClick={() => uploadInputRef.current?.click()}
+              >
+                <span className="material-symbols-outlined">upload</span>
+                {t('agent.attachUploadFile')}
+              </button>
+              <input
+                ref={uploadInputRef}
+                type="file"
+                multiple
+                accept={INBOX_UPLOAD_ACCEPT}
+                className="agent-upload-file-input"
+                onChange={handleUploadChange}
+              />
+              {/* 09-01 B4（R2.1 / dogfood #45）：图片上传入口——canvas 预检压缩（>10MB 两档
+                  JPG）后落 inbox/images/ 挂 image 附件（指针 + b64hash）。粘贴截图走
+                  textarea onPaste 同一 action。 */}
+              <button
+                type="button"
+                className="agent-attach-item"
+                onClick={() => imageUploadInputRef.current?.click()}
+              >
+                <span className="material-symbols-outlined">image</span>
+                {t('agent.attachUploadImage')}
+              </button>
+              <input
+                ref={imageUploadInputRef}
+                type="file"
+                multiple
+                accept={CHAT_IMAGE_ACCEPT}
+                className="agent-upload-file-input"
+                onChange={handleImageUploadChange}
+              />
+              {/* 09-01 A3（R1.8/AC6i）：inbox 材料段——已上传材料再次挂附件（哈希命中
+                  零 LLM；新会话复用长寿命材料的主入口）。 */}
+              {inboxFiles.length > 0 && (
+                <>
+                  <div className="agent-attach-section-title">{t('agent.attachInbox')}</div>
+                  {inboxFiles.map((f) => (
+                    <button
+                      key={f.rel}
+                      type="button"
+                      className="agent-attach-item"
+                      onClick={() => handleAttachInboxMaterial(f.rel, f.name)}
+                    >
+                      <span className="material-symbols-outlined">markdown</span>
+                      {f.name}
+                    </button>
+                  ))}
+                </>
+              )}
               <div className="agent-attach-section-title">{t('agent.attachChapter')}</div>
               {chapters.map((ch) => (
                 <button
@@ -403,6 +648,7 @@ export function AgentInput() {
           value={text}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={handleKeyDown}
+          onPaste={handlePaste}
           rows={1}
           disabled={inputBusy}
         />
@@ -425,7 +671,13 @@ export function AgentInput() {
             <span className="material-symbols-outlined">stop</span>
           </button>
         ) : (
-          <button type="button" className="agent-input-btn" onClick={handleSend} title={t('agent.send')} disabled={!text.trim()}>
+          <button
+            type="button"
+            className="agent-input-btn"
+            onClick={handleSend}
+            title={t('agent.send')}
+            disabled={!text.trim() || uploadsInFlight}
+          >
             <span className="material-symbols-outlined">send</span>
           </button>
         )}

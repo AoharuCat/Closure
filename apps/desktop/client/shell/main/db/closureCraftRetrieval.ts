@@ -78,30 +78,60 @@ function rowToCraftHit(r: CraftRow): CraftHit {
 type QueryPlan = { hasVec: boolean; hasFts: boolean };
 
 /**
+ * F-08 补偿（design §2.4 / E10.2b W4.2）：vec0 虚表无 tags 列（标量列装不下数组 OR），
+ * tags 只能融合后过滤——vec KNN 窗口外的标签命中行会丢。tags 在场时 vec0 行预算 ×4
+ * 放宽窗口；剩余损失由金标「tag 命中在 vec 窗口外」用例量化（AC10），命中不足 k 时
+ * 记诚实日志（searchCraft 返回形态无 note 位——CraftHit[]，W4.2 拍板记日志）。
+ */
+const TAG_VEC_WINDOW_MULTIPLIER = 4;
+
+/**
  * Assemble the craft RRF SQL + positional params for the four arm-combinations.
  * Mirrors `buildRrfQuery` with the `project_id` filter dropped (global scope) and
  * table/column names swapped. vec0 metadata `WHERE` supports only `= != > >= < <=`
  * (no IN/LIKE), so `craft_type = ?` is pushed inside vec0 AND applied in the final
  * closure_craft_entry filter (belt-and-suspenders, same as searchClosure).
+ *
+ * `tags`（E10.2b W4.2 / R10）：**融合后过滤**——final WHERE 上的 `EXISTS (json_each(
+ * c.tags) … IN (…))` 精确 OR 匹配（mirror W2 listCraftCards 的 tags 过滤实现；json_each
+ * 对 SQL NULL 返回空集不报错——材料 chunk 行 tags 恒 NULL，已实测钉住）。tags 在场时
+ * vecK 窗口按 TAG_VEC_WINDOW_MULTIPLIER 放宽（F-08 补偿）。
  */
 function buildCraftRrfQuery(args: {
   craftType?: string;
+  tags: readonly string[];
   k: number; // final LIMIT (candidateLimit = max(k, topN) so rerank has a pool)
   topN: number;
   qVec: Buffer | null;
   ftsTerm: string | null;
   vecArm: boolean;
 }): { sql: string; params: unknown[]; plan: QueryPlan } {
-  const { craftType, k, topN, qVec, ftsTerm, vecArm } = args;
+  const { craftType, tags, k, topN, qVec, ftsTerm, vecArm } = args;
   const hasVec = qVec !== null && vecArm;
   const hasFts = ftsTerm !== null;
   const vecCt = craftType ? ' AND craft_type = ?' : ''; // inside vec0
   const vecCtParams = craftType ? [craftType] : [];
-  const whereCt = craftType ? 'WHERE c.craft_type = ?' : ''; // final filter (no project_id)
+  // Final fused-set filter (applies AFTER RRF fusion — tags 是融合后过滤 by design).
+  const whereParts: string[] = [];
+  const whereParams: unknown[] = [];
+  if (craftType) {
+    whereParts.push('c.craft_type = ?');
+    whereParams.push(craftType);
+  }
+  if (tags.length > 0) {
+    whereParts.push(
+      `EXISTS (SELECT 1 FROM json_each(c.tags) je WHERE je.value IN (${tags
+        .map(() => '?')
+        .join(',')}))`,
+    );
+    whereParams.push(...tags);
+  }
+  const whereCt = whereParts.length > 0 ? `WHERE ${whereParts.join(' AND ')}` : '';
   // Story 8.7 dual-vector (mirror searchClosure): vec0 `k` counts VECTOR ROWS and
   // every craft doc occupies two (#body + #identity), so the row budget is
   // doubled to hold the distinct-doc pool at topN after the per-doc dedupe.
-  const vecK = topN * 2;
+  // E10.2b W4.2: tags 在场再乘 TAG_VEC_WINDOW_MULTIPLIER（F-08 补偿，见常量注记）。
+  const vecK = topN * 2 * (tags.length > 0 ? TAG_VEC_WINDOW_MULTIPLIER : 1);
   // Dual-vector KNN CTE chain (mirror searchClosure's vecCtes, minus the
   // project_id partition): KNN over ALL rows -> best row per doc (that row's
   // vector_kind becomes the hit's kind) -> rn over the deduped set (one doc =
@@ -135,10 +165,10 @@ function buildCraftRrfQuery(args: {
                    c.name AS name, c.body_text AS body_text, c.summary_text AS summary_text,
                    NULL AS vector_kind, 0 AS score, NULL AS fts_rank, NULL AS vec_distance
             FROM closure_craft_entry c
-            ${craftType ? 'WHERE c.craft_type = ?' : ''}
+            ${whereCt}
             ORDER BY c.updated_at DESC
             LIMIT ?`,
-      params: craftType ? [craftType, k] : [k],
+      params: [...whereParams, k],
       plan: { hasVec: false, hasFts: false },
     };
   }
@@ -163,7 +193,7 @@ function buildCraftRrfQuery(args: {
             ${whereCt}
             ORDER BY score DESC
             LIMIT ?`,
-      params: craftType ? [ftsTerm, topN, craftType, k] : [ftsTerm, topN, k],
+      params: [ftsTerm, topN, ...whereParams, k],
       plan: { hasVec: false, hasFts: true },
     };
   }
@@ -182,7 +212,7 @@ function buildCraftRrfQuery(args: {
             ${whereCt}
             ORDER BY score DESC
             LIMIT ?`,
-      params: [qVec, vecK, ...vecCtParams, ...(craftType ? [craftType] : []), k],
+      params: [qVec, vecK, ...vecCtParams, ...whereParams, k],
       plan: { hasVec: true, hasFts: false },
     };
   }
@@ -208,7 +238,7 @@ function buildCraftRrfQuery(args: {
           ${whereCt}
           ORDER BY score DESC
           LIMIT ?`,
-    params: [qVec, vecK, ...vecCtParams, ftsTerm, topN, ...(craftType ? [craftType] : []), k],
+    params: [qVec, vecK, ...vecCtParams, ftsTerm, topN, ...whereParams, k],
     plan: { hasVec: true, hasFts: true },
   };
 }
@@ -231,21 +261,34 @@ async function defaultEmbed(model: ResolvedModel, text: string): Promise<number[
  * `searchClosure` minus the projectId scope.
  *
  * @param query free-text query (embedded for the vector arm; sanitized + phrase-
- *   quoted for the FTS arm).
- * @param opts craftType (structured pre-filter), k (final result count, default
- *   10), topN (per-arm candidate depth fed into RRF, default 20).
+ *   quoted for the FTS arm). May be empty when `tags` is present (E10.2b W4.2
+ *   纯标签浏览——falls to the structured-only path).
+ * @param opts craftType (structured pre-filter), tags (E10.2b W4.2 / R10 自由
+ *   标签过滤——融合后 OR 匹配 + vec 窗口 ×4 补偿, F-08), k (final result count,
+ *   default 10), topN (per-arm candidate depth fed into RRF, default 20).
  * @param deps DI seam for tests (stubbed embed/resolveModel/rerank -> zero network).
  * @returns ranked CraftHit[] (empty on best-effort failure - never throws).
  */
 export async function searchCraft(
   query: string,
-  opts?: { craftType?: string; k?: number; topN?: number },
+  opts?: { craftType?: string; tags?: readonly string[]; k?: number; topN?: number },
   deps?: RetrievalDeps,
 ): Promise<CraftHit[]> {
   const k = opts?.k ?? 10;
   const topN = opts?.topN ?? 20;
   const candidateLimit = Math.max(k, topN);
   const craftType = opts?.craftType;
+  // Defensive normalization (schema already guards the agent path; searchCraft
+  // is also called directly by tests + the future eval runner): strip a leading
+  // '#' (命中渲染展示 `#tag` 形态——agent 自然照抄该形态) + trim + dedup + drop
+  // empties so the IN (...) placeholder list never carries junk params.
+  const tags = Array.from(
+    new Set(
+      (opts?.tags ?? [])
+        .map((t) => t.trim().replace(/^#/, ''))
+        .filter((t) => t.length > 0),
+    ),
+  );
   const resolveModel = deps?.resolveModel ?? resolveEmbeddingModel;
   const embed = deps?.embed ?? defaultEmbed;
   const db = getDb();
@@ -282,6 +325,7 @@ export async function searchCraft(
   const runQuery = (qVecOverride: Buffer | null): CraftHit[] => {
     const { sql, params } = buildCraftRrfQuery({
       craftType,
+      tags,
       k: candidateLimit,
       // CR-craft-kb-006: per-arm CTE LIMIT + vec0 `k=?` take `topN`; bump to
       // `candidateLimit` so k in [21, 50] is satisfiable in single-arm mode
@@ -295,14 +339,27 @@ export async function searchCraft(
     return rows.map(rowToCraftHit);
   };
 
+  // F-08 honest note (W4.2 拍板：CraftHit[] 无 note 位 → 记日志)：tags 过滤后命中不足
+  // k——可能真没有，也可能标签命中落在 vec 窗口外（×4 补偿后的残余损失，金标 AC10 量化）。
+  const logTagShortfall = (hits: readonly CraftHit[]): void => {
+    if (tags.length > 0 && hits.length < k) {
+      getLogger().info(
+        { tags, expected: k, got: hits.length },
+        'craft retrieval: tags filter left fewer than k hits (F-08 vec-window boundary - refine tags or widen query)',
+      );
+    }
+  };
+
   try {
     const hits = runQuery(qVec);
     // Shared cross-encoder rerank stage (Story 2.1): RRF topN -> rerank -> top-k.
     // rerank unavailable -> degrade to RRF top-k (slice(0, k)).
-    return await rerankCandidates(query, hits, k, {
+    const ranked = await rerankCandidates(query, hits, k, {
       resolveModel: deps?.resolveRerankModel,
       rerank: deps?.rerank,
     });
+    logTagShortfall(ranked);
+    return ranked;
   } catch (err) {
     getLogger().warn(
       { err: err instanceof Error ? err.message : String(err), craftType },
@@ -315,10 +372,12 @@ export async function searchCraft(
           'craft retrieval: retrying FTS-only (vec arm dropped)',
         );
         const retryHits = runQuery(null);
-        return await rerankCandidates(query, retryHits, k, {
+        const ranked = await rerankCandidates(query, retryHits, k, {
           resolveModel: deps?.resolveRerankModel,
           rerank: deps?.rerank,
         });
+        logTagShortfall(ranked);
+        return ranked;
       } catch (err2) {
         getLogger().warn(
           { err: err2 instanceof Error ? err2.message : String(err2), craftType },

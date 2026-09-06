@@ -26,6 +26,8 @@ import {
   wikiSiteOverrideSchema,
   resolveModelInfo,
 } from '../src';
+import { desktopIpcSchema } from '../src';
+import type { ResolveInboxAttachmentResult, StoreAttachmentDescriptionInput } from '../src';
 
 describe('shared contracts', () => {
   it('accepts a simplified task request and result pair', () => {
@@ -698,6 +700,108 @@ describe('model registry thinking kinds + limits (thinking adapters task)', () =
     });
     expect(resolveModelInfo('qwen-max').thinking).toBeUndefined();
     expect(resolveModelInfo('qwen-max').limits).toBeUndefined();
+  });
+});
+
+// ── B1 附件（R2.4，09-01）：registry vision 标记（第三轮 registry 派生 additive）──
+// 标记 = 确定性多模态（官方文档全系支持图片输入）；ABSENT ≠ 不支持，只是未验证——
+// 未标家族的图片一律走 visionModel 转述安全路径，绝不盲发（design D-G 红线）。
+describe('model registry vision marks (B1 agent attachments)', () => {
+  it('确定性多模态家族 → vision: true', () => {
+    expect(resolveModelInfo('gpt-4o').vision).toBe(true);
+    expect(resolveModelInfo('gpt-4o-mini').vision).toBe(true);
+    expect(resolveModelInfo('gpt-4.1').vision).toBe(true);
+    expect(resolveModelInfo('o4-mini').vision).toBe(true);
+    expect(resolveModelInfo('GLM-4.5V').vision).toBe(true); // glob 大小写不敏感
+    expect(resolveModelInfo('gemini-2.5-flash').vision).toBe(true);
+    expect(resolveModelInfo('gemini-3-pro').vision).toBe(true);
+    expect(resolveModelInfo('doubao-1.5-vision-pro-32k').vision).toBe(true);
+    expect(resolveModelInfo('doubao-vision-lite').vision).toBe(true);
+  });
+
+  it('qwen*vl* 新模式：Qwen 视觉语言线全系命中（置于 qwen-* 之前，specific first）', () => {
+    expect(resolveModelInfo('qwen-vl-max').vision).toBe(true);
+    expect(resolveModelInfo('qwen2-vl-7b-instruct').vision).toBe(true);
+    expect(resolveModelInfo('qwen2.5-vl-72b-instruct').vision).toBe(true);
+    expect(resolveModelInfo('qwen3-vl-plus').vision).toBe(true);
+    // thinking 刻意不标（该线思考参数形态未验证 → ABSENT，协议层 param-strip 兜底）。
+    expect(resolveModelInfo('qwen3-vl-plus').thinking).toBeUndefined();
+    // 主线（max/plus/turbo）不受新模式波及：落 qwen-*，无 vision。
+    expect(resolveModelInfo('qwen-max').vision).toBeUndefined();
+    expect(resolveModelInfo('qwen-plus-latest').vision).toBeUndefined();
+  });
+
+  it('Claude 3 系起全系多模态（含 claude-* 兜底；2.x 已全面下线不可配）', () => {
+    expect(resolveModelInfo('claude-opus-5').vision).toBe(true);
+    expect(resolveModelInfo('claude-sonnet-4-5').vision).toBe(true);
+    expect(resolveModelInfo('claude-3-7-sonnet-latest').vision).toBe(true);
+    // 4.6 等未单列版本落 claude-* 兜底 → 同样携带 vision。
+    expect(resolveModelInfo('claude-sonnet-4-6').vision).toBe(true);
+  });
+
+  it('未标家族 → vision 键 ABSENT（≠不支持；走 visionModel 转述安全路径）', () => {
+    // 整形断言（toEqual）钉 ABSENT 语义而非 undefined 值。
+    expect(resolveModelInfo('qwen-max')).toEqual({ capability: 'text', alias: 'Qwen max' });
+    // OpenAI 家族内混纯文本变体（codex / *-preview / *-mini / 老 4 系）→ 保守不标。
+    expect(resolveModelInfo('gpt-5.1').vision).toBeUndefined();
+    expect(resolveModelInfo('o1').vision).toBeUndefined();
+    expect(resolveModelInfo('o3-mini').vision).toBeUndefined();
+    expect(resolveModelInfo('gpt-4-turbo').vision).toBeUndefined();
+    // GLM/Kimi/DeepSeek 主线识图能力未验证 → 不标。
+    expect(resolveModelInfo('glm-5.3').vision).toBeUndefined();
+    expect(resolveModelInfo('kimi-k3').vision).toBeUndefined();
+    expect(resolveModelInfo('deepseek-v4-pro').vision).toBeUndefined();
+    // 未知家族零 vision（与既有 thinking/limits 兜底行为一致）。
+    expect(resolveModelInfo('unknown-model-xyz').vision).toBeUndefined();
+  });
+
+  it('basename 二轮匹配同样携带 vision（聚合供应商 org 前缀 id）', () => {
+    // qwen*vl* 对整串 org 前缀 id 即命中（中缀星模式）→ alias 取 basename。
+    expect(resolveModelInfo('Qwen/Qwen3-VL-8B')).toMatchObject({
+      capability: 'text',
+      vision: true,
+    });
+    expect(resolveModelInfo('Qwen/Qwen3-VL-8B').alias).toBe('Qwen3-VL-8B');
+    // 前缀锚定模式（glm-4.5v*）对整串不命中 → basename 二轮命中 → vision 与 thinking 同时携带。
+    expect(resolveModelInfo('Pro/GLM/glm-4.5v')).toMatchObject({
+      capability: 'text',
+      thinking: 'glm-forced-basic',
+      vision: true,
+    });
+  });
+});
+
+// ── A 波 09-01 CR patch：inbox 附件 IPC 契约（CR-010 notes / CR-013 capturedMtime）──
+describe('inbox attachment IPC contracts (09-01 A-wave, CR-010/CR-013)', () => {
+  it('三通道均在 desktopIpcSchema channel 枚举内（preload/securitySurface 白名单的契约面）', () => {
+    expect(desktopIpcSchema.safeParse({ channel: 'project:parse-inbox-doc' }).success).toBe(true);
+    expect(desktopIpcSchema.safeParse({ channel: 'project:resolve-inbox-attachment' }).success).toBe(true);
+    expect(desktopIpcSchema.safeParse({ channel: 'project:store-attachment-description' }).success).toBe(true);
+    expect(desktopIpcSchema.safeParse({ channel: 'project:not-a-channel' }).success).toBe(false);
+  });
+
+  it('ResolveInboxAttachmentResult.notes / StoreAttachmentDescriptionInput.capturedMtime 形态锁（编译期）', () => {
+    // 纯类型契约运行时无表示——编译期赋值锁 additive 字段就位（typecheck 门生效）：
+    // notes 供 preview 被编码抑制时 UI 说明原因（CR-010）；capturedMtime 供 store 侧
+    // TOCTOU 守卫比对（CR-013）。
+    const resolveOk: ResolveInboxAttachmentResult = {
+      ok: true,
+      contentHash: 'sha256:fixture',
+      mtime: 1_725_000_000_000,
+      preview: '',
+      derivedPath: 'inbox/大纲.md',
+      reused: false,
+      notes: ['疑似非 UTF-8 编码——建议先转存为 UTF-8 后重新解析。'],
+    };
+    const storeInput: StoreAttachmentDescriptionInput = {
+      projectPath: 'C:/proj',
+      filePath: 'inbox/大纲.md',
+      description: '二战背景的群像大纲',
+      capturedMtime: 1_725_000_000_000,
+    };
+    expect(resolveOk.ok).toBe(true);
+    expect(resolveOk.notes).toHaveLength(1);
+    expect(storeInput.capturedMtime).toBe(1_725_000_000_000);
   });
 });
 

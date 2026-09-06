@@ -84,6 +84,31 @@ describe('ipc-provider 多轮回传 reasoning（S4b design §5.2）', () => {
       .find((m) => m.role === 'assistant');
     expect('reasoning_content' in (assistant ?? {})).toBe(false);
   });
+
+  // task 09-01 B2（R2.3）组合核对：带图 user 消息与 assistant reasoning 回传同史共存
+  // ——user 走 image parts 分支，assistant 的 reasoning_content 照常回传，互不干扰。
+  it('带图 user 消息 + assistant reasoning 同史 → parts 分支与 reasoning_content 回传互不干扰', async () => {
+    const seam = installSeam();
+    const messages: SessionMessage[] = [
+      {
+        id: 'u1',
+        role: 'user',
+        content: '看图',
+        images: [{ path: 'inbox/images/a.png', b64hash: 'ha', name: '图a' }],
+        createdAt: 1,
+      },
+      { id: 'a1', role: 'assistant', content: '答案', reasoning: '思考', reasoningSignature: 's1', createdAt: 2 },
+    ];
+
+    await generate(messages, 'SYS', [], SIGNAL);
+
+    const payload = requestOf(seam).request.messages as Array<Record<string, unknown>>;
+    expect(Array.isArray(payload[1].content)).toBe(true); // user → parts（含 image part）
+    expect((payload[1].content as Array<Record<string, unknown>>).some((p) => p.type === 'image')).toBe(true);
+    const assistant = payload.find((m) => m.role === 'assistant');
+    expect(assistant?.reasoning_content).toBe('思考');
+    expect(assistant?.reasoningSignature).toBe('s1');
+  });
 });
 
 describe('ipc-provider thinking 透传（S4b design §2）', () => {

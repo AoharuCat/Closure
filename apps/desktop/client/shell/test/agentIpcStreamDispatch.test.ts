@@ -51,6 +51,9 @@ vi.mock('../main/ipc/modelGatewayIpc', async (importOriginal) => {
 import { generate } from '@orison/desktop-agent';
 import type { GenerationDelta, SessionMessage } from '@orison/desktop-agent';
 import { registerAgentIpc } from '../main/ipc/agentIpc';
+// 09-01 附件 B3：agentIpc 装配 agentImageParts 内核（防环注入缝——漏装配 = 生产图片全降级）。
+import { __getAgentImagePartsCoreForTest } from '../main/ipc/agentImageParts';
+import { prepareVisionImage } from '../main/research/visionAnalysis';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // dogfood T1 Stage 1（流式缝分派 / design §2）：agentIpc 的 generateTextImpl 按
@@ -124,6 +127,19 @@ describe('agentIpc 流式缝分派（dogfood T1 Stage 1）', () => {
     expect(call.length).toBe(2);
     expect(call[1]).toBe(signal);
     expect(result).toEqual({ content: 'plain', toolCalls: undefined, finishReason: 'stop' });
+  });
+
+  // 09-01 附件 B3：registerAgentIpc 装配 agentImageParts 防环注入内核——generateTextImpl
+  // 保持纯分派不动（上一对用例钉分派），图片处理内核经 installAgentImagePartsCore 注入
+  //（mirror setGenerateTextFn 形态）。漏装配时生产全图降级，此处钉死 wiring。
+  it('registerAgentIpc 装配 agentImageParts 内核（prepareImage = 真 prepareVisionImage）', () => {
+    const core = __getAgentImagePartsCoreForTest();
+    expect(core).not.toBeNull();
+    expect(core!.prepareImage).toBe(prepareVisionImage);
+    expect(typeof core!.resolveModelRef).toBe('function');
+    expect(typeof core!.readModelConfig).toBe('function');
+    // CR-003a：转述进度广播发射器（全窗 webContents.send('image-relay-progress')）随内核装配。
+    expect(typeof core!.notifyRelayProgress).toBe('function');
   });
 
   // dogfood R2 #7：车道过缝——agent 侧 GenerateOptions.lane 经 ipc-provider 序列化进

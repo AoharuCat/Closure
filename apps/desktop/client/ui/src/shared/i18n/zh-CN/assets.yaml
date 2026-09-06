@@ -44,3 +44,4 @@ projectTree:
   deleteConfirmDir: "删除文件夹“{name}”及其全部内容？此操作不可撤销。"
   noProjectPath: "未打开项目。"
   importFailed: "文件导入失败"
+  pdfNoPreview: "PDF 已收入 inbox/，可拖入对话框让 Agent 解析读取"

@@ -1,0 +1,130 @@
+# 「材料」页（Story 10.1 Wave D，D7 独立左导航页）i18n 全词表。
+# 文案中文化纪律（mirror 设定页先例）：zh 界面零英文术语露出；键名（代码标识符，
+# = 契约字段原样）不受限。词表权威源：provenance medium 词表 = contracts/material.ts
+# 注释（V1 六值 + R1 预留五值全量呈现——未知值**原样呈现不推测**：mediumLabel 键回落时
+# 显示原文，非归 medium.other）。
+materials:
+  title: "材料"
+  # ── scope 车道切换 ──
+  scope:
+    project: "本项目"
+    global: "全局库"
+    projectDisabledHint: "未打开项目——切到全局库或先打开项目"
+  # ── 列表 ──
+  list:
+    name: "名称"
+    medium: "来源"
+    quality: "质量"
+    chapters: "分章"
+    chars: "字数"
+    time: "摄取时间"
+    empty: "还没有材料——把文件拖到下方导入区开始摄取"
+    loading: "加载中…"
+    error: "加载失败：{message}"
+    retry: "重试"
+  # ── 格式徽章（MATERIAL_FORMATS；10.2a += 字幕 srt/ass/vtt）──
+  format:
+    txt: "TXT"
+    md: "MD"
+    docx: "DOCX"
+    pdf: "PDF"
+    epub: "EPUB"
+    srt: "SRT"
+    ass: "ASS"
+    vtt: "VTT"
+  # ── 来源类别（provenance.medium 开放词表：V1 六值 + R1 五值预留全呈现）──
+  medium:
+    novel_text: "小说文本"
+    lecture: "讲义"
+    interview: "访谈"
+    criticism: "批评"
+    wiki: "百科社区"
+    other: "其他"
+    game_files: "游戏文件"
+    community_data: "社区转写"
+    runtime_hook: "运行时钩子"
+    screen_capture: "屏幕截取"
+    video: "视频"
+  # ── 来源层级（provenance.tier，10.4 三级来源）──
+  tier:
+    original: "原作"
+    community: "社区"
+    criticism: "批评"
+    unspecified: "未标注"
+  # ── 质量徽章（AC8 诚实标注；failed = 摄取失败登记行 CR-030）──
+  quality:
+    scanned: "扫描件"
+    nonUtf8: "编码可疑"
+    ok: "质量正常"
+    failed: "摄取失败"
+  # ── 分章状态与置信（low-confidence = 章界挂起检索照常，F-09）──
+  chapter:
+    count: "{count} 章"
+    method:
+      regex: "正则分章"
+      llm-fallback: "AI 兜底分章"
+      manual: "人工校对"
+      none: "未分章"
+    confidence:
+      high: "高置信"
+      medium: "中置信"
+      low: "低置信"
+      manual: "人工"
+    lowConfidenceBadge: "章界待校对"
+    lowConfidenceHint: "章界不可信（挂起人工校对），检索不受影响。可编辑派生 .md 里的章标记后重摄取完成校对。"
+  # ── 行操作 ──
+  action:
+    delete: "删除"
+    deleteConfirmTitle: "删除材料"
+    deleteConfirmMessage: "确认删除「{name}」？将同时清除原件、派生 .md 与检索索引（.orison/history 有快照兜底）。"
+    deleteConfirmLabel: "删除"
+    reingest: "重摄取"
+    openDerived: "打开派生 .md"
+    revealDerived: "在文件夹中显示"
+    editProvenance: "出处信息"
+    refresh: "刷新"
+  # ── 批量导入 ──
+  import:
+    dropzone: "拖入 TXT / MD / DOCX / PDF / EPUB / SRT / ASS / VTT 文件（每批最多 250 份、单份 50MB）"
+    dropzoneActive: "松开导入"
+    browse: "选择文件…"
+    progress: "导入中 {done}/{total}…"
+    summary: "已导入 {count} 份"
+    rejectedSummary: "拒收 {count} 份"
+    failedSummary: "摄取失败 {count} 份（文件已拷入，稍后自动重试）"
+    rejectedKind:
+      unsupported-format: "不支持的格式"
+      too-large: "超过 50MB"
+      batch-overflow: "超过单批 250 份"
+      stem-conflict: "同名异扩展冲突（会覆写派生 .md）"
+      sensitive: "源在敏感目录"
+      missing: "源文件不可访问"
+    failedTitle: "导入失败：{message}"
+  # ── provenance 表单（F-05 五字段后补；blur/change 落盘——无保存/关闭钮）──
+  # 10.2a += 标题（name 列，materialId 路径身份不变）/ 简介（provenance.description）。
+  provenance:
+    title: "出处信息"
+    nameLabel: "标题"
+    medium: "来源类别"
+    tier: "来源层级"
+    author: "作者"
+    lang: "语言"
+    originDate: "年代"
+    description: "简介"
+    mediumPlaceholder: "选择来源类别"
+    tierPlaceholder: "选择来源层级"
+    saved: "出处信息已更新"
+    nameSaved: "标题已更新"
+    saveFailed: "保存失败：{message}"
+    loading: "读取中…"
+    loadFailed: "读取失败：{message}"
+  # ── toast 反馈 ──
+  toast:
+    deleted: "已删除「{name}」"
+    deleteFailed: "删除失败：{message}"
+    reingested: "已重新摄取「{name}」"
+    reingestFailed: "重摄取失败：{message}"
+    openDerivedFailed: "打开派生文件失败"
+    derivedMissing: "派生 .md 尚未生成——先重摄取"
+    pathCopied: "路径已复制，请用系统编辑器打开：{path}"
+    pathUnavailable: "未取得文件路径，无法导入——可改用「选择文件…」入口"

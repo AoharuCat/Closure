@@ -3,8 +3,11 @@ import { useShallow } from 'zustand/react/shallow';
 import { useAppStore } from '../../shared/store/appStore';
 import { useI18n } from '../../shared/i18n/useI18n';
 import type { AgentMessage } from '../../shared/store/agentSlice';
+import type { ImageAttachment } from '@orison/shared-contracts';
 import { WRITE_TOOLS } from '../../shared/store/agentDiffSlice';
 import type { Attachment, SelectionAttachment } from '../../shared/types/attachment';
+// 09-01 B4（R2.6）：气泡 image 缩略图的盘读路径拼接 + 绝对路径归一（ProjectTree.tsx:230 同款）。
+import { chatImageAbsolutePath } from '../../shared/api/chatImages';
 import { AgentToolCard } from './AgentToolCard';
 import { DiffCard } from './DiffCard';
 // dogfood R2 #12：三派发工具的成功产出（大纲/分集草案、调研报告）专用产出卡——
@@ -61,6 +64,72 @@ function TruncateFromHereButton({ onClick, t }: { onClick: () => void; t: (k: st
 function attachmentIcon(type: Attachment['type']): string {
   if (type === 'chapter') return 'description';
   return 'insert_drive_file';
+}
+
+/**
+ * 09-01 B4（R2.6 / dogfood #45）：user 气泡 references 的 image 分支缩略图。两态：
+ * - attachment 带 `dataUrl`（发送时刻 uploadStates 里的压缩后 dataUrl，乐观消息直显）→ 直接渲染；
+ * - 无（重载会话 / 重启 jsonl 读回——references 是 UI 内存态从不落盘）→ useEffect 经
+ *   `readFileBinary`（ProjectTree.tsx:231-245 同款 IPC）按项目相对指针读盘转 dataUrl 渲染，
+ *   加载中占位框；读失败保持占位（文件被移动/删除不炸气泡）。效果 cleanup 的 cancelled
+ *   旗防在途读盘落到已卸载/已切项目的消息上。
+ */
+function ImageReferenceThumb({
+  image,
+  dataUrl,
+  t,
+}: {
+  image: ImageAttachment;
+  dataUrl?: string;
+  t: (k: string) => string;
+}) {
+  const projectPath = useAppStore((s) => s.currentProject?.path);
+  const [loadedUrl, setLoadedUrl] = useState<string | null>(dataUrl ?? null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    setFailed(false);
+    if (dataUrl) {
+      setLoadedUrl(dataUrl);
+      return;
+    }
+    setLoadedUrl(null);
+    if (!projectPath) return;
+    let cancelled = false;
+    const fullPath = chatImageAbsolutePath(projectPath, image.path);
+    void (async () => {
+      try {
+        const payload = await window.orisonDesktop?.readFileBinary?.(fullPath);
+        if (cancelled) return;
+        if (payload?.base64) {
+          setLoadedUrl(`data:${payload.mimeType};base64,${payload.base64}`);
+        } else {
+          setFailed(true);
+        }
+      } catch {
+        if (!cancelled) setFailed(true);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [dataUrl, projectPath, image.path]);
+
+  return (
+    <span className="agent-msg-image-thumb" title={image.label} role="img" aria-label={image.label}>
+      {loadedUrl ? (
+        <img src={loadedUrl} alt={image.label} />
+      ) : failed ? (
+        <span className="agent-msg-image-thumb-fallback">
+          <span className="material-symbols-outlined" aria-hidden="true">broken_image</span>
+          {t('agent.imageThumbLoadFailed')}
+        </span>
+      ) : (
+        <span className="agent-msg-image-thumb-loading">
+          <span className="material-symbols-outlined agent-upload-spin" aria-hidden="true">progress_activity</span>
+          {t('agent.imageThumbLoading')}
+        </span>
+      )}
+    </span>
+  );
 }
 
 /**
@@ -352,6 +421,15 @@ function AgentMessageItemImpl({ message, isLatest, canTruncateFrom, onTruncateFr
             {message.references.map((ref) =>
               ref.type === 'selection' ? (
                 <SelectionReferenceChip key={`selection-${ref.id}`} ref={ref} />
+              ) : ref.type === 'image' ? (
+                // 09-01 B4（R2.6）：image 引用缩略图——dataUrl 直显（乐观消息）或盘读还原
+                //（重载会话）。`dataUrl` 是 UI 内存态扩展（AgentMessageReference），非契约字段。
+                <ImageReferenceThumb
+                  key={`image-${ref.id}`}
+                  image={ref}
+                  dataUrl={(ref as ImageAttachment & { dataUrl?: string }).dataUrl}
+                  t={t}
+                />
               ) : (
                 <span key={`${ref.type}-${ref.id}`} className="agent-attachment-chip">
                   <span className="material-symbols-outlined" style={{ fontSize: '0.7rem' }}>

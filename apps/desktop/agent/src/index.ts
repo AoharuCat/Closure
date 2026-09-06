@@ -62,6 +62,11 @@ export { formatStorySyncChapterLabel, STORY_SYNC_REVIEW_CAP } from './tool/write
 // buildStyleContext = 全量版编译（纯函数）。style_context_brief 不导出——planner 派发侧
 // （dispatch-planners）现读现编，非链内 artifact。
 export { readStyleCardBody, buildStyleContext } from './tool/style-card';
+// E10.3b（task 09-05）W1：14 节解析单源导出——shell decon:export-style（拆书风格维 → 目标
+// 项目风格卡合并写）与 p4Style 特化面消费（语义键替换识别节/保留手写节，不复制匹配逻辑
+// 防漂移——SECTION_DEFS 本体私有，解析经 parseStyleSections 已含键匹配）。
+export { parseStyleSections } from './tool/style-card';
+export type { StyleSectionKey } from './tool/style-card';
 // C1.2 llmlint（Step 7 shell wiring）：lint 引擎面导出——shell lintIpc 直调（库形态内嵌，mirror
 // closureChainIpc 直调 repository「零逻辑复制」姿态）。getLintEngine/aggregateFullReport = 纯读 +
 // 纯聚合；writeLintChapterLedger = 账本写手单源（apply-fix 后刷新章账与 post-settle 共语义，防两处

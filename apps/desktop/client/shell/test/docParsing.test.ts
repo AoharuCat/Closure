@@ -21,15 +21,17 @@ import { createRequire } from 'node:module';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
+  EPUB_MAX_TEXT_CHARS,
   NON_UTF8_SUSPECT_RATIO,
   SCANNED_PAGE_CHAR_THRESHOLD,
   classifyDocumentKind,
   decodeTextDocument,
   extractDocxText,
+  extractEpubText,
   extractPdfTextLayer,
   utf8ReplacementCharRatio,
 } from '../main/research/docParsing';
-import { buildDocxFixture, buildPdfFixture } from './fixtures/documentFixtures';
+import { buildDocxFixture, buildEpubFixture, buildPdfFixture } from './fixtures/documentFixtures';
 
 // ── classifyDocumentKind ──
 
@@ -47,12 +49,14 @@ describe('classifyDocumentKind', () => {
     expect(classifyDocumentKind('noext', 'application/pdf')).toBe('pdf');
     expect(classifyDocumentKind('noext', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')).toBe('docx');
     expect(classifyDocumentKind('noext', 'text/plain')).toBe('text');
-    expect(classifyDocumentKind('noext', 'application/epub+zip')).toBe('unsupported');
+    // Story 10.1 Wave B：epub 进分类（jszip 内置路径；端点档恒不涉）。
+    expect(classifyDocumentKind('noext', 'application/epub+zip')).toBe('epub');
   });
 
   it('uppercase extensions + unsupported kinds', () => {
     expect(classifyDocumentKind('DOC.PDF')).toBe('pdf');
-    expect(classifyDocumentKind('book.epub')).toBe('unsupported');
+    expect(classifyDocumentKind('book.epub')).toBe('epub');
+    expect(classifyDocumentKind('BOOK.EPUB')).toBe('epub');
     expect(classifyDocumentKind('data.xlsx')).toBe('unsupported');
     expect(classifyDocumentKind('archive.zip')).toBe('unsupported');
   });
@@ -175,4 +179,200 @@ describe('pdfjs runtime resolution sanity', () => {
     expect(pkgPath).toBeTruthy();
     expect(existsSync(path.join(path.dirname(pkgPath), 'standard_fonts'))).toBe(true);
   });
+});
+
+// ── extractEpubText（Story 10.1 Wave B，REAL jszip + node-html-parser on hand-built epubs）──
+//
+// fixtures 自制（AC11 版权红线）：STORE-method zip（documentFixtures.buildEpubFixture），
+// zip 条目逆序落盘——提取必须按 OPF spine 阅读序而非 zip 存储序。
+
+describe('extractEpubText', () => {
+  const LONG_BODY = (heading: string, filler: string) =>
+    `<h1>${heading}</h1><p>${filler}</p><p>第二段正文与实体：A &amp; B &#x4e2d;文。</p><p>末段收尾。</p>`;
+
+  it('好档：多文档按 spine 顺序拼接 + 块级断行 + 实体解码 + kind=text', async () => {
+    const extraction = await extractEpubText(
+      buildEpubFixture({
+        documents: [
+          { href: 'c1.xhtml', body: LONG_BODY('第一章', '墨'.repeat(80)) },
+          { href: 'c2.xhtml', body: LONG_BODY('第二章', '雨'.repeat(80)) },
+          { href: 'c3.xhtml', body: LONG_BODY('第三章', '风'.repeat(80)) },
+        ],
+      }),
+    );
+    expect(extraction.kind).toBe('text');
+    expect(extraction.documents).toBe(3);
+    expect(extraction.notes).toEqual([]);
+    // spine 顺序：第一章在第二章前（zip 逆序落盘，非按 spine 会反序）。
+    const lines = extraction.text.split('\n\n');
+    expect(lines[0]).toBe('第一章');
+    expect(extraction.text.indexOf('第一章')).toBeLessThan(extraction.text.indexOf('第二章'));
+    expect(extraction.text.indexOf('第二章')).toBeLessThan(extraction.text.indexOf('第三章'));
+    // 实体解码 + 块级断行：h1/p 各自成段。
+    expect(lines).toContain('第二段正文与实体：A & B 中文。');
+    // head/title 跳过（正文只来自 body）。
+    expect(extraction.text).not.toContain('fixture');
+  }, 30_000);
+
+  it('坏 zip：typed throw（handler 降级结构化 parse-failed）', async () => {
+    await expect(extractEpubText(Buffer.from('this is not an epub at all', 'utf-8'))).rejects.toThrow(/zip 结构损坏/);
+  });
+
+  it('加密 epub（META-INF/encryption.xml）：typed throw（DRM 不硬读）', async () => {
+    await expect(
+      extractEpubText(
+        buildEpubFixture({
+          documents: [{ href: 'c1.xhtml', body: LONG_BODY('第一章', '墨'.repeat(80)) }],
+          encrypted: true,
+        }),
+      ),
+    ).rejects.toThrow(/加密/);
+  });
+
+  it('扫描图 epub：每文档平均非空白字符低于阈值 → kind=scanned（文本仍返回——降级标注非拒收）', async () => {
+    const extraction = await extractEpubText(
+      buildEpubFixture({
+        documents: [
+          { href: 'p1.xhtml', body: '<p>图</p><img src="a.png"/>' },
+          { href: 'p2.xhtml', body: '<p>注</p><img src="b.png"/>' },
+        ],
+      }),
+    );
+    expect(extraction.documents).toBe(2);
+    expect(extraction.avgCharsPerDoc).toBeLessThan(SCANNED_PAGE_CHAR_THRESHOLD);
+    expect(extraction.kind).toBe('scanned');
+    // 文本仍返回（诚实降级——材料侧标 scanned 质量信号，AC8）。
+    expect(extraction.text).toContain('图');
+    expect(extraction.text).toContain('注');
+  }, 30_000);
+
+  it('缺 container.xml：typed throw（结构坏档）', async () => {
+    await expect(
+      extractEpubText(
+        buildEpubFixture({
+          documents: [{ href: 'c1.xhtml', body: LONG_BODY('第一章', '墨'.repeat(80)) }],
+          omitContainer: true,
+        }),
+      ),
+    ).rejects.toThrow(/container\.xml/);
+  }, 30_000);
+
+  it('spine 引用缺失（manifest 外 idref）：跳过 + note（不整体拒收）', async () => {
+    const extraction = await extractEpubText(
+      buildEpubFixture({
+        documents: [{ href: 'c1.xhtml', body: LONG_BODY('第一章', '墨'.repeat(80)) }],
+        danglingSpineIdrefs: ['ghost-ref'],
+      }),
+    );
+    expect(extraction.kind).toBe('text');
+    expect(extraction.documents).toBe(1); // 幽灵引用不计文档数
+    expect(extraction.notes.join('\n')).toContain('1 项引用');
+    expect(extraction.text).toContain('第一章');
+  }, 30_000);
+
+  // ── CR 修复批（2026-09-02 BMad CR）──
+
+  it('`<br>` = 行内断行（单 \\n）不额外段落化；块级标签才 \\n\\n 段落分隔（CR-004）', async () => {
+    const extraction = await extractEpubText(
+      buildEpubFixture({
+        documents: [
+          {
+            href: 'addr.xhtml',
+            body: '<p>上海市徐汇区<br/>某路 100 弄<br/>3 号楼 502 室</p><p>下一处地址</p>',
+          },
+        ],
+      }),
+    );
+    const paras = extraction.text.split('\n\n');
+    expect(paras).toEqual([
+      '上海市徐汇区\n某路 100 弄\n3 号楼 502 室', // br 密集折行 = 同段三行（地址/诗句形态）
+      '下一处地址', // 块级 <p> 边界 = 段落空行分隔
+    ]);
+  }, 30_000);
+
+  it('fixture 形态（CR-016）：mimetype 固定首位未压缩条目（EPUB 规范）；其余逆序落盘仍按 spine 提取', async () => {
+    const buf = buildEpubFixture({
+      documents: [
+        { href: 'c1.xhtml', body: LONG_BODY('第一章', '墨'.repeat(80)) },
+        { href: 'c2.xhtml', body: LONG_BODY('第二章', '雨'.repeat(80)) },
+      ],
+    });
+    // 首个本地文件头（30 字节固定段）：名字段 = mimetype、method=STORE（未压缩）、
+    // 数据体紧跟（'application/epub+zip' 未压缩可直读）。
+    expect(buf.readUInt16LE(26)).toBe('mimetype'.length);
+    expect(buf.slice(30, 30 + 'mimetype'.length).toString('latin1')).toBe('mimetype');
+    expect(buf.readUInt16LE(8)).toBe(0); // method: store
+    expect(buf.slice(38, 38 + 'application/epub+zip'.length).toString('latin1')).toBe('application/epub+zip');
+    // mimetype 之后的条目仍逆序：spine 序提取不受存储序影响的证明保持成立。
+    const extraction = await extractEpubText(buf);
+    expect(extraction.text.indexOf('第一章')).toBeLessThan(extraction.text.indexOf('第二章'));
+  }, 30_000);
+
+  it('单条目声明解压尺寸超上限（CR-020）：inflate 前预检跳过——不物化解压炸弹，诚实 note', async () => {
+    const extraction = await extractEpubText(
+      buildEpubFixture({
+        documents: [
+          { href: 'c1.xhtml', body: LONG_BODY('第一章', '墨'.repeat(80)) },
+          {
+            href: 'bomb.xhtml',
+            body: '<p>小体量但谎报巨解压尺寸</p>',
+            declaredUncompressedSize: EPUB_MAX_TEXT_CHARS * 3 + 1, // 声明字节 > cap×3 防炸阈（真实常量）
+          },
+        ],
+      }),
+    );
+    expect(extraction.documents).toBe(1); // 炸弹条目未解压、不计文档
+    expect(extraction.text).toContain('第一章');
+    expect(extraction.text).not.toContain('谎报');
+    expect(extraction.notes.join('\n')).toContain('跳过解压');
+  }, 30_000);
+
+  it('实际累计超上限（CR-020）：逐文档累计即停——截断于超限文档、后续不读（诚实 note）', async () => {
+    const extraction = await extractEpubText(
+      buildEpubFixture({
+        documents: [
+          { href: 'a.xhtml', body: `<p>${'墨'.repeat(80)}</p>` },
+          { href: 'b.xhtml', body: `<p>${'雨'.repeat(80)}</p>` },
+          { href: 'c.xhtml', body: `<p>${'风'.repeat(80)}</p>` },
+          { href: 'd.xhtml', body: `<p>${'雪'.repeat(80)}</p>` },
+        ],
+      }),
+      { maxTextChars: 200 }, // 测试缝注入小上限：a(80)+b(80)≤200；+c(80)=240>200 → 截断于 c
+    );
+    expect(extraction.documents).toBe(3);
+    expect(extraction.text).toContain('风'); // 超限文档本身已物化（先物化后累计）……
+    expect(extraction.text).not.toContain('雪'); // ……但其后的 d 不再读
+    expect(extraction.notes.join('\n')).toContain('已截断');
+  }, 30_000);
+
+  it('container.xml full-path URI 编码（%20）：decode 后命中 OPF（CR-021）', async () => {
+    const extraction = await extractEpubText(
+      buildEpubFixture({
+        opfZipPath: 'OEBPS/My Book/content.opf', // zip 内实际条目（含空格）
+        containerFullPath: 'OEBPS/My%20Book/content.opf', // container 声明（URI 编码形态）
+        documents: [{ href: 'c1.xhtml', body: LONG_BODY('第一章', '墨'.repeat(80)) }],
+      }),
+    );
+    expect(extraction.kind).toBe('text');
+    expect(extraction.text).toContain('第一章');
+  }, 30_000);
+
+  it('spine 未知/缺 media-type：不静默丢——note 记 skipped；已知非正文（图片）静默跳过（CR-022）', async () => {
+    const extraction = await extractEpubText(
+      buildEpubFixture({
+        documents: [
+          { href: 'c1.xhtml', body: LONG_BODY('第一章', '墨'.repeat(80)) },
+          { href: 'weird.xhtml', body: '<p>神秘格式内容</p>', mediaType: 'application/octet-stream' },
+          { href: 'nomt.xhtml', body: '<p>未声明类型</p>', mediaType: '' },
+          { href: 'cover.png', body: '', mediaType: 'image/png' },
+        ],
+      }),
+    );
+    expect(extraction.documents).toBe(1); // 只有 c1 是可读文本文档
+    const notes = extraction.notes.join('\n');
+    expect(notes).toContain('spine item doc1 media-type application/octet-stream skipped');
+    expect(notes).toContain('spine item doc2 media-type none skipped');
+    expect(notes).not.toContain('image/png'); // 已知非正文 = 合法跳过，不 note
+    expect(extraction.text).toContain('第一章');
+  }, 30_000);
 });

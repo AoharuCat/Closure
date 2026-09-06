@@ -11,3 +11,18 @@
 // ⚠️ 本文件禁 import 任何东西（含 type-only 以外的相对模块）——加了就会
 // 重新打开 sandbox 崩溃面。shell 侧消费面仍走 barrel（world-panel re-export）。
 export const WORLD_CHANGED_CHANNEL = 'world:changed';
+
+// Story 10.1 Wave D（F-23）：材料变更推送通道。file:changed 是 project 作用域（负载带
+// projectPath）——全局材料车道（~/.orison/materials/）无 projectPath 可挂，材料变更广播
+// 单列本通道（invoke 通道不进 enum 同 world:changed 先例；preload 经本叶子深导入取值）。
+export const MATERIAL_CHANGED_CHANNEL = 'material:changed';
+
+// E10.2b（task 09-05 Wave 1）：蒸馏进度推送通道（相位 + 耗时 + materialId——运行阶段
+// 可见性硬要求）。invoke 通道不进 desktopIpcSchema enum 同 material:changed 先例；
+// preload 经本叶子深导入取值（zod-free 纪律同上）。
+export const CRAFT_DISTILL_PROGRESS_CHANNEL = 'craft:distill-progress';
+
+// E10.3a（task 09-05）W6：拆解管线进度推送通道（jobId + pass 相位——运行阶段可见性
+// 硬要求，mirror craft:distill-progress）。best-effort 可丢，读侧兜底 = decon:get 拉取；
+// invoke 通道不进 enum 同先例，preload 经本叶子深导入取值。
+export const DECON_PROGRESS_CHANNEL = 'decon:progress';

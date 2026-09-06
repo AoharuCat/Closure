@@ -222,6 +222,40 @@ agent:
   attachChapter: "Chapters"
   attachFile: "Open files"
   removeAttachment: "Remove"
+  # 09-01 A3 (inbox attachment upload): upload section + chip state machine + inbox materials (R1.1/R1.2b/R1.8).
+  attachUpload: "Upload"
+  attachUploadFile: "Upload files…"
+  attachInbox: "Inbox materials"
+  uploadStateUploading: "Uploading…"
+  uploadStateParsing: "Parsing…"
+  uploadStateError: "Parsing failed — remove it and retry, or use a supported format (TXT / MD / DOCX / PDF)."
+  uploadStateErrorScanned: "Scanned PDF cannot be parsed — configure a doc-parser endpoint (MinerU / docling, OCR-capable) in Settings ▸ Research & Vision, or give page screenshots to a vision model; the original is kept in inbox/."
+  # CR-018: importFiles rejection copy in three tiers (toast + chip tooltip share the tier
+  # wording domain; bare name = extension rejection fallback, reason-suffixed forms are the
+  # settled shell-side markers in projectFileIpc).
+  uploadRejectedFormat: "Rejected unsupported file(s): {names} (supported: TXT / MD / DOCX / PDF)"
+  uploadRejectedTooLarge: "Rejected file(s) over the 50 MB limit: {names}"
+  uploadRejectedBatchLimit: "Rejected file(s) over the 100-per-batch limit: {names}"
+  uploadStateErrorRejectedFormat: "Upload rejected — unsupported format (TXT / MD / DOCX / PDF supported); remove it and use a supported format."
+  uploadStateErrorRejectedSize: "Upload rejected — over the 50 MB limit; use a smaller file."
+  uploadStateErrorRejectedBatch: "Upload rejected — batches are limited to 100 files; upload in smaller batches."
+  # 09-01 A4/B4 (R1.3/AC4 + R2.1): drop-onto-panel ingestion — documents take the upload path,
+  # images take the same action as the other chat-image entries (non-whitelist toast reject;
+  # ready entries never render as chips, hence no ready-state copy key).
+  # CR-020: mention images in the rejection copy — matches the actual accept surface
+  # (document whitelist + image whitelist).
+  dropzoneRejected: "Rejected unsupported file(s): {names} (you can drop TXT / MD / DOCX / PDF documents or PNG / JPG / WEBP / GIF images)"
+  # 09-01 B4 (chat image attachments / dogfood #45): image upload entry + image chip state copy + bubble thumbnails.
+  attachUploadImage: "Upload image…"
+  uploadImageStateUploading: "Processing…"
+  uploadImageStateError: "Image processing failed — remove it and retry."
+  uploadImageStateErrorType: "Unsupported image format (supported: PNG / JPG / WEBP / GIF; convert SVG / HEIC to PNG first)"
+  uploadImageStateErrorTooLarge: "Image too large: still over 10 MB after two-pass compression — use a smaller image"
+  imageThumbLoading: "Loading image…"
+  imageThumbLoadFailed: "Image could not be loaded (the file may have been moved or deleted)"
+  # CR-003a (decision a): image-relay progress strip — run-phase visibility for serial
+  # multi-image relaying (direct pass / full cache hit send no events, so nothing shows).
+  imageRelayProgress: "Describing images {current}/{total}"
   mcp: "MCP"
   loading: "Loading..."
   passageReview: "Passage rewrite"

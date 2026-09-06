@@ -11,6 +11,7 @@ import {
   COMPACTION_TRIGGER_RATIO,
   DEFAULT_REDLINE_PERCENT,
   CONTEXT_REPLY_RESERVE_TOKENS,
+  IMAGE_TOKEN_BUDGET,
 } from '../src/context/tokenEstimator';
 import type { SessionMessage } from '../src/types';
 
@@ -134,5 +135,69 @@ describe('tokenEstimator', () => {
     expect(updateCalibrationRatio(1.0, 0, 800)).toBe(1.0);
     expect(updateCalibrationRatio(1.0, 1000, 0)).toBe(1.0);
     expect(updateCalibrationRatio(1.0, -1, 100)).toBe(1.0);
+  });
+
+  // task 09-01 B 波 B2（R2.3b / 复查 M2，AC12b）：image parts 不在 content 字符串里，
+  // 估算对 `m.images` 逐图加固定预算——红线/投影判定、校准环（贴图会话后续纯文本轮
+  // 不再被系统性抬高的 ratio 过早压缩）、summarizer 决策三处口径一并修复。
+  describe('image token budget（B2 R2.3b / 复查 M2）', () => {
+    const baseMsg: SessionMessage = { id: '1', role: 'user', content: '看图', createdAt: 1 };
+
+    it('IMAGE_TOKEN_BUDGET 常量锚点 = 2,500（归一后保守上界，design §2.3b）', () => {
+      expect(IMAGE_TOKEN_BUDGET).toBe(2_500);
+    });
+
+    it('单图：估算 = 无图基线 + 恰好一份固定预算（≥ 每图预算，AC12b）', () => {
+      const base = estimateMessagesTokens([baseMsg]);
+      const withOne = estimateMessagesTokens([
+        { ...baseMsg, images: [{ path: 'inbox/images/a.png', b64hash: 'h1', name: 'a' }] },
+      ]);
+      expect(withOne).toBe(base + IMAGE_TOKEN_BUDGET);
+      expect(withOne).toBeGreaterThanOrEqual(IMAGE_TOKEN_BUDGET);
+    });
+
+    it('多图：逐图线性加算（3 图 = 基线 + 3×预算），图间互不干扰', () => {
+      const base = estimateMessagesTokens([baseMsg]);
+      const withThree = estimateMessagesTokens([
+        {
+          ...baseMsg,
+          images: [
+            { path: 'inbox/images/1.png', b64hash: 'b1', name: '一' },
+            { path: 'inbox/images/2.png', b64hash: 'b2', name: '二' },
+            { path: 'inbox/images/3.png', b64hash: 'b3', name: '三' },
+          ],
+        },
+      ]);
+      expect(withThree).toBe(base + 3 * IMAGE_TOKEN_BUDGET);
+    });
+
+    it('images 空数组 = 无字段消息零变化（防御：不产 0×预算以外的差异）', () => {
+      const base = estimateMessagesTokens([baseMsg]);
+      expect(estimateMessagesTokens([{ ...baseMsg, images: [] }])).toBe(base);
+    });
+
+    it('无 images 的既有消息零变化（回归：字段缺席不触发任何加算）', () => {
+      const messages: SessionMessage[] = [
+        { id: '1', role: 'user', content: '正文', createdAt: 1 },
+        { id: '2', role: 'assistant', content: '回答', createdAt: 2 },
+      ];
+      // 与逐字段手算等值（content 估算 + 每消息 4 framing）——images 加算路径零参与。
+      const expected = messages.reduce((sum, m) => sum + estimateTokens(m.content) + 4, 0);
+      expect(estimateMessagesTokens(messages)).toBe(expected);
+    });
+
+    it('图预算进红线口径：贴图消息把估算顶过触发线（三触发消费同一估算）', () => {
+      // 构造：正文估算极小 + 384 图（384×2500 = 960,000 ≥ 950,000 缺省红线）→ 触发。
+      const manyImages = Array.from({ length: 384 }, (_, i) => ({
+        path: `inbox/images/${i}.png`,
+        b64hash: `h${i}`,
+        name: `${i}`,
+      }));
+      const tokens = estimateMessagesTokens([{ ...baseMsg, images: manyImages }]);
+      expect(shouldTriggerCompaction(0, tokens)).toBe(true);
+      // 同估算去掉图 → 远低于触发线（对照：预算本身即差值来源）。
+      const noImages = estimateMessagesTokens([baseMsg]);
+      expect(shouldTriggerCompaction(0, noImages)).toBe(false);
+    });
   });
 });

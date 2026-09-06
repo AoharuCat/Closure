@@ -47,8 +47,10 @@ export interface CatalogFilter {
  * get_entry 把段当实体档案）。**排除式**（NOT IN）而非列举式：未来新「段类」来源
  * 自动排除，实体类新增自动入目录。检索面（searchClosure/query_story）不受影响——
  * 它们不按 source_kind 过滤，正文段落照样可查（query_story 消费），只是不进实体目录。
+ * Story 10.1 Wave C：加 `'material'`（材料 chunk 行——外部材料段，非项目实体，同理
+ * 排除；材料检索走 query_story 混合检索天然含它）。
  */
-const CATALOG_EXCLUDED_SOURCE_KINDS = ['chapter', 'chapter_summary'] as const;
+const CATALOG_EXCLUDED_SOURCE_KINDS = ['chapter', 'chapter_summary', 'material'] as const;
 
 function catalogConditions(projectId: string, filter: CatalogFilter): {
   where: string;

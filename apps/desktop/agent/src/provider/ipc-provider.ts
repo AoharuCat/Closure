@@ -1,4 +1,4 @@
-import type { SessionMessage, ToolCall, ToolDefinition } from '../types';
+import type { SessionImagePointer, SessionMessage, ToolCall, ToolDefinition } from '../types';
 import type { CacheConfig } from '../context/contextManager';
 import type { GenerationLane, ThinkingControl } from '@orison/shared-contracts';
 import { zodToJsonSchema } from 'zod-to-json-schema';
@@ -128,6 +128,40 @@ let _generateText: GenerateTextFn | undefined;
 
 export function setGenerateTextFn(fn: GenerateTextFn) {
   _generateText = fn;
+}
+
+/**
+ * 带图 user 消息的 content parts 组装（task 09-01 B 波 R2.3 / dogfood #45，纯函数
+ * 测试锚点）。首位恒为 text part（正文含指针块文本），其后逐图一枚 image part。
+ *
+ * 线上是**指针形态**（path 项目相对 + b64hash 指纹）而非 b64：agent 是纯编排层
+ * 零 FS（ADR-2），指针→字节的读盘/归一/vision 路由/转述统一收在 shell generate 缝
+ *（design §2.3，B3 的 resolveImageParts 按 {path, b64hash} 改写为 b64 或转述文本）。
+ *
+ * CR-001 决议 b（BMad CR 2026-09-01）：线上 part 形态**钉死**
+ * `{ type:'image', image: { path, b64hash, projectPath? } }`——projectPath（指针所在
+ * 项目根，session.projectPath 透传）有则带，shell 据它精确定位读盘根；无字段的旧
+ * 消息 part 形态与既有逐字节一致（键缺席非 undefined——条件展开，ABSENT 语义）。
+ * shell 侧（agentImageParts）与 agent 侧同形态消费，勿改字段名。
+ */
+export function buildImagesParts(
+  content: string,
+  images: SessionImagePointer[],
+): Array<
+  | { type: 'text'; text: string }
+  | { type: 'image'; image: { path: string; b64hash: string; projectPath?: string } }
+> {
+  return [
+    { type: 'text' as const, text: content },
+    ...images.map((img) => ({
+      type: 'image' as const,
+      image: {
+        path: img.path,
+        b64hash: img.b64hash,
+        ...(img.projectPath ? { projectPath: img.projectPath } : {}),
+      },
+    })),
+  ];
 }
 
 function messagesToPayload(messages: SessionMessage[], system: string, tools: ToolDefinition[], cacheConfig?: CacheConfig, sessionId?: string) {
@@ -269,6 +303,14 @@ function messagesToPayload(messages: SessionMessage[], system: string, tools: To
       }
     } else if (m.role === 'tool') {
       // Skip tool messages without results
+    } else if (m.role === 'user' && m.images && m.images.length > 0) {
+      // task 09-01 B 波（R2.3）：带图 user 消息 → content 组 text + image parts
+      //（指针形态，见 buildImagesParts 注释）。空 images 数组走下方原 else（与无字段
+      // 消息字节一致）。历史重放每轮全量重发时 shell 侧转述缓存按 b64hash 去重。
+      formatted.push({
+        role: 'user',
+        content: buildImagesParts(m.content, m.images),
+      });
     } else {
       formatted.push({ role: m.role, content: m.content });
     }

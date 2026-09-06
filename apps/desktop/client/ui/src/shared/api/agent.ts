@@ -4,6 +4,7 @@ import type {
   BatchKind,
   CompileRevisionIntentInput,
   CompileRevisionIntentResult,
+  ImageAttachment,
   ParticipationGear,
   ResumeChapterChainInput,
   RunChapterChainSummary,
@@ -13,13 +14,22 @@ import type { Attachment } from '../types/attachment';
 
 const api = window.orisonDesktop;
 
+/**
+ * 09-01 B4（R2.6 / dogfood #45）：UI 侧消息引用类型——image 变体可携带**内存态**
+ * `dataUrl`（发送时刻 uploadStates 里的压缩后 dataUrl，乐观消息气泡缩略图直显）。
+ * 该字段只活在 renderer 内存：不进 streamAgentMessage 的 attachments（IPC 保持纯
+ * 指针不夹带 MB 级 b64）、不落会话 jsonl——重载会话由 ImageReferenceThumb 经
+ * readFileBinary 盘读还原。非 image 变体零变化（纯联合扩展）。
+ */
+export type AgentMessageReference = Attachment | (ImageAttachment & { dataUrl?: string });
+
 export type AgentMessage = {
   id: string;
   role: 'user' | 'assistant' | 'tool';
   content: string;
   toolCalls?: Array<{ id: string; name: string; input: unknown }>;
   toolResults?: Array<{ toolCallId?: string; toolId?: string; toolName?: string; output: string; metadata?: unknown }>;
-  references?: Attachment[];
+  references?: AgentMessageReference[];
   /**
    * dogfood T1 Stage 2/4：'aborted_partial' = abort/流中断时已流出部分文本的落盘标记
    * （design §3.3）——UI 直出跳过打字机动画。
@@ -141,18 +151,49 @@ export async function createAgentSession(
   }) as Promise<{ id: string; agentName: string; projectPath: string; status: string; messages: AgentMessage[] }>;
 }
 
+/** 会话消息的原始线形态（getAgentSession IPC 返回；images 为 B2 落 jsonl 的指针字段）。 */
+type RawSessionMessage = AgentMessage & {
+  images?: Array<{ path?: unknown; b64hash?: unknown; name?: unknown }>;
+};
+
+/**
+ * 09-01 B4（R2.6 历史加载映射）：user 消息的 `SessionMessage.images` 指针
+ * （`Array<{path, b64hash, name}>`，B2 载荷形态）→ `AgentMessage.references` 的 image
+ * 附件（label=name，缺名回落路径 basename）。references 是 UI 内存态从不落 jsonl——
+ * 重载/重启后气泡缩略图靠此映射重建（AC12 后半）；无 images 的消息原样返回零变化。
+ */
+function mapHistoryImagesToReferences(message: RawSessionMessage): AgentMessage {
+  if (message.role !== 'user' || !Array.isArray(message.images) || message.images.length === 0) {
+    return message;
+  }
+  const imageReferences: AgentMessageReference[] = message.images
+    .filter((img): img is { path: string; b64hash?: unknown; name?: unknown } =>
+      typeof img?.path === 'string' && img.path.length > 0)
+    .map((img) => ({
+      type: 'image' as const,
+      id: img.path,
+      label: typeof img.name === 'string' && img.name.length > 0 ? img.name : (img.path.split('/').pop() ?? img.path),
+      path: img.path,
+      b64hash: typeof img.b64hash === 'string' ? img.b64hash : '',
+    }));
+  if (imageReferences.length === 0) return message;
+  return { ...message, references: [...(message.references ?? []), ...imageReferences] };
+}
+
 export async function fetchAgentSession(sessionId: string, projectPath?: string) {
-  return api.getAgentSession(sessionId, projectPath) as Promise<{
+  const session = await api.getAgentSession(sessionId, projectPath) as ({
     id: string;
     status: string;
-    messages: AgentMessage[];
+    messages: RawSessionMessage[];
     permissionMode?: AgentMode;
     behaviorMode?: AgentBehaviorMode;
     /** Story 3.5: session-persisted participation gear + balanced/hands_off options. */
     participationGear?: ParticipationGear;
     balancedAskCategories?: BalancedAskCategory[];
     trustAdjudication?: boolean;
-  } | null>;
+  } | null);
+  if (!session) return session;
+  return { ...session, messages: (session.messages ?? []).map(mapHistoryImagesToReferences) };
 }
 
 export async function setAgentSessionMode(sessionId: string, projectPath: string | undefined, mode: AgentMode) {

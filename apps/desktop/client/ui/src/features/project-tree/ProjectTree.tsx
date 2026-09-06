@@ -5,7 +5,7 @@ import { useI18n } from '../../shared/i18n/useI18n';
 import { useAppStore } from '../../shared/store/appStore';
 import { useConfirmStore } from '../../shared/store/confirmStore';
 import { useToastStore } from '../../shared/store/toastStore';
-import { isImageFileName, isDocxFileName } from '../../shared/utils/fileType';
+import { isImageFileName, isDocxFileName, getFileExtension } from '../../shared/utils/fileType';
 import { normalizePath } from '../../shared/utils/paths';
 import { FileTreeNode } from './FileTreeNode';
 import type { CreatingType, CtxState, FileEntry } from './types';
@@ -242,6 +242,13 @@ export function ProjectTree() {
       }
       if (!isCurrentProject(capturedPath)) return;
       openFile(fullPath, entry.name, '', { kind: 'image' });
+      return;
+    }
+
+    // pdf 无文本直读路径：落到下方文本分支会把二进制按 UTF-8 读成乱码 tab。拦截为
+    // 友好提示——内容由 Agent 经对话框附件/拖入后解析读取（09-01-agent-chat-attachments R1.4）。
+    if (getFileExtension(entry.name) === 'pdf') {
+      useToastStore.getState().showToast(t('projectTree.pdfNoPreview'), 'info');
       return;
     }
 

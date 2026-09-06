@@ -23,9 +23,11 @@ vi.mock('../main/ipc/modelGatewayIpc', () => ({
 }));
 
 import { searchCraft } from '../main/db/closureCraftRetrieval';
+import { insertCraftCard, reviewCraftCard } from '../main/db/closureCraftCardRepository';
 import { EMBED_DIM, floatArrayToBuffer } from '../main/db/closureIndexer';
 import { closeDb, getDb } from '../main/db/index';
 import { isSqliteVecAvailable, resetSqliteVecState } from '../main/db/sqliteVecLoader';
+import type { CraftCard } from '@orison/shared-contracts';
 
 let sqliteUsable = true;
 try {
@@ -78,7 +80,7 @@ function seedCraft(
   name: string,
   body: string,
   vec: number[] | null,
-  opts?: { identityVec?: number[] | null; summaryText?: string },
+  opts?: { identityVec?: number[] | null; summaryText?: string; tags?: string[] },
 ) {
   const db = getDb();
   if (isSqliteVecAvailable()) {
@@ -86,9 +88,9 @@ function seedCraft(
   }
   db.prepare('DELETE FROM closure_craft_entry WHERE craft_id=?').run(craftId);
   db.prepare(
-    `INSERT INTO closure_craft_entry (craft_id, craft_type, source_kind, name, body_text, summary_text)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-  ).run(craftId, craftType, 'user', name, body, opts?.summaryText ?? null);
+    `INSERT INTO closure_craft_entry (craft_id, craft_type, source_kind, name, body_text, summary_text, tags)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(craftId, craftType, 'user', name, body, opts?.summaryText ?? null, opts?.tags ? JSON.stringify(opts.tags) : null);
   if (!isSqliteVecAvailable()) return;
   const insertVec = db.prepare(
     `INSERT INTO closure_craft_vec (vector_id, craft_id, craft_type, source_kind, vector_kind, embedding)
@@ -339,5 +341,162 @@ describe.skipIf(!sqliteUsable)('closureCraftRetrieval DB integration (Story 2.1)
     expect(hits.every((h) => h.vectorKind === undefined)).toBe(true);
     // Entry-level summary still passes through on the FTS-only path.
     expect(hits[0].summaryText).toBe('游侠指南');
+  });
+
+  // ── E10.2b W4.2（R10 / F-08）：tags 融合后过滤 ──
+
+  it('tags 过滤：单标签只回标签命中行（无标签/NULL 标签行不误报不报错）', async () => {
+    // T1 带目标标签；T2 无 tags 列值（NULL——材料 chunk 行生产形态）；T3 空标签数组。
+    seedCraft('T1', 'shuangdian', 'Tagged', 'Tagged\ntexas ranger', null, { tags: ['都市'] });
+    seedCraft('T2', 'shuangdian', 'NullTag', 'NullTag\ntexas ranger', null);
+    seedCraft('T3', 'shuangdian', 'EmptyTag', 'EmptyTag\ntexas ranger', null, { tags: [] });
+
+    const hits = await searchCraft('texas', { tags: ['都市'], k: 10 }, {
+      resolveModel: () => null,
+      embed: async () => VEC_A,
+    });
+    expect(hits.map((h) => h.craftId)).toEqual(['T1']);
+  });
+
+  it('tags 多标签任一命中即召回（OR 语义）+ # 前缀容忍（命中渲染展示 #tag 形态）', async () => {
+    seedCraft('U1', 'shuangdian', 'UA', 'UA\ntexas ranger', null, { tags: ['都市'] });
+    seedCraft('U2', 'shuangdian', 'UB', 'UB\ntexas ranger', null, { tags: ['悬疑'] });
+    seedCraft('U3', 'shuangdian', 'UC', 'UC\ntexas ranger', null, { tags: ['仙侠'] });
+
+    const hits = await searchCraft('texas', { tags: ['#都市', '悬疑'], k: 10 }, {
+      resolveModel: () => null,
+      embed: async () => VEC_A,
+    });
+    expect(hits.map((h) => h.craftId).sort()).toEqual(['U1', 'U2']);
+  });
+
+  it('tags 零命中 → 空结果（不抛错）', async () => {
+    seedCraft('V1', 'shuangdian', 'VA', 'VA\ntexas ranger', null, { tags: ['都市'] });
+
+    const hits = await searchCraft('texas', { tags: ['不存在的标签'], k: 10 }, {
+      resolveModel: () => null,
+      embed: async () => VEC_A,
+    });
+    expect(hits).toEqual([]);
+  });
+
+  it('tags 与 query 文本组合：文本命中 + 标签命中双重收窄', async () => {
+    seedCraft('W1', 'shuangdian', 'WA', 'WA\ntexas ranger', null, { tags: ['都市'] });
+    seedCraft('W2', 'shuangdian', 'WB', 'WB\noregon trail', null, { tags: ['都市'] });
+
+    // 两条都带标签，但只有 W1 的 body 命中 'texas'——组合 = FTS 命中 ∩ 标签命中。
+    const hits = await searchCraft('texas', { tags: ['都市'], k: 10 }, {
+      resolveModel: () => null,
+      embed: async () => VEC_A,
+    });
+    expect(hits.map((h) => h.craftId)).toEqual(['W1']);
+  });
+
+  it('tags 与 craft_type 组合（同 WHERE 两条件 AND）', async () => {
+    seedCraft('X1', 'shuangdian', 'XA', 'XA\ntexas ranger', null, { tags: ['都市'] });
+    seedCraft('X2', 'playbook', 'XB', 'XB\ntexas ranger', null, { tags: ['都市'] });
+
+    const hits = await searchCraft('texas', { tags: ['都市'], craftType: 'playbook', k: 10 }, {
+      resolveModel: () => null,
+      embed: async () => VEC_A,
+    });
+    expect(hits.map((h) => h.craftId)).toEqual(['X2']);
+  });
+
+  it('纯标签浏览：query 空 + tags 在场 → 结构化路径回标签命中（无 query 不拦）', async () => {
+    seedCraft('Y1', 'shuangdian', 'YA', 'YA body', null, { tags: ['都市'] });
+    seedCraft('Y2', 'shuangdian', 'YB', 'YB body', null);
+
+    const hits = await searchCraft('', { tags: ['都市'], k: 10 }, {
+      resolveModel: () => null,
+      embed: async () => VEC_A,
+    });
+    expect(hits.map((h) => h.craftId)).toEqual(['Y1']);
+  });
+
+  it('F-08 补偿：标签命中行在默认 vec KNN 窗口外 → tags 在场时窗口 ×4 放宽后召回（AC10 构造用例）', async () => {
+    // 构造：45 条 filler（向量与 query 同向 = 全部近于标签行）+ 1 条标签行（正交向量 =
+    // 距离最远，排名 46）。默认窗口 vecK = topN*2 = 40 向量行——标签行必然窗外；tags
+    // 在场 ×4 → 160 ≥ 46，标签行进融合集后被 tags 过滤保留。
+    // FTS 面：标签行 body 不含 'texas'——不做 vec 补偿时任何臂都捞不回它。
+    for (let i = 0; i < 45; i++) {
+      seedCraft(`F${String(i).padStart(2, '0')}`, 'shuangdian', `Filler${i}`, `Filler${i}\ntexas`, VEC_A);
+    }
+    seedCraft('RARE', 'shuangdian', 'RareTagged', 'RareTagged\nrare lore only', VEC_B, { tags: ['稀有'] });
+
+    // 无 tags：标签行不可见（FTS 不命中 + 默认 vec 窗口外）。
+    const noTags = await searchCraft('texas', { k: 10 }, {
+      resolveModel: () => stubModel(),
+      embed: async () => VEC_A,
+    });
+    expect(noTags.map((h) => h.craftId)).not.toContain('RARE');
+    expect(noTags).toHaveLength(10); // 窗口内 filler 撑满 k
+
+    // tags 在场：×4 窗口把标签行捞回，融合后过滤只留标签命中行。
+    const withTags = await searchCraft('texas', { tags: ['稀有'], k: 10 }, {
+      resolveModel: () => stubModel(),
+      embed: async () => VEC_A,
+    });
+    expect(withTags.map((h) => h.craftId)).toEqual(['RARE']);
+    expect(withTags[0].vecDistance).toBeDefined(); // vec 臂参与了该命中
+  });
+
+  // ── E10.2b W4.3：手艺卡检索可见性 = 人审状态（AC6——verify 前后）──
+
+  function makeRetrievalCard(status: CraftCard['status']): CraftCard {
+    return {
+      cardId: 'card-0123456789ab',
+      category: 'qingxu',
+      termId: 'term-01234567',
+      title: '先抑后扬三层回报',
+      claim: {
+        condensed: '先压低处境再给回报，回报强度与压抑时长成正比。',
+        points: ['压抑段控制在一章内'],
+        scenarios: ['开篇钩子'],
+        counterexamples: [],
+      },
+      tags: ['爽文'],
+      teachings: [
+        {
+          teachingId: 'tea-0123456789ab',
+          materialId: 'mat-0123456789ab',
+          materialContentHash: `sha256:${'a'.repeat(64)}`,
+          author: '老作者',
+          quote: '先抑后扬的关键是压抑的度。',
+          anchor: { chapterIndex: 0, charStart: 120, charEnd: 480, paraStart: 3, paraEnd: 6 },
+          rank: 'normal',
+          note: null,
+          stale: false,
+        },
+      ],
+      dispute: false,
+      status,
+      rejectReason: null,
+      confidence: 0.8,
+      createdAt: '2026-09-05T00:00:00.000Z',
+      updatedAt: '2026-09-05T00:00:00.000Z',
+    };
+  }
+
+  it('pending 卡不可检 → verify 后 query_craft 检回（entry 行 verify 时写——AC6）', async () => {
+    const card = makeRetrievalCard('pending_review');
+    await insertCraftCard(card, { resolveModel: () => null });
+
+    const before = await searchCraft('先抑后扬', { k: 10 }, {
+      resolveModel: () => null,
+      embed: async () => VEC_A,
+    });
+    expect(before.map((h) => h.craftId)).not.toContain(`card:${card.cardId}`);
+
+    await reviewCraftCard(card.cardId, 'verify', {}, { resolveModel: () => null });
+
+    const after = await searchCraft('先抑后扬', { k: 10 }, {
+      resolveModel: () => null,
+      embed: async () => VEC_A,
+    });
+    expect(after.map((h) => h.craftId)).toContain(`card:${card.cardId}`);
+    const hit = after.find((h) => h.craftId === `card:${card.cardId}`)!;
+    expect(hit.craftType).toBe('qingxu'); // craft_type = 大类 slug（F-10）
+    expect(hit.sourceKind).toBe('craft_card');
   });
 });

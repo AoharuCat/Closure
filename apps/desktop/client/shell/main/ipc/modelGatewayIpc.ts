@@ -31,6 +31,7 @@ import {
 import type { GenerationDelta } from '@orison/model-protocols';
 import { readModelConfigFromDisk } from './configIpc';
 import { resolveModelInfo } from '@orison/shared-contracts';
+import { resolveImageParts } from './agentImageParts';
 
 /**
  * Resolve a `{keyId, modelId}` ref to a `ResolvedModel` with decrypted apiKey.
@@ -83,6 +84,8 @@ export function resolveModel(ref: ModelRef, config: ModelConfig = readModelConfi
   // the basename second-pass for aggregator-prefixed ids). Conditional spreads
   // keep the keys ABSENT for unknown models — the protocol layer's fallback
   // (guardrail cap, no thinking injection) keys off the fields' absence.
+  // 09-01 附件 B1（R2.4）：vision 布尔第三轮同型 additive——true = 确定性多模态（图片
+  // b64 直传）；ABSENT = 未验证（≠不支持），图片走 visionModel 转述安全路径，绝不盲发。
   const info = resolveModelInfo(model.id);
   return {
     keyId: key.id,
@@ -93,6 +96,7 @@ export function resolveModel(ref: ModelRef, config: ModelConfig = readModelConfi
     capability: model.capability,
     ...(info.thinking ? { thinkingKind: info.thinking } : {}),
     ...(info.limits ? { limits: info.limits } : {}),
+    ...(info.vision ? { vision: true } : {}),
   };
 }
 
@@ -307,18 +311,30 @@ export function _resetLaneWarnForTest(): void {
 
 export async function handleGenerateText(payload: GenerateTextPayload, signal?: AbortSignal): Promise<TextGenerationResponse> {
   const resolved = resolveModel(payload.ref);
+  // 09-01 附件 B3（design §2.3）：指针 image part → b64/转述文本。双 handler 共同下沉层——
+  // 无图快径引用不变（request 对象零重打包，既有载荷逐字节一致）；转述路径只在带图时才
+  // 产生 visionModel 调用。CR-007：既有 signal 经 deps 贯穿到 resolveImageParts——转述
+  // generateText 与主调用同一取消通道（停止钮对转述生效；转述内部独立包 600s ceiling）。
+  let request = payload.request;
+  if (request && Array.isArray(request.messages)) {
+    const messages = await resolveImageParts(request.messages, resolved, { signal });
+    if (messages !== request.messages) {
+      // 改写后的 part 全部是合法 GenerationPart 形态（text / b64 image）。
+      request = { ...request, messages: messages as typeof request.messages };
+    }
+  }
   // dogfood R2 #7：request.lane → ProtocolCallContext.lane（undefined = interactive 语义）；
   // CR-35：lane 先过 safeParse 归一（枚举外值回落 undefined + 一次性 warn）。
-  const lane = normalizeRequestLane(payload.request?.lane);
+  const lane = normalizeRequestLane(request?.lane);
   if (lane !== 'background') {
-    return generateText(resolved, payload.request, { signal, lane });
+    return generateText(resolved, request, { signal, lane });
   }
   // CR-34（#50 关严）：非流式 background 路径套 600s 硬上限——罩住整条 generateText
   // 调用（含协议层内部快速重试）。超时按现有超时错误形态（ProtocolTimeoutError）上抛；
   // interactive/absent 路径原样直通（signal 引用不变，零回归）。
   const ceilingSignal = signalWithCeiling(signal, BACKGROUND_NONSTREAM_CEILING_MS);
   try {
-    return await generateText(resolved, payload.request, { signal: ceilingSignal, lane });
+    return await generateText(resolved, request, { signal: ceilingSignal, lane });
   } catch (err) {
     // CR-33 同序保护：调用方主动取消优先于超时映射（先查原始 signal，再判上限是否到点）。
     if (signal?.aborted) throw err;
@@ -354,10 +370,19 @@ export async function handleGenerateTextStream(
   onDelta: (d: GenerationDelta) => void,
 ): Promise<TextGenerationResponse> {
   const resolved = resolveModel(payload.ref);
+  // 09-01 附件 B3（design §2.3）：与 handleGenerateText 同一图片处理下沉层（双路径同罩）。
+  // CR-007：既有 signal 同样贯穿（流式路径的转述取消与 ceiling 语义与非流式一致）。
+  let request = payload.request;
+  if (request && Array.isArray(request.messages)) {
+    const messages = await resolveImageParts(request.messages, resolved, { signal });
+    if (messages !== request.messages) {
+      request = { ...request, messages: messages as typeof request.messages };
+    }
+  }
   return generateTextStream(
     resolved,
-    payload.request,
-    { signal, lane: normalizeRequestLane(payload.request?.lane) },
+    request,
+    { signal, lane: normalizeRequestLane(request?.lane) },
     onDelta,
   );
 }

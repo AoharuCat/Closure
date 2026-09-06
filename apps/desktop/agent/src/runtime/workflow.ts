@@ -101,7 +101,23 @@ export interface MessageSelectionAnchor {
  */
 export type MessageAttachment =
   | { type: 'chapter'; id: string; label: string }
-  | { type: 'file'; id: string; label: string }
+  | {
+      type: 'file';
+      id: string;
+      label: string;
+      /**
+       * 附件语义自证字段（task 09-01 agent-chat-attachments R1.2b/R1.2c，2026-09-01）：
+       * mirror shared-contracts `FileAttachment`（contracts/attachment.ts，手动 keep-in-sync）。
+       * 仅上传路径 set；既有 file 附件（open files / 结构 pattern / 资产图片）无字段，
+       * renderAttachmentsIntoContent 走原分支零变化。additive optional 零迁移。
+       */
+      preview?: string;
+      description?: string;
+      /** description 生成时间（epoch ms）。 */
+      describedAt?: number;
+      /** 挂附件时文件最后改动时间（epoch ms）。 */
+      fileMtime?: number;
+    }
   | {
       type: 'selection';
       id: string;
@@ -111,6 +127,23 @@ export type MessageAttachment =
       chapterId?: string;
       filePath?: string;
       anchor: MessageSelectionAnchor;
+    }
+  | {
+      /**
+       * Chat 图片附件（task 09-01 B 波 R2.3 / dogfood #45）：mirror shared-contracts
+       * `ImageAttachment`（contracts/attachment.ts，手动 keep-in-sync 既有惯例）。
+       * 指针形态（path 项目相对 + b64hash 落盘字节指纹）——createUserMessage 提取进
+       * `SessionMessage.images` 指针字段（jsonl 落盘 + messagesToPayload 组 image
+       * parts 双消费），content 侧另有指针行保文本连续性；字节活（指针→b64/归一/
+       * vision 路由/转述）全在 shell generate 缝——agent 零 FS（ADR-2）。
+       */
+      type: 'image';
+      id: string;
+      label: string;
+      /** 项目相对路径（`inbox/images/<file>`）。 */
+      path: string;
+      /** 落盘图片字节的 sha256 指纹。 */
+      b64hash: string;
     };
 
 export interface SendMessageInput {
@@ -2095,7 +2128,8 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions = {}): Wor
 
       const runAbortSignal = runState.beginRun(input.sessionId, input.abortSignal);
 
-      const userMsg = createUserMessage(input.content, input.attachments);
+      // CR-001b：session.projectPath 透传进 image 指针（shell 精确定位读盘根）。
+      const userMsg = createUserMessage(input.content, input.attachments, undefined, session.projectPath);
       addMessage(input.sessionId, userMsg);
       updateStatus(input.sessionId, 'running');
 
@@ -2191,7 +2225,8 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions = {}): Wor
       const runAbortSignal = runState.beginRun(input.sessionId, input.abortSignal);
 
       // dogfood R2 #93：messageKind 盖章透传（系统事件回注——jsonl 落盘带 kind 可审计）。
-      const userMsg = createUserMessage(input.content, input.attachments, input.messageKind);
+      // CR-001b：session.projectPath 透传进 image 指针（shell 精确定位读盘根）。
+      const userMsg = createUserMessage(input.content, input.attachments, input.messageKind, session.projectPath);
       addMessage(input.sessionId, userMsg);
       updateStatus(input.sessionId, 'running');
 
@@ -2419,18 +2454,46 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions = {}): Wor
   return runtime;
 }
 
-function createUserMessage(
+/**
+ * Construct the user message for a send/stream turn. 导出面 = 纯构造测试锚点
+ * （mirror renderAttachmentsIntoContent / formatAttachmentTimestamp 的导出先例——
+ * task 09-01 B2 钉 images 指针提取行为）。
+ */
+export function createUserMessage(
   content: string,
   attachments?: MessageAttachment[],
   /** dogfood R2 #93：系统事件回注盖章（chain_completed_event）；缺省无 kind（既有调用零变化）。 */
   kind?: SessionMessage['kind'],
+  /**
+   * CR-001 决议 b（BMad CR 2026-09-01）：指针所在项目根（调用点从所在 session 拿
+   * session.projectPath 透传）——填入每条 image 指针，shell generate 缝据此精确定位
+   * 读盘根。可选入参：缺省（含既有两参/三参调用）不产 projectPath 字段，逐字节零变化。
+   */
+  projectPath?: string,
 ): SessionMessage {
+  // task 09-01 B 波（R2.3）：image 附件提取进 `images` 指针字段（不内嵌 b64——jsonl
+  // 防膨胀；字节已落盘 inbox/images/，shell generate 缝按指针读回）。name 取附件
+  // label（展示名）。非 image 附件零影响；无 image 附件时字段缺席（additive optional）。
+  const images = attachments?.filter(
+    (att): att is Extract<MessageAttachment, { type: 'image' }> => att.type === 'image',
+  );
   return {
     id: randomUUID(),
     role: 'user',
     content: renderAttachmentsIntoContent(content, attachments),
     createdAt: Date.now(),
     ...(kind !== undefined ? { kind } : {}),
+    ...(images && images.length > 0
+      ? {
+          images: images.map((img) => ({
+            path: img.path,
+            b64hash: img.b64hash,
+            name: img.label,
+            // CR-001b：有则带（条件展开 ABSENT 语义）——无参/空串缺省回落无字段形态。
+            ...(projectPath ? { projectPath } : {}),
+          })),
+        }
+      : {}),
   };
 }
 
@@ -2455,8 +2518,16 @@ function buildReferenceBlock(references?: ResolvedReferencePayload[]): string | 
  * the passages the user is discussing along with their provenance and anchor.
  * Selection attachments are rendered as quoted blocks with source + anchor hints;
  * chapter/file attachments are rendered as lightweight context pointers.
+ *
+ * 上传附件语义自证分支（task 09-01 agent-chat-attachments R1.2b/R1.2c，2026-09-01）：
+ * 带 preview/description 的 file 附件（上传路径 set）额外渲染「描述 + 预览 + 引导行」，
+ * 防「凭文件名猜内容」幻觉——文件名乱码/正文不提时模型第一眼即知附件性质。
+ *
+ * 图片附件指针行（task 09-01 B 波 R2.3 / dogfood #45）：image 变体渲染
+ * `[图片引用 · label] (path: …)` 一行——字节走 SessionMessage.images 结构化指针
+ * （messagesToPayload 组 image part），本行只保文本连续性。
  */
-function renderAttachmentsIntoContent(content: string, attachments?: MessageAttachment[]): string {
+export function renderAttachmentsIntoContent(content: string, attachments?: MessageAttachment[]): string {
   if (!attachments || attachments.length === 0) {
     return content;
   }
@@ -2488,12 +2559,54 @@ function renderAttachmentsIntoContent(content: string, attachments?: MessageAtta
       // `id` of `pattern:<value>`. Render a dedicated structure-pattern directive
       // (NOT a fake file path the leader might try to read_file).
       blocks.push(`[结构 pattern: ${att.label}] (作者选定此结构骨架作起步方向；据此塑造主线，非逐字套用)`);
+    } else if (att.type === 'file' && (att.preview !== undefined || att.description !== undefined)) {
+      // R1.2b/R1.2c 语义自证：字段门控——仅上传路径 set 的附件带 preview/description，
+      // 描述行/预览行随字段存在渲染；staleness 由 fileMtime > describedAt 推断（时间字段
+      // 缺失不推断）；无四字段的既有 file 附件（open files / 资产图片）不进此分支，
+      // 走下方原 else 渲染零变化（pattern 附件 id 前缀门控在前，亦不受影响）。
+      const lines: string[] = [`[引用文件: ${att.label}] (path: ${att.id})`];
+      if (att.description !== undefined) {
+        lines.push(
+          att.describedAt !== undefined
+            ? `描述(生成于 ${formatAttachmentTimestamp(att.describedAt)}): ${att.description}`
+            : `描述: ${att.description}`,
+        );
+      }
+      if (att.preview !== undefined) {
+        lines.push(`预览: ${att.preview}`);
+      }
+      // staleness 严格大于才成立（早于/等于不算晚于）；时间字段缺失不推断。
+      if (att.fileMtime !== undefined && att.describedAt !== undefined && att.fileMtime > att.describedAt) {
+        lines.push(
+          `(文件最后改动 ${formatAttachmentTimestamp(att.fileMtime)}，晚于描述生成——请以 read_file 实读为准；随消息上传的文件，请先阅读后再依据它回应，勿凭文件名猜测内容)`,
+        );
+      } else {
+        lines.push('(随消息上传的文件，请先阅读后再依据它回应，勿凭文件名猜测内容)');
+      }
+      blocks.push(lines.join('\n'));
+    } else if (att.type === 'image') {
+      // task 09-01 B 波（R2.3）：图片附件指针行——字节不进消息（结构化指针走
+      // SessionMessage.images 字段 + messagesToPayload image part）；本行保 agent
+      // 历史文本连续性（压缩后指针行随消息进 summary，路径仍可读/可 read_file）。
+      // 分支置于 file 门控分支之后（type 判别互斥，既有 file/chapter/selection/pattern
+      // 分支顺序与语义零变化）。
+      blocks.push(`[图片引用 · ${att.label}] (path: ${att.path})`);
     } else {
       blocks.push(`[引用文件: ${att.label}] (path: ${att.id})`);
     }
   }
 
   return `${blocks.join('\n\n')}\n---\n${content}`;
+}
+
+/**
+ * 附件指针块时间戳展示（R1.2b/R1.2c）：epoch ms → 本地时区 `YYYY-MM-DD HH:mm`。
+ * 纯函数测试锚点（mirror renderChainCompletedEventMessage 的导出先例）。
+ */
+export function formatAttachmentTimestamp(epochMs: number): string {
+  const d = new Date(epochMs);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
 function createSkillPreloadMessages(skill: NormalizedSkill, input?: string): { assistantMsg: SessionMessage; toolMsg: SessionMessage } {

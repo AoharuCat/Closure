@@ -16,8 +16,10 @@ import {
   type GenerateTextFn,
   type ExecuteToolFn,
 } from '@orison/desktop-agent';
-import { handleGenerateText, handleGenerateTextStream } from './modelGatewayIpc';
-import { readTaskModelSlots, readUserPreferencesFromDisk } from './configIpc';
+import { handleGenerateText, handleGenerateTextStream, resolveModel } from './modelGatewayIpc';
+import { installAgentImagePartsCore } from './agentImageParts';
+import { prepareVisionImage } from '../research/visionAnalysis';
+import { readModelConfigFromDisk, readTaskModelSlots, readUserPreferencesFromDisk } from './configIpc';
 import { handleToolExecute } from './toolExecution';
 import { normalizeProjectKey } from './pathGuard';
 import { getLogger } from '../logger';
@@ -210,6 +212,22 @@ export function registerAgentIpc(getWin: () => BrowserWindow | null) {
     return result as any;
   };
   setGenerateTextFn(generateTextImpl);
+
+  // 09-01 附件 B3（design §2.3）：agentImageParts 防环注入内核装配——prepareImage
+  // （visionAnalysis）/ resolveModelRef（modelGatewayIpc）/ readModelConfig（configIpc）
+  // 三者都在既有依赖环上，经此处装配（mirror setGenerateTextFn 注入形态；wiring 由
+  // agentIpcStreamDispatch.test 钉死）。CR-003a（决议 a）：转述进度广播发射器——mirror
+  // notifyUI 的全窗 webContents.send 广播形态，专用通道 'image-relay-progress'、载荷
+  // { current, total }（单窗口 app 无需 session 定向）；直传路/缓存全命中不发，UI 消费
+  // 面后置按此载荷形态接入。
+  installAgentImagePartsCore({
+    prepareImage: prepareVisionImage,
+    resolveModelRef: resolveModel,
+    readModelConfig: readModelConfigFromDisk,
+    notifyRelayProgress: (progress) => {
+      BrowserWindow.getAllWindows().forEach((w) => w.webContents.send('image-relay-progress', progress));
+    },
+  });
 
   // C3.2 task-model routing: inject the slot resolver next to the generate
   // seam (mirror of setGenerateTextFn — the agent runtime never reads disk

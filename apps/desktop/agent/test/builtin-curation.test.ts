@@ -102,6 +102,27 @@ describe('Story 3.6 AC9：全 9 研究工具分类一致（策展 write / 设定
   });
 });
 
+describe('query_craft tags 参数面（E10.2b W4.2 三处同步——agent 侧）', () => {
+  it('registers optional tags: string[] + 描述带标签发现/组合用法（LLM-facing）', () => {
+    const tool = registry.get('query_craft')!;
+    expect(tool).toBeDefined();
+
+    const parse = tool.parameters as z.ZodType<Record<string, unknown>>;
+    // tags 可选——既有调用面零改动；带 tags 解析通过并保留数组。
+    expect(() => parse.parse({ query: '爽点' })).not.toThrow();
+    const parsed = parse.parse({ query: '情绪', tags: ['爽文', '都市'], k: 5 });
+    expect(parsed.tags).toEqual(['爽文', '都市']);
+    // tags 非字符串数组拒（schema 层守门——shell handler never-throws 之前的第一道）。
+    expect(() => parse.parse({ query: 'x', tags: '爽文' })).toThrow();
+    expect(() => parse.parse({ query: 'x', tags: [''] })).toThrow();
+
+    // 描述文本：手艺卡块 + 标签行（标签发现机制）+ tags OR 召回语义。
+    expect(tool.description).toContain('手艺卡');
+    expect(tool.description).toContain('标签: #');
+    expect(tool.description).toContain('任一命中即召回');
+  });
+});
+
 describe('toolPolicy mode filtering（共享行为面——零回归 + 新工具分档）', () => {
   const ids = (mode: 'readonly' | 'suggest' | 'auto') =>
     filterToolsForPolicy({ tools: registry.all(), sessionMode: mode }).map((t) => t.id);

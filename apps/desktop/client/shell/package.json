@@ -30,6 +30,7 @@
     "better-sqlite3": "12.9.0",
     "electron-updater": "^6.3.9",
     "isomorphic-git": "^1.37.6",
+    "jszip": "^3.10.1",
     "mammoth": "1.9.0",
     "node-html-parser": "^9.0.1",
     "pdfjs-dist": "^6.2.108",

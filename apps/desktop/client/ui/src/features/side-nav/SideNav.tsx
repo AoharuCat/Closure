@@ -3,7 +3,7 @@ import { useI18n } from '../../shared/i18n/useI18n';
 import { useShallow } from 'zustand/react/shallow';
 import { Tooltip } from '../../shared/components/Tooltip';
 import {
-  overviewItem, outlineItem, structureItem, assetsItem, settingItem,
+  overviewItem, outlineItem, structureItem, assetsItem, settingItem, materialsItem, craftItem, deconItem,
   productionItems, type PageNavItem,
 } from './navItems';
 import { openWriting } from '../editor/openWriting';
@@ -131,6 +131,13 @@ export function SideNav() {
           {/* 「设定」页（task 08-30-asset-cards-visualization A1）：asset_cards 8 类
               设定卡浏览/编辑聚合页——master-detail（左列表右详情）。 */}
           <NavButton item={settingItem} active={isPageActive('setting')} onClick={() => handlePage('setting')} t={t} />
+          {/* 「材料」页（Story 10.1 Wave D，D7）：摄取基座材料库管理面——scope 切换
+              （本项目 ↔ 全局库）+ 列表/删除/重摄取/批量拖入。 */}
+          <NavButton item={materialsItem} active={isPageActive('materials')} onClick={() => handlePage('materials')} t={t} />
+          {/* 「手艺」页（E10.2b W5）：蒸馏人审面——队列/卡编辑/并排对比/废弃区/词表。 */}
+          <NavButton item={craftItem} active={isPageActive('craft')} onClick={() => handlePage('craft')} t={t} />
+          {/* 「拆书」页（E10.3b W6）：小说拆解管线面——进度/人审闸门/产出阅读/风格导出。 */}
+          <NavButton item={deconItem} active={isPageActive('decon')} onClick={() => handlePage('decon')} t={t} />
 
           <div className="side-nav-separator" />
 

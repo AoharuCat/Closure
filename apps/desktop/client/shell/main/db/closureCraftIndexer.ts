@@ -1,7 +1,6 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
-import type Database from 'better-sqlite3';
 import type { ResolvedModel } from '@orison/shared-contracts';
 import { generateEmbeddings } from '@orison/model-protocols';
 import { getDb } from './index';
@@ -19,6 +18,9 @@ import {
 import { resolveEmbeddingModel, resolveSummaryModel } from '../ipc/modelGatewayIpc';
 import { parseCraftMd, extractCraftName, deriveCraftId } from './craftMd';
 import { listCraftMdFiles } from './craftKbPaths';
+// E10.2b Wave 2（F-05）：reindexAllCraft 末尾串接卡 sweep。单向依赖（卡 repository 不 import
+// 本模块——dim 读取走 craftVecDim leaf，见该文件头注记）。
+import { firstCraftCardCondensed, reindexAllCards } from './closureCraftCardRepository';
 import { getLogger } from '../logger';
 
 /**
@@ -43,15 +45,13 @@ import { getLogger } from '../logger';
  * Read the current `closure_craft_vec` embedding dimension from the live schema
  * (mirror of `getCurrentVecDim` for the craft table). null when the table is
  * absent (vec extension not loaded, or not yet created).
+ *
+ * E10.2b Wave 2: implementation moved to the `craftVecDim.ts` leaf (breaks the
+ * indexer ↔ card-repository cycle — see that file). Re-exported here so the
+ * existing import points (materialIndexer / retrieval side) stay untouched.
  */
-export function getCurrentCraftVecDim(db: Database.Database): number | null {
-  const row = db
-    .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='closure_craft_vec'")
-    .get() as { sql: string | null } | undefined;
-  if (!row?.sql) return null;
-  const m = row.sql.match(/float\[(\d+)\]/);
-  return m ? Number(m[1]) : null;
-}
+import { getCurrentCraftVecDim } from './craftVecDim';
+export { getCurrentCraftVecDim };
 
 /**
  * Dependency-injection seam (mirrors closureIndexer.ReindexDeps). Tests pass
@@ -336,11 +336,24 @@ export function reindexCraftDelete(craftId: string): void {
  * (force=true bypasses the hash skip). Unlike single-doc `reindexCraftDoc`, this
  * REQUIRES a configured embedding model (the user explicitly asked to switch).
  *
- * @returns `reindexed` (success count), `dimChanged`, `newDim` (null when no docs).
+ * E10.2b Wave 2（F-05）：末尾串接 **reindexAllCards sweep**——手艺卡 #claim 向量路在同一
+ * DROP+清 hash 点位之后重嵌全部卡（含 pending/rejected——去重面常驻全卡），entry 检索行按卡
+ * 状态重建。卡行不能两条路都没有（8.7/10.1 同款教训）：上方结构重建的 `UPDATE ... SET
+ * content_hash = NULL WHERE model IS NOT NULL` 天然连带卡 entry 行（同表），sweep 必须在同一次
+ * 调用内把重嵌补回。craft KB 零文档但有卡的形态（两百份语料先行蒸馏、未挂任何 doc）：探针
+ * 体回退到首个卡 condensed，避免早退把卡 sweep 一并跳过。
+ *
+ * @returns `reindexed` (success count), `dimChanged`, `newDim` (null when no docs),
+ *   `cardsReembedded` (E10.2b additive — card sweep success count).
  */
 export async function reindexAllCraft(
   deps: CraftReindexDeps = {},
-): Promise<{ reindexed: number; dimChanged: boolean; newDim: number | null }> {
+): Promise<{
+  reindexed: number;
+  dimChanged: boolean;
+  newDim: number | null;
+  cardsReembedded: number;
+}> {
   const resolveModel = deps.resolveModel ?? resolveEmbeddingModel;
   const embed = deps.embed ?? defaultEmbed;
   const resolveSummary = deps.resolveSummaryModel ?? resolveSummaryModel;
@@ -353,11 +366,14 @@ export async function reindexAllCraft(
   }
 
   const files = listCraftMdFiles();
-  if (files.length === 0) {
-    return { reindexed: 0, dimChanged: false, newDim: null };
+  const firstCardCondensed = firstCraftCardCondensed();
+  if (files.length === 0 && firstCardCondensed === null) {
+    return { reindexed: 0, dimChanged: false, newDim: null, cardsReembedded: 0 };
   }
 
-  // Probe the new model's dim by embedding the first non-empty body.
+  // Probe the new model's dim by embedding the first non-empty body (E10.2b:
+  // fallback to the first card condensed when the craft KB has no docs but
+  // cards exist — the sweep still needs a dim-true probe).
   let probeBody = 'probe';
   for (const f of files) {
     try {
@@ -370,6 +386,9 @@ export async function reindexAllCraft(
     } catch {
       // skip unreadable file
     }
+  }
+  if (probeBody === 'probe' && firstCardCondensed !== null) {
+    probeBody = firstCardCondensed;
   }
   let newDim: number;
   try {
@@ -402,17 +421,28 @@ export async function reindexAllCraft(
   const dimChanged = vecAvailable && currentDim !== null && newDim !== currentDim;
   const vecMissing = vecAvailable && currentDim === null;
   if (dimChanged || vecMissing) {
-    db.exec('DROP TABLE IF EXISTS closure_craft_vec');
-    db.exec(
-      `CREATE VIRTUAL TABLE closure_craft_vec USING vec0(
-        vector_id TEXT PRIMARY KEY,
-        craft_id TEXT,
-        craft_type TEXT,
-        source_kind TEXT,
-        vector_kind TEXT,
-        embedding float[${newDim}] distance_metric=cosine
-      )`,
-    );
+    db.transaction(() => {
+      db.exec('DROP TABLE IF EXISTS closure_craft_vec');
+      db.exec(
+        `CREATE VIRTUAL TABLE closure_craft_vec USING vec0(
+          vector_id TEXT PRIMARY KEY,
+          craft_id TEXT,
+          craft_type TEXT,
+          source_kind TEXT,
+          vector_kind TEXT,
+          embedding float[${newDim}] distance_metric=cosine
+        )`,
+      );
+      // Story 10.1 Wave C（E1 同款教训）：结构 DROP 重建 = 全部既有向量丢失（vec0 无导出/
+      // 导入路径）。同步把「有向量记账」的行（model IS NOT NULL）content_hash 清 NULL——
+      // pending_embed 语义，下次 reindex NULL !== hash 即触发重嵌补回。不清则 hash-skip
+      // 永久阻断重嵌：向量静默丢失（FTS-only 降质无提示）。⚠️ UPDATE 天然**连带材料行**
+      // （source_kind='material_chunk'）——本函数只重灌 craft 文档，材料行不随 files 枚举
+      // 重嵌，hash 不清则材料向量在 craft 模型迁移后永久丢失（materialIndexer 的重索引/
+      // rebuild 路径以 NULL 语义重试补回）。mirror initSchema entry_vec 迁移点同款 UPDATE
+      // （两处同步纪律）。成对事务包裹（mirror identity_backfill 多语句迁移先例）。
+      db.exec('UPDATE closure_craft_entry SET content_hash = NULL WHERE model IS NOT NULL');
+    })();
     getLogger().info(
       { oldDim: currentDim, newDim, reason: vecMissing ? 'missing-recreate' : 'dim-change' },
       'craft reindexAllCraft: closure_craft_vec recreated',
@@ -441,7 +471,20 @@ export async function reindexAllCraft(
     }
   }
 
-  return { reindexed, dimChanged, newDim };
+  // E10.2b Wave 2（F-05）：卡 sweep 同点位收尾——DROP+清 hash 已连带卡 entry 行（同表
+  // UPDATE），此处按 #claim 路重嵌全部卡 + entry 行按卡状态重建（verified 重写 / 其余
+  // 清检索面）。恒 force 语义（sweep 即迁移本身）；per-card 容错 mirror 上方 per-doc 循环。
+  let cardsReembedded = 0;
+  try {
+    cardsReembedded = await reindexAllCards({ resolveModel: () => model, embed });
+  } catch (err) {
+    getLogger().warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'craft reindexAllCraft: card sweep failed - continuing (docs rebuilt)',
+    );
+  }
+
+  return { reindexed, dimChanged, newDim, cardsReembedded };
 }
 
 /**
@@ -457,9 +500,25 @@ export async function scanAndReindexCraftKb(deps?: CraftReindexDeps): Promise<vo
   const scannedCraftIds = new Set(files.map((f) => f.craftId));
 
   // Delete orphans: indexed craft_ids no longer present on disk.
+  // ⚠️ Story 10.1 Wave C（F-01）：closure_craft_entry 现与材料 chunk 行同表共存
+  // （source_kind='material_chunk'，materialIndexer 写入，craft_id = `mat:...` 不在
+  // craft KB 扫描集内）。orphan 枚举/删除谓词必须排除它们——否则每次启动扫描/重扫会把
+  // 材料索引当 orphan 全删。**用 `!= 'material_chunk'` 而非 `= 'craft_md'`**：生产
+  // source_kind 值域是 'bundled'|'user'（reindexCraftDoc 写入侧），'craft_md' 仅是 schema
+  // DEFAULT 零行持有——`= 'craft_md'` 会清不掉任何行；`!=` 排除式对未来 craft kind 也稳
+  // （新 craft kind 仍由本扫描管理）。
+  // ⚠️ E10.2b Wave 2（F-01 三犯防御）：手艺卡 entry 行（source_kind='craft_card'，craft_id =
+  // `card:...` 前缀，卡 repository 写入）同不在此扫描的领地——卡行生命周期归卡索引器（verify 写/
+  // reject 删/降级删）。**排除式值域同步扩**：NOT IN ('material_chunk','craft_card')。卡行是
+  // db 真相源的派生检索面（无盘上文件对应），按「不在扫描集」判 orphan 会把已核卡的检索行
+  // 在每次启动时全删（8.7/10.1 同款教训第三犯防御，值域按生产写点核实在先）。
   let indexed: Array<{ craft_id: string }>;
   try {
-    indexed = db.prepare('SELECT craft_id FROM closure_craft_entry').all() as Array<{ craft_id: string }>;
+    indexed = db
+      .prepare(
+        "SELECT craft_id FROM closure_craft_entry WHERE source_kind NOT IN ('material_chunk','craft_card')",
+      )
+      .all() as Array<{ craft_id: string }>;
   } catch (err) {
     getLogger().warn(
       { err: err instanceof Error ? err.message : String(err) },

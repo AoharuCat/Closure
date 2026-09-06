@@ -29,6 +29,34 @@ import { registerAuthorProfileIpc } from './ipc/authorProfileIpc';
 import { registerResearchConfigIpc } from './ipc/researchConfigIpc';
 import { registerLintIpc } from './ipc/lintIpc';
 import { registerWorldIpc } from './ipc/worldIpc';
+// A 波 09-01：inbox 附件三通道（parse-inbox-doc / resolve-inbox-attachment /
+// store-attachment-description）——handler 收在 parseDocumentHandlers.ts 同文件
+// （design §1.2「收在 parseDocumentHandlers.ts 同文件」），共享解析内核。
+import { registerInboxAttachmentIpc } from './ipc/toolHandlers/parseDocumentHandlers';
+// Story 10.1 Wave D：材料库管理面六通道（materials:list/get/delete/reingest/import/
+// update-provenance）。
+import { registerMaterialIpc } from './ipc/materialIpc';
+// Story 10.1 Wave C：材料 LLM 兜底生产装配（extraction 任务档 → resolveModel → generateText，
+// materialIngest.ts JSDoc 指定链）+ 全局材料车道启动扫描/watcher（~/.orison/materials/）。
+import { installMaterialLLMCoreProduction } from './ipc/toolHandlers/materialLLMCore';
+// E10.2b（task 09-05）W3：蒸馏管线 LLM 缝生产装配（slot 路由 extraction/review-judge 档，
+// craftDistillPipeline.ts JSDoc 指定链）+ 手艺蒸馏两通道（craft:distill-run/status）。
+import { installCraftDistillLlmCoreProduction } from './ipc/toolHandlers/craftDistillLlmCore';
+// E10.3a（task 09-05）W2：拆解管线 LLM 缝生产装配（slot 路由 extraction/review-judge/
+// writer-draft 档——deconLlmCore.ts JSDoc 指定链，materialLLMCore 同型先装后用）。
+import { installDeconLlmCoreProduction } from './decon/deconLlmCore';
+// E10.3a（task 09-05，CR-1）：拆解 job 启动对账（kill/崩溃残留 running → paused 可续跑）。
+import { reconcileStaleDeconJobsOnStartup } from './decon/deconJob';
+import { registerCraftIpc } from './ipc/craftIpc';
+// E10.3a（task 09-05）W6：拆解管线七通道（decon:create/start/pause/cancel/delete/get/list +
+// decon:progress 广播埋点在 deconIpc 编排层）。
+import { registerDeconIpc } from './ipc/deconIpc';
+import { backfillGlobalMaterials } from './db/materialIndexer';
+import {
+  startGlobalMaterialWatcher,
+  stopGlobalMaterialWatcher,
+  stopProjectMaterialWatcher,
+} from './db/materialWatcher';
 import { fetchOrisonFile } from './orisonFileProtocol';
 import { closeDb, getDb } from './db';
 import { scanAndReindexCraftKb } from './db/closureCraftIndexer';
@@ -193,6 +221,17 @@ function registerAllIpc() {
   // world:subject-detail——纯读，无窗口面；world:changed 推送不经本注册器，发射埋三写入口
   // 经 worldNotify 全窗口广播）。
   registerWorldIpc();
+  // A 波 09-01：inbox 附件（上传预解析 + 哈希身份 resolve + description 回写）。
+  registerInboxAttachmentIpc();
+  // Story 10.1 Wave D：材料库管理面（list/get/delete 四清/reingest/import/update-provenance
+  // + material:changed 广播埋点）。
+  registerMaterialIpc();
+  // E10.2b（task 09-05）W3：手艺蒸馏管线两通道（craft:distill-run 批量入队 +
+  // craft:distill-status 台账查询；review 侧九通道归 W4/W5 UI waves）。
+  registerCraftIpc();
+  // E10.3a（task 09-05）W6：拆解管线七通道（child A P0-P2 + 断点底座的控制面；
+  // canon 浏览/reports 等消费面通道归 child B 增补）。
+  registerDeconIpc();
 }
 
 function createWindow() {
@@ -365,6 +404,21 @@ app.whenReady().then(() => {
   // dogfood R2 #101①：失败路径弹原生错误框（详情+日志目录+重编指引）+ app.exit(1)；
   // 返回 false 即中止启动序列（不再注册 IPC / 开窗——与旧 throw 的中止语义等价但可诊断）。
   if (!initProjectRegistryOrExit()) return;
+  // E10.3a（task 09-05，CR-1）：拆解 job 启动对账——kill/崩溃残留的 status='running' 拆解
+  // job 翻 paused（可续跑态——pass_state 台账在，用户 start 即重入；否则 startDeconJob 的
+  // running no-op 分支会让 AC2 的 IPC 断点路径永远打不开）。进程重启时在途注册表恒空，
+  // running 必为残留（mirror reconcileStaleProjectRuns D4 先例）。best-effort。
+  try {
+    const flipped = reconcileStaleDeconJobsOnStartup();
+    if (flipped > 0) {
+      getLogger().info({ flipped }, 'decon: stale running jobs reconciled to paused on startup');
+    }
+  } catch (err) {
+    getLogger().warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'decon: stale-job startup reconciliation failed (non-fatal)',
+    );
+  }
   // Story 3.6 WP2 (R13/D6; CR P2): apply the persisted research proxy tier
   // before any research network call can fire (all research outbound rides the
   // dedicated `research` partition session, so one setProxy covers netFetch +
@@ -379,6 +433,15 @@ app.whenReady().then(() => {
       'research proxy startup apply failed - continuing',
     );
   }
+  // Story 10.1 Wave C：材料分章 LLM 兜底内核装配（watcher 链上的 ingestMaterial 在启动扫描
+  // 期即可能触发兜底——先装后扫）。每调用现解析（档位/配置即时生效），安装期零副作用。
+  installMaterialLLMCoreProduction();
+  // E10.2b（task 09-05）W3：蒸馏管线 LLM 内核装配（materialLLMCore 同型——先装后用；蒸馏由
+  // 用户触发非启动扫描，装配点在 registerAllIpc 之前即满足时序，与材料内核并列置此收口）。
+  installCraftDistillLlmCoreProduction();
+  // E10.3a（task 09-05）W2：拆解管线 LLM 内核装配（同上先装后用——拆解由用户触发，装配点在
+  // registerAllIpc 之前即满足时序；温度随档契约见 deconLlmCore.ts）。
+  installDeconLlmCoreProduction();
   // Story 2.1: scan the global craft KB (~/.orison/craft-kb/ + bundled seeds) and
   // incrementally reindex new/changed docs into closure_craft_* on startup. Fire-
   // and-forget: craft reindex does async embeds (slow), must not block app launch.
@@ -390,6 +453,15 @@ app.whenReady().then(() => {
   // every startup and re-runs the rebuild sweep, replacing the luck-based
   // "next model change" self-heal. Chained (not parallel) so the two startup embed
   // passes stay serialized; equally fire-and-forget + best-effort.
+  //
+  // 🔑 CR-005（BMad 2026-09-02）：全局材料车道 backfill + watcher 排在本链**末尾**串行——
+  // craft 扫描的 vec dim-swap（ensureCraftVecDim 对 closure_craft_vec 的 DROP+reCREATE）与
+  // 材料全局车道 INSERT 是跨 await 的两条异步链：并行时 dim-swap 窗口期（表已 DROP 未重建/
+  // 旧维表）落材料 craft_vec 行 = 旧维污染或直接失败。better-sqlite3 单连接同步不救跨链交错
+  // （同步语句在两条 async 链间仍会交错执行），故把材料 backfill/watcher 排进同一条 promise
+  // 链消竞态（每段 catch 后恢复，后续段照跑——单段失败不阻断整链）。watcher 也压后：其事件
+  // 链（registerMaterial → INSERT）与 dim-swap 同竞态面。仍 fire-and-forget：craft 全量
+  // embed 慢，不阻窗口创建（mirror 原注释语义）。
   void scanAndReindexCraftKb()
     .catch((err) => {
       getLogger().warn(
@@ -403,6 +475,21 @@ app.whenReady().then(() => {
         { err: err instanceof Error ? err.message : String(err) },
         'embedding index startup reconcile failed - continuing',
       );
+    })
+    // Story 10.1 Wave C（F-16）：全局材料车道（~/.orison/materials/）启动扫描——覆盖「app 未
+    // 运行时拷入」的无 watcher 事件场景（mirror craft 启动扫描先例）；orphan 清扫 + mtime
+    // 快路幂等（未变原件零解析）+ failed 退避（CR-030）。best-effort。
+    .then(() => backfillGlobalMaterials())
+    .catch((err) => {
+      getLogger().warn(
+        { err: err instanceof Error ? err.message : String(err) },
+        'material global-lane startup backfill failed - continuing',
+      );
+    })
+    // 之后起全局车道 watcher（增量进件；Linux 递归 watch 不可用降级到本启动扫描 + 手动
+    // 重摄取）。
+    .then(() => {
+      startGlobalMaterialWatcher();
     });
   // Story 2.1 CR-craft-kb-011: watch the user craft KB dir for incremental
   // edits / additions / deletions so a reindex lands without an app restart.
@@ -456,6 +543,21 @@ app.on('will-quit', () => {
     stopChapterChunkWatcher();
   } catch (err) {
     getLogger().warn({ err: err instanceof Error ? err.message : String(err) }, 'stopChapterChunkWatcher on quit failed');
+  }
+  // Story 10.1: stop the global material watcher too (same lifecycle - mirror
+  // stopCraftKbWatcher; 项目车道 watcher 随 project:unwatch 生命周期，这里兜底).
+  try {
+    stopGlobalMaterialWatcher();
+  } catch (err) {
+    getLogger().warn({ err: err instanceof Error ? err.message : String(err) }, 'stopGlobalMaterialWatcher on quit failed');
+  }
+  // Story 10.1 CR-009：项目车道 material watcher 兜底停——其主生命周期在 project:unwatch
+  // （projectIpc 切换/关闭），quit 时若项目仍看守中（直接退出未切项目）这里兜住句柄与
+  // debounce 定时器（mirror stopGlobalMaterialWatcher / materialWatcher 文件头声明）。
+  try {
+    stopProjectMaterialWatcher();
+  } catch (err) {
+    getLogger().warn({ err: err instanceof Error ? err.message : String(err) }, 'stopProjectMaterialWatcher on quit failed');
   }
   try {
     closeDb();

@@ -62,12 +62,53 @@ export interface ChapterAttachment {
   label: string;
 }
 
-/** Lightweight pointer to a whole open file. */
+/**
+ * Lightweight pointer to a whole open file.
+ *
+ * 附件语义自证字段（task 09-01 agent-chat-attachments R1.2b/R1.2c，2026-09-01）：仅
+ * **上传路径**（外部文件拷入 inbox/ 后挂附件）会 set 这四个字段——open files / 结构
+ * pattern / 资产图片等既有 file 附件不带字段，渲染零变化。agent 侧 mirror
+ * `apps/desktop/agent/src/runtime/workflow.ts` 的 `MessageAttachment` file 变体同步加
+ * （手动 keep-in-sync 既有惯例）。零 migration：纯 additive optional，旧 attachments
+ * / 会话 jsonl 无字段读回 undefined。
+ */
 export interface FileAttachment {
   type: 'file';
   id: string;
   label: string;
+  /**
+   * 机械预览（同步，进件即有）：解析内核解码后开头 ~200 字单行化（GBK 等非 UTF-8 由
+   * 内核触发转换提示而非喂乱码）。防「凭文件名猜内容」的第一层。
+   */
+  preview?: string;
+  /**
+   * LLM 一句话定性（≤50 字，只依据内容，章摘要 synopsis 同型机制；异步回填不阻塞
+   * Send，失败静默降级 preview-only）。防「凭文件名猜内容」的第二层。
+   */
+  description?: string;
+  /** description 生成时间（epoch ms）——staleness 判定输入（fileMtime > describedAt = 文件晚于描述）。 */
+  describedAt?: number;
+  /** 挂附件时文件最后改动时间（epoch ms，stat 取）。 */
+  fileMtime?: number;
+}
+
+/**
+ * Chat 图片附件（task 09-01 agent-chat-attachments B 波 / dogfood #45）：用户在
+ * Agent 对话框上传/拖入/粘贴的图片，进件时字节已落盘 `<project>/inbox/images/`——
+ * 附件只携带**指针**（path + b64hash），绝不内嵌 b64（会话 jsonl 防膨胀；字节活
+ * 统一收在 shell——agent 是纯编排层零 FS，ADR-2）。agent 侧 mirror
+ * `apps/desktop/agent/src/runtime/workflow.ts` 的 `MessageAttachment` image 变体
+ * 同步加（手动 keep-in-sync 既有惯例）。零 migration：纯 additive union 变体。
+ */
+export interface ImageAttachment {
+  type: 'image';
+  id: string;
+  label: string;
+  /** 项目相对路径（`inbox/images/<file>`）——agent 历史里可读、工具可按路径访问的指针。 */
+  path: string;
+  /** 落盘图片字节的 sha256 指纹（shell 转述缓存 key / 历史重放去重依据）。 */
+  b64hash: string;
 }
 
 /** Any attachment that can be pinned to a message. */
-export type Attachment = ChapterAttachment | FileAttachment | SelectionAttachment;
+export type Attachment = ChapterAttachment | FileAttachment | SelectionAttachment | ImageAttachment;

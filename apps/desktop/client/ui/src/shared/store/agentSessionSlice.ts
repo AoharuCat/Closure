@@ -1,5 +1,10 @@
 import type { StateCreator } from 'zustand';
-import type { BalancedAskCategory, ParticipationGear } from '@orison/shared-contracts';
+import type {
+  BalancedAskCategory,
+  ImageAttachment,
+  ModelConfig,
+  ParticipationGear,
+} from '@orison/shared-contracts';
 import {
   BALANCED_ASK_CATEGORIES_DEFAULT,
   PARTICIPATION_GEAR_DEFAULT,
@@ -7,7 +12,7 @@ import {
 } from '@orison/shared-contracts';
 import type { AgentMode, AgentBehaviorMode } from './types';
 import type { ChainRunState } from './chainStreamBuffer';
-import type { Attachment } from '../types/attachment';
+import type { Attachment, FileAttachment } from '../types/attachment';
 import {
   createAgentSession,
   fetchAgentSession,
@@ -22,6 +27,26 @@ import {
   type AgentMessage,
   type AgentSessionMeta,
 } from '../api/agent';
+import {
+  classifyImportRejections,
+  dialogueModelRefFromConfig,
+  generateAttachmentDescription,
+  importFilesToInbox,
+  NON_UTF8_ATTACHMENT_ADVISORY,
+  pathForUploadFile,
+  readInboxMaterialText,
+  resolveInboxAttachment,
+  shouldSkipAttachmentDescription,
+  storeAttachmentDescription,
+} from '../api/inboxAttachments';
+import {
+  compressChatImage,
+  imageFileStem,
+  saveChatImage,
+  sha256Hex,
+  type ChatImageCompressResult,
+} from '../api/chatImages';
+import type { ResolveInboxAttachmentResult } from '@orison/shared-contracts';
 import { randomUUID } from '../util/id';
 import { registerProjectReset } from './resetRegistry';
 import { storage } from './storage';
@@ -102,6 +127,40 @@ export function gearOptionsIfChanged(
 }
 
 export type { AgentMessage, AgentSessionMeta };
+
+/**
+ * 09-01 A3（inbox 附件上传）：上传/解析 chip 状态机相位（design §1.2 D-I）。
+ * uploading（importFiles 拷入中）→ parsing（resolve 预解析/哈希中）→ ready（挂载完成，
+ * 键迁移为附件 id=derivedPath）| error（扫描件/解析失败——指引 + 可移除，原件保留 inbox/）。
+ */
+export type AttachmentUploadPhase = 'uploading' | 'parsing' | 'ready' | 'error';
+
+/**
+ * attachmentUploadStates 的条目（在途态携带 label 供 chip 渲染——附件对象尚未存在）。
+ * 09-01 B4（B 波图片线）additive：`variant:'image'` 条目走图片专用文案 + 缩略图直显
+ * （thumbDataUrl = 压缩后 dataUrl，进件即显、ready 迁移保留）；errorKind 扩图片三档
+ * （非白名单 / 压不动超限 / 解码失败）。
+ */
+export type InboxUploadEntry = {
+  state: AttachmentUploadPhase;
+  /** chip 显示名（上传原文件名 / inbox 材料段点选的文件名）。 */
+  label: string;
+  /**
+   * error 细分：scanned 扫描件 PDF（指引文案不同，AC3）；B4 图片三档见
+   * ChatImageCompressResult；CR-018 importFiles 拒收三档（扩展名 / 超 50MB / 超单批）。
+   */
+  errorKind?: 'scanned' | 'not-image' | 'too-large' | 'decode-failed'
+    | 'rejected-format' | 'rejected-size' | 'rejected-batch';
+  /** B4：image 线条目标记（chip 分流渲染——缩略图 + 图专用状态/拒收文案）。 */
+  variant?: 'image';
+  /** B4：压缩后 dataUrl（chip 缩略图直显；压缩完成即挂、ready 迁移保留，随发送整体清场）。 */
+  thumbDataUrl?: string;
+  /**
+   * CR-010②：resolve 解析备注首项（非 UTF-8 转换提示 / 端点降级备注等）——ready 条目
+   * 迁移携带，chip tooltip 消费（用户侧提示面；模型侧走 preview 的机器提示文案）。
+   */
+  note?: string;
+};
 
 export type AgentSessionSlice = {
   agentMode: AgentMode;
@@ -193,6 +252,27 @@ export type AgentSessionSlice = {
   addAttachment: (attachment: Attachment) => void;
   removeAttachment: (id: string) => void;
   clearAttachments: () => void;
+
+  /**
+   * 09-01 A3（inbox 附件上传，design D-I / 复查 M3）：上传/解析 chip 状态机。进
+   * store 独立字段而非组件本地态——AgentPanel 不随项目切换卸载，组件态会跨项目
+   * 残留转圈。在途键 = `upload-<uuid>` 临时 id；挂载成功后条目迁移为 ready（键 =
+   * 附件 id=derivedPath）。`newAgentSession` / `resetAgentForProjectSwitch` /
+   * 发送消费三处同步清；所有异步完成回调带 isCurrentProject 守卫。
+   */
+  attachmentUploadStates: Record<string, InboxUploadEntry>;
+  /** 上传入口（隐藏 file input onchange）：拷入 inbox/ → 逐文件 resolve 挂载。 */
+  uploadInboxFiles: (files: File[]) => Promise<void>;
+  /**
+   * 09-01 B4（R2.1/R2.2 / dogfood #45）：chat 图片三入口统一 action（选择器按钮 / 剪贴板
+   * 粘贴 / AgentPanel drop zone 三入口共用）。逐图 canvas 预检压缩 → `inbox/images/` 落盘
+   * （notify=true）→ 挂 `ImageAttachment`（指针 + b64hash，形态与 shell B3 逐字对齐）。
+   */
+  uploadChatImages: (files: File[]) => Promise<void>;
+  /** attach 菜单「inbox 材料」段入口（R1.8）：项目内已存在材料直接 resolve 挂载。 */
+  attachInboxMaterial: (relPath: string, displayName: string) => Promise<void>;
+  /** 移除上传 chip（在途移除 = 完成回调弃挂；error 态移除 = 清指引）。 */
+  removeAttachmentUpload: (uploadId: string) => void;
 
   agentSessions: AgentSessionMeta[];
   /**
@@ -297,6 +377,151 @@ export const createAgentSessionSlice: StateCreator<Deps, [], [], AgentSessionSli
       locale,
       onJump: (sessionId) => { void get().switchAgentSession(sessionId); },
     });
+  };
+
+  // ── 09-01 A3：inbox 附件上传（uploading → parsing → ready | error 状态机）──
+
+  /** description 异步回填串行链（API 并发纪律——多 fresh 附件逐个生成，不并发突刺）。 */
+  let inboxDescriptionQueue: Promise<void> = Promise.resolve();
+
+  const setUploadEntry = (uploadId: string, patch: Partial<InboxUploadEntry>) =>
+    set((s) => {
+      const prev = s.attachmentUploadStates[uploadId];
+      // 在途移除守卫：chip 已被用户移除 → 不复活（完成回调据此弃挂）。
+      if (!prev) return s;
+      return { attachmentUploadStates: { ...s.attachmentUploadStates, [uploadId]: { ...prev, ...patch } } };
+    });
+
+  const deleteUploadEntry = (uploadId: string) =>
+    set((s) => {
+      if (!(uploadId in s.attachmentUploadStates)) return s;
+      const next = { ...s.attachmentUploadStates };
+      delete next[uploadId];
+      return { attachmentUploadStates: next };
+    });
+
+  /**
+   * fresh 描述异步回填（R1.2b / design D-B'，AC6e）：读派生材料前 ~8K 字 → 直调
+   * model:generate-text（ref = dialogue 档，C3.2 单控制面）一句话定性 ≤50 字 → 回填
+   * 附件对象 + storeAttachmentDescription 写回 sidecar（下次直命中，AC6f）。
+   * never-throws：失败/超时（~10s）静默降级 preview-only；回填守卫 = 附件仍在
+   * pendingAttachments + isCurrentProject（已发送/已移除/已切项目 → 丢弃）。
+   * CR-010③：生成前 U+FFFD 替换率 ≥3% 跳过（preview-only 降级——防 LLM 对乱码编造
+   * 定性）。CR-013：写回 sidecar 带 capturedMtime（resolve 时 mtime，shell 比对现盘
+   * 更新即拒——防过期描述挂新哈希、staleness 恒假）。
+   */
+  const backfillInboxDescription = async (args: {
+    projectPath: string;
+    epoch: number;
+    attachmentId: string;
+    derivedPath: string;
+    /** resolve 返回的 mtime（= 附件 fileMtime）——CR-013 TOCTOU 守卫载荷。 */
+    capturedMtime?: number;
+  }): Promise<void> => {
+    const { projectPath, epoch, attachmentId, derivedPath, capturedMtime } = args;
+    try {
+      const content = await readInboxMaterialText(projectPath, derivedPath);
+      if (!content || !isCurrentProjectScope(epoch, projectPath)) return;
+      // CR-010③：乱码守卫（生成输入同窗检测，纯代码判定）——跳过生成不报错。
+      if (shouldSkipAttachmentDescription(content)) return;
+      // 跨 slice 读（state-management spec 惯例：typed cleanup tracked）。
+      const modelConfig = (get() as unknown as { modelConfig?: ModelConfig }).modelConfig;
+      const description = await generateAttachmentDescription({
+        modelRef: dialogueModelRefFromConfig(modelConfig),
+        content,
+      });
+      if (description === null) return; // 失败/超时静默（preview 兜底，不报错不影响发送）
+      if (!isCurrentProjectScope(epoch, projectPath)) return;
+      if (!get().pendingAttachments.some((a) => a.id === attachmentId)) return; // 已发送/已移除
+      const describedAt = Date.now();
+      set((s) => ({
+        pendingAttachments: s.pendingAttachments.map((a) =>
+          a.id === attachmentId && a.type === 'file' ? { ...a, description, describedAt } : a,
+        ),
+      }));
+      // 写回 sidecar（fire-and-forget；失败静默——缓存可再生，重新挂载时会重新生成）。
+      void storeAttachmentDescription({ projectPath, filePath: derivedPath, description, capturedMtime }).catch(() => {});
+    } catch {
+      /* never-throws */
+    }
+  };
+
+  /**
+   * 挂附件协议消费端（上传与 inbox 材料段两入口共用）：resolve → 成功挂 file 指针
+   * （preview/description/describedAt/fileMtime 四元数据齐填，A3b 字段）+ 条目迁移
+   * ready（键 = 附件 id=derivedPath）；fresh（无描述）→ 入队 description 异步回填。
+   * 失败 → error 态（scanned 带指引文案，AC3；原件保留 inbox/ 不静默删）。
+   */
+  const resolveAndAttachInboxFile = async (args: {
+    projectPath: string;
+    epoch: number;
+    /** null = 无对应 chip（导入数超 chip 数的兜底路径），直接挂载不经状态机。 */
+    uploadId: string | null;
+    relPath: string;
+    label: string;
+  }): Promise<void> => {
+    const { projectPath, epoch, uploadId, relPath, label } = args;
+    if (uploadId) setUploadEntry(uploadId, { state: 'parsing' });
+    let result: ResolveInboxAttachmentResult;
+    try {
+      result = await resolveInboxAttachment({ projectPath, filePath: relPath });
+    } catch {
+      if (uploadId && isCurrentProjectScope(epoch, projectPath)) {
+        setUploadEntry(uploadId, { state: 'error' });
+      }
+      return;
+    }
+    if (!isCurrentProjectScope(epoch, projectPath)) return; // 复查 M3：切项目守卫
+    if (!result.ok) {
+      if (uploadId) {
+        setUploadEntry(uploadId, {
+          state: 'error',
+          errorKind: result.kind === 'scanned' ? 'scanned' : undefined,
+        });
+      }
+      return;
+    }
+    if (uploadId && !(uploadId in get().attachmentUploadStates)) return; // 在途移除守卫
+    const attachment: FileAttachment = {
+      type: 'file',
+      id: result.derivedPath,
+      label,
+      // CR-010①：preview 被编码检测抑制为空（非 UTF-8/GBK）且带解析备注 → 填机器提示
+      // 文案（指针块「预览:」行保门控成立——模型侧引导可达；与引导行同语言域，不走 i18n）。
+      preview: result.preview
+        || (result.notes && result.notes.length > 0 ? NON_UTF8_ATTACHMENT_ADVISORY : undefined),
+      description: result.description,
+      describedAt: result.describedAt,
+      fileMtime: result.mtime,
+    };
+    get().addAttachment(attachment);
+    if (uploadId) {
+      // 条目迁移 ready（键 = 附件 id；chip 转由 pendingAttachments 侧渲染）。CR-010②：
+      // 备注首项随迁移携带（chip tooltip 消费——用户侧提示面）。
+      set((s) => {
+        const next = { ...s.attachmentUploadStates };
+        delete next[uploadId];
+        next[result.derivedPath] = {
+          state: 'ready',
+          label,
+          ...(result.notes && result.notes.length > 0 ? { note: result.notes[0] } : {}),
+        };
+        return { attachmentUploadStates: next };
+      });
+    }
+    if (!result.description) {
+      // 入队 thunk（非已启动的 promise）——真正串行：上一个回填完成后才发起下一个
+      // generateText（API 并发纪律）。CR-013：携带 resolve 时 mtime 供 sidecar 写回守卫。
+      inboxDescriptionQueue = inboxDescriptionQueue
+        .then(() => backfillInboxDescription({
+          projectPath,
+          epoch,
+          attachmentId: result.derivedPath,
+          derivedPath: result.derivedPath,
+          capturedMtime: result.mtime,
+        }))
+        .catch(() => {});
+    }
   };
 
   // The agent conversation is keyed to a project path; drop it on switch so
@@ -533,8 +758,222 @@ export const createAgentSessionSlice: StateCreator<Deps, [], [], AgentSessionSli
         : { pendingAttachments: [...s.pendingAttachments, attachment] }
     )),
   removeAttachment: (id) =>
-    set((s) => ({ pendingAttachments: s.pendingAttachments.filter((a) => a.id !== id) })),
-  clearAttachments: () => set({ pendingAttachments: [] }),
+    set((s) => {
+      // 09-01 A3：连带清 ready 态上传条目（键 = 附件 id）。
+      const nextStates = { ...s.attachmentUploadStates };
+      delete nextStates[id];
+      return {
+        pendingAttachments: s.pendingAttachments.filter((a) => a.id !== id),
+        attachmentUploadStates: nextStates,
+      };
+    }),
+  clearAttachments: () =>
+    set((s) => {
+      // CR-009：连带清 ready 态条目（键 = 附件 id，与 removeAttachment 同形态）——ready
+      // 条目持 MB 级 thumbDataUrl，pending 清空后成孤儿驻留。在途（uploading/parsing，
+      // 完成回调由条目缺失守卫自理）与 error 指引条目（用户可见提示面）不受影响。
+      const next: Record<string, InboxUploadEntry> = {};
+      for (const [key, entry] of Object.entries(s.attachmentUploadStates)) {
+        if (entry.state !== 'ready') next[key] = entry;
+      }
+      return { pendingAttachments: [], attachmentUploadStates: next };
+    }),
+
+  // ── 09-01 A3：inbox 附件上传状态机 ──
+
+  attachmentUploadStates: {},
+
+  async uploadInboxFiles(files) {
+    const projectPath = get().currentProject?.path;
+    if (!projectPath || files.length === 0) return;
+    const epoch = projectEpoch;
+    // 每 file 一 chip（uploading）——进件即有确定性反馈（design D-B）。
+    const entries = files.map((file) => ({ uploadId: `upload-${randomUUID()}`, label: file.name }));
+    set((s) => {
+      const next = { ...s.attachmentUploadStates };
+      for (const e of entries) next[e.uploadId] = { state: 'uploading', label: e.label };
+      return { attachmentUploadStates: next };
+    });
+    // 换绝对路径（Electron 37 无 File.path——pathForFile 先例 FileTreeNode.tsx；
+    // bridge 收口经 api 层）；取不到路径的（非 Electron 环境）直接落 error 态。
+    const sourcePaths: string[] = [];
+    files.forEach((file, i) => {
+      const p = pathForUploadFile(file);
+      if (p) sourcePaths.push(p);
+      else setUploadEntry(entries[i].uploadId, { state: 'error' });
+    });
+    let imported: string[] = [];
+    let rejected: string[] = [];
+    if (sourcePaths.length > 0) {
+      try {
+        ({ imported, rejected } = await importFilesToInbox(projectPath, sourcePaths));
+      } catch {
+        /* 全批失败——下方 leftover 处理统一转 error 态 */
+      }
+    }
+    if (!isCurrentProjectScope(epoch, projectPath)) return; // 复查 M3
+    // CR-018：拒收三档分类（扩展名 / 超 50MB / 超单批）——带原因形态（SH-a 定型
+    // `name (超过 50MB 上限)` 等）分流，toast 文案不再把大小/批量误说成「不支持的格式」。
+    const rejectTiers = classifyImportRejections(rejected);
+    if (rejected.length > 0) {
+      const locale = (get() as unknown as { resolvedLocale?: string }).resolvedLocale ?? 'zh-CN';
+      const segments: string[] = [];
+      if (rejectTiers.format.length > 0) {
+        segments.push(translate(locale, 'agent.uploadRejectedFormat', {
+          names: rejectTiers.format.slice(0, 5).join('、'),
+        }));
+      }
+      if (rejectTiers.tooLarge.length > 0) {
+        segments.push(translate(locale, 'agent.uploadRejectedTooLarge', {
+          names: rejectTiers.tooLarge.slice(0, 5).join('、'),
+        }));
+      }
+      if (rejectTiers.batchLimit.length > 0) {
+        segments.push(translate(locale, 'agent.uploadRejectedBatchLimit', {
+          names: rejectTiers.batchLimit.slice(0, 5).join('、'),
+        }));
+      }
+      if (segments.length > 0) {
+        useToastStore.getState().showToast(segments.join('；'), 'warning', 5000);
+      }
+    }
+    // imported rel ↔ chip 对位（basename 命中；uniquePath 加序号的撞名件落顺序兜底）。
+    const used = new Set<string>();
+    const resolveQueue: { uploadId: string | null; rel: string }[] = [];
+    const unmatched: string[] = [];
+    for (const rel of imported) {
+      const base = rel.split('/').pop() ?? rel;
+      const hit = entries.find((e) => !used.has(e.uploadId) && e.label === base);
+      if (hit) {
+        used.add(hit.uploadId);
+        resolveQueue.push({ uploadId: hit.uploadId, rel });
+      } else {
+        unmatched.push(rel);
+      }
+    }
+    for (const rel of unmatched) {
+      const free = entries.find((e) => !used.has(e.uploadId));
+      if (free) used.add(free.uploadId);
+      resolveQueue.push({ uploadId: free ? free.uploadId : null, rel });
+    }
+    // leftover（拒收之外的静默跳过：大小闸/拷贝失败）→ error 态明示（不静默吞）。
+    // CR-018：拒收件按裸名对位 tier errorKind（chip 指引文案区分三档）；其余静默跳过
+    // 保持通用 error 态。
+    const rejectKindByBase = new Map<string, NonNullable<InboxUploadEntry['errorKind']>>();
+    for (const n of rejectTiers.format) rejectKindByBase.set(n, 'rejected-format');
+    for (const n of rejectTiers.tooLarge) rejectKindByBase.set(n, 'rejected-size');
+    for (const n of rejectTiers.batchLimit) rejectKindByBase.set(n, 'rejected-batch');
+    for (const e of entries) {
+      if (!used.has(e.uploadId)) {
+        setUploadEntry(e.uploadId, { state: 'error', errorKind: rejectKindByBase.get(e.label) });
+      }
+    }
+    // 逐文件串行 resolve（解析可能走 docParser 端点——API 并发纪律）。
+    for (const { uploadId, rel } of resolveQueue) {
+      const label = entries.find((e) => e.uploadId === uploadId)?.label ?? (rel.split('/').pop() ?? rel);
+      await resolveAndAttachInboxFile({ projectPath, epoch, uploadId, relPath: rel, label });
+    }
+  },
+
+  // ── 09-01 B4：chat 图片附件（三入口统一；mirror uploadInboxFiles 状态机形态）──
+
+  async uploadChatImages(files) {
+    const projectPath = get().currentProject?.path;
+    if (!projectPath || files.length === 0) return;
+    const epoch = projectEpoch;
+    // 每 file 一 chip（uploading，variant=image）——压缩/落盘在途即有确定性反馈。
+    const entries = files.map((file) => ({
+      uploadId: `upload-${randomUUID()}`,
+      label: file.name || 'image',
+      file,
+    }));
+    set((s) => {
+      const next = { ...s.attachmentUploadStates };
+      for (const e of entries) next[e.uploadId] = { state: 'uploading', label: e.label, variant: 'image' };
+      return { attachmentUploadStates: next };
+    });
+    // 逐图串行：canvas 压缩 + 落盘 IPC（API 并发纪律 mirror A3 resolve 串行）。
+    for (const e of entries) {
+      let compressed: ChatImageCompressResult;
+      try {
+        compressed = await compressChatImage(e.file);
+      } catch {
+        compressed = { ok: false, reason: 'decode-failed' }; // never-throws 兜底（解码/环境异常）
+      }
+      if (!isCurrentProjectScope(epoch, projectPath)) return; // 复查 M3：切项目守卫
+      if (!(e.uploadId in get().attachmentUploadStates)) continue; // 在途移除守卫（chip 已被用户移除）
+      if (!compressed.ok) {
+        setUploadEntry(e.uploadId, { state: 'error', errorKind: compressed.reason });
+        continue;
+      }
+      // 缩小后的 ok 结果提为 const（下方 set 闭包保留 narrowing）。
+      const image = compressed;
+      // 压缩即显缩略图（仍在 uploading 态——落盘 IPC 在途 chip 已可预览，R2.6 pending 直显）。
+      setUploadEntry(e.uploadId, { thumbDataUrl: image.dataUrl });
+      // 🔴 b64hash 形态与 shell B3 逐字对齐（agentImageParts resolveImageBytes 以
+      // `createHash('sha256').update(落盘字节).digest('hex')` 比对）：hash 输入 = 与
+      // b64Json 载荷严格同源的字节（compressChatImage 契约），sha256Hex 见该模块头注释。
+      // never-throws 兜底（WebCrypto 缺席等环境异常——error 态明示，不悬转圈）。
+      let b64hash: string;
+      try {
+        b64hash = await sha256Hex(image.bytes);
+      } catch {
+        if (isCurrentProjectScope(epoch, projectPath) && e.uploadId in get().attachmentUploadStates) {
+          setUploadEntry(e.uploadId, { state: 'error', errorKind: 'decode-failed' });
+        }
+        continue;
+      }
+      if (!isCurrentProjectScope(epoch, projectPath)) return;
+      if (!(e.uploadId in get().attachmentUploadStates)) continue; // 在途移除守卫
+      let saved: Awaited<ReturnType<typeof saveChatImage>>;
+      try {
+        saved = await saveChatImage(projectPath, compressed.b64, compressed.mimeType, imageFileStem(e.label));
+      } catch {
+        if (isCurrentProjectScope(epoch, projectPath) && e.uploadId in get().attachmentUploadStates) {
+          setUploadEntry(e.uploadId, { state: 'error' }); // 落盘失败（IPC 拒绝等）——可移除重试
+        }
+        continue;
+      }
+      if (!isCurrentProjectScope(epoch, projectPath)) return; // 复查 M3
+      if (!(e.uploadId in get().attachmentUploadStates)) continue; // 在途移除守卫
+      const attachment: ImageAttachment = {
+        type: 'image',
+        id: saved.relativePath,
+        label: e.label,
+        path: saved.relativePath,
+        b64hash,
+      };
+      get().addAttachment(attachment);
+      // 条目迁移 ready（键 = 附件 id = 落盘相对路径；thumbDataUrl 随迁移保留——chip 由
+      // pendingAttachments 侧渲染时经此查缩略图，发送时随状态机整体清场）。
+      set((s) => {
+        const next = { ...s.attachmentUploadStates };
+        delete next[e.uploadId];
+        next[saved.relativePath] = {
+          state: 'ready',
+          label: e.label,
+          variant: 'image',
+          thumbDataUrl: image.dataUrl,
+        };
+        return { attachmentUploadStates: next };
+      });
+    }
+  },
+
+  async attachInboxMaterial(relPath, displayName) {
+    const projectPath = get().currentProject?.path;
+    if (!projectPath) return;
+    const epoch = projectEpoch;
+    const uploadId = `upload-${randomUUID()}`;
+    set((s) => ({
+      attachmentUploadStates: { ...s.attachmentUploadStates, [uploadId]: { state: 'parsing', label: displayName } },
+    }));
+    await resolveAndAttachInboxFile({ projectPath, epoch, uploadId, relPath, label: displayName });
+  },
+
+  removeAttachmentUpload: (uploadId) => {
+    deleteUploadEntry(uploadId);
+  },
 
   agentSessions: [],
   // R2 #14：初始非草稿（挂载即空白视图 = 无会话状态，非用户点过「新会话」）。
@@ -659,17 +1098,31 @@ export const createAgentSessionSlice: StateCreator<Deps, [], [], AgentSessionSli
       return false;
     }
 
+    // 09-01 B4（R2.6）：乐观消息引用携带缩略 dataUrl（仅 UI 直显——下方 IPC attachments
+    // 保持纯指针不夹带 MB 级 b64；重载会话走 ImageReferenceThumb 盘读还原）。非 image
+    // 附件零变化。dataUrl 取自 uploadStates 的 ready 条目（发送后随状态机整体清场）。
+    const references = attachments.length > 0
+      ? attachments.map((a) => {
+          if (a.type !== 'image') return a;
+          const thumb = state.attachmentUploadStates[a.id]?.thumbDataUrl;
+          return thumb ? { ...a, dataUrl: thumb } : a;
+        })
+      : undefined;
+
     const userMsg: AgentMessage = {
       id: randomUUID(),
       role: 'user',
       content,
-      references: attachments.length > 0 ? attachments : undefined,
+      references,
       createdAt: Date.now(),
     };
     set((s) => ({
       agentMessages: [...s.agentMessages, userMsg],
       agentError: null,
       pendingAttachments: [],
+      // 09-01 A3：附件随消息消费——上传状态机一并清（ready 条目随附件走，error 指引
+      // chip 不跨发送残留在下一轮输入区）。
+      attachmentUploadStates: {},
     }));
 
     const sid = sessionId;
@@ -776,6 +1229,9 @@ confirmedGear = get().agentParticipationGear;
       activeSessionRunning: false,
       agentError: null,
       pendingAttachments: [],
+      // 09-01 A3（design D-I）：新会话清上传状态机——在途回调被 isCurrentScope/条目
+      // 缺失守卫拦下，不把旧会话产物带进新会话输入区。
+      attachmentUploadStates: {},
       sessionSwitching: false,
       // R2 #14：显式「新会话」意图 → 历史列表顶部出现草稿行（真会话建立/切换时清除）。
       draftSession: true,
@@ -818,6 +1274,10 @@ confirmedGear = get().agentParticipationGear;
       sessionSwitching: false,
       agentError: null,
       pendingAttachments: [],
+      // 09-01 A3（复查 M3）：切项目清上传状态机——AgentPanel 不随项目切换卸载，组件
+      // 本地态会跨项目残留转圈；在途回调由 isCurrentProjectScope(epoch) 守卫拦下，
+      // 旧项目产物/chip 不泄漏进新项目视图（AC6b）。
+      attachmentUploadStates: {},
       agentSessions: [],
       // R2 #14：项目重置不带草稿标记（新项目视图≠用户点了「新会话」）。
       draftSession: false,
@@ -965,6 +1425,10 @@ confirmedGear = participationGear;
           // 漏了历史批量消息退回扁平渲染（分组丢失）。
           ...(m.batchId !== undefined ? { batchId: m.batchId } : {}),
           ...(m.batchKind !== undefined ? { batchKind: m.batchKind } : {}),
+          // 09-01 B4（R2.6）：references 透传（fetchAgentSession 已把 SessionMessage.images
+          // 映射成 image 引用——B2 载荷形态）——switch 手动重映射漏字段家族（3.3 Blind-002
+          // 同款坑），漏了重载会话气泡丢附件缩略图。内存态字段（dataUrl）读回时不存在。
+          ...(m.references ? { references: m.references } : {}),
           createdAt: m.createdAt,
           // dogfood R2 #50：autoResume（重开项目/刷新自动接续）盖章「已落定历史」——
           // 末条 assistant 不打字机回放（回放空泡首帧打断跳底 + 重开项目每次重播是噪音）；
