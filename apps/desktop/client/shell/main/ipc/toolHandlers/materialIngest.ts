@@ -37,6 +37,10 @@
  *   - 重建 ≠ 本次解析时先核**原件身份**（CR-001）：登记 content hash（deps.getRegisteredContentHash
  *     缝）与本次解析一致 → 差异来自派生人工编辑 → 不覆写派生、保留人工内容
  *     （outcome='reingest-skipped-manual' + note 确认提示）。
+ *   - 〔C2 防清 belt〕CR-001 路径上 markers=0（章标记丢失/被剥——应用内编辑器保存往返〔R10〕/
+ *     外部编辑器）时重建产出零章——登记行既有章界非空则**保留既有章界与分章结论**（同
+ *     preserveCuratedProvenance 防清哲学），不落 0 章中间行（F1 假态/F12 cleared 窗口根因）；
+ *     相 B 重索引 autoResplit 事务覆写真实值。经 deps.getRegisteredMaterial 缝取既有行。
  *   - 内容变更（shingle ≥0.8 相似 = 小幅 / 其余 = 大幅，attachmentMeta.ts:203 纯函数先例，
  *     首部 8K 采样对拍）→ 自动路径重跑 + 诚实 note；**人工标记随之丢失 = 已知限制**
  *     （prd Out of Scope：内容变更重摄取回自动分章，history 快照兜底）。
@@ -188,6 +192,14 @@ export interface MaterialIngestDeps {
    * 变更」自动路径（watcher 首登/自愈场景无登记行可查，行为不变）。
    */
   getRegisteredContentHash?: (materialId: string) => Promise<string | null> | string | null;
+  /**
+   * 登记库既有材料行读取缝（C2 防清 belt）：markers=0 重摄取（CR-001 人工保留路径）重建零章时，
+   * 既有行章界非空则保留既有 chapters + chapterDetection（不落 0 章中间行——F1 假态/F12
+   * cleared 窗口根因；相 B 重索引 autoResplit 事务覆写真实值）。生产装配（Wave C
+   * materialIndexer.runRegisterMaterial）透传 getMaterialRow；未装配/零章行/缺行 → belt 不触发
+   * （首登/failed/挂起行维持诚实零章现状），行为与无本缝时一致。
+   */
+  getRegisteredMaterial?: (materialId: string) => Promise<Material | null> | Material | null;
   /**
    * 登记+索引钩子〔F-24〕——Wave C 装配真身（closure_material upsert + materialIndexer）；
    * 默认 no-op。失败 catch + warn 不阻断（登记层 DERIVED 可由 watcher/启动扫描重建；
@@ -1218,11 +1230,12 @@ export async function ingestMaterial(
         // 人工编辑：**不覆写派生、保留人工内容**（outcome='reingest-skipped-manual'，note 说明
         // 确认姿势）；hash 不同（或登记缝不可用）→ 原件真变了，走既有自动路径。
         const currentHash = sha256Content(normalized);
-        const registeredHash = await readRegisteredContentHash(
-          deps,
-          materialIdFor(scopeInput.scope, materialSourcePath(scopeInput.scope, rel)),
-        );
+        const materialId = materialIdFor(scopeInput.scope, materialSourcePath(scopeInput.scope, rel));
+        const registeredHash = await readRegisteredContentHash(deps, materialId);
         if (registeredHash === currentHash) {
+          // C2 防清 belt 取数：markers=0（章标记丢失/被剥）重建必零章——取既有行以便保留
+          // 章界（markers>0 时重建非空，无需取）；缝未装配/零章行 → null（诚实零章现状）。
+          const registeredMaterial = markers.length === 0 ? await readRegisteredMaterialForBelt(deps, materialId) : null;
           return await assembleReusedFromMarkers({
             scopeInput,
             rel,
@@ -1238,6 +1251,7 @@ export async function ingestMaterial(
             charCount: normalized.length,
             contentHash: currentHash,
             existingDerived,
+            registeredMaterial,
             now,
             onRegistered,
             outcome: 'reingest-skipped-manual',
@@ -1389,15 +1403,32 @@ interface ReuseAssembleInput {
   /** 差异点②：REUSE 装配的 contentHash 基面（字幕 = 拼合 hash；五格式 = normalized hash）。 */
   contentHash: string;
   existingDerived: string;
+  /**
+   * C2 防清 belt：登记库既有行（markers=0 时调用方经 getRegisteredMaterial 缝取）。重建零章
+   * 且既有行章界非空 → 保留既有 chapters + chapterDetection；null/缺省 = 无可保留（诚实零章）。
+   */
+  registeredMaterial?: Material | null;
   now: () => Date;
   onRegistered: (material: Material) => Promise<void> | void;
   outcome: Extract<IngestMaterialOutcome, 'reused' | 'reingest-skipped-manual'>;
 }
 
+/** C2 防清 belt note（markers=0 保留既有章界——诚实标注保留行为，相 B 重索引收敛真实值）。 */
+const MISSING_MARKERS_PRESERVE_NOTE = '章标记缺失：已保留既有章界，待重索引收敛为真实值。';
+
 /** 从既有派生 .md 的标记行重建章界并装配 REUSE/人工保留结果（字幕与五格式幂等分支共用，CR-8）。 */
 async function assembleReusedFromMarkers(input: ReuseAssembleInput): Promise<IngestMaterialResult> {
   const markers = parseChapterMarkers(input.existingDerived);
   const rebuilt = rebuildChaptersFromMarkers(input.existingDerived, markers);
+  // C2 防清 belt：markers=0（章标记丢失/被剥——R10 应用内编辑往返/外部编辑器）重建零章——既有
+  // 登记行章界非空且派生仍有正文时保留既有章界 + 分章结论（同 preserveCuratedProvenance 防清
+  // 哲学；chapters 与 chapterDetection 同源保留，守 F-18 两处同值纪律），不落 0 章中间行
+  // （F1「0 章|章界待校对」假态/F12 cleared 窗口根因）；相 B 重索引 autoResplit 读磁盘派生
+  // 重切、registrationConverged 必不相等 → 事务覆写真实值，belt 不拦收敛。既有行零章（首登/
+  // 挂起/failed）或派生已被清空（CR-11 同哲学——不为空派生伪造结构）→ 维持诚实零章现状。
+  const registered = input.registeredMaterial ?? null;
+  const preserveRegistered =
+    registered !== null && rebuilt.chapters.length === 0 && input.existingDerived.trim() !== '';
   const material = assembleMaterial({
     scopeInput: input.scopeInput,
     rel: input.rel,
@@ -1405,15 +1436,15 @@ async function assembleReusedFromMarkers(input: ReuseAssembleInput): Promise<Ing
     via: input.via,
     scanned: input.scanned,
     nonUtf8: input.nonUtf8,
-    parseNotes: input.parseNotes,
+    parseNotes: preserveRegistered
+      ? [...input.parseNotes, MISSING_MARKERS_PRESERVE_NOTE]
+      : input.parseNotes,
     charCount: input.charCount,
     contentHash: input.contentHash,
-    chapters: chaptersFromRebuilt(rebuilt),
-    chapterDetection: {
-      method: rebuilt.docMethod,
-      confidence: rebuilt.docConfidence,
-      matchedFormats: [],
-    },
+    chapters: preserveRegistered ? registered.chapters : chaptersFromRebuilt(rebuilt),
+    chapterDetection: preserveRegistered
+      ? registered.quality.chapterDetection
+      : { method: rebuilt.docMethod, confidence: rebuilt.docConfidence, matchedFormats: [] },
     now: input.now,
   });
   await notifyRegistered(input.onRegistered, material);
@@ -1432,6 +1463,20 @@ async function readRegisteredContentHash(deps: MaterialIngestDeps, materialId: s
   if (!deps.getRegisteredContentHash) return null;
   try {
     return await deps.getRegisteredContentHash(materialId);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * C2 belt 登记缝读取（never-throws）：未装配/抛错/缺行/**零章行**（首登/挂起/failed——无可
+ * 保留）→ null（belt 不触发，诚实零章现状）。零章判空在缝侧收口，调用方不重复判。
+ */
+async function readRegisteredMaterialForBelt(deps: MaterialIngestDeps, materialId: string): Promise<Material | null> {
+  if (!deps.getRegisteredMaterial) return null;
+  try {
+    const row = await deps.getRegisteredMaterial(materialId);
+    return row !== null && row.chapters.length > 0 ? row : null;
   } catch {
     return null;
   }

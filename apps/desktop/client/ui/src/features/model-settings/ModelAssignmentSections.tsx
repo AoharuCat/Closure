@@ -6,6 +6,7 @@ import type {
   ModelProtocol,
   ModelRef,
   SlotAssignment,
+  SlotFallbackEntry,
   TaskModelSlot,
   ThinkingKind,
   UnifiedLevel,
@@ -53,6 +54,9 @@ function buildEnabledModelOptions(config: ModelConfig): EnabledModelOption[] {
 // Task-oriented routing slots (C3.2): which writing stage each select assigns a
 // model to. Table-driven — a future slot is one enum member (shared-contracts)
 // plus one row here; labels/descriptions live in i18n settings.yaml.
+// 09-13 链流程重排 R1b：审核族细档四行紧跟 review-judge（粗档/回落档在前，细档在后）。
+// 细档保持「自动」时回落 review-judge 档（taskModelRouting TASK_SLOT_FALLBACK 单源）；
+// 异构审核 = 各审核环节可指不同模型交叉把关。
 const TASK_MODEL_SLOT_DEFS: ReadonlyArray<{
   slot: TaskModelSlot;
   labelKey: string;
@@ -61,16 +65,29 @@ const TASK_MODEL_SLOT_DEFS: ReadonlyArray<{
   { slot: 'writer-selfcheck', labelKey: 'settings.taskSlotWriterSelfcheck', descKey: 'settings.taskSlotWriterSelfcheckDesc' },
   { slot: 'writer-draft', labelKey: 'settings.taskSlotWriterDraft', descKey: 'settings.taskSlotWriterDraftDesc' },
   { slot: 'review-judge', labelKey: 'settings.taskSlotReviewJudge', descKey: 'settings.taskSlotReviewJudgeDesc' },
+  { slot: 'plan-review', labelKey: 'settings.taskSlotPlanReview', descKey: 'settings.taskSlotPlanReviewDesc' },
+  { slot: 'multi-review', labelKey: 'settings.taskSlotMultiReview', descKey: 'settings.taskSlotMultiReviewDesc' },
+  { slot: 'route-judge', labelKey: 'settings.taskSlotRouteJudge', descKey: 'settings.taskSlotRouteJudgeDesc' },
+  { slot: 'revision-guard', labelKey: 'settings.taskSlotRevisionGuard', descKey: 'settings.taskSlotRevisionGuardDesc' },
   { slot: 'extraction', labelKey: 'settings.taskSlotExtraction', descKey: 'settings.taskSlotExtractionDesc' },
   { slot: 'dispatch', labelKey: 'settings.taskSlotDispatch', descKey: 'settings.taskSlotDispatchDesc' },
   { slot: 'dialogue', labelKey: 'settings.taskSlotDialogue', descKey: 'settings.taskSlotDialogueDesc' },
 ];
 
-function buildTaskModelOptions(config: ModelConfig): Array<{ value: string; label: string }> {
+function buildTaskModelOptions(
+  config: ModelConfig,
+  t: (key: string, vars?: Record<string, string | number>) => string,
+): Array<{ value: string; label: string }> {
   // Enabled TEXT models only — these slots steer writing-pipeline generation.
-  return listNovelTextModelRefs(config.keys).map((opt) => ({
+  // 09-12 agy provider W4：CLI（antigravity-cli）text 模型一并指派（生成经 gateway
+  // resolveModel 分派协议层 CLI 驱动），选项带形态标识——指派时即知该形态无 Closure
+  // 工具面（协议层剥离），而非事后查 driver warn。
+  return listNovelTextModelRefs(config.keys, { includeCli: true }).map((opt) => ({
     value: `${opt.ref.keyId}::${opt.ref.modelId}`,
-    label: opt.label,
+    label:
+      opt.protocol === 'antigravity-cli'
+        ? `${opt.label} · ${t('settings.cliNoToolsBadge')}`
+        : opt.label,
   }));
 }
 
@@ -106,6 +123,26 @@ function thinkingSelectValue(assignment: SlotAssignment, editingCustom: string |
   if (editingCustom !== undefined) return 'custom';
   if (assignment.thinkingCustom) return 'custom';
   return assignment.thinking ?? 'auto';
+}
+
+/**
+ * 回退链条目的思考 select 显示值（mirror thinkingSelectValue + 主指派档行的 CR-016
+ * 回显兜底——存量非法/协议拦截回显 auto；条目即 SlotFallbackEntry 同形）。
+ */
+function entrySelectThinkingValue(
+  entry: SlotFallbackEntry,
+  info: SlotThinkingInfo,
+  editingCustom: string | undefined,
+): string {
+  if (editingCustom !== undefined) return 'custom';
+  const storedIllegal =
+    entry.thinking !== undefined && entry.thinking !== 'auto'
+    && !(info.levels.includes(entry.thinking) && (entry.thinking !== 'off' || info.offLegal));
+  const storedCustomIllegal = !!entry.thinkingCustom && info.customHint === 'none';
+  if (info.levels.length > 0 && !info.protocolSupported) return 'auto';
+  if (storedIllegal || storedCustomIllegal) return 'auto';
+  if (entry.thinkingCustom) return 'custom';
+  return entry.thinking ?? 'auto';
 }
 
 type SlotThinkingInfo = {
@@ -266,12 +303,13 @@ export function ModelAssignmentSections({ t, modelConfig, setModelConfig }: Prop
   // Task-model routing (C3.2): per-stage model designation. Options are the
   // enabled text models; "Auto" empties the slot so the generation gateway
   // auto-picks (the pre-routing behavior, identical to an unset config).
-  const taskModelOptions = buildTaskModelOptions(modelConfig);
+  const taskModelOptions = buildTaskModelOptions(modelConfig, t);
 
-  // thinking adapters task：custom 档的**草稿**态（per-slot）。选中「自定义…」时先入
-  // 草稿、select 停在 custom，直到 validateCustom 通过才落配置（非法值不发，PRD 验收 3）。
-  // 换模型/Auto 清档时一并清草稿（草稿属于旧模型）。
-  const [customDrafts, setCustomDrafts] = useState<Partial<Record<TaskModelSlot, string>>>({});
+  // thinking adapters task：custom 档的**草稿**态（per-slot + per-回退条目——条目键
+  // `${slot}::fb::${index}`）。选中「自定义…」时先入草稿、select 停在 custom，直到
+  // validateCustom 通过才落配置（非法值不发，PRD 验收 3）。换模型/Auto 清档时一并清
+  // 草稿（草稿属于旧模型）。
+  const [customDrafts, setCustomDrafts] = useState<Record<string, string>>({});
 
   // CR-006: a designation outlives the key/model disappearing from the enabled
   // options (key deleted / model disabled). The section must stay rendered with
@@ -527,6 +565,311 @@ export function ModelAssignmentSections({ t, modelConfig, setModelConfig }: Prop
     );
   }
 
+  // ── 09-12 子2 fallback chains（design §2/§8①）：档位回退链编辑 ──
+  // 有序条目列表（添加/删除/上移/下移，MVP 不做拖拽）；每项 = 模型 ref + 自带思考策略
+  //（条目即 SlotFallbackEntry，同形输入——per-entry thinking 复用 slotThinkingInfo 能力
+  // 判定）。链挂 assignment 上 ⇒ 主模型必须是显式指派（auto 档无链——零默认链拍板的
+  // 结构保证）。写侧两态：空链不落 fallbacks 键。已选（主指派 + 前序条目）在 select 中
+  // 禁用（去重第一道；读侧 warn+drop 兜底）。失效条目保持可选 + 「已失效」明示（CR-006
+  // 同款——不让 select 看起来是空）。链长不设上限（开放项 B 拍板）。
+
+  /** 回退链写侧单源：空链剥 fallbacks 键（二态契约）。 */
+  function writeFallbackEntries(slot: TaskModelSlot, entries: SlotFallbackEntry[]) {
+    const current: Partial<Record<TaskModelSlot, SlotAssignment>> = modelConfig.taskModels ?? {};
+    const assignment = current[slot];
+    if (!assignment) return;
+    const { fallbacks: _old, ...base } = assignment;
+    void setModelConfig({
+      ...modelConfig,
+      taskModels: {
+        ...current,
+        [slot]: entries.length > 0 ? { ...base, fallbacks: entries } : base,
+      },
+    });
+  }
+
+  function onFallbackEntryModelChange(slot: TaskModelSlot, index: number, event: ChangeEvent<HTMLSelectElement>) {
+    const next = event.target.value;
+    const entries = [...(modelConfig.taskModels?.[slot]?.fallbacks ?? [])];
+    const entry = entries[index];
+    if (!entry) return;
+    const sepIdx = next.indexOf('::');
+    if (sepIdx < 0) return; // 畸形值整条忽略（CR-007 纪律）
+    // 换模型 = 思考策略重置 auto（fresh 条目天然丢弃 thinking/thinkingCustom——与主指派
+    // 换模型同款语义：策略合法性按模型）；草稿随模型切换作废。
+    entries[index] = { keyId: next.slice(0, sepIdx), modelId: next.slice(sepIdx + 2) };
+    setCustomDrafts((drafts) => {
+      const nextDrafts = { ...drafts };
+      delete nextDrafts[`${slot}::fb::${index}`];
+      return nextDrafts;
+    });
+    writeFallbackEntries(slot, entries);
+  }
+
+  function onFallbackAdd(slot: TaskModelSlot) {
+    const assignment = modelConfig.taskModels?.[slot];
+    if (!assignment) return;
+    const entries = modelConfig.taskModels?.[slot]?.fallbacks ?? [];
+    const taken = new Set([
+      `${assignment.keyId}::${assignment.modelId}`,
+      ...entries.map((e) => `${e.keyId}::${e.modelId}`),
+    ]);
+    const candidate = taskModelOptions.find((opt) => !taken.has(opt.value));
+    if (!candidate) return; // 全部已选——无可加（添加钮本就 disabled）
+    const sepIdx = candidate.value.indexOf('::');
+    writeFallbackEntries(slot, [
+      ...entries,
+      { keyId: candidate.value.slice(0, sepIdx), modelId: candidate.value.slice(sepIdx + 2) },
+    ]);
+  }
+
+  function onFallbackRemove(slot: TaskModelSlot, index: number) {
+    const entries = modelConfig.taskModels?.[slot]?.fallbacks ?? [];
+    if (index < 0 || index >= entries.length) return;
+    writeFallbackEntries(slot, entries.filter((_, i) => i !== index));
+    // 草稿键随条目左移一位对齐（删除点之后的条目索引各 -1）——只删本键会把被删位之后
+    // 的草稿错配给相邻条目（select 误显 custom + 他人草稿值）。
+    setCustomDrafts((drafts) => {
+      const hasDraftInRange = entries.some((_, i) => i >= index && `${slot}::fb::${i}` in drafts);
+      if (!hasDraftInRange) return drafts;
+      const nextDrafts = { ...drafts };
+      for (let i = index; i < entries.length - 1; i += 1) {
+        const src = drafts[`${slot}::fb::${i + 1}`];
+        if (src !== undefined) nextDrafts[`${slot}::fb::${i}`] = src;
+        else delete nextDrafts[`${slot}::fb::${i}`];
+      }
+      delete nextDrafts[`${slot}::fb::${entries.length - 1}`];
+      return nextDrafts;
+    });
+  }
+
+  function onFallbackMove(slot: TaskModelSlot, index: number, dir: -1 | 1) {
+    const entries = [...(modelConfig.taskModels?.[slot]?.fallbacks ?? [])];
+    const target = index + dir;
+    if (target < 0 || target >= entries.length) return;
+    [entries[index], entries[target]] = [entries[target]!, entries[index]!];
+    writeFallbackEntries(slot, entries);
+    // 草稿随条目对调（索引键草稿的镜像同步——否则移动后 custom 草稿挂在别人行上）。
+    const keyA = `${slot}::fb::${index}`;
+    const keyB = `${slot}::fb::${target}`;
+    setCustomDrafts((drafts) => {
+      if (!(keyA in drafts) && !(keyB in drafts)) return drafts;
+      return { ...drafts, [keyA]: drafts[keyB], [keyB]: drafts[keyA] };
+    });
+  }
+
+  /** 条目思考档变更（mirror onThinkingChange，条目靶向 + 条目键草稿）。 */
+  function onFallbackThinkingChange(slot: TaskModelSlot, index: number, event: ChangeEvent<HTMLSelectElement>) {
+    const next = event.target.value;
+    const entries = [...(modelConfig.taskModels?.[slot]?.fallbacks ?? [])];
+    const entry = entries[index];
+    if (!entry) return;
+    const base: SlotFallbackEntry = { keyId: entry.keyId, modelId: entry.modelId };
+    const draftKey = `${slot}::fb::${index}`;
+    if (next === 'custom') {
+      setCustomDrafts((drafts) => ({ ...drafts, [draftKey]: entry.thinkingCustom ?? '' }));
+      return;
+    }
+    setCustomDrafts((drafts) => {
+      if (!(draftKey in drafts)) return drafts;
+      const nextDrafts = { ...drafts };
+      delete nextDrafts[draftKey];
+      return nextDrafts;
+    });
+    if (next === 'auto') {
+      entries[index] = base;
+      writeFallbackEntries(slot, entries);
+      return;
+    }
+    const level = UNIFIED_LEVELS.find((l) => l === next);
+    if (!level) return;
+    entries[index] = { ...base, thinking: level };
+    writeFallbackEntries(slot, entries);
+  }
+
+  /** 条目自定义思考值输入（mirror onThinkingCustomChange，条目靶向）。 */
+  function onFallbackThinkingCustomChange(
+    slot: TaskModelSlot,
+    index: number,
+    event: ChangeEvent<HTMLInputElement>,
+    kind: ThinkingKind,
+  ) {
+    const draft = event.target.value;
+    const draftKey = `${slot}::fb::${index}`;
+    setCustomDrafts((drafts) => ({ ...drafts, [draftKey]: draft }));
+    const entries = [...(modelConfig.taskModels?.[slot]?.fallbacks ?? [])];
+    const entry = entries[index];
+    if (!entry) return;
+    const base: SlotFallbackEntry = { keyId: entry.keyId, modelId: entry.modelId };
+    const trimmed = draft.trim();
+    if (!trimmed) {
+      entries[index] = base;
+      writeFallbackEntries(slot, entries);
+      return;
+    }
+    const result = validateCustom(kind, trimmed);
+    if (!result.ok) return;
+    entries[index] = { ...base, thinkingCustom: result.value };
+    writeFallbackEntries(slot, entries);
+  }
+
+  /**
+   * 回退链子区（design §8①）。条目思考行复用 slotThinkingInfo（条目即 SlotFallbackEntry
+   * 同形——per-entry kind 不同各自判定）；协议拦截/存量非法等回显守卫与主指派同款。
+   */
+  function renderFallbackChain(slot: TaskModelSlot, assignment: SlotAssignment | undefined) {
+    if (!assignment) return null; // 链挂 assignment 上——auto 档（无显式指派）结构性无链
+    const entries = assignment.fallbacks ?? [];
+    const primaryValue = `${assignment.keyId}::${assignment.modelId}`;
+    const addable = taskModelOptions.some(
+      (opt) =>
+        opt.value !== primaryValue
+        && !entries.some((e) => `${e.keyId}::${e.modelId}` === opt.value),
+    );
+    return (
+      <div className="model-fallback-chain">
+        <span className="model-fallback-chain-label">{t('settings.fallbackChain')}</span>
+        {entries.length === 0 ? (
+          <p className="model-fallback-chain-hint">{t('settings.fallbackChainHint')}</p>
+        ) : (
+          entries.map((entry, index) => {
+            const value = `${entry.keyId}::${entry.modelId}`;
+            // 去重第一道：主指派 + 前序条目已选的选项禁用（本条目自身保持选中可回显）。
+            const taken = new Set([
+              primaryValue,
+              ...entries.slice(0, index).map((e) => `${e.keyId}::${e.modelId}`),
+            ]);
+            const stale =
+              !taskModelOptions.some((opt) => opt.value === value)
+                ? { value, label: `${t('settings.taskModelStale')}: ${entry.keyId} / ${entry.modelId}` }
+                : null;
+            // per-entry thinking（复用主指派档行的能力判定）。
+            const entryProtocol = modelConfig.keys.find((key) => key.id === entry.keyId)?.protocol;
+            const entryInfo = slotThinkingInfo(entry, entryProtocol);
+            const entryProtocolBlocked = !!entryInfo && entryInfo.levels.length > 0 && !entryInfo.protocolSupported;
+            const draftKey = `${slot}::fb::${index}`;
+            const editingCustom = customDrafts[draftKey];
+            const entrySelectValue = entryInfo
+              ? entrySelectThinkingValue(entry, entryInfo, editingCustom)
+              : 'hidden';
+            const entryCustomDraftRaw = editingCustom ?? entry.thinkingCustom;
+            return (
+              <div className="model-fallback-entry" key={`${value}::${index}`}>
+                <span className="model-fallback-entry-order">{index + 1}</span>
+                <label className="form-field-input-row model-fallback-entry-model">
+                  <span className="form-field-input-label">{t('settings.fallbackEntryModel')}</span>
+                  <select
+                    className="form-field-input"
+                    value={value}
+                    onChange={(event) => onFallbackEntryModelChange(slot, index, event)}
+                  >
+                    {stale ? <option value={stale.value}>{stale.label}</option> : null}
+                    {taskModelOptions.map((opt) => (
+                      <option key={opt.value} value={opt.value} disabled={taken.has(opt.value)}>
+                        {opt.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                {entryInfo ? (
+                  <label className="form-field-input-row model-fallback-entry-thinking">
+                    <span className="form-field-input-label">{t('settings.thinkingLevel')}</span>
+                    <select
+                      className="form-field-input"
+                      value={entrySelectValue}
+                      onChange={(event) => onFallbackThinkingChange(slot, index, event)}
+                    >
+                      <option value="auto">{t('settings.thinkingAuto')}</option>
+                      {entryProtocolBlocked ? null : (
+                        <>
+                          {entryInfo.levels.map((level) => (
+                            <option
+                              key={level}
+                              value={level}
+                              disabled={level === 'off' && !entryInfo.offLegal}
+                            >
+                              {t(THINKING_LEVEL_KEYS[level])}
+                            </option>
+                          ))}
+                          {entryInfo.customHint !== 'none' ? (
+                            <option value="custom">{t('settings.thinkingCustom')}</option>
+                          ) : null}
+                        </>
+                      )}
+                    </select>
+                  </label>
+                ) : null}
+                {entrySelectValue === 'custom' && entryInfo && entryInfo.customHint !== 'none' ? (
+                  <label className="form-field-input-row model-fallback-entry-custom">
+                    <span className="form-field-input-label">{t('settings.thinkingCustomLabel')}</span>
+                    {entryInfo.customHint === 'numeric' ? (
+                      <input
+                        type="number"
+                        className="form-field-input form-field-input-narrow"
+                        min={entryInfo.numericRange?.[0]}
+                        max={entryInfo.numericRange?.[1]}
+                        step={1}
+                        value={entryCustomDraftRaw ?? ''}
+                        onChange={(event) => onFallbackThinkingCustomChange(slot, index, event, entryInfo.kind)}
+                      />
+                    ) : (
+                      <input
+                        type="text"
+                        className="form-field-input"
+                        value={entryCustomDraftRaw ?? ''}
+                        onChange={(event) => onFallbackThinkingCustomChange(slot, index, event, entryInfo.kind)}
+                      />
+                    )}
+                  </label>
+                ) : null}
+                <span className="model-fallback-entry-actions">
+                  <button
+                    type="button"
+                    className="model-fallback-entry-action"
+                    disabled={index === 0}
+                    title={t('settings.fallbackMoveUp')}
+                    aria-label={t('settings.fallbackMoveUp')}
+                    onClick={() => onFallbackMove(slot, index, -1)}
+                  >
+                    <span className="material-symbols-outlined" aria-hidden="true">keyboard_arrow_up</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="model-fallback-entry-action"
+                    disabled={index === entries.length - 1}
+                    title={t('settings.fallbackMoveDown')}
+                    aria-label={t('settings.fallbackMoveDown')}
+                    onClick={() => onFallbackMove(slot, index, 1)}
+                  >
+                    <span className="material-symbols-outlined" aria-hidden="true">keyboard_arrow_down</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="model-fallback-entry-action"
+                    title={t('settings.fallbackRemove')}
+                    aria-label={t('settings.fallbackRemove')}
+                    onClick={() => onFallbackRemove(slot, index)}
+                  >
+                    <span className="material-symbols-outlined" aria-hidden="true">close</span>
+                  </button>
+                </span>
+              </div>
+            );
+          })
+        )}
+        <button
+          type="button"
+          className="model-fallback-add"
+          disabled={!addable}
+          onClick={() => onFallbackAdd(slot)}
+        >
+          <span className="material-symbols-outlined" aria-hidden="true">add</span>
+          {t('settings.fallbackAdd')}
+        </button>
+      </div>
+    );
+  }
+
   /** Shared by the 向量/重排 sidecar pickers: "Auto" (or a malformed value)
    * clears the designation → resolver capability auto-detect; a `keyId::modelId`
    * value parses into the ref. */
@@ -583,6 +926,8 @@ export function ModelAssignmentSections({ t, modelConfig, setModelConfig }: Prop
                 </label>
                 {/* thinking adapters task：档行内联思考策略（模型有 registry 档案才出）。 */}
                 {renderThinkingControl(slot, assignment)}
+                {/* 09-12 子2：回退链子区（主模型显式指派才挂——auto 档结构性无链）。 */}
+                {renderFallbackChain(slot, assignment)}
                 <p className="model-task-slot-desc">{t(descKey)}</p>
               </div>
             );

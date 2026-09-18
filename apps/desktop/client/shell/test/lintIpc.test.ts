@@ -15,14 +15,16 @@ const {
   projectLintReportForL2,
   resolveTaskModel,
   assignmentThinkingControl,
+  assignmentFallbackChain,
   resolveModel,
-  generateText,
+  handleGenerateText,
   readModelConfigFromDisk,
   loadProject,
   assertSafePath,
   warn,
   info,
   error,
+  ModelResolutionError,
 } = vi.hoisted(() => ({
   handle: vi.fn(),
   getLintEngine: vi.fn(),
@@ -33,14 +35,24 @@ const {
   // S4c：lintIpc classify 携思考策略——mock 归一函数（真实现由 agent 包 wiring 测试钉）；
   // 缺省 vi.fn 返 undefined = 未配思考 → 请求不带 thinking 键（auto，字节级不变）。
   assignmentThinkingControl: vi.fn(),
+  assignmentFallbackChain: vi.fn(() => undefined),
   resolveModel: vi.fn(),
-  generateText: vi.fn(),
+  handleGenerateText: vi.fn(),
   readModelConfigFromDisk: vi.fn(),
   loadProject: vi.fn(),
   assertSafePath: vi.fn(),
   warn: vi.fn(),
   info: vi.fn(),
   error: vi.fn(),
+  // CR-19（09-12 子2 CR 批）：classify 预检撤除后「没配模型」的 distinct 降级日志按
+  // ModelResolutionError 甄别（真形态 = modelGatewayIpc 的 resolveModel 纯配置失败类型；
+  // 此处镜像类供 mock 面注入）。
+  ModelResolutionError: class ModelResolutionError extends Error {
+    constructor(message: string) {
+      super(message);
+      this.name = 'ModelResolutionError';
+    }
+  },
 }));
 
 vi.mock('electron', () => ({
@@ -59,10 +71,18 @@ vi.mock('@orison/desktop-agent', () => ({
   projectLintReportForL2,
   resolveTaskModel,
   assignmentThinkingControl,
+  assignmentFallbackChain,
 }));
-vi.mock('@orison/model-protocols', () => ({ generateText }));
 vi.mock('../main/ipc/configIpc', () => ({ readModelConfigFromDisk }));
-vi.mock('../main/ipc/modelGatewayIpc', () => ({ resolveModel }));
+// 09-12 子2（复核 H1 重接）：classify 经网关环入口——mock 面加 handleGenerateText。
+// CR-19（09-12 子2 CR 批）：classify 预检撤除（不再跑 resolveModel——单源解析在环内
+// per-attempt）；resolveModel 保留在 mock 面（model-probe 测试面）；ModelResolutionError
+// 镜像类随 mock 注入（classify 失败点按它甄别 distinct 降级日志）。
+vi.mock('../main/ipc/modelGatewayIpc', () => ({
+  resolveModel,
+  handleGenerateText,
+  ModelResolutionError,
+}));
 vi.mock('../main/ipc/pathGuard', () => ({ assertSafePath }));
 vi.mock('@orison/desktop-local-bff', () => ({ loadProject }));
 // CR-020：logger mock 补 error——lintIpc 的模式 A 错误路径（loadProject threw / apply-fix failed）
@@ -247,7 +267,7 @@ describe('lintIpc', () => {
     expect(await modelProbe(undefined)).toEqual({ available: true });
     // 与 classify 同一解析链（单源）——不发任何网络请求。
     expect(resolveTaskModel).toHaveBeenCalledWith('review-judge');
-    expect(generateText).not.toHaveBeenCalled();
+    expect(handleGenerateText).not.toHaveBeenCalled();
   });
 
   it('model-probe: resolveModel 抛错（无启用模型）→ available:false，不抛（模式 A）', async () => {
@@ -516,20 +536,27 @@ describe('lintIpc', () => {
   it('classify: no full-report on disk → degraded (never throws)', async () => {
     const result = await classify({ projectPath: PROJECT_DIR });
     expect(result).toEqual({ verdicts: [], degraded: true });
-    expect(generateText).not.toHaveBeenCalled();
+    expect(handleGenerateText).not.toHaveBeenCalled();
   });
 
-  it('classify: unresolvable model → degraded without any LLM call', async () => {
+  it('classify: 没配模型（环入口 ModelResolutionError）→ degraded + distinct 降级日志，不重试（CR-19 预检撤除后失败点甄别）', async () => {
     writeFullReport(sampleFullReport());
     projectLintProjection();
-    readModelConfigFromDisk.mockReturnValue({ keys: [], taskModels: {} });
-    resolveModel.mockImplementation(() => {
-      throw new Error('no enabled model');
-    });
+    // CR-19：预检已撤——「没配模型」经环入口同步抛（resolveModel 在环内 per-attempt
+    // 权威解析，纯配置失败零网络）。mock 面注入镜像类形态。
+    handleGenerateText.mockRejectedValue(new ModelResolutionError("Model ref points to unknown key 'default'"));
 
     const result = await classify({ projectPath: PROJECT_DIR });
     expect(result).toEqual({ verdicts: [], degraded: true });
-    expect(generateText).not.toHaveBeenCalled();
+    // 环入口确实被调（单次）且失败后不再重试（调用失败非 JSON 解析失败——design §4）。
+    expect(handleGenerateText).toHaveBeenCalledTimes(1);
+    // distinct 日志路径保持（原预检的日志语义收编到失败点）。
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ err: expect.stringContaining('unknown key') }),
+      'lintIpc classify: no model resolvable (review-judge slot / auto-pick) → degraded',
+    );
+    // 预检撤除的回归锚：classify 不再跑第二遍 resolveModel（双解析 TOCTOU 消除）。
+    expect(resolveModel).not.toHaveBeenCalled();
   });
 
   it('classify: fenced JSON parsed → verdicts kept; hallucinated ruleIds dropped; review-judge 档经 resolveTaskModel 单源解析（CR-026）', async () => {
@@ -548,7 +575,7 @@ describe('lintIpc', () => {
       keys: [{ id: 'k1', models: [{ id: 'm1', enabled: true }] }],
     });
     resolveModel.mockReturnValue({ keyId: 'k1', modelId: 'm1' });
-    generateText.mockResolvedValue({
+    handleGenerateText.mockResolvedValue({
       model: 'm1',
       text:
         '```json\n{"verdicts":[{"ruleId":"r1","truePositiveRatio":0.8,"note":"删填充词"},' +
@@ -563,16 +590,13 @@ describe('lintIpc', () => {
     expect(result.verdicts.find((v) => v.ruleId === 'hallucinated')).toBeUndefined();
     // 档位解析经 agent 包 resolveTaskModel('review-judge') 单源（不再手写 config.taskModels 复刻）。
     expect(resolveTaskModel).toHaveBeenCalledWith('review-judge');
-    expect(resolveModel).toHaveBeenCalledWith(
-      { keyId: 'k1', modelId: 'm1' },
-      expect.objectContaining({ keys: expect.anything() }),
-    );
+    // CR-19：预检撤除——classify 面零 resolveModel 调用（真实解析单源在环内 per-attempt）。
+    expect(resolveModel).not.toHaveBeenCalled();
     // 覆盖完整（r1+r2）→ 不带 partial 标记。
     expect((result as { partial?: boolean }).partial).toBeUndefined();
-    // maxTokens 提至 8192（CR-012：4096 对 25 规则组会截断）。
-    expect(generateText).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.objectContaining({ maxTokens: 8192 }),
+    // maxTokens 提至 8192（CR-012：4096 对 25 规则组会截断）——环入口 payload.request 形态。
+    expect(handleGenerateText).toHaveBeenCalledWith(
+      expect.objectContaining({ request: expect.objectContaining({ maxTokens: 8192 }) }),
     );
   });
 
@@ -592,26 +616,25 @@ describe('lintIpc', () => {
     });
     resolveModel.mockReturnValue({ keyId: 'k1', modelId: 'm1' });
     assignmentThinkingControl.mockReturnValue({ level: 'high' });
-    generateText.mockResolvedValue({ model: 'm1', text: '{"verdicts":[]}' });
+    handleGenerateText.mockResolvedValue({ model: 'm1', text: '{"verdicts":[]}' });
 
     let result = await classify({ projectPath: PROJECT_DIR });
     expect(result.degraded).toBe(false);
     // 归一函数吃到完整 assignment（thinking 键在场）。
     expect(assignmentThinkingControl).toHaveBeenCalledWith({ keyId: 'k1', modelId: 'm1', thinking: 'high' });
-    // 请求体带 thinking（两次调用同携——重试不丢策略）。
-    expect(generateText).toHaveBeenCalledTimes(1);
-    expect(generateText).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.objectContaining({ thinking: { level: 'high' } }),
+    // 请求体带 thinking（两次调用同携——重试不丢策略）——环入口 payload.request 形态。
+    expect(handleGenerateText).toHaveBeenCalledTimes(1);
+    expect(handleGenerateText).toHaveBeenCalledWith(
+      expect.objectContaining({ request: expect.objectContaining({ thinking: { level: 'high' } }) }),
     );
 
     // 未配思考（归一返 undefined）→ 请求体无 thinking 键（auto，字节级不变）。
-    generateText.mockClear();
+    handleGenerateText.mockClear();
     assignmentThinkingControl.mockReturnValue(undefined);
-    generateText.mockResolvedValue({ model: 'm1', text: '{"verdicts":[]}' });
+    handleGenerateText.mockResolvedValue({ model: 'm1', text: '{"verdicts":[]}' });
     result = await classify({ projectPath: PROJECT_DIR });
     expect(result.degraded).toBe(false);
-    const request = generateText.mock.calls[0][1] as Record<string, unknown>;
+    const request = (handleGenerateText.mock.calls[0][0] as { request: Record<string, unknown> }).request;
     expect('thinking' in request).toBe(false);
   });
 
@@ -620,11 +643,11 @@ describe('lintIpc', () => {
     projectLintProjection();
     readModelConfigFromDisk.mockReturnValue({ keys: [] });
     resolveModel.mockReturnValue({ keyId: 'k1', modelId: 'm1' });
-    generateText.mockResolvedValue({ model: 'm1', text: '{"verdicts":[]}' });
+    handleGenerateText.mockResolvedValue({ model: 'm1', text: '{"verdicts":[]}' });
 
     const result = await classify({ projectPath: PROJECT_DIR });
     expect(result).toEqual({ verdicts: [], degraded: false });
-    expect(generateText).toHaveBeenCalledTimes(1); // 已成功解析——重试即误重试
+    expect(handleGenerateText).toHaveBeenCalledTimes(1); // 已成功解析——重试即误重试
   });
 
   it('classify: verdicts 全为清单外 ruleId（全幻觉被滤）→ 诚实空成功，不重试（CR-012）', async () => {
@@ -632,14 +655,14 @@ describe('lintIpc', () => {
     projectLintProjection();
     readModelConfigFromDisk.mockReturnValue({ keys: [] });
     resolveModel.mockReturnValue({ keyId: 'k1', modelId: 'm1' });
-    generateText.mockResolvedValue({
+    handleGenerateText.mockResolvedValue({
       model: 'm1',
       text: '{"verdicts":[{"ruleId":"made-up","truePositiveRatio":1,"note":"幻觉"}]}',
     });
 
     const result = await classify({ projectPath: PROJECT_DIR });
     expect(result).toEqual({ verdicts: [], degraded: false });
-    expect(generateText).toHaveBeenCalledTimes(1);
+    expect(handleGenerateText).toHaveBeenCalledTimes(1);
   });
 
   it('classify: finishReason=length 截断 → 直接 degraded，不重试（CR-012）', async () => {
@@ -648,7 +671,7 @@ describe('lintIpc', () => {
     readModelConfigFromDisk.mockReturnValue({ keys: [] });
     resolveModel.mockReturnValue({ keyId: 'k1', modelId: 'm1' });
     // 即便残余恰好是合法 JSON，截断输出不可信（verdicts 可能只覆盖前半清单）。
-    generateText.mockResolvedValue({
+    handleGenerateText.mockResolvedValue({
       model: 'm1',
       finishReason: 'length',
       text: '{"verdicts":[{"ruleId":"r1","truePositiveRatio":0.8,"note":"被切断的前半"}]}',
@@ -656,7 +679,7 @@ describe('lintIpc', () => {
 
     const result = await classify({ projectPath: PROJECT_DIR });
     expect(result).toEqual({ verdicts: [], degraded: true });
-    expect(generateText).toHaveBeenCalledTimes(1); // 同参数重跑大概率再截——不重试
+    expect(handleGenerateText).toHaveBeenCalledTimes(1); // 同参数重跑大概率再截——不重试
   });
 
   it('classify: verdicts 覆盖不足 → partial=true（additive 标记，C1.3 消费）（CR-012）', async () => {
@@ -671,7 +694,7 @@ describe('lintIpc', () => {
     });
     readModelConfigFromDisk.mockReturnValue({ keys: [] });
     resolveModel.mockReturnValue({ keyId: 'k1', modelId: 'm1' });
-    generateText.mockResolvedValue({
+    handleGenerateText.mockResolvedValue({
       model: 'm1',
       text: '{"verdicts":[{"ruleId":"r1","truePositiveRatio":0.8,"note":"漏了 r2"}]}',
     });
@@ -691,14 +714,14 @@ describe('lintIpc', () => {
     });
     readModelConfigFromDisk.mockReturnValue({ keys: [] });
     resolveModel.mockReturnValue({ keyId: 'k1', modelId: 'm1' });
-    generateText.mockResolvedValue({
+    handleGenerateText.mockResolvedValue({
       model: 'm1',
       text: '{"verdicts":[{"ruleId":"density.x","truePositiveRatio":0.9,"note":"密度真阳"}]}',
     });
 
     const result = await classify({ projectPath: PROJECT_DIR });
     // 密度指纹即无可判对象进 LLM（旧逻辑 findings 空即诚实空跳过——CR-013 修正）。
-    expect(generateText).toHaveBeenCalledTimes(1);
+    expect(handleGenerateText).toHaveBeenCalledTimes(1);
     expect(result.degraded).toBe(false);
     expect(result.verdicts).toEqual([
       { ruleId: 'density.x', truePositiveRatio: 0.9, note: '密度真阳' },
@@ -710,11 +733,11 @@ describe('lintIpc', () => {
     projectLintProjection();
     readModelConfigFromDisk.mockReturnValue({ keys: [] });
     resolveModel.mockReturnValue({ keyId: 'k1', modelId: 'm1' });
-    generateText.mockResolvedValue({ model: 'm1', text: '这不是 JSON' });
+    handleGenerateText.mockResolvedValue({ model: 'm1', text: '这不是 JSON' });
 
     const result = await classify({ projectPath: PROJECT_DIR });
     expect(result).toEqual({ verdicts: [], degraded: true });
-    expect(generateText).toHaveBeenCalledTimes(2); // 解析失败一次重试（design §4）
+    expect(handleGenerateText).toHaveBeenCalledTimes(2); // 解析失败一次重试（design §4）
   });
 
   it('apply-fix: invalid patches → invalid-patches（模式 A）', async () => {

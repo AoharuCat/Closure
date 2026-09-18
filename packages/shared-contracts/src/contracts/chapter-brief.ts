@@ -207,6 +207,25 @@ export const chapterBriefSchema = z.object({
   // 显式行消费（体现非复述）。二态：缺失 = 无弧走向（默认，主笔照写）；≥1 = 有走向；空 `[]` 合法
   // （本章确无角色进展——过场章），**不加 .min(1)**。
   characterProgressions: z.array(briefCharacterProgressionSchema).optional(),
+  // #recompileHints（链流程重排 W2 遗留①）：规划环 revise 回环的**重编意图注入**——brief-compiler
+  // 重跑时读上一轮 plan_review artifact 的 hard findings 机械注入（纯投影，不判语义），让规划环
+  // revise 有实质输入而非「同输入确定性重编 + 空 LLM 复判到 cap」。随 chapterTask JSON 进写手
+  // prompt（写手据 hints 自查/规避），A2 复审在卡面上可见（brief JSON 自带）。二态 .min(1)
+  //（mirror gap_whitelist：缺失 = 无重编提示默认 / ≥1 = 有提示；空 [] 第三态拒收）。首圈无
+  // plan_review → 缺省零回归。
+  recompileHints: z
+    .array(
+      z.object({
+        /** 六维 canonical 标识（mirror PlanReviewFinding.dimension，开放 string）。 */
+        dimension: z.string().min(1),
+        /** 对照输入的哪条字段（grounding 硬要求，mirror PlanReviewFinding.grounding）。 */
+        grounding: z.string().min(1),
+        /** 问题说明 + 可执行的重编方向（mirror PlanReviewFinding.note）。 */
+        note: z.string().min(1),
+      }),
+    )
+    .min(1)
+    .optional(),
   // #readiness 就绪阶梯（4.1 §3.2）：brief-compiler 产 chapter_brief 时填；运行时 gate 据此阻断交接。
   // additive optional——4.0 既有 brief（无 readiness）仍合法（gate 入口调 computeReadiness 现算补上）。
   readiness: briefReadinessSchema.optional(),

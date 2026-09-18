@@ -1,0 +1,147 @@
+writing:
+  chapters:
+    title: "Chapters"
+    empty: "No chapters yet — outline your story structure first"
+    hint: "Click a chapter to open its manuscript tab; a dot marks chapters with a running/paused chain"
+    # 09-13 子3 W6 (design §6.3): chapter-card derivation state — stale badge + re-extract button.
+    staleBadge: "Derivations stale"
+    reExtract: "Re-extract"
+    reExtractBusy: "Extracting"
+  chains:
+    label: "Chains"
+  # W6: chain session chips (chapter-number label + awaiting-review badge; fallback reuses writing.run.fallbackTitle).
+  chip:
+    chapter: "Chapter {n}"
+    badge: "Review"
+  run:
+    fallbackTitle: "Chapter chain"
+    chapter: "Chapter {n} · {title}"
+    status:
+      running: "Running"
+      paused: "Awaiting review"
+      completed: "Completed"
+      error: "Failed"
+      aborted: "Interrupted"
+    modelFallback: "↻ fell back from {from}"
+    # 09-18 CR batch B (CR-4②/CR-11): paused-chain "open review" manual re-entry button + persistent
+    # "self-review converged in N laps" chip after the loop segment (D-e lap visibility, one of three).
+    enterReview: "Open review"
+    lapsDone: "Self-review: {n} laps"
+  # 09-18 CR batch B (CR-12): empty-timeline idle line copy follows the run status (was always "generating").
+  timeline:
+    idleRunning: "Generating…"
+    idlePaused: "Paused — awaiting review"
+    idleEmpty: "No timeline data"
+  empty:
+    title: "No chapter chain running"
+    body: "Chapter writing still starts from the chat panel — tell the AI which chapter to write and in what direction. Once a chain is running, its full timeline (thinking / tools / artifacts / prose stream) shows up here."
+  noProject:
+    title: "No project open"
+    body: "Open or create a project — this page becomes the observability surface for chapter-writing chains."
+  # 09-13 子3 W5 (design §1.3/§4): review phase (phase container + final card + escalate card + stub card).
+  review:
+    pauseKind:
+      final: "Final review"
+      escalate: "Escalation"
+      brief: "Plan review"
+      suspension: "Suspension check"
+      guard: "Guard rail"
+      draft: "Draft review"
+      stub: "Paused"
+      pending: "Preparing review"
+    tlToggle: "▤ Timeline"
+    collapse: "Collapse review"
+    drawerTitle: "Timeline · look back"
+    # 09-18 CR batch B (CR-10): pending placeholder (chapter_review metadata in transit — guards
+    # against the stub card flashing on production chains).
+    pending:
+      body: "Pause payload in transit — the review card will appear here…"
+    final:
+      title: "Final review"
+      docSub: "Final draft — edit freely, or select text to let the AI refine it"
+      summaryTitle: "AI self-review summary"
+      summaryVerdictLabel: "Verdict"
+      summaryReasonsLabel: "Reasons"
+      summaryReasons: "{n} reasons"
+      summaryLint: "Anti-slop lint report"
+      loops: "Self-review converged in {n} laps · under cap"
+      loopsCapped: "Self-review hit the cap at {n} laps"
+      summaryMissing: "(no self-review summary in this payload — absent, not hidden)"
+      dirty: "Unaccepted manual edits"
+      accept: "Accept & continue"
+      acceptWithEdits: "Accept & continue · manual edits: {n}"
+      invalidEdit: "Edited text is empty — to clear the chapter use “Abort” instead"
+      redo: "Send back for rewrite…"
+      abort: "Abort chapter"
+      redoPanelTitle: "Send back · revision notes"
+      required: "Required"
+      redoHint: "Your notes are injected as the revision directive for the next writing lap"
+      redoRequiredHint: "Empty notes cannot be sent back — describe the direction (no blind guessing)"
+      redoPlaceholder: "Describe why it's sent back and the desired direction; the AI will revise accordingly…"
+      redoSubmit: "Send back (whole chapter)"
+      reason1: "Motivation still underdeveloped"
+      reason2: "Back half rushes"
+      reason3: "Dialogue too bookish"
+      reason4: "More scene description"
+      abandonTitle: "Abort this chapter?"
+      abandonBody: "Aborting interrupts this chain run; the produced draft is not persisted and the timeline stays for review."
+      abandonConfirm: "Confirm abort"
+      selectionBar: "Selection actions"
+      selectionRefine: "Refine by instruction"
+      intentCardTitle: "Refine selection"
+      escHint: "Esc to cancel"
+      intentPlaceholder: "Instruct on the selected passage, e.g.: make the hesitation more restrained, drop the “like” simile…"
+      compileIntent: "Compile intent → confirm"
+    escalate:
+      title: "Escalation · in-loop"
+      hint: "The router is unsure — the author decides. Pick a disposition per finding (picks auto-synthesize structured feedback the AI follows per item — no need to accept or reject all):"
+      route: "Route: {route}"
+      itemsTitle: "Adjudication findings"
+      itemsCount: "{n} items"
+      pick:
+        accept: "Accept as truth"
+        revise: "Revise"
+        ignore: "Ignore"
+      supplementPlaceholder: "Supplement (optional — recommended to state the revision direction for “Revise” picks)"
+      submit: "Submit picks"
+      submitCounts: " ({accept} accepted · {revise} revised)"
+      submitDisabledHint: "Cannot submit with none picked or all ignored — give a disposition per item"
+      abort: "Abort chapter"
+    stub:
+      title: "Chapter chain paused"
+      body: "This chain is paused with no review payload (direct-run lane has no checkpoint event surface). Continue or abort; start chapter writing from the chat panel for the full review flow."
+      resume: "Continue"
+      abort: "Abort"
+  # 09-13 子3 W6 (design §6.2): terminal outcome three-state cards + chapter-card derivation actions.
+  outcome:
+    completedTitle: "Chain completed"
+    completedSub: "The extraction segment ran once against the final draft — derived state is consistent by construction."
+    duration: "total {d}"
+    noRows: "(no extraction-segment artifact frames in this run — derived state per chapter cards and setting surfaces)"
+    openProse: "Open manuscript →"
+    openWorld: "World panel →"
+    openChat: "Setting patch review →"
+    worldEvents: "World events"
+    promises: "Promise registrations"
+    unitEvents: "entries"
+    unitItems: "items"
+    errorTitle: "Chain failed"
+    errorAt: "Failed at {node} — upstream nodes' timeline and artifacts are preserved for inspection."
+    errorAtUnknown: "Failed node unknown (terminal frame not reached) — upstream nodes' timeline and artifacts are preserved."
+    noErrorDetail: "(no error-detail frames — copy diagnostics and check the main-process log)"
+    retryHint: "Recovery: chapters already on disk can be re-extracted from the chapter list on the left; or re-dispatch from the chat panel. Chain-snapshot liveness after error is unverified — no checkpoint-restart promise."
+    copyDiagnostics: "⧉ Copy diagnostics"
+    copied: "Diagnostics copied to clipboard"
+    copyFailed: "Copy failed (clipboard unavailable)"
+    backToChat: "Back to chat panel"
+    abortedTitle: "Chain interrupted"
+    abortedBody: "The chain run was interrupted — either you aborted it during review, or it was cut passively (stream cut / turn ended)."
+    abortedKept: "Produced thinking, investigation and artifact snapshots stay in the timeline above for review."
+  derivation:
+    done: "Re-extraction complete: derived state refreshed"
+    failed: "Re-extraction failed: {reason}"
+    reviewStaged: "Re-extraction complete: {n} setting patches awaiting review (chat panel)"
+    landed: "Re-extraction complete: {fields} landed automatically"
+    # CR-6: staging guards — a different-run pending batch is not overwritten / no active session to carry the review.
+    pendingConflict: "A patch batch is already awaiting review — handle the review card first; this batch was not staged"
+    noSession: "Re-extraction finished, but no active session is available to carry the review — patches not staged"

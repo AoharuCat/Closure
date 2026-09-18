@@ -25,6 +25,9 @@ import type { ResearchSuspension } from './research-brief';
 import { storyDecisionDraftSchema, storyDecisionSchema, type StoryDecisionDraft } from './story-decision';
 import type { StoryDecision } from './story-decision';
 import { revisionIntentSchema } from './revision-intent';
+// 链流程重排 W4（R6 链外重提取）：story-sync 再提取产物 + PatchReview envelope 形态（ReExtractChapterResult）。
+import type { NovelStorySyncPayload } from './novel-orchestration';
+import type { FieldPatchEntry } from './project-patch';
 
 // ── Story 4.0 写章战术链段：initialArtifacts 组装纯函数（design §4.8 / implement.md 6.1/6.2）──
 //
@@ -337,19 +340,39 @@ export const resumeChapterChainInputSchema = zValue
     projectPath: zValue.string().min(1),
     sessionId: zValue.string().min(1),
     chapterId: zValue.string().optional(),
-    action: zValue.enum(['continue', 'redo', 'abort']),
+    // 链流程重排 W2：+ 'accept'（终稿 checkpoint 专属——接受终稿，可携 editedDraft；其余 stage 沿用
+    // continue/redo/abort）。机械控制信号封闭 enum。
+    action: zValue.enum(['continue', 'accept', 'redo', 'abort']),
     feedback: zValue.string().optional(),
     revisionIntent: revisionIntentSchema.optional(),
     // Story 7.2：art-mode force-accept（soft-violation pause 后作者强行放行）。**仅 action=redo 时透传**
     // （IPC redoOpts 据 guardOverride 切 redo.nodeId=revision-guard-agent；soft-violation pause 时 guard 已在
     // completedNodes，continue 会跳过 → splice 不发生，故 force-accept 必须 redo）。
     guardOverride: zValue.enum(['force-accept']).optional(),
+    // 链流程重排 W2（R3 终稿手改通道）：人手改正文**全文**（终稿卡编辑面产出）。resume 入口
+    // （shell）先 F1a 立即落正文（editedDraft 覆写 draft.initial.text + wordCount 机械重算）再续跑
+    // E 段——E 段对改后正文提取。**仅 action=accept 合法**（accept 是终稿 checkpoint 专属动作）。
+    // 与 revisionIntent/feedback 不同：editedDraft 是整稿直给非意图编译——人改不走 optimizer（人改
+    // 是最高权威，三层权威「用户原话硬」）。
+    editedDraft: zValue.string().min(1).optional(),
   })
   // BMad CR CR-001：guardOverride 仅 redo 合法。continue+guardOverride 会 silent drop（guard 在 completedNodes
   // 被跳过，force-accept 不发生）—— schema refinement 拒，防 caller 误用（IPC handler 只 redo 透传）。
   .refine((v) => v.guardOverride === undefined || v.action === 'redo', {
     message: 'guardOverride 仅 action=redo 合法（soft-violation pause 时 guard 已 completedNodes，continue 会跳过）',
     path: ['guardOverride'],
+  })
+  // 链流程重排 W2：editedDraft 仅 accept 合法（终稿手改是 accept 的可选载荷；redo 回环的改稿意图走
+  // feedback/revisionIntent 通道，混入整稿覆写会绕过环内保义链）。mirror guardOverride refine 姿态。
+  .refine((v) => v.editedDraft === undefined || v.action === 'accept', {
+    message: 'editedDraft 仅 action=accept 合法（终稿手改全文是接受动作的可选载荷；redo 改稿走 feedback/revisionIntent）',
+    path: ['editedDraft'],
+  })
+  // CR-13（09-13 CR 修复批）：空白串拒收——min(1) 放行 whitespace-only（F1a truthy 判会以空白覆写
+  // 正文 / workflow trim 判又静默丢编辑，两侧口径漂移）。schema 侧 trim 非空硬拒，两侧守卫同源。
+  .refine((v) => v.editedDraft === undefined || v.editedDraft.trim().length > 0, {
+    message: 'editedDraft 不能为空白串（终稿手改需有实质内容；清空正文请用 abort）',
+    path: ['editedDraft'],
   });
 
 /**
@@ -374,6 +397,102 @@ export const compileRevisionIntentInputSchema = zValue.object({
   anchorContextChars: zValue.number().int().min(1).optional(),
 });
 
+// ── 链流程重排 W4（R6 链外重提取）：`closure:re-extract-chapter` + `closure:chapter-derivation-status` ──
+//
+// 落盘后手改正文（accept 落盘 → 编辑器改 md）此前零重提取机制（chapterChunkWatcher 只重建检索 chunk，
+// world/promise/arc/summary/mention/story-sync 衍生状态无「章改完」入口）；E 段失败章标（derivationStale）
+// 也只有 summary 瞬态信号。R6 = 重提取能力（盘上正文 → standalone E 段 → 幂等写）+ 查询面（章卡
+// 「重提取」按钮态数据源，UI 归子3）。
+
+/**
+ * `closure:re-extract-chapter` IPC 请求体 Zod schema（链流程重排 W4 / R6）。
+ *
+ * projectPath/chapterId required（路径守卫 + 反向映射键）。autonomy = story-sync 反哺 patches 的档位
+ * 分流（auto 直落 / suggest+readonly envelope PatchReview 人审，mirror applyStorySyncOnResume 判定）；
+ * 重提取无自然 leader 会话可读 permissionMode，缺省 'suggest'（保守——补丁默认进人审）。
+ */
+export const reExtractChapterInputSchema = zValue.object({
+  projectPath: zValue.string().min(1),
+  chapterId: zValue.string().min(1),
+  autonomy: zValue.enum(['readonly', 'suggest', 'auto']).default('suggest'),
+});
+
+/** 重提取统计（各段计数——context isolation：不灌全 artifacts，只汇总计数供 UI）。 */
+export interface ReExtractChapterStats {
+  /** E1-E2 world 落表 slice 数。 */
+  worldWrites: number;
+  /** E1-E2 总 patches 数。 */
+  worldPatches: number;
+  /** E2 写表失败数（>0 → ok:false 反映）。 */
+  worldWriteErrors: number;
+  /** E4 检出的 perspective gaps 数。 */
+  promiseGaps: number;
+  /** E4 涌现产出的 Promise actions 数。 */
+  promiseActions: number;
+  /** E5 弧节拍数（对终稿声明）。 */
+  arcBeats: number;
+  /** E7 storyTime 漂移 warning 数。 */
+  driftWarnings: number;
+  /** E3 情绪校验降级标注（数据源缺陷，如实带出）。 */
+  emotionDegraded?: boolean;
+}
+
+/**
+ * `closure:re-extract-chapter` 返回（agent runtime 产出 + IPC 层 story-sync 档位分流 additive 挂载）。
+ *
+ * ok:false 时 reason 是面向用户的明确原因（章不存在 / 正文为空 / 映射失败 / E 段失败摘要）；E 段失败
+ * 额外带 errors（runChain blocked/error 明细）。storySyncLanded/storySyncReview 由 IPC 层挂
+ * （mirror RunChapterChainSummary 两侧 additive 字段形态）。
+ */
+export interface ReExtractChapterResult {
+  ok: boolean;
+  reason?: string;
+  chapterId?: string;
+  episodeId?: string;
+  /** 盘上正文字数（剥 frontmatter 后）。 */
+  wordCount?: number;
+  stats?: ReExtractChapterStats;
+  /** E9 story-sync 再提取产物（patches 供 IPC 层档位分流——plan-review L5：重提取再产 patches 走档位）。 */
+  storySync?: NovelStorySyncPayload;
+  /** runChain errors（E 段节点 blocked/error 时带）。 */
+  errors?: string[];
+  /** story-sync 档位分流落点（IPC 层挂）：auto 档直落成功的 fields。 */
+  storySyncLanded?: { note: string; fields: string[] };
+  /** story-sync 档位分流落点（IPC 层挂）：suggest/readonly 档 envelope（PatchReview 人审）。 */
+  storySyncReview?: { note: string; patches: FieldPatchEntry[] };
+}
+
+/**
+ * `closure:chapter-derivation-status` IPC 请求体 Zod schema（链流程重排 W4）。
+ *
+ * 轻量查询：全部注册章的衍生状态新鲜度（供子3 章卡「重提取」按钮态）。optional chapterId 收窄单章。
+ */
+export const chapterDerivationStatusInputSchema = zValue.object({
+  projectPath: zValue.string().min(1),
+  chapterId: zValue.string().optional(),
+});
+
+/** 单章衍生状态行。 */
+export interface ChapterDerivationStatusEntry {
+  chapterId: string;
+  /** 反向映射出的 episode id（映射失败 → 缺省——该章无重提取通道）。 */
+  episodeId?: string;
+  /** E6 章摘要是否已物化（false = 从未跑过提取段——链前旧章 / E 段失败中断）。 */
+  summaryPresent: boolean;
+  /**
+   * 持久 stale 信号：章摘要 degradedNote 含「正文已修订」标注（degradeMentionLedgerForChapterFile 在
+   * 每次章正文写盘点 fire——手改/落盘后均标）。true = 正文在最近一次提取后被改过。
+   */
+  synopsisStale: boolean;
+  /** 派生态：synopsisStale || !summaryPresent（重提取按钮态单字段消费）。 */
+  stale: boolean;
+}
+
+/** `closure:chapter-derivation-status` 返回。 */
+export interface ChapterDerivationStatusResult {
+  chapters: ChapterDerivationStatusEntry[];
+}
+
 /**
  * Story 4.3 Step 3：write_chapter tool paused summary → `chapter_review` metadata shape（design §3.5 / §3.6）。
  *
@@ -391,13 +510,30 @@ export const compileRevisionIntentInputSchema = zValue.object({
  */
 export type ChapterReviewMetadata = {
   type: 'chapter_review';
-  /** checkpoint 阶段。Story 7.2 加 'revision-guard'（段落级改稿保义门 soft-violation pause → art-mode 卡）。 */
-  stage: 'brief' | 'draft' | 'verdict' | 'revision-guard';
+  /**
+   * checkpoint 阶段。Story 7.2 加 'revision-guard'（段落级改稿保义门 soft-violation pause → art-mode 卡）。
+   * 链流程重排 W2 加 'final'（终稿人审——route accept 后、E 段提取前；正文可编辑，accept 可携
+   * editedDraft 手改全文）。旧 'draft'/'verdict' 停点已随档位重映射退役（deriveCheckpointPolicy 输出
+   * 只含 brief/final；旧 stage paused 快照在 write_chapter 拦截门废弃）——枚举值保留兼容旧持久载荷。
+   */
+  stage: 'brief' | 'draft' | 'final' | 'verdict' | 'revision-guard';
   chapterId?: string;
   /** draft checkpoint pause 时的正文（review 载荷；brief/verdict pause 缺省）。 */
   draftContent?: string;
   /** brief checkpoint pause 时的 chapter_brief artifact（review 载荷；draft/verdict pause 缺省）。 */
   briefContent?: unknown;
+  /**
+   * 链流程重排 W2（plan-review M5 字段级 additive 清单）：终稿 checkpoint（stage='final'）的审读摘要
+   * ——verdict（review.latest 审读结论）+ reasons（route 理由 + 审读 summary）+ loopCount（自审环迭代数）
+   * + capExhausted（环 cap 是否耗尽）。终稿卡据此呈现「AI 自审收敛了几轮、结论如何」。其他 stage 缺省。
+   */
+  reviewSummary?: { verdict: string; reasons: string[]; loopCount: number; capExhausted: boolean };
+  /**
+   * 链流程重排 W2（R2 去味门禁）：终稿 checkpoint 的 lint 终态报告（去 AI 味静态扫描 digest——命中
+   * 计数 + 高优命中摘录）。终稿卡消费（UI 渲染归子3）。degraded（引擎缺位）时为占位说明串。其他
+   * stage 缺省。
+   */
+  lintReport?: string;
   /**
    * Story 7.2：revision-guard pause（soft-violation）时的保义门载荷（findings + 改前/改后 + L1 幅度）。
    * UI art-mode 卡据此展示，作者决定强行放行/改/取消。其他 stage 缺省。
@@ -410,7 +546,12 @@ export type ChapterReviewMetadata = {
    * 非挂起 pause 缺省。镜像 agent RunSnapshotSummary.researchSuspension（research-brief.ts 单源）。
    */
   researchSuspension?: ResearchSuspension;
-  resumeOptions: readonly ('continue' | 'redo' | 'abort')[];
+  /**
+   * resumeOptions：UI 渲染动作按钮（机械控制信号，非 LLM 判）。'accept'（链流程重排 W2）= 终稿
+   * checkpoint 专属——接受终稿（可携 editedDraft 手改全文，经 resumeChapterChain action='accept'）；
+   * 其余 stage 沿用 continue/redo/abort。
+   */
+  resumeOptions: readonly ('continue' | 'accept' | 'redo' | 'abort')[];
 };
 
 // ── Story 4.6：裁决器建议 parse（三路径鲁棒 robust extraction，对象形态）──

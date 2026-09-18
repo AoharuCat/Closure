@@ -1,4 +1,4 @@
-import type { SceneGraph, ThinkingControl } from '@orison/shared-contracts';
+import type { GenerateFallbackEntry, SceneGraph, ThinkingControl } from '@orison/shared-contracts';
 import { mergeWorldEvents, type AxisExtraction, type MergedWorldWrite, type PerAxisEvents } from './world-state-merge';
 import { createWorldExtractorNode, type WorldWriter } from './world-extractor-node';
 import type { GenerateFn, LlmNodeDeps } from './llm-node';
@@ -84,6 +84,13 @@ export interface BackfillDeps {
   modelRef?: { keyId: string; modelId: string };
   /** S4b：档位思考策略（extraction assignment 整体，与 modelRef 同源）。 */
   thinking?: ThinkingControl;
+  /** 09-12 子2 fallback chains（H2 透传面）：extraction 档回退链 → extractor 节点。 */
+  fallbacks?: GenerateFallbackEntry[];
+  /**
+   * 09-12 usage-panel：任务档位/流程标签（workflow 装配传 'extraction'——与路由同
+   * slot 名；透传 LlmNodeDeps.taskType 进 generate opts → ledger task_type 列）。
+   */
+  taskType?: string;
   /** 链段 abort 信号（optional，缺省建永不 abort controller，同 createLlmNode）。 */
   signal?: AbortSignal;
   /**
@@ -162,6 +169,10 @@ export async function backfillWorldState(input: BackfillInput, deps: BackfillDep
     generate: deps.generate,
     modelRef: deps.modelRef,
     ...(deps.thinking ? { thinking: deps.thinking } : {}),
+    // 09-12 子2（H2）：extraction 档回退链透传（空链不占位）。
+    ...(deps.fallbacks?.length ? { fallbacks: deps.fallbacks } : {}),
+    // 09-12 usage-panel：taskType 透传（未标注不占位）。
+    ...(deps.taskType ? { taskType: deps.taskType } : {}),
     signal: deps.signal,
   };
   const extractorNodes: Record<WorldPatchAxis, AgentNode> = {

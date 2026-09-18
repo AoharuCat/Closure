@@ -5,12 +5,30 @@ import type {
   CompileRevisionIntentInput,
   CompileRevisionIntentResult,
   ImageAttachment,
+  ModelFallbackSwitchEvent,
   ParticipationGear,
   ResumeChapterChainInput,
   RunChapterChainSummary,
   StreamAgentMessageResult,
+  // 09-13 子3 W6：章卡衍生状态面契约（derivation-status 查询 + 链外重提取）。
+  ChapterDerivationStatusResult,
+  ReExtractChapterResult,
 } from '@orison/shared-contracts';
 import type { Attachment } from '../types/attachment';
+// 09-13 子2 W3：chain-node-artifact 载荷镜像（chainStreamBuffer 是链类型镜像 home——
+// CHAIN_NODE_ORDER 先例；agent 包 types.ts 单源）。W4 增 chain-tool / pauseKind 同 home 镜像。
+import type { ChainNodeArtifactData, ChainNodeDonePauseKind, ChainToolEventData } from '../store/chainStreamBuffer';
+
+/**
+ * CR-15（09-12 子2 CR 批）：回退事件载荷单源 = shared-contracts
+ * `ModelFallbackSwitchEvent`（from/to/reason/attempt）+ 链车道扩展（nodeId/role）——
+ * mirror agent 包 ModelFallbackEventData 的同款扩展形态（UI 包不依赖 agent 包，
+ * 本地投影一次；下方 child/顶层两事件变体共用，不再各持 inline 副本）。
+ */
+type ModelFallbackEventData = ModelFallbackSwitchEvent & {
+  nodeId?: string;
+  role?: string;
+};
 
 const api = window.orisonDesktop;
 
@@ -36,8 +54,11 @@ export type AgentMessage = {
    *
    * dogfood R2 #16：'intent_restate'（Story 3.3 线 D 意图复述标记）已删——快捷按钮移除后
    * 零消费者，agent 侧停止盖章。字面量保留仅为读旧会话 jsonl 兼容。
+   *
+   * system 稳定化（09-12）：'session_state_note' = turn 开始追加的 interaction 状态注记
+   *（user-role 系统消息，给 LLM 的状态广播）——UI 静默不渲染（jsonl 落盘保留审计）。
    */
-  kind?: 'intent_restate' | 'aborted_partial';
+  kind?: 'intent_restate' | 'aborted_partial' | 'session_state_note';
   /**
    * dogfood T1 #27②（design §6.3）：深度思考终帧聚合值（delta reasoning 流的终态）。
    * additive optional——旧消息无字段零迁移。只展示 + 持久化，不回传模型。
@@ -75,6 +96,18 @@ export type AgentMessage = {
    */
   batchId?: string;
   batchKind?: BatchKind;
+  /**
+   * 09-12 子2 fallback chains（design §7.2）：本条 assistant 消息实际由哪个模型生成
+   * （backend SessionMessage.generatedBy 透传——fetch 对账/历史装载路径携带；流式终帧
+   * 事件不带，回合结束对账后补上）。UI 终态徽标「实际模型 B · 回退自 A」数据源；
+   * additive optional——旧消息无字段零迁移。
+   */
+  generatedBy?: {
+    keyId: string;
+    modelId: string;
+    /** 仅发生过回退时携带（≥1 条逐家失败记录）。 */
+    fallbackFrom?: Array<{ keyId: string; modelId: string; reason: string }>;
+  };
   createdAt: number;
 };
 
@@ -109,7 +142,13 @@ export type AgentChildStreamEvent = {
      * （无载荷，agent 侧 emitChildStarted）——UI 据此建 started live 占位（agentEvents 活跃
      * 分支 → agentStreamBuffer.ensureChildStartedPlaceholder）。additive：旧消费者忽略。
      */
-    | { type: 'started'; data: Record<string, never> };
+    | { type: 'started'; data: Record<string, never> }
+    /**
+     * 09-12 子2 fallback chains（design §7）：子 agent 循环内的模型切换（child 通道冒泡）。
+     * additive：旧消费者忽略。载荷引用 shared-contracts 单源（CR-15——回退事件形状
+     * 五处结构复制收敛；from/to/reason/attempt + 链车道 nodeId/role 同一 data 接口）。
+     */
+    | { type: 'model-fallback'; data: ModelFallbackEventData };
 };
 
 export type AgentStreamEvent =
@@ -125,8 +164,44 @@ export type AgentStreamEvent =
    * agent 侧；UI 侧 Stage 3 只消费到「run 态计数」，正文流式渲染 S4（agentEvents 分发器）。
    */
   | { type: 'delta'; data: { messageId: string; channel: 'text' | 'reasoning' | 'tool'; delta: string; toolName?: string } }
-  | { type: 'chain-delta'; data: { nodeId: string; role: string; phase?: string; messageId: string; delta: string; seq: number } }
-  | { type: 'chain-node-done'; data: { nodeId: string; status: string } };
+  | { type: 'chain-delta'; data: { nodeId: string; role: string; phase?: string; channel?: 'text' | 'reasoning'; messageId: string; delta: string; seq: number } }
+  /**
+   * 09-13 子2 W4（design §4）：哨兵 paused 帧 additive 携带暂停理由（普通节点 done 帧不带——
+   * 非 paused 终态不带）。additive：旧消费者不读该字段照旧。
+   */
+  | { type: 'chain-node-done'; data: { nodeId: string; status: string; pauseKind?: ChainNodeDonePauseKind } }
+  /**
+   * 09-13 子2 W3（design §2）：节点终态产出快照（五 kind summary）。additive：旧消费者忽略
+   * （agentEvents dispatcher default 分支）；载荷类型 mirror 单源 = chainStreamBuffer（agent 包
+   * types.ts 的 UI 镜像，CHAIN_NODE_ORDER 先例）。消费方 = 子3 写作页时间线。
+   */
+  | { type: 'chain-node-artifact'; data: ChainNodeArtifactData }
+  /**
+   * 09-13 子2 W4（design §3，B 定案）：链内工具调用（agent-loop 工具执行 seam；nodeId 当前恒
+   * draft-writer-agent）。additive：旧消费者忽略（dispatcher default 分支）；载荷 mirror 单源 =
+   * chainStreamBuffer。消费方 = 子3 写作页时间线（调查层）。
+   */
+  | { type: 'chain-tool'; data: ChainToolEventData }
+  /**
+   * 09-12 子2 fallback chains（design §7）：模型切换事件（leader 对话车道 / 链车道）。
+   * additive：旧消费者忽略。from = 失败家解析身份，to = 接管条目；链车道带 nodeId/role。
+   * 载荷引用 shared-contracts 单源（CR-15——与 child 通道变体同一 data 接口）。
+   */
+  | { type: 'model-fallback'; data: ModelFallbackEventData }
+  /**
+   * 09-12 子5 R6（design §11）：leader 会话上下文窗口占用量（估算口径与压缩触发同源
+   * ——prepareContext loadTokens × 校准比；仅 leader 流式车道发射）。windowTokens 为
+   * **注入原值**（assignment 未知窗口 → null——UI 收 null 隐藏条，不得用 1M 缺省充数）。
+   * additive：旧消费者忽略。agent 侧发射源已接线（loop.ts onContextUsage →
+   * streamMessage → 本变体；非流式 sendMessage 与桥车道不经 runLoop，不发射）。
+   */
+  | { type: 'context-usage'; data: { usedTokens: number; windowTokens: number | null; redlinePercent: number } }
+  /**
+   * 09-12 子4 W4（design §8）：桥车道运行期通知——`sendback`（present_result 打回重跑
+   * 一次）/ `sendback-missed`（二次未调接受 + 警告）/ `soft-denied`（MCP 工具软拒三形态
+   * 任一信号命中 = 预授权缺失，AC7 诊断入口）。additive：旧消费者忽略。
+   */
+  | { type: 'bridge-notice'; data: { notice: 'sendback' | 'sendback-missed' | 'soft-denied' } };
 
 export type AgentSkillInfo = {
   name: string;
@@ -271,6 +346,30 @@ export async function resolveAgentConfirmation(sessionId: string, callId: string
  */
 export async function resumeChapterChain(input: ResumeChapterChainInput): Promise<RunChapterChainSummary> {
   return api.resumeChapterChain(input);
+}
+
+// ── 链流程重排 W4（R6 / 09-13 子3 W6）：章卡衍生状态面（shell handler 在位、本波补 preload
+// 暴露——两通道的 UI api 封装归本文件，resumeChapterChain 同族归属）。──
+
+/**
+ * 查询注册章的衍生状态新鲜度（`closure:chapter-derivation-status` IPC）。轻量 best-effort：
+ * 查询侧失败返空 chapters（不 throw）——章卡 stale 徽标 / 重提取按钮态数据源。
+ */
+export async function chapterDerivationStatus(
+  input: { projectPath: string; chapterId?: string },
+): Promise<ChapterDerivationStatusResult> {
+  return api.chapterDerivationStatus(input);
+}
+
+/**
+ * 链外重提取（`closure:re-extract-chapter` IPC）：盘上该章正文 standalone 重跑提取段
+ * （E1-E9 幂等写），修复「落盘后手改 / E 段失败章标」的衍生状态漂移。autonomy 缺省
+ * 'suggest'（shell 侧默认保守——story-sync 反哺补丁默认人审，mirror resume 终态分流）。
+ */
+export async function reExtractChapter(
+  input: { projectPath: string; chapterId: string; autonomy?: 'readonly' | 'suggest' | 'auto' },
+): Promise<ReExtractChapterResult> {
+  return api.reExtractChapter(input);
 }
 
 /**

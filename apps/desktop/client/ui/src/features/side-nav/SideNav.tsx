@@ -4,9 +4,8 @@ import { useShallow } from 'zustand/react/shallow';
 import { Tooltip } from '../../shared/components/Tooltip';
 import {
   overviewItem, outlineItem, structureItem, assetsItem, settingItem, materialsItem, craftItem, deconItem,
-  productionItems, type PageNavItem,
+  writingItem, productionItems, type PageNavItem,
 } from './navItems';
-import { openWriting } from '../editor/openWriting';
 
 function NavButton({ item, active, onClick, t }: { item: PageNavItem; active: boolean; onClick: () => void; t: (k: string) => string }) {
   return (
@@ -115,18 +114,10 @@ export function SideNav() {
               derived from scene_graph (the first real UI consumer of the graph).
               Sibling to outline — both are structural views of the story. */}
           <NavButton item={structureItem} active={isPageActive('structure')} onClick={() => handlePage('structure')} t={t} />
-          {/* Writing opens the manuscript as a file tab (the source of truth),
-              not a page route — the legacy novel/script pages were retired. */}
-          <Tooltip label={t('nav.writing')} placement="right">
-            <button
-              type="button"
-              className="icon-rail-btn"
-              onClick={() => { void openWriting(); }}
-              aria-label={t('nav.writing')}
-            >
-              <span className="material-symbols-outlined" aria-hidden="true">edit_note</span>
-            </button>
-          </Tooltip>
+          {/* 「写作」页（task 09-13-writing-page-ui W1）：写章链运行态面——章节列/多会话条/
+              运行时间线/审阅相位。原按钮直开稿件 tab 的职责移交页面路由；开稿件 tab 的
+              入口保留在 OverviewPage「继续写作」/世界面板跳写作位/写作页章节列三 caller。 */}
+          <NavButton item={writingItem} active={isPageActive('writing')} onClick={() => handlePage('writing')} t={t} />
           <NavButton item={assetsItem} active={isPageActive('assets')} onClick={() => handlePage('assets')} t={t} />
           {/* 「设定」页（task 08-30-asset-cards-visualization A1）：asset_cards 8 类
               设定卡浏览/编辑聚合页——master-detail（左列表右详情）。 */}

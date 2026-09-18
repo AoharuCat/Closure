@@ -773,6 +773,28 @@ describe('Story 6.5 Promise ledger schema + 派生 + projector', () => {
     expect(r.beats).toHaveLength(2);
   });
 
+  it('applyPromiseActions：同 actions 双投影幂等（链流程重排 W3——同章重跑 E 段 promise_ledger_update 无重复登记）', () => {
+    // E 段（E4 promise-emergence → promise_ledger_update）重跑场景（redo 到链尾 / re-extract-chapter）：
+    // 同章同 actions 二次投影后 registry 逐字段相等——add_promise 同 id partial-merge 覆盖 +
+    // add_beat 自然键（promiseId::sceneRef / id）upsert + resolvePromiseFulfillment 稳定派生，
+    // 三者共同保证不累积重复登记（W0-2 结论回归锚）。
+    const actions = [
+      {
+        type: 'add_promise',
+        promise: { id: 'p1', title: '密信', summary: '读者债' },
+        firstBeat: { promiseId: 'p1', sceneRef: 's1', kind: 'plant' },
+      },
+      { type: 'add_beat', beat: { promiseId: 'p1', sceneRef: 's2', kind: 'payoff' } },
+    ] as const;
+    const first = applyPromiseActions(promiseRegistrySchema.parse({}), [...actions]);
+    const second = applyPromiseActions(first, [...actions]);
+    expect(second.promises).toHaveLength(1);
+    expect(second.beats).toHaveLength(2);
+    expect(second.beats.map((b) => b.id).sort()).toEqual(first.beats.map((b) => b.id).sort());
+    // 双投影后 status 派生稳定（payoff 在 → fulfilled 不翻转不重复）。
+    expect(second.promises[0].status).toBe(first.promises[0].status);
+  });
+
   it('applyPromiseActions：update_beat 浅合并 patch（保留 id）', () => {
     const base = applyPromiseActions(promiseRegistrySchema.parse({}), [
       {

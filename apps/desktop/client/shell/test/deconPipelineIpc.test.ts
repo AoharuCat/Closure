@@ -462,6 +462,8 @@ function buildHandlers(counts: ChainMockCounts): { handlers: DeconIpcHandlers; p
       return p;
     },
     readCurrentFingerprints: () => ({ materialContentHash: CONTENT_HASH, derivedHash: sha(currentDerived) }),
+    // CR-1 拍板 B：getDecon 章 label 装配注入（生产 readDeconDerivedTextFor 读 fs——测试零文件依赖）。
+    readMaterialDerivedText: () => currentDerived,
     now: () => NOW,
     notify: (event) => progressEvents.push(event),
   });
@@ -517,6 +519,9 @@ maybe('decon IPC 全链（P0→P2）', () => {
     const detail = await handlers.getDecon({ jobId });
     expect(detail?.job.status).toBe('done');
     expect(detail?.fresh).toBe(true);
+    // CR-1 拍板 B：章标标签表随 detail 载荷（chapterHeadings 单源——fixture 章 title '第N章'
+    // 充当章标行，chapterShortLabel 解析出「第 N 章」零序号算术）。
+    expect(detail?.chapterLabels).toEqual({ 0: '第 1 章', 1: '第 2 章', 2: '第 3 章' });
     const costByPass = detail?.job.cost.byPass ?? {};
     expect(costByPass.p1a?.calls).toBeGreaterThan(0);
     expect(costByPass.p1b?.calls).toBe(3);
@@ -994,6 +999,8 @@ maybe('decon IPC 全链（P0→P2）', () => {
     // 通道承载，error 留给真失败不污染诊断面）。
     expect(progressEvents.at(-1)?.status).toBe('paused');
     expect(progressEvents.at(-1)?.note).toContain('待人工确认');
+    // F14：闸门 note 零内部 IPC 通道名泄漏（decon:approve-review 等——用户面只说确认后自动续跑）。
+    expect(progressEvents.at(-1)?.note).not.toContain('decon:');
     expect(progressEvents.at(-1)?.error).toBeUndefined();
 
     const countsAfterP1 = { ...counts };

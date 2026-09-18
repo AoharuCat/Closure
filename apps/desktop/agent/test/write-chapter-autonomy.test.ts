@@ -91,7 +91,7 @@ describe('write_chapter tool mode wiring（Story 4.3 Step 3）', () => {
     errors: [],
   };
 
-  it('permissionMode=suggest → runChapterChain 收 mode.pauseStages=["draft"] + escalateMode="ask"', async () => {
+  it('permissionMode=suggest → runChapterChain 收 mode.pauseStages=["final"]（W2 终稿人审）+ escalateMode="ask"', async () => {
     writeReadyProject();
     runChapterChain.mockResolvedValue(SUMMARY_COMPLETED);
     setSessionPermissionMode('suggest');
@@ -101,7 +101,7 @@ describe('write_chapter tool mode wiring（Story 4.3 Step 3）', () => {
 
     const options = runChapterChain.mock.calls[0][2] as { mode?: { pauseStages: string[]; escalateMode: string } };
     expect(options.mode).toBeDefined();
-    expect(options.mode!.pauseStages).toEqual(['draft']);
+    expect(options.mode!.pauseStages).toEqual(['final']);
     expect(options.mode!.escalateMode).toBe('ask');
   });
 
@@ -118,7 +118,7 @@ describe('write_chapter tool mode wiring（Story 4.3 Step 3）', () => {
     expect(options.mode!.escalateMode).toBe('auto-trust');
   });
 
-  it('permissionMode=readonly → mode.pauseStages=["brief","draft","verdict"]', async () => {
+  it('permissionMode=readonly → mode.pauseStages=["brief","final"]（W2：旧 draft/verdict 停点退役）', async () => {
     writeReadyProject();
     runChapterChain.mockResolvedValue(SUMMARY_COMPLETED);
     setSessionPermissionMode('readonly');
@@ -127,10 +127,10 @@ describe('write_chapter tool mode wiring（Story 4.3 Step 3）', () => {
     await writeChapterTool.execute({ episodeId: 'ep1', chapterBrief: { goal: 'g' } }, ctx);
 
     const options = runChapterChain.mock.calls[0][2] as { mode?: { pauseStages: string[] } };
-    expect(options.mode!.pauseStages).toEqual(['brief', 'draft', 'verdict']);
+    expect(options.mode!.pauseStages).toEqual(['brief', 'final']);
   });
 
-  it('session 缺（getSession 返 undefined）→ 兜底 suggest（pauseStages=["draft"]）', async () => {
+  it('session 缺（getSession 返 undefined）→ 兜底 suggest（pauseStages=["final"]，W2 映射）', async () => {
     writeReadyProject();
     runChapterChain.mockResolvedValue(SUMMARY_COMPLETED);
     setSessionPermissionMode(undefined);
@@ -139,7 +139,7 @@ describe('write_chapter tool mode wiring（Story 4.3 Step 3）', () => {
     await writeChapterTool.execute({ episodeId: 'ep1', chapterBrief: { goal: 'g' } }, ctx);
 
     const options = runChapterChain.mock.calls[0][2] as { mode?: { pauseStages: string[] } };
-    expect(options.mode!.pauseStages).toEqual(['draft']); // 兜底 suggest
+    expect(options.mode!.pauseStages).toEqual(['final']); // 兜底 suggest
   });
 });
 

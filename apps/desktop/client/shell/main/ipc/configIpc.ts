@@ -11,10 +11,11 @@ import type {
   ModelRef,
   ResearchNetConfig,
   SlotAssignment,
+  SlotFallbackEntry,
   TaskModelSlot,
   UserPreferencesConfig,
 } from '@orison/shared-contracts';
-import { parseFlatYaml, stringifyFlatYaml, modelConfigSaveSchema, taskModelSlotSchema, slotAssignmentSchema, DEFAULT_USER_PREFERENCES, DEFAULT_RESEARCH_NET_CONFIG, researchNetConfigSchema, resolveModelInfo, THINKING_PROFILES, isVectorArmDegraded, clampInterfaceScale } from '@orison/shared-contracts';
+import { parseFlatYaml, stringifyFlatYaml, modelConfigSaveSchema, taskModelSlotSchema, slotAssignmentSchema, DEFAULT_USER_PREFERENCES, DEFAULT_RESEARCH_NET_CONFIG, researchNetConfigSchema, resolveModelInfo, THINKING_PROFILES, isVectorArmDegraded, clampInterfaceScale, clampUsageRetentionDays, BLOCKED_CUSTOM_HEADER_NAMES, MODEL_DEFAULT_RANGES, MODEL_PRICING_RANGE, KEY_TIMEOUT_SECONDS_RANGE, customHeaderNameSchema, customHeaderValueSchema, flatQuoted, type FlatConfigValue } from '@orison/shared-contracts';
 import { atomicWriteFileSync } from '@orison/shared-contracts/fs/atomicWrite';
 import { getLogger } from '../logger';
 import { getResearchSession } from '../research/researchSession';
@@ -124,6 +125,12 @@ function healDerivedModelFields(keys: ApiKeyEntry[]): ApiKeyEntry[] {
     ...key,
     models: key.models.map((m) => {
       const info = resolveModelInfo(m.id);
+      // 09-12 agy provider：CLI 键的 alias 是 `agy models` TSV 的官方显示名（比 registry
+      // 族名兜底更权威——gemini-* 全落「Gemini」×N 不可分辨），heal 只重算 capability，
+      // 非空 alias 原样保留；capability 仍以 registry 为准（两形态同一推断源）。
+      if (key.protocol === 'antigravity-cli' && m.alias.trim()) {
+        return { ...m, alias: m.alias, capability: info.capability };
+      }
       return { ...m, alias: info.alias, capability: info.capability };
     }),
   }));
@@ -315,6 +322,95 @@ const SLOT_THINKING_LEVELS: ReadonlySet<string> = new Set(
 );
 
 /**
+ * Thinking-policy flat-key reader (09-12 子2 fallback chains, design §2): ONE
+ * two-layer legality judgement (shape enum → per-model registry kind →
+ * THINKING_PROFILES) shared by the main slot assignment AND the fallback-chain
+ * entries — each entry's policy must be judged against ITS OWN model (kinds
+ * differ across the chain), so the main assignment's profile can never be
+ * reused. Returns only the legal fields; illegal hand-edited values drop just
+ * that policy field with a warn (CR-008/CR-016 semantics unchanged for the
+ * main assignment — warn context/message bytes are identical there).
+ * `label` names the field in the warn text: 'slot.thinking' for the main
+ * assignment, `slot.fallbacks.N.thinking` for a chain entry.
+ */
+function readSlotPolicyFields(
+  raw: ReturnType<typeof parseFlatYaml>,
+  prefix: string,
+  modelId: string,
+  warnCtx: Record<string, unknown>,
+  label: string,
+): Pick<SlotAssignment, 'thinking' | 'thinkingCustom'> {
+  const fields: Pick<SlotAssignment, 'thinking' | 'thinkingCustom'> = {};
+  // CR-016: per-model legality (registry kind → THINKING_PROFILES). Kindless
+  // models (qwen etc.) are NOT judged — registry silence is not a legality
+  // verdict, and their policy fields ride along untouched.
+  const policyProfile = (() => {
+    const kind = resolveModelInfo(modelId).thinking;
+    return kind ? THINKING_PROFILES[kind] : undefined;
+  })();
+  const thinking = raw[`${prefix}.thinking`];
+  if (thinking !== undefined) {
+    const trimmed = typeof thinking === 'string' ? thinking.trim() : '';
+    const level = trimmed as NonNullable<SlotAssignment['thinking']>;
+    const shapeIllegal = !SLOT_THINKING_LEVELS.has(trimmed);
+    const modelIllegal =
+      !shapeIllegal &&
+      policyProfile !== undefined &&
+      level !== 'auto' &&
+      !(
+        policyProfile.levels.includes(level) &&
+        (level !== 'off' || policyProfile.offLegal)
+      );
+    if (shapeIllegal) {
+      getLogger().warn(
+        { ...warnCtx, value: String(thinking) },
+        `task-models sidecar: illegal ${label} value — thinking policy ignored for this slot`,
+      );
+    } else if (modelIllegal) {
+      getLogger().warn(
+        { ...warnCtx, modelId, value: trimmed },
+        `task-models sidecar: ${label} value not legal for this model — thinking policy ignored for this slot`,
+      );
+    } else {
+      fields.thinking = level;
+    }
+  }
+  const thinkingCustom = raw[`${prefix}.thinkingCustom`];
+  if (thinkingCustom !== undefined) {
+    // Number coercion: parseFlatYaml parses unquoted numerics as numbers, and
+    // a numeric BUDGET is a legitimate custom value ("8192" written by the
+    // save path round-trips unquoted and comes back as number 8192).
+    // Canonicalize to the schema's string form; booleans/null/comment garbage
+    // stay illegal.
+    const asString =
+      typeof thinkingCustom === 'number' && Number.isFinite(thinkingCustom)
+        ? String(thinkingCustom)
+        : typeof thinkingCustom === 'string'
+          ? thinkingCustom.trim()
+          : '';
+    // Comment-tolerance mirrors CR-008: both inline tails (`v # note`) and
+    // comment-only values (`key: # note`) are rejected here.
+    if (!asString || asString.includes(' #') || asString.startsWith('#')) {
+      getLogger().warn(
+        warnCtx,
+        `task-models sidecar: illegal ${label}Custom value — custom policy ignored for this slot`,
+      );
+    } else if (policyProfile !== undefined && policyProfile.customHint === 'none') {
+      // CR-016: the model is not customizable — a stored custom value can
+      // never be sent; drop it here so the resolver and the UI never see a
+      // dead policy.
+      getLogger().warn(
+        { ...warnCtx, modelId },
+        `task-models sidecar: ${label}Custom not supported by this model — custom policy ignored for this slot`,
+      );
+    } else {
+      fields.thinkingCustom = asString;
+    }
+  }
+  return fields;
+}
+
+/**
  * Read the task-routing slot designations (C3.2 + 08-25 thinking policy).
  * Hand-edit tolerant — the disk file is the ONE lenient face of the slot
  * contract: an entry under an unknown slot key is never read (only the six
@@ -378,80 +474,67 @@ export function readTaskModelSlots(): ModelConfig['taskModels'] {
         continue;
       }
       const assignment: SlotAssignment = { keyId: keyId.trim(), modelId: modelId.trim() };
-      // CR-016: per-model legality (registry kind → THINKING_PROFILES), a second
-      // layer under the shape checks below. Drops only what the MODEL rejects:
-      // 'off' on a forced-thinking kind, tiers the profile does not offer (gemini),
-      // and custom values on customHint:'none' kinds. Kindless models (qwen etc.)
-      // are NOT judged — registry silence is not a legality verdict, and their
-      // policy fields ride along untouched (the protocol layer never injects for
-      // an unknown kind; the UI hides the control).
-      const policyProfile = (() => {
-        const kind = resolveModelInfo(assignment.modelId).thinking;
-        return kind ? THINKING_PROFILES[kind] : undefined;
-      })();
       // Thinking policy keys (08-25): per-key leniency — an illegal hand-edited
       // value drops just the policy field (warn), never the slot itself. An
-      // absent key leaves the field off the assignment entirely (auto).
-      const thinking = raw[`${slot}.thinking`];
-      if (thinking !== undefined) {
-        const trimmed = typeof thinking === 'string' ? thinking.trim() : '';
-        const level = trimmed as NonNullable<SlotAssignment['thinking']>;
-        const shapeIllegal = !SLOT_THINKING_LEVELS.has(trimmed);
-        const modelIllegal =
-          !shapeIllegal &&
-          policyProfile !== undefined &&
-          level !== 'auto' &&
-          !(
-            policyProfile.levels.includes(level) &&
-            (level !== 'off' || policyProfile.offLegal)
-          );
-        if (shapeIllegal) {
+      // absent key leaves the field off the assignment entirely (auto). The
+      // two-layer legality now lives in readSlotPolicyFields (shared with the
+      // fallback entries below — per-model, so each target model is judged
+      // against its own registry kind).
+      const policy = readSlotPolicyFields(raw, slot, assignment.modelId, { slot }, 'slot.thinking');
+      if (policy.thinking !== undefined) assignment.thinking = policy.thinking;
+      if (policy.thinkingCustom !== undefined) assignment.thinkingCustom = policy.thinkingCustom;
+      // ── 09-12 子2 fallback chain：`${slot}.fallbacks.N.*` flat 键连续扫描 ──
+      // 索引 0..N 顺序读，keyId/modelId 缺失（含注释尾污染）即链止；条目与主指派或
+      // 前序条目重复 → warn + drop（读侧容忍——去重不入 schema，UI 侧已选禁用是第一道）；
+      // 条目 thinking 合法性逐条判定（同 helper、各自模型）。链挂 assignment 上 ⇒ 本循环
+      // 只有主指派有效才进来（缺 keyId/modelId 的 slot 早 continue），auto-pick 档无链。
+      // 零有效条目 → fallbacks 字段不出现（二态契约——写侧同款）。
+      // CR-18（09-12 子2 CR 批）：本 flat 读路径对空数组形态**天然免疫**（手编 yaml 写
+      // `slot.fallbacks: []` 解析为标量键、链扫描按 `fallbacks.N.*` 子键进行，空数组根本
+      // 进不了 assignment）——空数组的 lenient 归一单点在 save 面
+      // normalizeTaskModelsForParse（parse 前 `[]` → 缺席），读侧无需第二处。
+      const chain: NonNullable<SlotAssignment['fallbacks']> = [];
+      const seenRefs = new Set([JSON.stringify([assignment.keyId, assignment.modelId])]);
+      for (let i = 0; ; i++) {
+        const entryPrefix = `${slot}.fallbacks.${i}`;
+        const fbKeyId = raw[`${entryPrefix}.keyId`];
+        const fbModelId = raw[`${entryPrefix}.modelId`];
+        if (typeof fbKeyId !== 'string' || !fbKeyId.trim()) break;
+        if (typeof fbModelId !== 'string' || !fbModelId.trim()) break;
+        if (fbKeyId.includes(' #') || fbModelId.includes(' #')) {
+          // CR-008 family: never ingest comment text as a ref component — the
+          // chain stops at this entry (a mid-chain gap), the slot and earlier
+          // entries survive.
           getLogger().warn(
-            { slot, value: String(thinking) },
-            'task-models sidecar: illegal slot.thinking value — thinking policy ignored for this slot',
+            { slot, entry: i },
+            'task-models sidecar: fallback entry value contains a trailing comment (" #") — chain stops at this entry',
           );
-        } else if (modelIllegal) {
-          getLogger().warn(
-            { slot, modelId: assignment.modelId, value: trimmed },
-            'task-models sidecar: slot.thinking value not legal for this model — thinking policy ignored for this slot',
-          );
-        } else {
-          assignment.thinking = level;
+          break;
         }
-      }
-      const thinkingCustom = raw[`${slot}.thinkingCustom`];
-      if (thinkingCustom !== undefined) {
-        // Number coercion: parseFlatYaml parses unquoted numerics as numbers,
-        // and a numeric BUDGET is a legitimate custom value ("8192" written by
-        // the save path round-trips unquoted and comes back as number 8192).
-        // Canonicalize to the schema's string form instead of dropping the
-        // user's setting; booleans/null/comment garbage stay illegal.
-        const asString =
-          typeof thinkingCustom === 'number' && Number.isFinite(thinkingCustom)
-            ? String(thinkingCustom)
-            : typeof thinkingCustom === 'string'
-              ? thinkingCustom.trim()
-              : '';
-        // Comment-tolerance mirrors CR-008: parseFlatYaml does not treat a
-        // value-position `#` as a comment, so both inline tails (`v # note`) and
-        // comment-only values (`key: # note`) must be rejected here.
-        if (!asString || asString.includes(' #') || asString.startsWith('#')) {
+        const entryKey = fbKeyId.trim();
+        const entryModel = fbModelId.trim();
+        const refKey = JSON.stringify([entryKey, entryModel]);
+        if (seenRefs.has(refKey)) {
           getLogger().warn(
-            { slot },
-            'task-models sidecar: illegal slot.thinkingCustom value — custom policy ignored for this slot',
+            { slot, entry: i, keyId: entryKey, modelId: entryModel },
+            'task-models sidecar: duplicate fallback entry (matches the main assignment or an earlier entry) — entry dropped',
           );
-        } else if (policyProfile !== undefined && policyProfile.customHint === 'none') {
-          // CR-016: the model is not customizable (on/off-only or non-injectable
-          // family) — a stored custom value can never be sent; drop it here so
-          // the resolver and the UI never see a dead policy.
-          getLogger().warn(
-            { slot, modelId: assignment.modelId },
-            'task-models sidecar: slot.thinkingCustom not supported by this model — custom policy ignored for this slot',
-          );
-        } else {
-          assignment.thinkingCustom = asString;
+          continue;
         }
+        seenRefs.add(refKey);
+        const entry: SlotFallbackEntry = { keyId: entryKey, modelId: entryModel };
+        const entryPolicy = readSlotPolicyFields(
+          raw,
+          entryPrefix,
+          entryModel,
+          { slot, entry: i },
+          `slot.fallbacks.${i}.thinking`,
+        );
+        if (entryPolicy.thinking !== undefined) entry.thinking = entryPolicy.thinking;
+        if (entryPolicy.thinkingCustom !== undefined) entry.thinkingCustom = entryPolicy.thinkingCustom;
+        chain.push(entry);
       }
+      if (chain.length > 0) assignment.fallbacks = chain;
       slots[slot] = assignment;
     }
     const result = Object.keys(slots).length > 0 ? slots : undefined;
@@ -506,8 +589,51 @@ function writeTaskModels(slots: ModelConfig['taskModels']): void {
     // modelConfigSaveSchema.parse on the save path.
     if (assignment.thinking) flat[`${slot}.thinking`] = assignment.thinking;
     if (assignment.thinkingCustom) flat[`${slot}.thinkingCustom`] = assignment.thinkingCustom;
+    // 09-12 子2 fallback chain (design §2): flat keys `${slot}.fallbacks.N.*`,
+    // written only when the assignment carries a chain — an existing sidecar
+    // without the keys round-trips unchanged (zero migration, the two-state
+    // write-side discipline: zero entries = keys stay absent). Entries arrive
+    // schema-validated here — writeTaskModels only runs after
+    // modelConfigSaveSchema.parse on the save path.
+    if (assignment.fallbacks?.length) {
+      assignment.fallbacks.forEach((entry, i) => {
+        flat[`${slot}.fallbacks.${i}.keyId`] = entry.keyId;
+        flat[`${slot}.fallbacks.${i}.modelId`] = entry.modelId;
+        if (entry.thinking) flat[`${slot}.fallbacks.${i}.thinking`] = entry.thinking;
+        if (entry.thinkingCustom) flat[`${slot}.fallbacks.${i}.thinkingCustom`] = entry.thinkingCustom;
+      });
+    }
   }
   atomicWriteFileSync(p, stringifyFlatYaml(flat), 'utf-8');
+}
+
+/**
+ * CR-18（09-12 子2 CR 批）：taskModels lenient 归一——slot 的 `fallbacks` 为**空数组**时
+ * 剥键（空链 ≡ 无链，slotAssignmentSchema `.min(1)` 二态契约的空侧），归一后再过
+ * modelConfigSaveSchema.parse。语义等价归一而非校验放宽：非空链照常严格 parse
+ *（`.min(1)` 对「链上条目」的约束原样保留），只是空数组不再砖死整次 parse（此前一个
+ * slot 携 `fallbacks: []` 的载荷 = 用户连无关设置都存不了）。
+ *
+ * 归一**单点**在本 helper：侧车 flat 读路径天然免疫（readTaskModelSlots 按
+ * `slot.fallbacks.N.*` 键连续扫描，手编 yaml 写 `fallbacks: []` 根本进不了 assignment
+ * ——空数组形态只可能经 save 载荷回流）；agent 投递侧 assignmentFallbackChain 的
+ * `?.length` 门保留为第二道（单处防御）。
+ */
+function normalizeTaskModelsForParse(config: ModelConfig): ModelConfig {
+  const taskModels = config?.taskModels;
+  if (!taskModels) return config;
+  let changed = false;
+  const normalized: NonNullable<ModelConfig['taskModels']> = {};
+  for (const [slot, assignment] of Object.entries(taskModels) as Array<[TaskModelSlot, SlotAssignment | undefined]>) {
+    if (assignment && Array.isArray(assignment.fallbacks) && assignment.fallbacks.length === 0) {
+      const { fallbacks: _empty, ...rest } = assignment;
+      normalized[slot] = rest;
+      changed = true;
+    } else {
+      normalized[slot] = assignment;
+    }
+  }
+  return changed ? { ...config, taskModels: normalized } : config;
 }
 
 /* ── Research net proxy sidecar (Story 3.6 WP2, R13 / design D6) ── */
@@ -637,29 +763,232 @@ function readKeyFile(filePath: string): ApiKeyEntry | null {
 
     const name = typeof raw.name === 'string' ? raw.name : id;
     const protocol = readProtocol(raw.protocol);
-    const baseUrl = typeof raw.baseUrl === 'string' ? raw.baseUrl : '';
-    const apiKey = typeof raw.apiKey === 'string' ? decrypt(raw.apiKey) : '';
+    // 09-12 agy provider：CLI 键的 baseUrl/apiKey 不落盘（写侧分支），缺席读回
+    // undefined；HTTP 键两行恒在场（旧文件逐字节不变）。cliExecutable 仅 CLI 键携带。
+    const cliExecutable =
+      typeof raw.cliExecutable === 'string' && raw.cliExecutable.trim()
+        ? raw.cliExecutable.trim()
+        : undefined;
+    const baseUrl = typeof raw.baseUrl === 'string' ? raw.baseUrl : undefined;
+    const apiKey = typeof raw.apiKey === 'string' ? decrypt(raw.apiKey) : undefined;
+
+    // 09-12 子3（design §7 读侧 lenient）：传输面四键 + 模型 defaults/extraBody/pricing
+    // 按缺席处理一切病态形态（mirror readCapability 风格——盘上手改坏值不炸加载，
+    // save 面 refine 才是强闸）。二态布尔只认 true（false ≡ ABSENT）。CR-5：lenient
+    // 丢弃不再零诊断——每个「在场但不可用」的值 warn 留痕（坏值静默变缺席 = 用户配置
+    // 神秘丢失无迹可查）。
+    const warnCtx = { keyId: id, file: path.basename(filePath) };
+    const customHeaders = readCustomHeaders(raw, warnCtx);
+    const timeoutSeconds = readTimeoutSeconds(raw.timeoutSeconds, warnCtx);
+    const streamingDisabled = raw.streamingDisabled === true || raw.streamingDisabled === 'true';
+    const verifySsl = raw.verifySsl === true || raw.verifySsl === 'true';
 
     const models: ApiKeyEntry['models'] = [];
     for (let i = 0; ; i++) {
       const modelId = raw[`models.${i}.id`];
       if (typeof modelId !== 'string' || !modelId) break;
+      const defaults = readModelDefaults(raw, i, { ...warnCtx, modelIndex: i });
+      const extraBody = readModelExtraBody(raw[`models.${i}.extraBody`], { ...warnCtx, modelIndex: i });
+      const pricing = readModelPricing(raw, i, { ...warnCtx, modelIndex: i });
       models.push({
         id: modelId,
         capability: readCapability(raw[`models.${i}.capability`]),
         alias: typeof raw[`models.${i}.alias`] === 'string' ? raw[`models.${i}.alias`] as string : modelId,
         enabled: raw[`models.${i}.enabled`] === true || raw[`models.${i}.enabled`] === 'true',
+        ...(defaults ? { defaults } : {}),
+        ...(extraBody ? { extraBody } : {}),
+        ...(pricing ? { pricing } : {}),
       });
     }
 
-    return { id, name, protocol, baseUrl, apiKey, models };
+    return {
+      id,
+      name,
+      protocol,
+      baseUrl,
+      apiKey,
+      models,
+      ...(cliExecutable ? { cliExecutable } : {}),
+      ...(Object.keys(customHeaders).length > 0 ? { customHeaders } : {}),
+      ...(timeoutSeconds !== undefined ? { timeoutSeconds } : {}),
+      ...(streamingDisabled ? { streamingDisabled } : {}),
+      ...(verifySsl ? { verifySsl } : {}),
+    };
   } catch {
     return null;
   }
 }
 
+/**
+ * 子3：flat 键 `headers.<Name>` 连续收集——lenient 读侧三道闸（CR-2/CR-3 09-12 子3
+ * CR 批，全部与 save 面单源）：
+ * 1. 名过 `customHeaderNameSchema`（token 子集正则单源 import——手抄正则与 schema 漂移
+ *    是 CR-3 的第二半）；2. 名过 `BLOCKED_CUSTOM_HEADER_NAMES`（wire 序列化关键头黑名单
+ *    同源 import——手改盘文件的 Authorization/Host 不得零过滤零日志地骑进该 key 的每个
+ *    请求）；3. 值过 `customHeaderValueSchema`（控制字符/超长——CR/LF 进 undici
+ *    Headers.set 抛错 = 该 key 全请求死，CR-17 复发级）。
+ * 数值/布尔形态宽容回 String（手编 yaml 不加引号的 header 值）。丢弃一律 warn（CR-5）。
+ */
+function readCustomHeaders(
+  raw: ReturnType<typeof parseFlatYaml>,
+  warnCtx: Record<string, unknown>,
+): Record<string, string> {
+  const headers: Record<string, string> = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (!key.startsWith('headers.')) continue;
+    const name = key.slice('headers.'.length);
+    if (!customHeaderNameSchema.safeParse(name).success) {
+      getLogger().warn(
+        { ...warnCtx, name },
+        'key file: illegal custom header name — header dropped (save face rejects it loudly; fix the file)',
+      );
+      continue;
+    }
+    if (BLOCKED_CUSTOM_HEADER_NAMES.has(name.toLowerCase())) {
+      getLogger().warn(
+        { ...warnCtx, name },
+        'key file: custom header name is a wire-serialization header (blocked) — header dropped',
+      );
+      continue;
+    }
+    const asString =
+      typeof value === 'string'
+        ? value
+        : typeof value === 'number' || typeof value === 'boolean'
+          ? String(value)
+          : null;
+    if (asString === null) {
+      getLogger().warn(
+        { ...warnCtx, name },
+        'key file: custom header value is not a usable scalar — header dropped',
+      );
+      continue;
+    }
+    if (!customHeaderValueSchema.safeParse(asString).success) {
+      getLogger().warn(
+        { ...warnCtx, name },
+        'key file: illegal custom header value (control characters / over 8192 chars) — header dropped',
+      );
+      continue;
+    }
+    headers[name] = asString;
+  }
+  return headers;
+}
+
+/**
+ * 子3 per-key 超时读（CR-4/CR-7 09-12 子3 CR 批）：正整数 + 域上界（KEY_TIMEOUT_SECONDS
+ * 单源——9999999 这种数日级 abort 窗按缺席处理）。在场但非法 → warn（CR-5）。
+ */
+function readTimeoutSeconds(value: unknown, warnCtx: Record<string, unknown>): number | undefined {
+  if (value === undefined) return undefined;
+  const usable =
+    typeof value === 'number' &&
+    Number.isInteger(value) &&
+    value >= KEY_TIMEOUT_SECONDS_RANGE.min &&
+    value <= KEY_TIMEOUT_SECONDS_RANGE.max;
+  if (!usable) {
+    getLogger().warn(
+      { ...warnCtx, value: String(value), max: KEY_TIMEOUT_SECONDS_RANGE.max },
+      'key file: illegal timeoutSeconds — treated as absent (must be an integer within the allowed range)',
+    );
+    return undefined;
+  }
+  return value;
+}
+
+/** 子3 模型默认参数六字段（与 modelDefaultsSchema 字段名同源；数值域 = MODEL_DEFAULT_RANGES 单源，CR-7）。 */
+const MODEL_DEFAULT_FIELDS = ['temperature', 'topP', 'frequencyPenalty', 'presencePenalty', 'contextWindow', 'maxOutputTokens'] as const;
+
+function readModelDefaults(
+  raw: ReturnType<typeof parseFlatYaml>,
+  index: number,
+  warnCtx: Record<string, unknown>,
+): ApiKeyEntry['models'][number]['defaults'] {
+  const collected: Record<string, number> = {};
+  for (const field of MODEL_DEFAULT_FIELDS) {
+    const value = raw[`models.${index}.defaults.${field}`];
+    if (value === undefined) continue;
+    const range = MODEL_DEFAULT_RANGES[field];
+    // CR-4：contextWindow/maxOutputTokens 是 int 字段——0/负/小数进链路会把预算/压缩
+    // 红线数学毒化到 0（读侧 finite-only 放行是三处链路的源头洞）。CR-7：范围外
+    // （temperature 99 → 每请求 400）同样按缺席 + warn。
+    const usable =
+      typeof value === 'number' &&
+      Number.isFinite(value) &&
+      (!range.integer || Number.isInteger(value)) &&
+      value >= range.min &&
+      value <= range.max;
+    if (!usable) {
+      getLogger().warn(
+        { ...warnCtx, field, value: String(value) },
+        'key file: illegal model default value — field dropped (out of the schema domain)',
+      );
+      continue;
+    }
+    collected[field] = value;
+  }
+  return Object.keys(collected).length > 0 ? collected : undefined;
+}
+
+/** 子3：extraBody 单键 JSON-string（flat YAML dotted-key 无法忠实承载嵌套 JSON——design §4.3）。非对象产物按缺席。 */
+function readModelExtraBody(
+  value: unknown,
+  warnCtx: Record<string, unknown>,
+): ApiKeyEntry['models'][number]['extraBody'] {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || !value.trim()) {
+    getLogger().warn(warnCtx, 'key file: illegal extraBody form — treated as absent');
+    return undefined;
+  }
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      getLogger().warn(warnCtx, 'key file: extraBody is not a JSON object — treated as absent');
+      return undefined;
+    }
+    return parsed as Record<string, unknown>;
+  } catch {
+    // 坏 JSON 按缺席（warn 留痕，CR-5——静默丢弃让盘上配置神秘消失无迹可查）。
+    getLogger().warn(warnCtx, 'key file: extraBody is broken JSON — treated as absent');
+    return undefined;
+  }
+}
+
+/** 子3 模型单价三字段（per 1M tokens，纯数字；域 = MODEL_PRICING_RANGE 单源，CR-7）。 */
+const MODEL_PRICING_FIELDS = ['inputPerMillion', 'outputPerMillion', 'cachedInputPerMillion'] as const;
+
+function readModelPricing(
+  raw: ReturnType<typeof parseFlatYaml>,
+  index: number,
+  warnCtx: Record<string, unknown>,
+): ApiKeyEntry['models'][number]['pricing'] {
+  const collected: Record<string, number> = {};
+  for (const field of MODEL_PRICING_FIELDS) {
+    const value = raw[`models.${index}.pricing.${field}`];
+    if (value === undefined) continue;
+    const usable =
+      typeof value === 'number' &&
+      Number.isFinite(value) &&
+      value >= MODEL_PRICING_RANGE.min &&
+      value <= MODEL_PRICING_RANGE.max;
+    if (!usable) {
+      getLogger().warn(
+        { ...warnCtx, field, value: String(value) },
+        'key file: illegal model pricing value — field dropped (must be a non-negative finite number)',
+      );
+      continue;
+    }
+    collected[field] = value;
+  }
+  return Object.keys(collected).length > 0 ? collected : undefined;
+}
+
 function readProtocol(value: unknown): ModelProtocol {
-  return value === 'anthropic-compatible' ? 'anthropic-compatible' : 'openai-compatible';
+  // 09-12 agy provider：第三枚举成员原样透传——读侧吞掉会把 CLI 键静默降级成
+  // 空 baseUrl 的 openai-compatible（生成必炸且难溯源）。
+  if (value === 'anthropic-compatible' || value === 'antigravity-cli') return value;
+  return 'openai-compatible';
 }
 
 function readCapability(value: unknown): ModelCapability {
@@ -689,19 +1018,57 @@ function writeModelConfig(config: ModelConfig): void {
 
   // Write each key
   for (const key of config.keys) {
-    const apiKey = key.apiKey || existingById.get(key.id)?.apiKey || '';
-    const flat: Record<string, string | number | boolean | null> = {
+    const flat: Record<string, FlatConfigValue> = {
       id: key.id,
       name: key.name,
       protocol: key.protocol,
-      baseUrl: key.baseUrl,
-      apiKey: encrypt(apiKey),
     };
+    if (key.protocol === 'antigravity-cli') {
+      // 09-12 agy provider：CLI 键不落 HTTP 凭据（schema 形态互斥的盘面镜像），
+      // cliExecutable 是该形态的判别载荷。模型列表与 HTTP 键同形。
+      if (key.cliExecutable) flat.cliExecutable = key.cliExecutable;
+    } else {
+      // HTTP 键写入序（id/name/protocol/baseUrl/apiKey）与旧实现逐键一致——旧文件字节不变。
+      const apiKey = key.apiKey || existingById.get(key.id)?.apiKey || '';
+      flat.baseUrl = key.baseUrl ?? '';
+      flat.apiKey = encrypt(apiKey);
+      // 09-12 子3：传输面三键（headers 平铺 `headers.<Name>` / timeoutSeconds /
+      // streamingDisabled）——条件展开，二态不落空值（CLI 键 refine 拒收这三个字段，
+      // 只可能出现在 HTTP 分支）。verifySsl 在分支外两形态共写（CLI 容忍——refine 放行，
+      // 无消费面）。CR-6：header 字符串值一律 flatQuoted（写侧引号包裹）——裸写时
+      // yes/no/true/false/null/精确数值族的字符串会被 parseScalar 重释成布尔/数值/null
+      // （'null' 直接丢头），引号形态经 JSON 对称还原逐字保真。
+      if (key.customHeaders && Object.keys(key.customHeaders).length > 0) {
+        for (const [headerName, headerValue] of Object.entries(key.customHeaders)) {
+          flat[`headers.${headerName}`] = flatQuoted(headerValue);
+        }
+      }
+      if (typeof key.timeoutSeconds === 'number') flat.timeoutSeconds = key.timeoutSeconds;
+      if (key.streamingDisabled === true) flat.streamingDisabled = true;
+    }
+    if (key.verifySsl === true) flat.verifySsl = true;
     key.models.forEach((model, i) => {
       flat[`models.${i}.id`] = model.id;
       flat[`models.${i}.capability`] = model.capability;
       flat[`models.${i}.alias`] = model.alias;
       flat[`models.${i}.enabled`] = model.enabled;
+      // 09-12 子3：模型默认参数 / extraBody（单键 JSON-string——flat dotted-key 无法
+      // 忠实承载嵌套 JSON）/ 单价——全部条件展开（缺席字段不落键，旧文件字节不变）。
+      if (model.defaults) {
+        for (const field of MODEL_DEFAULT_FIELDS) {
+          const value = model.defaults[field];
+          if (typeof value === 'number') flat[`models.${i}.defaults.${field}`] = value;
+        }
+      }
+      if (model.extraBody && Object.keys(model.extraBody).length > 0) {
+        flat[`models.${i}.extraBody`] = JSON.stringify(model.extraBody);
+      }
+      if (model.pricing) {
+        for (const field of MODEL_PRICING_FIELDS) {
+          const value = model.pricing[field];
+          if (typeof value === 'number') flat[`models.${i}.pricing.${field}`] = value;
+        }
+      }
     });
     atomicWriteFileSync(path.join(keysDir, `${key.id}.yaml`), stringifyFlatYaml(flat), 'utf-8');
   }
@@ -853,6 +1220,9 @@ function readUserPreferences(): UserPreferencesConfig {
             : DEFAULT_USER_PREFERENCES.wallpaperFrostBlur,
       // R8 全局界面缩放：读路径钳回合法带（0.85–1.3）；非法/缺键回默认 1（存量文件零迁移）。
       interfaceScale: clampInterfaceScale(raw?.interfaceScale),
+      // 09-12 usage-panel R5 用量保留窗：读路径钳回合法带 [7,730]（UI 输入框约束，但
+      // flat YAML 可手改）；非法/缺键回默认 90（存量文件零迁移，interfaceScale 同款）。
+      usageRetentionDays: clampUsageRetentionDays(raw?.usageRetentionDays),
     };
   } catch {
     return { ...DEFAULT_USER_PREFERENCES };
@@ -901,6 +1271,12 @@ function writeUserPreferences(config: UserPreferencesConfig): void {
   // 钳回合法带；NaN/Infinity 仍不写键（盘面保持干净可手改）。
   if (typeof config.interfaceScale === 'number' && Number.isFinite(config.interfaceScale)) {
     flat.interfaceScale = clampInterfaceScale(config.interfaceScale);
+  }
+  // 09-12 usage-panel R5：用量保留窗**写时钳制** [7,730]（clamp-before-persist 保磁盘
+  // 恒合法——越界值不先落盘，mirror interfaceScale 先例）；NaN/Infinity 不写键（盘面
+  // 保持干净可手改）。
+  if (typeof config.usageRetentionDays === 'number' && Number.isFinite(config.usageRetentionDays)) {
+    flat.usageRetentionDays = clampUsageRetentionDays(config.usageRetentionDays);
   }
   atomicWriteFileSync(p, stringifyFlatYaml(flat), 'utf-8');
 }
@@ -1306,8 +1682,10 @@ export function registerConfigIpc() {
   ipcMain.handle('config:save-model', async (_, config: ModelConfig) => {
     // Capture the PRE-save embedding-model designation, then persist. The parse
     // validates the renderer payload (and is the source of `after`).
+    // CR-18（09-12 子2 CR 批）：parse 前过 taskModels lenient 归一——slot 的空
+    // `fallbacks: []` 归一为缺席（空链 ≡ 无链），不砖死整次 parse；非空链严格面不变。
     const before = readModelConfig();
-    const parsed = modelConfigSaveSchema.parse(config);
+    const parsed = modelConfigSaveSchema.parse(normalizeTaskModelsForParse(config));
     writeModelConfig(parsed);
 
     // CR-01/AC7: if the embedding-model designation changed, reindex every

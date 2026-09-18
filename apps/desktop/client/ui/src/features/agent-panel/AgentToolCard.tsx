@@ -5,9 +5,15 @@ import { toolPresentation, toolLabel, toolSummary } from './toolMeta';
 
 type Props = {
   result: { toolId?: string; toolName?: string; output?: string; metadata?: unknown };
+  /**
+   * 子4 W6（design §8）：「桥」徽标——本次工具调用经 MCP 工具桥（agy 侧循环）执行的
+   * 会话级标注（caller 用 useAgyBridgeLaneActive 派生 + childTag 排除传入）。缺省
+   * undefined = 普通车道零变化。
+   */
+  bridge?: boolean;
 };
 
-export function AgentToolCard({ result }: Props) {
+export function AgentToolCard({ result, bridge }: Props) {
   const resolvedLocale = useAppStore((s) => s.resolvedLocale);
   const { t } = useI18n(resolvedLocale);
   const imagePaths: string[] =
@@ -40,6 +46,11 @@ export function AgentToolCard({ result }: Props) {
         <>
           <span className="material-symbols-outlined agent-tool-card-icon" aria-hidden="true">{icon}</span>
           <span className="agent-tool-card-name">{label}</span>
+          {bridge && (
+            <span className="agent-tool-card-bridge-badge" title={t('agent.bridgeToolBadgeTitle')}>
+              {t('agent.bridgeToolBadge')}
+            </span>
+          )}
           {summary && <span className="agent-tool-card-summary" title={summary}>{summary}</span>}
           <span className={`agent-tool-card-status${isError ? ' agent-tool-card-status--error' : ''}`}>
             {isError ? '⚠' : '✓'}

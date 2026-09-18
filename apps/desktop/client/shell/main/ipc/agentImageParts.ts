@@ -367,6 +367,8 @@ async function relayImageDescription(
       resolved,
       {
         model: resolved.modelId,
+        // 09-12 usage-panel：识图转述 = vision-relay 流程标签（design §0 表）。
+        taskType: 'vision-relay',
         messages: [{
           role: 'user',
           content: [

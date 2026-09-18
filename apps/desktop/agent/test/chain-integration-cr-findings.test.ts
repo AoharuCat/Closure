@@ -8,7 +8,7 @@ import {
 import { runChain } from '../src/runtime/chainRunner';
 import {
   createChapterChainNodes,
-  CHAPTER_CHAIN_REVISION_LOOP,
+  CHAPTER_CHAIN_LOOPS,
 } from '../src/nodes/chapter-chain';
 import { registry } from '../src/tool/registry';
 import type { GenerateFn } from '../src/nodes/llm-node';
@@ -16,15 +16,15 @@ import type { SessionState } from '../src/types';
 import type { RunSnapshot } from '../src/contracts/run';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Story 7.4 BMad CR findings — 真链集成验证测试（2026-08-13）
+// Story 7.4 BMad CR findings — 真链集成验证测试（2026-08-13；链流程重排 W1d 按新链序对齐）
 //
 // **目的**：用真链（createChapterChainNodes 装全链 + runChain 驱动）验证三个 HIGH finding + 一个 MEDIUM
 // 的生产链行为修复。不 mock runChapterChain，只 mock LLM generate + 注册 spy tool。
 //
-// 三个 HIGH + 一个 MEDIUM（CR-001/002/003/004 修复后状态）：
-// - HIGH-1 FIXED：feedback-ledger-node 在生产链可达（移 route 前，through-break 不再阻断）
-// - HIGH-2 FIXED：completeness-verify-node 在生产链可达（移 route 前）
-// - HIGH-3 FIXED：redo 清 review.latest → targeted-revision skip（不再用过期 review 覆盖 splice）
+// 三个 HIGH + 一个 MEDIUM（CR-001/002/003/004 修复后状态；W1d 新链序下的重表达）：
+// - HIGH-1 FIXED：feedback-ledger-node 在生产链可达（E10 route 后自然前进；环回/escalate 延写）
+// - HIGH-2 FIXED：completeness-verify-node 在生产链可达（C6 环内，每圈跑）
+// - HIGH-3 lineage（W1d）：redo 前缀跳步停写手位重跑到链尾 + stale review/intent 不喂改稿
 // - MEDIUM-4 FIXED（code-level）：环 A splice 落盘 chapters/*.md（writeChapterTool 层 chapter_write）
 //
 // **关键约束**：每个测试明确断言 fixed 行为（reachable / not-overwritten），证明修复生效。
@@ -186,20 +186,35 @@ interface MakeGenerateOpts {
 
 /**
  * mock generate：按 system 标记路由 fixture JSON。system 标记对齐 prompts/*.yaml：
+ * - 「规划审核」→ brief-reviewer（A2，W1d 新节点）
  * - 「路由判决」→ route-agent
  * - 「保义裁判员」→ revision-guard L2
+ * - 「改稿意图编译器」→ revision-optimizer（C1，W1d 新节点）
  * - 「完整性审核」→ completeness-verify L2（**须在「审核」前**，否则被 multi-review 抢匹配）
- * - 「修订编辑」→ targeted-revision
  * - 「Reader-Audit」/「多维度」/「审核」→ multi-review
  * - 「状态提取」→ world-extractor（5 轴）
  * - 「涌现登记」→ promise-emergence
  * - 默认 → draft-writer
  */
+const PLAN_REVIEW_PASS = { verdict: 'pass', summary: '卡可写', findings: [] };
+const OPTIMIZER_INTENT = {
+  change: { summary: '补强主角动机' },
+  lockedItems: [],
+  rationale: { source: 'audit-finding', note: 'auto_revise A-trigger' },
+  provenance: {
+    rawUserInstruction: '据 Reader-Audit 审核发现修订本章明确缺陷（auto_revise route decision）',
+    compilerNote: '环内 C1 编译',
+  },
+};
+
 function makeGenerate(opts: MakeGenerateOpts = {}): ReturnType<typeof vi.fn<GenerateFn>> {
   const routeDecisions = opts.routeDecisions ?? ['accept_as_truth'];
   let routeIdx = 0;
   return vi.fn<GenerateFn>(async (_msgs, sys) => {
     const s = sys ?? '';
+    if (s.includes('规划审核')) {
+      return { content: JSON.stringify(PLAN_REVIEW_PASS), finishReason: 'stop' };
+    }
     if (s.includes('路由判决')) {
       const decision = routeDecisions[Math.min(routeIdx, routeDecisions.length - 1)];
       routeIdx += 1;
@@ -209,15 +224,13 @@ function makeGenerate(opts: MakeGenerateOpts = {}): ReturnType<typeof vi.fn<Gene
     if (s.includes('保义裁判员')) {
       return { content: JSON.stringify({ verdict: 'clean', findings: [], summary: '保义通过' }), finishReason: 'stop' };
     }
+    // revision-optimizer（C1 环回圈编译）—— anchorless intent（yaml 契约不产 scope）
+    if (s.includes('改稿意图编译器')) {
+      return { content: JSON.stringify(OPTIMIZER_INTENT), finishReason: 'stop' };
+    }
     // completeness-verify L2 —— 须在 multi-review「审核」前匹配（含「审核」子串）
     if (s.includes('完整性审核')) {
       return { content: JSON.stringify(COMPLETENESS_RESULT), finishReason: 'stop' };
-    }
-    if (s.includes('修订编辑')) {
-      return {
-        content: JSON.stringify({ title: '修订章', text: 'TARGETED_REVISION_OVERWRITE_MARKER', wordCount: 100, revisionNotes: ['据旧 review 修订'] }),
-        finishReason: 'stop',
-      };
     }
     if (s.includes('Reader-Audit') || s.includes('多维度') || s.includes('审核')) {
       return { content: JSON.stringify(REVIEW_RESULT), finishReason: 'stop' };
@@ -242,10 +255,11 @@ function makeGenerate(opts: MakeGenerateOpts = {}): ReturnType<typeof vi.fn<Gene
 /** 从 generate mock 调用序列抽取 system 标记类型（用于验证节点执行序）。 */
 function classifyCall(sys: unknown): string {
   const s = typeof sys === 'string' ? sys : '';
+  if (s.includes('规划审核')) return 'brief-reviewer';
   if (s.includes('路由判决')) return 'route';
   if (s.includes('保义裁判员')) return 'revision-guard';
+  if (s.includes('改稿意图编译器')) return 'revision-optimizer';
   if (s.includes('完整性审核')) return 'completeness-verify';
-  if (s.includes('修订编辑')) return 'targeted-revision';
   if (s.includes('Reader-Audit') || s.includes('多维度') || s.includes('审核')) return 'multi-review';
   if (s.includes('状态提取')) return 'world-extractor';
   // 须在「涌现登记」前：story-sync system 防线规则 7 明文提及「涌现登记」（禁止项）。
@@ -267,7 +281,7 @@ async function runChainFull(
   overrides: {
     initialArtifacts?: Record<string, unknown>;
     resumedCompletedNodes?: string[];
-    revisionLoop?: { from: string; through: string; cap: number };
+    loops?: Array<{ from: string; through: string; cap: number }>;
   } = {},
 ): Promise<RunSnapshot> {
   const session = makeSession();
@@ -276,7 +290,7 @@ async function runChainFull(
       chain: createChapterChainNodes(generate, undefined, session),
       initialArtifacts: overrides.initialArtifacts ?? makeInitialArtifacts(),
       requirement: '',
-      revisionLoop: overrides.revisionLoop ?? CHAPTER_CHAIN_REVISION_LOOP,
+      loops: overrides.loops ?? CHAPTER_CHAIN_LOOPS,
       ...(overrides.resumedCompletedNodes ? { resumedCompletedNodes: overrides.resumedCompletedNodes } : {}),
     },
     {
@@ -291,47 +305,50 @@ async function runChainFull(
 // HIGH-1 FIXED：feedback-ledger-node 在生产链可达（移 route 前后对比）
 // ════════════════════════════════════════════════════════════════════════════
 
-describe('HIGH-1 FIXED: feedback-ledger-node 在生产链可达（BMad CR-001 fix）', () => {
+describe('HIGH-1 FIXED: feedback-ledger-node 在生产链可达（BMad CR-001 fix；W1d 挪 E10 终态一次写）', () => {
   beforeEach(() => {
     feedbackLedgerWriteCalls.length = 0;
   });
 
-  it('route=accept_as_truth（终态）→ feedback_ledger_write 被调用（route 移链尾后 pre-route 节点可达）', async () => {
+  it('route=accept_as_truth（终态）→ feedback_ledger_write 被调用（E10 在 route 后自然前进可达）', async () => {
     const generate = makeGenerate({ routeDecisions: ['accept_as_truth'] });
     const snapshot = await runChainFull(generate);
 
-    // CR-001 fix：route 是链尾 through 节点。pre-route 节点（含 feedback-ledger idx15）在 through-break 前跑完。
+    // W1d：route accept 后自然前进提取段，feedback-ledger（E10）终态一次写——三输入
+    // （环终态 review.latest + completeness + E3 emotion）在 E 段末点齐。
     expect(snapshot.status).toBe('completed');
     expect(snapshot.completedNodes).toContain('route-agent');
-    // feedback-ledger-node 在 completedNodes（修复前不可达，修复后可达）
     expect(snapshot.completedNodes).toContain('feedback-ledger-node');
 
-    // feedback_ledger_write spy 被调用 → HIGH-1 FIXED
+    // feedback_ledger_write spy 被调用 → HIGH-1 FIXED（提取段可达性）
     expect(feedbackLedgerWriteCalls.length).toBeGreaterThan(0);
 
     // feedback_ledger artifact 产出
     expect(snapshot.artifacts['feedback_ledger']).toBeDefined();
   });
 
-  it('route=auto_revise（break）→ feedback_ledger_write 被调用（pre-route 节点在 through-break 前）', async () => {
+  it('route=auto_revise（W1a 链内回环 + cap 耗尽强制 escalate-pause）→ E10 不跑（环体不含 E 段，账延到 resume-accept 后写）', async () => {
     const generate = makeGenerate({ routeDecisions: ['auto_revise'] });
     const snapshot = await runChainFull(generate);
 
-    // auto_revise → break（status=auto_revise_pending），但 feedback-ledger 在 route 前 → 已跑完
-    expect(snapshot.status).toBe('auto_revise_pending');
-    expect(snapshot.completedNodes).toContain('feedback-ledger-node');
-
-    // feedback_ledger_write spy 被调用 → HIGH-1 FIXED（auto_revise 路径也可达）
-    expect(feedbackLedgerWriteCalls.length).toBeGreaterThan(0);
+    // W1a+W1d：auto_revise 链内回环 3 次后 cap 耗尽 → 强制 escalate → escalate-pause（break）。
+    // feedback-ledger 在 E10（route 后提取段末）——环体 [revision-optimizer..route] 不含它，环回零重写；
+    // escalate-pause break 时 E 段未跑 → feedback 账**延到 resume-accept 后**（裁决 accept 续跑 E 段才写）。
+    expect(snapshot.status).toBe('paused');
+    expect(snapshot.escalatePause).toBe(true);
+    expect(snapshot.completedNodes).not.toContain('feedback-ledger-node');
+    expect(feedbackLedgerWriteCalls.length).toBe(0);
   });
 
-  it('route=escalate_user（终态）→ feedback_ledger_write 被调用', async () => {
+  it('route=escalate_user（灰区）→ E10 不跑（escalate-pause break；resume-accept 后续跑补写）', async () => {
     const generate = makeGenerate({ routeDecisions: ['escalate_user'] });
     const snapshot = await runChainFull(generate);
 
-    expect(snapshot.status).toBe('completed');
-    expect(snapshot.completedNodes).toContain('feedback-ledger-node');
-    expect(feedbackLedgerWriteCalls.length).toBeGreaterThan(0);
+    // W1a R4b：escalate → escalate-pause（status=paused + 标记）；E 段未跑——账延到裁决 accept 续跑
+    expect(snapshot.status).toBe('paused');
+    expect(snapshot.escalatePause).toBe(true);
+    expect(snapshot.completedNodes).not.toContain('feedback-ledger-node');
+    expect(feedbackLedgerWriteCalls.length).toBe(0);
   });
 });
 
@@ -356,77 +373,75 @@ describe('HIGH-2 FIXED: completeness-verify-node 在生产链可达（BMad CR-00
     expect(snapshot.artifacts['completeness_verify_result']).toBeDefined();
   });
 
-  it('route=auto_revise → completeness-verify L2 generate 被调用', async () => {
-    const generate = makeGenerate({ routeDecisions: ['auto_revise'] });
+  it('route=auto_revise（W1a 链内回环）→ completeness-verify L2 generate 被调用（环体每轮跑）', async () => {
+    const generate = makeGenerate({ routeDecisions: ['auto_revise', 'accept_as_truth'] });
     const snapshot = await runChainFull(generate);
 
-    expect(snapshot.status).toBe('auto_revise_pending');
+    // W1a：auto_revise 链内回环一次 → 二判 accept 终态；completeness-verify 在环体内每轮跑（2 次）
+    expect(snapshot.status).toBe('completed');
     expect(snapshot.completedNodes).toContain('completeness-verify-node');
 
     const sequence = getCallSequence(generate);
-    expect(sequence).toContain('completeness-verify');
+    expect(sequence.filter((c) => c === 'completeness-verify').length).toBe(2);
     expect(snapshot.artifacts['completeness_verify_result']).toBeDefined();
   });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
-// HIGH-3 FIXED：redo 清 review.latest → targeted-revision skip（不再覆盖 splice）
+// HIGH-3 lineage（链流程重排 W1d）：redo 语义按新链序重表达——targeted-revision 退役，
+// CR-003 的「过期 review 不喂改稿」防线由 revision-optimizer no-op（redo 清 review.latest 后）
+// + 多审重跑天然覆盖；本组钉死 M3 redo 移除边界（写手位重跑到链尾）+ 环计数重置。
 // ════════════════════════════════════════════════════════════════════════════
 
-describe('HIGH-3 FIXED: redo 清 review.latest → targeted-revision skip（BMad CR-003 fix）', () => {
-  // 链序（chapter-chain.ts CHAPTER_CHAIN_NODE_IDS，C1.2 lint-node 插入后）：
-  // 0 brief-compiler / 1 draft-writer / 2 revision-guard / 3 lint-node（C1.2）/ 4-8 world-extractor×5 /
-  // 9 world-merge / 10 emotion-verify / 11 promise-emergence / 12 arc-emergence / 13 chapter-summary /
-  // 14 storytime-drift / 15 mention-ledger / 16 story-sync / 17 targeted-revision / 18 multi-review /
-  // 19 completeness-verify / 20 feedback-ledger / 21 route
+describe('HIGH-3 lineage（W1d 新链 redo 语义）：写手位重跑到链尾 + stale review/intent 不喂改稿', () => {
+  // 链序（chapter-chain.ts CHAPTER_CHAIN_NODE_IDS，W1d）：
+  // 0 brief-compiler / 1 brief-reviewer / 2 revision-optimizer / 3 draft-writer / 4 revision-guard /
+  // 5 lint / 6 multi-review / 7 completeness / 8 route（环 through）/ 9-13 world×5 / 14 merge /
+  // 15 emotion / 16 promise / 17 arc / 18 summary / 19 storytime / 20 mention / 21 story-sync /
+  // 22 feedback-ledger
   //
-  // revisionLoop = {from: targeted-revision(17), through: route(21), cap: 3}
+  // loops = [规划环 {0..1} cap2, 自审环 {2..8} cap3]
   //
-  // CR-003 fix：redo 时清 review.latest artifact（workflow.ts redo path L862+）→ targeted-revision(17)
-  // shouldSkip(!review.latest) 跳过 → multi-review(18) 重跑产新 review → route(21) 重判。
-  //
-  // chain-integration 测试 limitation：runChain 直调不经 workflow.ts redo path（redo 清 review.latest 在
-  // workflow.ts runChapterChain 内）。本测试组**模拟 CR-003 fix 效果**：redo 传 initialArtifacts 不含
-  // review.latest（mirror workflow.ts 清后效果），验 targeted-revision skip + draft.initial 不被覆盖。
+  // redo（mirror workflow.ts redo path：清 review.latest + 非 guardOverride 清 stale revision_intent）
+  // 移除 [draft-writer, revision-guard, multi-review, route] → 前缀跳步停在写手位（idx3）→
+  // 重跑到链尾（M3：A1/A2/C1 规划侧保留 completed——人审反馈针对正文非任务卡）。
 
-  it('首次 run: route=auto_revise → break + snapshot 含 review.latest + completedNodes 含全 pre-route 节点', async () => {
-    const generate = makeGenerate({ routeDecisions: ['auto_revise', 'accept_as_truth'] });
+  it('干净终态基底：route=accept → snapshot 含 review.latest + completedNodes 含全节点 + draft 为写手产出', async () => {
+    const generate = makeGenerate({ routeDecisions: ['accept_as_truth'] });
     const snapshot = await runChainFull(generate);
 
-    // auto_revise → break
-    expect(snapshot.status).toBe('auto_revise_pending');
+    expect(snapshot.status).toBe('completed');
     expect(snapshot.completedNodes).toContain('route-agent');
 
-    // review.latest 产出（multi-review idx13 跑了）
+    // review.latest 产出（multi-review 跑了）
     expect(snapshot.artifacts['review.latest']).toBeDefined();
 
-    // CR-001/002 fix：completeness-verify + feedback-ledger 在 completedNodes（route 前）
+    // W1d 提取段可达：completeness（C6 环内）+ feedback-ledger（E10 route 后）
     expect(snapshot.completedNodes).toContain('completeness-verify-node');
     expect(snapshot.completedNodes).toContain('feedback-ledger-node');
 
-    // draft.initial 是 draft-writer 产出（未被 targeted-revision 覆盖——首跑 review.latest 在 multi-review 后产，
-    // targeted-revision 在 multi-review 前首跑 skip）
+    // draft.initial 是 draft-writer 产出（首圈 C1 no-op 无改稿轮——targeted-revision 已退役）
     const draft = snapshot.artifacts['draft.initial'] as { text: string };
     expect(draft.text).toContain('DRAFT_WRITER_MARKER');
-    expect(draft.text).not.toContain('TARGETED_REVISION_OVERWRITE_MARKER');
   });
 
-  it('CR-003 fix 验证：redo 不传 review.latest（模拟 workflow 清理）→ targeted-revision skip（不重跑）', async () => {
-    const generate = makeGenerate({ routeDecisions: ['auto_revise', 'accept_as_truth'] });
+  it('redo（清 review.latest + stale revision_intent，mirror workflow redo path）→ 前缀跳步停在写手位重跑到链尾', async () => {
+    const generate = makeGenerate({ routeDecisions: ['accept_as_truth'] });
 
-    // 首次 run
+    // 首次 run（干净终态）
     const snapshot1 = await runChainFull(generate);
-    expect(snapshot1.status).toBe('auto_revise_pending');
+    expect(snapshot1.status).toBe('completed');
 
-    // 模拟 redo（mirror workflow.ts runChapterChain redo + CR-003 fix 清 review.latest）：
-    // 1. 从 snapshot1.completedNodes 移除 loopNodes（draft-writer+revision-guard+multi-review+route）
-    // 2. **CR-003 fix**：从 initialArtifacts 删 review.latest（mirror workflow.ts redo path 清理）
+    // 模拟 redo（mirror workflow.ts runChapterChain redo path）：
+    // 1. 从 snapshot1.completedNodes 移除 redo 目标节点（写手 + guard + multi-review + route）
+    // 2. 清 review.latest（CR-003 lineage：过期 review 不喂环）
+    // 3. 清 stale revision_intent（W1d：redo 不注入新意图时 C1 上圈编译产物不残留喂写手）
     const loopNodes = ['draft-writer-agent', 'revision-guard-agent', 'multi-review-agent', 'route-agent'];
     const resumedCompletedNodes = snapshot1.completedNodes.filter((id) => !loopNodes.includes(id));
 
-    // CR-003 fix 核心：清 review.latest（模拟 workflow.ts redo path effect）
     const redoArtifacts = { ...snapshot1.artifacts };
     delete redoArtifacts['review.latest'];
+    delete redoArtifacts['revision_intent'];
 
     const snapshot2 = await runChainFull(generate, {
       initialArtifacts: redoArtifacts,
@@ -435,72 +450,49 @@ describe('HIGH-3 FIXED: redo 清 review.latest → targeted-revision skip（BMad
 
     expect(snapshot2.status).toBe('completed');
 
-    // redo generate 调用序列（第二次 runChain 的调用）
+    // redo generate 调用序列（首次 run 11 calls 后）：
+    // writer(1) + multi-review(1) + completeness(1) + route(1) + world-ext(5) + story-sync(1) = 10。
+    // **C1 revision-optimizer 不重跑**（completed 前缀保留——M3 移除边界：规划侧 + C1 留 completed）；
+    // **brief-reviewer 不重跑**（规划环节点保留）；提取段重跑到链尾（story-sync 每轮重提取）。
     const allCalls = getCallSequence(generate);
+    const redoCalls = allCalls.slice(11);
+    expect(redoCalls).not.toContain('brief-reviewer');
+    expect(redoCalls).not.toContain('revision-optimizer');
+    expect(redoCalls.filter((c) => c === 'draft-writer')).toHaveLength(1);
+    expect(redoCalls).toContain('story-sync');
 
-    // CR-003 fix 核心断言：redo 不重跑 targeted-revision（review.latest 清 → shouldSkip=true → skip）
-    const redoCalls = allCalls.slice(10); // 首次 run 10 calls 后（completeness-verify 可达 + story-sync 2.2 WP-E）
-    expect(redoCalls).not.toContain('targeted-revision');
-
-    // draft.initial 保留 draft-writer 产出（未被 targeted-revision 过期 review 覆盖）
+    // draft.initial 为重跑写手产出（新链无 targeted-revision 覆盖面）
     const draft2 = snapshot2.artifacts['draft.initial'] as { text: string };
     expect(draft2.text).toContain('DRAFT_WRITER_MARKER');
-    expect(draft2.text).not.toContain('TARGETED_REVISION_OVERWRITE_MARKER');
+
+    // M3 环计数重置：redo 重入 = 新 runChain 调用 → 环 count 从 0 起算（本例 route accept 无回环，
+    // 计数语义在 chainRunner.test.ts W1a M3 用例钉死——此处链级验「重入可正常终态」不卡死）。
   });
 
-  it('CR-003 fix 对比：redo 保留 review.latest（模拟 fix 前）→ targeted-revision 重跑 + 覆盖 draft.initial', async () => {
-    // 本测试验「fix 前行为」——不清 review.latest 时 targeted-revision 重跑覆盖（证明 fix 必要性）。
-    const generate = makeGenerate({ routeDecisions: ['auto_revise', 'accept_as_truth'] });
+  it('redo 调用计数：首次 11 + redo 10 = 21（C1/规划侧前缀保留零重跑；提取段 redo 重收一次）', async () => {
+    const generate = makeGenerate({ routeDecisions: ['accept_as_truth'] });
 
-    // 首次 run
-    const snapshot1 = await runChainFull(generate);
-    expect(snapshot1.status).toBe('auto_revise_pending');
+    const baseline = await runChainFull(generate);
+    expect(baseline.status).toBe('completed');
 
-    // redo **不清** review.latest（模拟 CR-003 fix 前的旧行为）
     const loopNodes = ['draft-writer-agent', 'revision-guard-agent', 'multi-review-agent', 'route-agent'];
-    const resumedCompletedNodes = snapshot1.completedNodes.filter((id) => !loopNodes.includes(id));
-
-    const snapshot2 = await runChainFull(generate, {
-      initialArtifacts: snapshot1.artifacts, // 保留 review.latest（fix 前行为）
-      resumedCompletedNodes,
-    });
-
-    // fix 前行为：targeted-revision 重跑（review.latest 在）→ 覆盖 draft.initial
-    const draft2 = snapshot2.artifacts['draft.initial'] as { text: string };
-    expect(draft2.text).toContain('TARGETED_REVISION_OVERWRITE_MARKER');
-
-    // 证明 fix 前 targeted-revision 在 redo 调用序列中
-    const redoCalls = getCallSequence(generate).slice(10); // 首次 run 10 calls 后（story-sync 2.2 WP-E）
-    expect(redoCalls).toContain('targeted-revision');
-  });
-
-  it('redo 调用计数：首次 10 + redo 10 = 20（CR-003 fix 后 targeted-revision skip；story-sync 2.2 WP-E 每轮提取）', async () => {
-    const generate = makeGenerate({ routeDecisions: ['auto_revise', 'accept_as_truth'] });
-
-    // 首次 run
-    const snapshot1 = await runChainFull(generate);
-
-    // redo with CR-003 fix（清 review.latest）
-    const loopNodes = ['draft-writer-agent', 'revision-guard-agent', 'multi-review-agent', 'route-agent'];
-    const resumedCompletedNodes = snapshot1.completedNodes.filter((id) => !loopNodes.includes(id));
-    const redoArtifacts = { ...snapshot1.artifacts };
+    const resumedCompletedNodes = baseline.completedNodes.filter((id) => !loopNodes.includes(id));
+    const redoArtifacts = { ...baseline.artifacts };
     delete redoArtifacts['review.latest'];
-    await runChainFull(generate, {
+    delete redoArtifacts['revision_intent'];
+    const redoSnapshot = await runChainFull(generate, {
       initialArtifacts: redoArtifacts,
       resumedCompletedNodes,
     });
+    expect(redoSnapshot.status).toBe('completed');
 
-    // 首次（CR-001/002 fix 后 completeness-verify 可达；2.2 WP-E story-sync 激活）：
-    //   draft(1) + world-ext(5) + multi-review(1) + completeness-verify(1) + route(1) + story-sync(1) = 10
-    // redo（CR-003 fix 清 review.latest）：
-    //   draft(1) + world-ext(5) + multi-review(1) + completeness-verify(1) + route(1) + story-sync(1) = 10
-    //   （targeted-revision shouldSkip=true skip；revision-guard skip：无 revision_intent scope.anchor；
-    //    promise-emergence skip：无新 gap；story-sync 每轮重提取——中间轮喂连续性记忆，终轮供 WP-E 反哺）
-    const allCalls = getCallSequence(generate);
-    const redoCalls = allCalls.slice(10); // 首次 run 10 calls 后
-    expect(redoCalls).not.toContain('targeted-revision');
-    expect(redoCalls).toContain('story-sync');
-    expect(generate.mock.calls.length).toBe(20);
+    // 首次：brief-reviewer(1) + draft(1) + multi-review(1) + completeness(1) + route(1)
+    //      + world-ext(5) + story-sync(1) = 11（C1 首圈 no-op 零调用）
+    // redo：draft(1) + multi-review(1) + completeness(1) + route(1) + world-ext(5) + story-sync(1) = 10
+    //      （C1/brief-reviewer 前缀保留不重跑；guard 无 anchored 意图 skip 零调用）
+    expect(generate.mock.calls.length).toBe(21);
+    const redoCalls = getCallSequence(generate).slice(11);
+    expect(redoCalls.filter((c) => c === 'story-sync')).toHaveLength(1);
   });
 });
 

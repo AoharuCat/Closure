@@ -12,7 +12,7 @@
  *     → novelChapters 中 sortOrder === index 的章，且该章**携正文文件**（sections[0].contentFile
  *       非空串——见 readChapterContentFile）
  *     → openWriting(chapter)（features/editor/openWriting.ts——OverviewPage「继续写作」与
- *       SideNav 写作入口同款文件 tab 流：readFile + openFile，本面板复用同一出口）
+ *       写作页章节列同款文件 tab 流：readFile + openFile，本面板复用同一出口）
  *
  * 兜底：episode 归属全缺时回落 presentationOrder.chapter（阅读起始章 ordinal，schema 必填，
  * 与 episode.index 同一章序空间——workbenchLayout「章 = episode.index, derived not stored」）。

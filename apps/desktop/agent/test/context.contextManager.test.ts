@@ -76,7 +76,6 @@ describe('contextManager', () => {
       abort: new AbortController().signal,
     });
 
-    expect(result.cacheConfig.enablePromptCache).toBe(true);
     expect(result.cacheConfig.pinnedContent).toContain('Hero');
     expect(result.cacheConfig.pinnedContent).toContain('brave knight');
   });

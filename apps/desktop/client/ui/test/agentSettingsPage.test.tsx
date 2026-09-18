@@ -1,6 +1,6 @@
 /**
  * Agent 设置页 = 模型分工三段（dogfood 2026-08-21 #43 迁自模型配置页）：
- * 任务模型六档路由 + 向量/重排 sidecar 选择器。
+ * 任务模型档位路由（C3.2 六档 + 09-13 R1b 审核族细档四档）+ 向量/重排 sidecar 选择器。
  * 原「补丁模式」死开关（autoApplyPatches，零消费者）已整链退役，不再有对应 UI。
  *
  * 纯 props 渲染（t + modelConfig + setModelConfig），无 store/IPC 依赖。
@@ -34,11 +34,15 @@ function buildConfig(overrides: Partial<ModelConfig> = {}): ModelConfig {
 
 const tFake = (key: string) => key;
 
-// The six task-routing slot label keys (C3.2), in design §2 order.
+// The task-routing slot label keys (C3.2 + 09-13 R1b 审核族细档), in DEFS order.
 const TASK_SLOT_LABEL_KEYS = [
   'settings.taskSlotWriterSelfcheck',
   'settings.taskSlotWriterDraft',
   'settings.taskSlotReviewJudge',
+  'settings.taskSlotPlanReview',
+  'settings.taskSlotMultiReview',
+  'settings.taskSlotRouteJudge',
+  'settings.taskSlotRevisionGuard',
   'settings.taskSlotExtraction',
   'settings.taskSlotDispatch',
   'settings.taskSlotDialogue',
@@ -48,11 +52,11 @@ afterEach(() => cleanup());
 
 describe('AgentSettingsPage 模型分工（迁自模型配置页，dogfood #43）', () => {
   describe('task model slots', () => {
-    it('renders six slot selects, each defaulting to Auto with an empty value', () => {
+    it('renders ten slot selects (six + R1b fine review slots), each defaulting to Auto with an empty value', () => {
       const setModelConfig = vi.fn().mockResolvedValue(undefined);
       render(<AgentSettingsPage t={tFake} modelConfig={buildConfig()} setModelConfig={setModelConfig} />);
 
-      expect(TASK_SLOT_LABEL_KEYS).toHaveLength(6);
+      expect(TASK_SLOT_LABEL_KEYS).toHaveLength(10);
       for (const labelKey of TASK_SLOT_LABEL_KEYS) {
         const select = screen.getByLabelText(labelKey) as HTMLSelectElement;
         // "Auto" is the first option and carries the empty value.
@@ -210,6 +214,43 @@ describe('AgentSettingsPage 模型分工（迁自模型配置页，dogfood #43�
       fireEvent.change(select, { target: { value: 'garbage-no-separator' } });
 
       expect(setModelConfig).not.toHaveBeenCalled();
+    });
+
+    // ── 09-12 agy provider W4：CLI（antigravity-cli）模型进任务档指派面 ──
+
+    it('CLI model options carry the no-tools form badge and stay assignable to a slot', async () => {
+      const cliKey: ApiKeyEntry = {
+        id: 'key_cli',
+        name: 'Antigravity',
+        protocol: 'antigravity-cli',
+        cliExecutable: 'C:/agy/bin/agy.exe',
+        models: [
+          { id: 'gemini-3.8-pro-high', alias: 'Gemini 3.8 Pro (High)', capability: 'text', enabled: true },
+        ],
+      };
+      const setModelConfig = vi.fn().mockResolvedValue(undefined);
+      render(
+        <AgentSettingsPage
+          t={tFake}
+          modelConfig={buildConfig({ keys: [baseKey, cliKey] })}
+          setModelConfig={setModelConfig}
+        />,
+      );
+
+      const draftSelect = screen.getByLabelText('settings.taskSlotWriterDraft') as HTMLSelectElement;
+      const cliOption = Array.from(draftSelect.options).find((o) => o.value === 'key_cli::gemini-3.8-pro-high');
+      // 形态标识（H3 可见性的设置面防线）：指派时即知该形态无 Closure 工具面。
+      expect(cliOption?.textContent).toBe('Antigravity - Gemini 3.8 Pro (High) · settings.cliNoToolsBadge');
+      // HTTP 选项不带标识。
+      const httpOption = Array.from(draftSelect.options).find((o) => o.value === 'key_001::gpt-4o');
+      expect(httpOption?.textContent).toBe('GPT-4o - GPT-4o Omni');
+
+      await userEvent.selectOptions(draftSelect, 'key_cli::gemini-3.8-pro-high');
+      expect(setModelConfig).toHaveBeenCalledTimes(1);
+      const arg = setModelConfig.mock.calls[0][0] as ModelConfig;
+      expect(arg.taskModels).toEqual({
+        'writer-draft': { keyId: 'key_cli', modelId: 'gemini-3.8-pro-high' },
+      });
     });
   });
 

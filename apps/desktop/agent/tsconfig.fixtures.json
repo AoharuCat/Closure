@@ -1,0 +1,9 @@
+{
+  // 09-13 子2 CR 批（CR-6）：UI 镜像漂移守卫的 agent 侧编译 gate——主 tsconfig 不含 test/
+  //（既有测试类型松散，全量收编超本批范围），本 gate 只把 chainObservabilitySamples.ts
+  //（fixture 注解锚）纳入 tsc 程序。挂 package typecheck script（两次 tsc 串联）。
+  // 详见 test/fixtures/chainObservabilitySamples.ts 文件头对拍机制说明。
+  "extends": "./tsconfig.json",
+  "include": ["src", "test/fixtures/chainObservabilitySamples.ts"],
+  "exclude": ["node_modules", "dist"]
+}

@@ -153,17 +153,6 @@ const CONTRACTS: AgentContract[] = [
     outputSchemaName: 'reviewOutputSchema',
     qualityGates: ['has_verdict', 'findings_grounded'],
   },
-  {
-    id: 'targeted-revision-agent',
-    role: '定向修订',
-    goal: '根据审核意见修订指定内容',
-    owns: [],
-    reads: ['outline', 'episode_outlines', 'asset_cards', 'world_setting'],
-    must: ['仅修改指定部分'],
-    mustNot: ['全文重写', '忽略审核意见'],
-    outputSchemaName: 'revisionOutputSchema',
-    qualityGates: ['addresses_feedback'],
-  },
   // Story 4.0（ADR-17 反馈路由）：route-agent 判 route_decision（auto_revise/accept_as_truth/escalate_user）。
   // ADR-4 双重表示同步——本 CONTRACTS[] 条目镜像 prompts/route-agent.yaml（system 三档判据 + 创作意图优先）。
   //

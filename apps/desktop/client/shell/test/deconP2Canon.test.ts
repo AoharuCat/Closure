@@ -816,6 +816,72 @@ maybe('runDeconP2（db 编排）', () => {
     expect(listDeconCanonEntries(jobId).length).toBeGreaterThanOrEqual(6);
   });
 
+  it('CR-4（共享脚手架）：finishReason=length → 升帽 ×2 重试一次 → 重试通过域照常完成（note 相位可见）', async () => {
+    const created = createDeconJob({ materialId: MAT_ID, tier: 'coarse' }, jobDeps());
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    const jobId = created.job.jobId;
+    expect(startDeconJob(jobId, jobDeps()).ok).toBe(true);
+
+    const stats = { calls: [] as { slot: string; system: string }[] };
+    const base = mkP2Generate('flashback', stats);
+    const notes: string[] = [];
+    let recallCalls = 0;
+    const caps: number[] = [];
+    const gen: DeconGenerateText = async (input) => {
+      if ((input.system ?? '').includes('设定档案整理器')) {
+        recallCalls += 1;
+        caps.push(input.maxTokens ?? -1);
+        if (recallCalls === 1) return { text: '{"entries":', finishReason: 'length' as const }; // world 域首调截断
+      }
+      return base(input);
+    };
+    const result = await runDeconP2(jobId, {
+      generateText: gen,
+      readDerivedText: () => DERIVED,
+      now: () => NOW,
+      notify: (event) => {
+        if (event.note !== undefined) notes.push(event.note);
+      },
+    });
+    expect(result.status).toBe('done');
+    // world 域 1+1 调（截断→升帽重试过）+ rule/tone 各 1 调。
+    expect(recallCalls).toBe(4);
+    expect(caps[1]).toBe(caps[0]! * 2); // 重试帽 ×DECON_LLM_RETRY_ESCALATE
+    expect(notes.some((n) => n.includes('升帽重试'))).toBe(true); // 重试相位 note 可见
+    expect(getDeconJob(jobId)?.cost.byPass.p2?.calls).toBeGreaterThanOrEqual(4); // actual 各记各的
+    expect(getDeconPassState(jobId, 'p2', 'world')?.status).toBe('done');
+  });
+
+  it('CR-4（共享脚手架）：length 重试仍截断 → failed（canon 语义面）+ 两笔各记账 + 域挂起', async () => {
+    const created = createDeconJob({ materialId: MAT_ID, tier: 'coarse' }, jobDeps());
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    const jobId = created.job.jobId;
+    expect(startDeconJob(jobId, jobDeps()).ok).toBe(true);
+
+    const stats = { calls: [] as { slot: string; system: string }[] };
+    const base = mkP2Generate('flashback', stats);
+    let recallCalls = 0;
+    const gen: DeconGenerateText = async (input) => {
+      if ((input.system ?? '').includes('设定档案整理器')) {
+        recallCalls += 1;
+        return { text: '{"entries":', finishReason: 'length' as const };
+      }
+      return base(input);
+    };
+    const result = await runDeconP2(jobId, { generateText: gen, readDerivedText: () => DERIVED, now: () => NOW });
+    expect(result.status).toBe('failed'); // P2 截断语义 = failed（半程产物不可续），非 capped
+    if (result.status === 'failed') {
+      expect(result.message).toContain('截断');
+      expect(result.message).toContain('不落半程产物');
+    }
+    expect(recallCalls).toBe(2); // 升帽重试一次后诚实挂起
+    expect(getDeconPassState(jobId, 'p2', 'world')?.status).toBe('failed');
+    expect(getDeconJob(jobId)?.status).toBe('failed');
+    expect(getDeconJob(jobId)?.cost.byPass.p2?.calls).toBe(2); // 两笔 actual 各记（重试不绕记账）
+  });
+
   it('CR-3：画像分批——10 锚定角色 → 2 批串行（每批 ≤8）且全员带画像（单 prompt 装 25+ 角色的 length 炸域防线）', async () => {
     const persons = Array.from({ length: 10 }, (_, i) => `角色${i}`);
     replaceDeconEntities(MAT_REF, DERIVED_HASH, persons.map((name, i) => mkEntity(name, 'person', [], false, [[i % 3, 1]])));

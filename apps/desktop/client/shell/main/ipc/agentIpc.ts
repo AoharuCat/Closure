@@ -14,16 +14,26 @@ import {
   type CreateSessionInput,
   type ExecuteSkillRequest,
   type GenerateTextFn,
+  type GenerateTextRequest,
   type ExecuteToolFn,
+  assignmentContextWindowTokens,
+  setBridgeTurnFn,
+  setAgyBridgeModeResolver,
 } from '@orison/desktop-agent';
-import { handleGenerateText, handleGenerateTextStream, resolveModel } from './modelGatewayIpc';
+// 子4 W4（09-12 agy MCP 工具桥）：dialogue 桥车道生产实现（consent 硬门 + 模型解析 +
+// 注册表 live 监听）——本文件只做注入接线（mirror setGenerateTextFn 装配形态）。
+import { agyBridgeProductionDeps, createAgyBridgeLaneModeResolver, createAgyBridgeTurnProduction } from './agyBridgeIpc';
+import { enrichSlotAssignment, handleGenerateText, handleGenerateTextStream, resolveModel } from './modelGatewayIpc';
 import { installAgentImagePartsCore } from './agentImageParts';
 import { prepareVisionImage } from '../research/visionAnalysis';
 import { readModelConfigFromDisk, readTaskModelSlots, readUserPreferencesFromDisk } from './configIpc';
 import { handleToolExecute } from './toolExecution';
 import { normalizeProjectKey } from './pathGuard';
 import { getLogger } from '../logger';
-import { resolveModelInfo } from '@orison/shared-contracts';
+import {
+  generateTextPayloadSchema,
+  type GenerateTextPayload,
+} from '@orison/shared-contracts';
 
 const logger = getLogger();
 
@@ -52,13 +62,13 @@ export function getAgentRuntime(): WorkflowRuntime {
  */
 const streamAbortControllers = new Map<string, Set<AbortController>>();
 
-function registerStreamAbortController(sessionId: string, controller: AbortController): void {
+export function registerStreamAbortController(sessionId: string, controller: AbortController): void {
   const set = streamAbortControllers.get(sessionId);
   if (set) set.add(controller);
   else streamAbortControllers.set(sessionId, new Set([controller]));
 }
 
-function unregisterStreamAbortController(sessionId: string, controller: AbortController): void {
+export function unregisterStreamAbortController(sessionId: string, controller: AbortController): void {
   const set = streamAbortControllers.get(sessionId);
   if (!set) return;
   set.delete(controller);
@@ -190,6 +200,62 @@ export async function reconcileStaleProjectRuns(): Promise<void> {
 
 let registered = false;
 
+/**
+ * CR-16（09-12 子2 CR 批）：agent 缝 body 的 schema 校验门——此前 `as any` 直传使畸形
+ * 载荷（坏 thinking 投影的回退链条目等）绕过 generateTextPayloadSchema 直达协议层
+ * （schema 存在但从未 parse 真实载荷）。校验语义（校验-only 门，非改写管线）：
+ * - 严格 safeParse 直接过 → **原 body 原样过缝**（引用/未知键零改写——快径字节级语义
+ *   不变；sessionKey 等两态归一 agent 装配侧已做，parse 产物不取代原 body）。
+ * - 缝上载荷可含**指针形态 image part**（`{type:'image', image:{path, b64hash}}`——
+ *   agent 零 FS，b64/转述归一在网关 resolveImageParts，generationPartSchema 只认归一
+ *   后的 b64Json/mimeType 形态）：首轮失败后把 content 数组里的 image part 置为最小
+ *   合法占位复跑一次——复跑成功 = 偏差仅在图片载荷 → 原样放行（指针必须存活到
+ *   resolveImageParts；图片 part 自身的畸形由该层 degrade 语义兜底，非本门职责）。
+ * - 仍失败 = 真畸形 → 抛（走既有错误路径：reject 上抛，agent 侧 generate 调用点 /
+ *   runLoop catch 面不变）。
+ */
+function assertAgentGenerateBodyValid(body: GenerateTextRequest): void {
+  const strict = generateTextPayloadSchema.safeParse(body);
+  if (strict.success) return;
+  const request = body.request;
+  const probe = {
+    ...body,
+    ...(request === undefined
+      ? {}
+      : {
+          request: {
+            ...request,
+            ...(Array.isArray(request.messages)
+              ? { messages: request.messages.map(placeholderImageParts) }
+              : {}),
+          },
+        }),
+  };
+  const retried = generateTextPayloadSchema.safeParse(probe);
+  if (retried.success) return;
+  throw new Error(
+    `agent generate body failed schema validation: ${retried.error.issues
+      .slice(0, 3)
+      .map((i) => `${i.path.join('.') || '<root>'}: ${i.message}`)
+      .join('; ')}`,
+  );
+}
+
+/** CR-16：图片 part 占位化——image part 的载荷整体换成最小合法形态（只用于复跑甄别，不进真实载荷）。 */
+function placeholderImageParts(message: unknown): unknown {
+  if (!message || typeof message !== 'object' || !Array.isArray((message as { content?: unknown }).content)) {
+    return message;
+  }
+  return {
+    ...message,
+    content: (message as { content: unknown[] }).content.map((part) =>
+      part !== null && typeof part === 'object' && (part as { type?: unknown }).type === 'image'
+        ? { type: 'image', image: { b64Json: '__placeholder__', mimeType: 'application/octet-stream' } }
+        : part,
+    ),
+  };
+}
+
 export function registerAgentIpc(getWin: () => BrowserWindow | null) {
   // Handlers register once for the app lifetime; a recreated window is resolved
   // lazily via getWin. Re-registering the same channel would throw.
@@ -205,13 +271,30 @@ export function registerAgentIpc(getWin: () => BrowserWindow | null) {
   // dogfood R2 #7：body 原样过缝——request.lane（child/链车道 'background'）随 body
   // 进入两 handler，由 modelGatewayIpc 透传到 ProtocolCallContext（车道选窗 240s +
   // 有界回退；缺席 = interactive 60s 红线原样）。
+  // 09-12 子2 fallback chains：onFallback 与 onDelta 同一 callbacks 对象过缝——
+  // 非流式调用配链时切换事件同样可达（onFallback 单独在场也走第 3 参）。
+  // CR-15（09-12 子2 CR 批）：onFallback 形态单源 ModelFallbackSwitchEvent
+  //（shared-contracts contracts/generation.ts）——inline 结构 cast 撤除。
+  // CR-16（09-12 子2 CR 批）：body 先过 generateTextPayloadSchema 校验门（见
+  // assertAgentGenerateBodyValid）——`as any` 直传使畸形载荷（坏 thinking 投影的回退
+  // 条目等）绕过 schema 直达协议层的缺口闭合（schema 存在且真实 parse）。
   const generateTextImpl: GenerateTextFn = async (body, abort, callbacks) => {
+    assertAgentGenerateBodyValid(body);
+    const onFallback = callbacks?.onFallback;
     const result = callbacks?.onDelta
-      ? await handleGenerateTextStream(body as any, abort, callbacks.onDelta)
-      : await handleGenerateText(body as any, abort);
-    return result as any;
+      ? await handleGenerateTextStream(body as unknown as GenerateTextPayload, abort, callbacks.onDelta, onFallback)
+      : await handleGenerateText(body as unknown as GenerateTextPayload, abort, onFallback);
+    return result;
   };
   setGenerateTextFn(generateTextImpl);
+
+  // 子4 W4（09-12 agy MCP 工具桥）：dialogue 桥车道注入 seam（mirror setGenerateTextFn——
+  // agent 纯编排，桥 turn 执行在 shell 桥基座 agyBridgeIpc：consent 硬门〔CR-27〕+ 模型
+  // 解析 + 注册表 live 监听）。wiring 测试钉死漏装配——删任一行桥车道静默回 runLoop
+  // 纯文本路径（resolver 未装配 = off，fail-safe 方向）。
+  const agyBridgeDeps = agyBridgeProductionDeps();
+  setAgyBridgeModeResolver(createAgyBridgeLaneModeResolver(agyBridgeDeps));
+  setBridgeTurnFn(createAgyBridgeTurnProduction(agyBridgeDeps));
 
   // 09-01 附件 B3（design §2.3）：agentImageParts 防环注入内核装配——prepareImage
   // （visionAnalysis）/ resolveModelRef（modelGatewayIpc）/ readModelConfig（configIpc）
@@ -237,7 +320,10 @@ export function registerAgentIpc(getWin: () => BrowserWindow | null) {
   // turn / next chain assembly without a restart. A missing/invalid sidecar
   // yields undefined → provider default sentinel → shell auto-pick (the
   // pre-routing path).
-  setTaskSlotResolver((slot) => readTaskModelSlots()?.[slot]);
+  // 09-12 子3 §4.4：闭包上叠 enrichSlotAssignment——key 级 defaults.contextWindow
+  // 覆盖注入 assignment.contextWindowTokens（runtime-only，sidecar 永不落盘此字段；
+  // 无值恒等返回——零配置键行为逐字节不变）。
+  setTaskSlotResolver((slot) => enrichSlotAssignment(readTaskModelSlots()?.[slot]));
 
   // S4b（task 08-25 design §4.1，thinking-controls）：压缩红线策略注入——mirror
   // setTaskSlotResolver 的注入形态（agent 运行时按 ADR-2 不读盘，shell 注入现读闭包）。
@@ -477,10 +563,11 @@ export function registerAgentIpc(getWin: () => BrowserWindow | null) {
       // 单源 readTaskModelSlots，与 setTaskSlotResolver 注入闭包同一读口）的 registry
       // limits.contextWindow。无指派 / 未知模型（无 limits）→ 不传（seam 回落缺省目标
       // = 现行为——固定 500K 目标治不了小窗模型，压缩 true 返回后下次请求照样 400）。
-      const dialogueAssignment = readTaskModelSlots()?.dialogue;
-      const windowTokens = dialogueAssignment
-        ? resolveModelInfo(dialogueAssignment.modelId).limits?.contextWindow
-        : undefined;
+      // 09-12 子3 §4.4：经 enrichSlotAssignment + assignmentContextWindowTokens（agent
+      // 包单源）取窗——key 级 defaults.contextWindow 覆盖对手动压缩同样生效，且「assignment
+      // → 窗口」推导与 agent 面零第二实现。
+      const dialogueAssignment = enrichSlotAssignment(readTaskModelSlots()?.dialogue);
+      const windowTokens = assignmentContextWindowTokens(dialogueAssignment);
       const result = await manualCompactSession.call(
         runtime,
         sessionId,

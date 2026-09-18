@@ -313,3 +313,93 @@ describe('setPendingPatch — chapter_candidate 同 run 多章 dedup（CR-4.1-05
     expect(chapterIds).toEqual(['ch_001', 'ch_002']);
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 09-13 子3 W4（design §5.2 / 拍板 D-g 切分）：applySelectedPatches 尾参 sessionId + excludeFields
+// 的 slice 行为——对话栏过滤挂载传 ['chapter_candidate']：隐藏的链产物**不随 Apply 静默落盘**
+//（applyAgentFieldPatch 不调）且**不静默清丢**（重 stage 进原键继续挂起，供写作页产物区审阅
+// 落盘）；排除集空 = 全批语义照旧清键。组件层测试只断言参数透传，此处钉 slice 真行为。
+// ═══════════════════════════════════════════════════════════════════════════
+describe('applySelectedPatches — W4 excludeFields（D-g 对话栏过滤挂载）', () => {
+  /** scene_graph + chapter_candidate 混合批（对话指挥产物 + 链产物同批——leader 车道 director 子 patch 同批真实形态）。 */
+  function mixedBatch(): ProjectFieldPatch {
+    return {
+      runId: 'run-dg',
+      createdAt: '2026-08-01T00:00:00Z',
+      patches: [
+        {
+          field: 'scene_graph' as any,
+          action: 'set',
+          data: { nodes: [], edges: [], lines: [] },
+          fieldVersion: 1,
+          generatedBy: 'story-planner-agent',
+        },
+        {
+          field: 'chapter_candidate' as any,
+          action: 'set',
+          data: { chapterId: 'ch_001', runId: 'run-dg', candidate: { content: '终稿正文' } },
+          fieldVersion: 1,
+          generatedBy: 'write_chapter',
+        },
+      ],
+    };
+  }
+
+  it('excludeFields=[chapter_candidate]：scene_graph 照常落盘，chapter_candidate 不落盘（applyAgentFieldPatch 不调）且重 stage 继续挂起', () => {
+    useTestStore.getState().setPendingPatch(SESS, mixedBatch());
+    selectPatches({ scene_graph: true, chapter_candidate: true });
+
+    const applied = useTestStore.getState().applySelectedPatches(undefined, ['chapter_candidate']);
+
+    // scene_graph 照常（creative field 车道）。
+    expect(window.orisonDesktop.syncField).toHaveBeenCalledTimes(1);
+    expect(useTestStore.getState().creativeFields.scene_graph).toBeDefined();
+    // 隐藏的链产物不随本批落盘——把关面（写作页）没审过，不得静默写 chapters/。
+    expect(window.orisonDesktop.applyAgentFieldPatch).not.toHaveBeenCalled();
+    // applied 返回不含被排除 patch。
+    expect(applied?.patches.map((p) => p.field as string)).toEqual(['scene_graph']);
+    // 重 stage：键保留、只含被排除的 chapter_candidate、selections 重置默认选中（写作页 apply 即落盘）。
+    const restaged = useTestStore.getState().pendingPatchBySession[SESS];
+    expect(restaged?.patch.patches.map((p) => p.field as string)).toEqual(['chapter_candidate']);
+    expect(restaged?.selections).toEqual({ chapter_candidate: true });
+    expect(restaged?.issues).toEqual([]);
+  });
+
+  it('excludeFields 后 selectedPatches 空（只勾了被排除 field）→ 返 null 且重 stage（不静默清丢）', () => {
+    useTestStore.getState().setPendingPatch(SESS, mixedBatch());
+    selectPatches({ chapter_candidate: true }); // scene_graph 未勾
+
+    const applied = useTestStore.getState().applySelectedPatches(undefined, ['chapter_candidate']);
+
+    expect(applied).toBeNull();
+    expect(window.orisonDesktop.syncField).not.toHaveBeenCalled();
+    expect(window.orisonDesktop.applyAgentFieldPatch).not.toHaveBeenCalled();
+    const restaged = useTestStore.getState().pendingPatchBySession[SESS];
+    expect(restaged?.patch.patches.map((p) => p.field as string)).toEqual(['chapter_candidate']);
+    expect(restaged?.selections).toEqual({ chapter_candidate: true });
+  });
+
+  it('排除集空（undefined）→ 全批语义照旧清键（既有挂载形态零回归）', () => {
+    useTestStore.getState().setPendingPatch(SESS, mixedBatch());
+    selectPatches({ scene_graph: true });
+
+    useTestStore.getState().applySelectedPatches(undefined, undefined);
+
+    expect(useTestStore.getState().pendingPatchBySession[SESS]).toBeUndefined();
+  });
+
+  it('尾参 sessionId → 按目标会话键 apply（写作页产物区按链会话挂载；视图会话键不动）', () => {
+    const chainSid = 'sess-chain';
+    useTestStore.getState().setPendingPatch(chainSid, makeChapterCandidatePatch());
+    const s = useTestStore.getState();
+    const entry = s.pendingPatchBySession[chainSid];
+    if (!entry) throw new Error('no pending patch entry');
+    useTestStore.setState({ pendingPatchBySession: { ...s.pendingPatchBySession, [chainSid]: { ...entry, selections: { chapter_candidate: true } } } });
+
+    useTestStore.getState().applySelectedPatches(chainSid);
+
+    // 目标会话键的 chapter_candidate 落盘 + 清键；视图会话（SESS）无键不受影响。
+    expect(window.orisonDesktop.applyAgentFieldPatch).toHaveBeenCalledTimes(1);
+    expect(useTestStore.getState().pendingPatchBySession[chainSid]).toBeUndefined();
+  });
+});

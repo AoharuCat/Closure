@@ -30,19 +30,16 @@ import {
   DECON_STALE_NOTE,
   capDeconUnit,
   checkDeconRunBoundary,
-  deconErrMsg,
-  estimateDeconCallTokens,
   failDeconUnit,
   loadRunningDeconJob,
   readDeconDerivedTextFor,
-  resolveDeconActualTokens,
+  runDeconLlmCall,
   sha256DeconContent,
-  writeDeconCost,
   writeDeconPassState,
   type DeconBoundaryStop,
 } from './deconRun';
+import { buildChapterHeadings as buildDeconChapterHeadings, chapterShortLabel as deconChapterShortLabel } from '../db/chapterHeadings';
 import { getDeconLlmCore, type DeconGenerateText } from './deconLlmCore';
-import { accumulateDeconCost, wouldExceedDeconBudget } from './deconBudget';
 import { decideDeconPassReentry, extractMaterialId, transitionDeconJob } from './deconJob';
 import { hashDeconProductOutput } from './p3Label';
 import type { DeconStyleSectionKey } from '@orison/shared-contracts';
@@ -145,6 +142,7 @@ function longestBlockInChapter(
 /**
  * 风格抽样段（纯函数）：每弧首/中/尾章各取章内最长块 + 高潮对照段（highlightSpans 峰值章的
  * 最长爽点段）。超总上限按序丢后续弧段（弃段计数留痕——spec 溢出计数纪律）。
+ * `chapterLabel` = chapterIndex → 真实章标短标签（C5——样本标签章号不再 index 算术，F19）。
  */
 export function collectDeconStyleSamples(
   derived: string,
@@ -152,6 +150,7 @@ export function collectDeconStyleSamples(
   chapters: ReadonlyArray<{ index: number; charStart: number; charEnd: number }>,
   arcs: readonly DeconArc[],
   labelsByChapter: ReadonlyMap<number, DeconChapterLabels>,
+  chapterLabel: (chapterIndex: number) => string,
 ): { samples: DeconStyleSample[]; droppedForCap: number } {
   const scope: Array<Pick<DeconArc, 'fromChapter' | 'toChapter'>> =
     arcs.length > 0
@@ -180,7 +179,7 @@ export function collectDeconStyleSamples(
       const bi = longestBlockInChapter(ch, blocks);
       if (bi < 0) continue;
       push(
-        `弧 ${arc.fromChapter}-${arc.toChapter} 章 · 第 ${ch.index + 1} 章（${ch === inArc[0] ? '弧首' : ch === inArc.at(-1) ? '弧尾' : '弧中'}）`,
+        `弧 ${arc.fromChapter}-${arc.toChapter} 章 · ${chapterLabel(ch.index)}（${ch === inArc[0] ? '弧首' : ch === inArc.at(-1) ? '弧尾' : '弧中'}）`,
         derived.slice(blocks[bi]!.start, blocks[bi]!.end),
       );
     }
@@ -199,7 +198,7 @@ export function collectDeconStyleSamples(
   if (climaxChapter >= 0 && climaxCount > 0) {
     const spans = labelsByChapter.get(climaxChapter)!.highlightSpans;
     const longest = spans.reduce((a, b) => (b.charEnd - b.charStart > a.charEnd - a.charStart ? b : a));
-    push(`高潮对照 · 第 ${climaxChapter + 1} 章（爽点段峰值章）`, derived.slice(longest.charStart, longest.charEnd));
+    push(`高潮对照 · ${chapterLabel(climaxChapter)}（爽点段峰值章）`, derived.slice(longest.charStart, longest.charEnd));
   }
   return { samples: picked, droppedForCap };
 }
@@ -460,6 +459,10 @@ export async function runDeconP4Style(jobId: string, deps: DeconP4StyleDeps = {}
     return failUnit('材料无有效段落（派生 .md 全空白）——不可分析');
   }
 
+  // C5：chapterIndex → 真实章标行映射（抽样段标签章号——F19）。
+  const headings = buildDeconChapterHeadings(derived, material.chapters);
+  const chShort = (chapterIndex: number): string => deconChapterShortLabel(headings.get(chapterIndex), chapterIndex);
+
   // style_stats 原料（p3b 先行——缺失诚实挂起，不编数字）。
   const statsProduct = getDeconProduct(jobId, 'p3b', 'stats');
   const statsParsed = statsProduct === null ? null : deconStatsPayloadSchema.safeParse(statsProduct.payload);
@@ -477,7 +480,7 @@ export async function runDeconP4Style(jobId: string, deps: DeconP4StyleDeps = {}
     const parsed = deconChapterLabelsSchema.safeParse(row.payload);
     if (parsed.success) labelsByChapter.set(Number(row.unit), parsed.data);
   }
-  const collected = collectDeconStyleSamples(derived, blocks, material.chapters, arcs, labelsByChapter);
+  const collected = collectDeconStyleSamples(derived, blocks, material.chapters, arcs, labelsByChapter, chShort);
   const toneEntries = listDeconCanonEntries(jobId, 'tone');
   const toneLines =
     toneEntries.length > 0
@@ -509,37 +512,35 @@ export async function runDeconP4Style(jobId: string, deps: DeconP4StyleDeps = {}
     droppedSamples: collected.droppedForCap,
   };
 
-  const est = estimateDeconCallTokens(DECON_P4_STYLE_SYSTEM_PROMPT, user, DECON_P4_STYLE_MAX_TOKENS);
-  if (wouldExceedDeconBudget(job.budget, job.cost, pass, est)) {
-    const note = `${pass} 风格分析预算超限（本次预估 ${est} tokens，已累计 ${job.cost.totalTokens}）——已诚实挂起（不烧 token），调整预算后续跑`;
-    capDeconUnit(jobId, pass, unit, note, nowIso());
-    return { status: 'capped', message: note, stats };
+  // C3 脚手架单源（预算门→调用→记账→length 升帽重试一次）；截断仍挂 = failed
+  // （风格节语义面——半程产物不可续，旧语义）。
+  const call = await runDeconLlmCall({
+    jobId,
+    pass,
+    unit,
+    slot: 'writer-draft',
+    system: DECON_P4_STYLE_SYSTEM_PROMPT,
+    user,
+    maxTokens: DECON_P4_STYLE_MAX_TOKENS,
+    budget: job.budget,
+    cost: job.cost,
+    job,
+    generate,
+    notify: deps.notify,
+    nowIso,
+    label: '风格分析',
+  });
+  if (!call.ok) {
+    if (call.kind === 'budget-capped') {
+      capDeconUnit(jobId, pass, unit, call.note, nowIso());
+      return { status: 'capped', message: call.note, stats };
+    }
+    if (call.kind === 'length') {
+      return failUnit(`${call.note}——已挂起（不落半程产物）`);
+    }
+    return failUnit(call.note); // error / empty
   }
-
-  let text = '';
-  let finishReason: string | undefined;
-  let usage: { promptTokens?: number; completionTokens?: number; totalTokens?: number } | undefined;
-  try {
-    const response = await generate({
-      slot: 'writer-draft',
-      system: DECON_P4_STYLE_SYSTEM_PROMPT,
-      user,
-      maxTokens: DECON_P4_STYLE_MAX_TOKENS,
-    });
-    text = (response?.text ?? '').trim();
-    finishReason = response?.finishReason;
-    usage = response?.usage;
-  } catch (err) {
-    return failUnit(`风格分析调用失败：${deconErrMsg(err)}`);
-  }
-  const actual = resolveDeconActualTokens(DECON_P4_STYLE_SYSTEM_PROMPT, user, text, usage);
-  writeDeconCost(jobId, job, accumulateDeconCost(job.cost, pass, actual.tokens, 1, actual.estimated), nowIso());
-  if (finishReason === 'length') {
-    return failUnit('风格分析输出因 token 上限截断（finishReason=length）——已挂起（不落半程产物）');
-  }
-  if (!text) {
-    return failUnit('风格分析返回空回复——已挂起');
-  }
+  const text = call.text;
   const parsedSections = parseDeconStyleSectionsResponse(text);
   if (parsedSections === null) {
     return failUnit('风格分析输出不可解析为可用节 JSON——整体拒收（不硬给风格卡）');

@@ -9,6 +9,10 @@ import { ConfirmDialog } from '../shared/components/ConfirmDialog';
 import { useToolEvents } from '../shared/hooks/useToolEvents';
 import { useCloseGuard } from '../shared/hooks/useCloseGuard';
 import { StyleInputDialog } from '../features/agent-panel/StyleInputDialog';
+// 子4 W6：agy MCP 工具桥知情同意对话框——agent 对话流 `agy_bridge_consent|` 前缀错误
+// 转模块级 ask 态，App 层条件挂载（mirror StyleInputDialog；对话流可能在任何视图触发）。
+import { AgyBridgeConsentDialog } from '../features/agent-panel/AgyBridgeConsentDialog';
+import { useAgyBridgeStore } from '../shared/store/agyBridgeStore';
 
 export function App() {
   const currentProject = useAppStore((s) => s.currentProject);
@@ -54,6 +58,8 @@ export function App() {
   // 风格卡片 MVP（08-28 C 路）：leader request_style_input → 风格片段对话框（App 级 modal
   // overlay，与 ConfirmDialog 同层；勿挂 AgentMessageItem——它随消息流滚动/被顶出视野）。
   const pendingStyleInput = useAppStore((s) => s.pendingStyleInput);
+  // 子4 W6：桥知情同意对话框待答态（agentEvents 错误分发器写入）。
+  const agyBridgeAsk = useAgyBridgeStore((s) => s.ask);
 
   useToolEvents();
   useCloseGuard();
@@ -68,6 +74,9 @@ export function App() {
     subscribeMaterialEvents();
     subscribeCraftEvents();
     subscribeDeconEvents();
+    // 子4 W6：桥状态面启动拉取（「桥」徽标派生 + 设置页/对话框快照基线；无 CLI key
+    // 时也拉——一次 invoke 的代价换状态面常新）。
+    void useAgyBridgeStore.getState().refreshStatus();
   }, [loadUserPreferences, loadModelConfig, loadAppVersion, restoreLastProject, subscribeUpdateEvents, subscribeWorldEvents, subscribeMaterialEvents, subscribeCraftEvents, subscribeDeconEvents]);
 
   useEffect(() => {
@@ -115,6 +124,7 @@ export function App() {
       <Toast />
       <ConfirmDialog />
       {pendingStyleInput !== null && <StyleInputDialog />}
+      {agyBridgeAsk !== null && <AgyBridgeConsentDialog />}
     </>
   );
 }

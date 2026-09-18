@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
-import type { ReusableAgentNodeContract, ThinkingControl } from '@orison/shared-contracts';
+import type { GenerateFallbackEntry, ReusableAgentNodeContract, ThinkingControl } from '@orison/shared-contracts';
 import type { AgentNode, NodeResult, NodeRunInput, RunSnapshot } from '../contracts/run';
-import type { GenerateOptions, GenerateResult } from '../provider/ipc-provider';
+import type { GenerateOptions, GenerateResult, GenerationDelta } from '../provider/ipc-provider';
 import type { SessionMessage, ToolDefinition } from '../types';
 import { loadAgentPrompt } from '../prompt/agentPrompt';
 import { renderTemplate } from '../prompt/template';
@@ -56,10 +56,12 @@ export interface LlmNodeConfig {
   /**
    * 可选：跳过 LLM 调用（design §4 实现决断 / implement.md 5.1b）。
    *
-   * 用于 revision 闭环首跑：targeted-revision 在链中位于 multi-review 前，首跑时 review.latest 缺。
-   * 若不跳过，requiredArtifactKeys 放 review.latest 会首跑 blocked；放 required 外又得在 run 里判。
-   * 故用 shouldSkip(run) 判「无 review.latest」→ 走 skipResult（pass-through draft.initial，不调 generate），
-   * 否则走正常 generate+parse（改稿 overwrite draft.initial）。
+   * 用于回环首圈：revision-optimizer（链流程重排 C1）在链序上位于 multi-review 前，首圈时
+   * review.latest 缺。若不跳过，requiredArtifactKeys 放 review.latest 会首圈 blocked；放 required
+   * 外又得在 run 里判。故用 shouldSkip(run) 判「无 review.latest」→ 走 skipResult（首圈 no-op 标记
+   * / 外部预置意图透传，不调 generate），否则走正常 generate+parse。
+   * （历史：Story 4.0 targeted-revision 首跑 pass-through 同款机制——该节点已随 09-13 W1d 退役，
+   * dormant 工厂仍在用。）
    */
   shouldSkip?: (run: RunSnapshot) => boolean;
   /** shouldSkip 返 true 时的产出（如 pass-through draft.initial）。缺省 → {stateKey:nodeId, artifact:{skipped:true}}。 */
@@ -76,6 +78,30 @@ export interface LlmNodeDeps {
   thinking?: ThinkingControl;
   /** 链段 abort 信号（runChain 注入）；缺省新建一个永不 abort 的 controller。 */
   signal?: AbortSignal;
+  // 09-12 agy provider CR-23：会话键**刻意不声明**——单发 llm-node 族结构性忽略它
+  //（缺省 = 单发冷路径）；真正的消费者是循环位（WriterNodeDeps.sessionKey /
+  // ResearchVerifierDeps.sessionKey → makeAgentLoop → generate opts），在那里声明。
+  /**
+   * 09-12 子2 fallback chains（H2 透传面）：slot 回退链随 deps 进 generate opts——
+   * brief-compiler / revision-guard / targeted-revision / route / 5 轴 extractor 等
+   * 单发 JSON 节点同样受链保护。**onFallback 刻意不声明**（design §7：可见性由网关
+   * logger.warn 兜底 + 无终态注记消费面，如实接受）。
+   */
+  fallbacks?: GenerateFallbackEntry[];
+  /**
+   * 09-12 usage-panel：任务档位/流程标签（chapter-chain llmDepsFor 按 slot 注入；透传
+   * generate opts → wire request.taskType → ledger task_type 列）。undefined = 未标注。
+   */
+  taskType?: string;
+  /**
+   * 09-13 子2 W1（design §1 思考流）：节点流回调——generate opts 透传 provider onDelta
+   * （每次尝试**预分配轮 messageId**，mirror makeAgentLoop 每轮预分配模式——重试轮换 id，
+   * UI 侧按轮分段）；tool 通道滤除（同 makeAgentLoop R2 #30——链卡正文只有文本）。
+   * 装配侧由 chapter-chain `withNodeStreaming` 注入（补 nodeId/role → workflow onNodeDelta）。
+   * 主消费者 = reasoning 思考流；text 同样透传（单发 JSON 节点的裸 text 由 caller 决定
+   * 消费与否）。缺省不开（零回归——opts 无 onDelta 键走非流式路径）。
+   */
+  onDelta?: (d: { messageId: string; channel: 'text' | 'reasoning'; delta: string }) => void;
 }
 
 const MAX_ATTEMPTS = 2; // 初试 + 重试一次（design §4.2 / implement.md 2.2）
@@ -95,7 +121,7 @@ export { MAX_ATTEMPTS };
  */
 export function createLlmNode(config: LlmNodeConfig, deps: LlmNodeDeps): AgentNode {
   const { nodeId, role, contract, buildPrompt, parseOutput, shouldSkip, skipResult } = config;
-  const { generate, modelRef, thinking, signal } = deps;
+  const { generate, modelRef, thinking, signal, fallbacks, taskType, onDelta } = deps;
 
   return {
     contract,
@@ -121,7 +147,26 @@ export function createLlmNode(config: LlmNodeConfig, deps: LlmNodeDeps): AgentNo
       let lastErr: unknown = null;
       for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
         try {
-          const result = await generate(messages, system, [], abortSignal, { modelRef, thinking });
+          // 09-12 子2（H2）：fallbacks 随 opts 透传（空链不占位）。
+          // 09-12 usage-panel：taskType 随 opts 透传（未标注不占位）。
+          // 09-13 子2 W1：onDelta 随 opts 透传——每次尝试预分配轮 messageId（mirror
+          // makeAgentLoop 每轮预分配：重试轮换 id，UI 侧按轮分段防重试混流）；tool 通道
+          // 滤除（R2 #30 同款——链卡正文只有文本）。缺省不占位（非流式路径零回归）。
+          const attemptMessageId = randomUUID();
+          const result = await generate(messages, system, [], abortSignal, {
+            modelRef,
+            thinking,
+            taskType,
+            ...(fallbacks?.length ? { fallbacks } : {}),
+            ...(onDelta
+              ? {
+                  onDelta: (d: GenerationDelta) => {
+                    if (d.type === 'tool') return;
+                    onDelta({ messageId: attemptMessageId, channel: d.type, delta: d.delta });
+                  },
+                }
+              : {}),
+          });
           return parseOutput(result.content, input.run);
         } catch (err) {
           if (isAbortError(err)) throw err; // 取消语义：传播，不吞成 error artifact

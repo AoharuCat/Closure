@@ -22,6 +22,7 @@ import {
   getMaterialRow,
 } from '../db/materialIndexer';
 import {
+  deleteDeconIllegalAllFailedPassStates,
   findInflightDeconJobByMaterial,
   getDeconDictionary,
   getDeconJob,
@@ -34,6 +35,7 @@ import {
   upsertDeconPassState,
 } from '../db/closure-decon';
 import { getDb } from '../db/index';
+import { getLogger } from '../logger';
 import { isDeconPipelineInflight } from './deconInflight';
 import { validateDeconDimensions } from './deconBudget';
 
@@ -431,6 +433,18 @@ export function startDeconJob(jobId: string, deps: DeconJobDeps = {}, budget?: D
     return { ok: false, error: 'invalid-state', job, message: `状态 ${job.status} 不允许 ${action}` };
   }
   updateDeconJobStatus(job.jobId, decision.status, null, now);
+  if (action === 'retry') {
+    // F16 清理侧：retry 续跑时收口 (pass,'all','failed') 化石行（多 unit pass 的非法形态——
+    // 见 db 侧谓词注释）。best-effort：清理失败不阻续跑（化石只影响 UI 聚合观感，重入语义不受）。
+    try {
+      deleteDeconIllegalAllFailedPassStates(job.jobId);
+    } catch (err) {
+      getLogger().warn(
+        { err: err instanceof Error ? err.message : String(err), jobId: job.jobId },
+        'decon: illegal (pass,all,failed) pass_state cleanup failed on retry (resume continues)',
+      );
+    }
+  }
   return { ok: true, job: { ...job, status: decision.status, error: null, updatedAt: now }, noop: false };
 }
 

@@ -68,6 +68,7 @@ function detailFixture(over: Partial<DeconJobDetail> = {}): DeconJobDetail {
   return {
     job: jobFixture(),
     passStates: [],
+    chapterLabels: {}, // CR-1 拍板 B：章标标签表（slice 透传，零加工）。
     fresh: true,
     canon: [],
     dictionary: null,

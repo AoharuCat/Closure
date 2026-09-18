@@ -4,6 +4,7 @@ import type {
   DeconCost,
   DeconEntity,
   DeconJob,
+  DeconProgressEvent,
   DeconSpan,
   DeconTimelineConsistency,
   Material,
@@ -23,17 +24,13 @@ import {
   DECON_STALE_NOTE,
   capDeconUnit,
   checkDeconRunBoundary,
-  deconErrMsg,
-  estimateDeconCallTokens,
   failDeconUnit,
   loadRunningDeconJob,
   readDeconDerivedTextFor,
-  resolveDeconActualTokens,
+  runDeconLlmCall,
   sha256DeconContent,
-  writeDeconCost,
 } from './deconRun';
 import { getDeconLlmCore, type DeconGenerateSlot, type DeconGenerateText } from './deconLlmCore';
-import { accumulateDeconCost, wouldExceedDeconBudget } from './deconBudget';
 import { decideDeconPassReentry, extractMaterialId, hashDeconCanonOutput, transitionDeconJob } from './deconJob';
 
 // ── E10.3a（task 09-05）W5：P2 canon 六域装配（parent design §2.2 / child A design §P2）──
@@ -628,6 +625,8 @@ interface DeconP2Ctx {
   cost: DeconCost;
   /** 域级审计计数聚合（CR-3/CR-4/CR-12c/CR-14e/CR-16——runDeconP2 汇入 stats + 日志）。 */
   audit: DeconP2Audit;
+  /** 重试相位 note（C3——升帽重试的 UI 可见面；缺省不发）。 */
+  notify?: (event: DeconProgressEvent) => void;
 }
 
 /** P2 域级审计计数（可选字段——零值面缺省不占 payload）。 */
@@ -650,49 +649,48 @@ type DeconP2DomainOutcome =
   | { ok: true; entries: DeconCanonEntry[] }
   | { ok: false; kind: 'capped' | 'failed'; message: string };
 
-/** 单次预算内 LLM 调用（capped 门前置 + cost 记账〔provider usage 真值优先 CR-13〕+ finishReason 权威停因）。 */
+/**
+ * 单次预算内 LLM 调用：**CR-4 收口 deconRun.runDeconLlmCall 共享脚手架**（est 预算门每 attempt
+ * 过门 + cost 记账〔provider usage 真值优先 CR-13〕+ finishReason=length 升帽 ×2 重试一次 +
+ * 每 attempt notify note）。三子调用（画像/召回/时间线）经本单点；本包装只剩 P2 语义映射：
+ * 预算超限 → capped；截断（重试仍 length）→ **failed**（canon 语义面——半程产物不可续）；
+ * 空回复/调用错 → failed。
+ */
 async function callDeconP2Llm(
   ctx: DeconP2Ctx,
+  unit: string,
   slot: DeconGenerateSlot,
   system: string,
   user: string,
   maxTokens: number,
 ): Promise<{ ok: true; text: string } | { ok: false; kind: 'capped' | 'failed'; message: string }> {
-  const est = estimateDeconCallTokens(system, user, maxTokens);
-  if (wouldExceedDeconBudget(ctx.job.budget, ctx.cost, 'p2', est)) {
-    return {
-      ok: false,
-      kind: 'capped',
-      message: `p2 预算超限（本次预估 ${est} tokens，已累计 ${ctx.cost.totalTokens}）——已诚实挂起（不烧 token），调整预算后续跑`,
-    };
-  }
-  let text = '';
-  let finishReason: string | undefined;
-  let usage: { promptTokens?: number; completionTokens?: number; totalTokens?: number } | undefined;
-  try {
-    const response = await ctx.generate({ slot, system, user, maxTokens });
-    text = (response?.text ?? '').trim();
-    finishReason = response?.finishReason;
-    usage = response?.usage;
-  } catch (err) {
-    return { ok: false, kind: 'failed', message: `canon 装配调用失败：${deconErrMsg(err)}` };
-  }
-  const actual = resolveDeconActualTokens(system, user, text, usage);
-  ctx.cost = accumulateDeconCost(ctx.cost, 'p2', actual.tokens, 1, actual.estimated);
-  // writeDeconCost 单源（CR-1）：行已删抛 DeconJobGoneError 静默中止，不 `?? ctx.job` 复活。
-  writeDeconCost(ctx.jobId, ctx.job, ctx.cost, ctx.nowIso());
-  if (finishReason === 'length') {
-    return { ok: false, kind: 'failed', message: 'canon 装配输出因 token 上限截断（finishReason=length）——已挂起，不落半程产物' };
-  }
-  if (!text) {
-    return { ok: false, kind: 'failed', message: 'canon 装配返回空回复——已挂起' };
-  }
-  return { ok: true, text };
+  const call = await runDeconLlmCall({
+    jobId: ctx.jobId,
+    pass: 'p2',
+    unit,
+    slot,
+    system,
+    user,
+    maxTokens,
+    budget: ctx.job.budget,
+    cost: ctx.cost,
+    job: ctx.job,
+    generate: ctx.generate,
+    ...(ctx.notify !== undefined ? { notify: ctx.notify } : {}),
+    nowIso: ctx.nowIso,
+    label: 'canon 装配',
+  });
+  ctx.cost = call.cost;
+  if (call.ok) return { ok: true, text: call.text };
+  if (call.kind === 'budget-capped') return { ok: false, kind: 'capped', message: call.note };
+  if (call.kind === 'length') return { ok: false, kind: 'failed', message: `${call.note}——已挂起，不落半程产物` };
+  return { ok: false, kind: 'failed', message: call.note }; // error / empty
 }
 
 /** 带约束式解析 + 重试一次的调用（parse null → 纠偏重试一次，仍坏诚实挂起——P1a 同款）。 */
 async function callDeconP2LlmParsed<T>(
   ctx: DeconP2Ctx,
+  unit: string,
   slot: DeconGenerateSlot,
   system: string,
   user: string,
@@ -701,7 +699,7 @@ async function callDeconP2LlmParsed<T>(
   correctiveNote: string,
 ): Promise<{ ok: true; parsed: T } | { ok: false; kind: 'capped' | 'failed'; message: string }> {
   for (let attempt = 0; attempt < 2; attempt++) {
-    const call = await callDeconP2Llm(ctx, slot, system, attempt > 0 ? `${user}\n\n${correctiveNote}` : user, maxTokens);
+    const call = await callDeconP2Llm(ctx, unit, slot, system, attempt > 0 ? `${user}\n\n${correctiveNote}` : user, maxTokens);
     if (!call.ok) return call;
     const parsed = parse(call.text);
     if (parsed !== null) return { ok: true, parsed };
@@ -808,6 +806,7 @@ async function assembleCharacterDomain(
     const allowed = new Set(batch.map((m) => m.canonical));
     const portrait = await callDeconP2LlmParsed(
       ctx,
+      'character',
       'extraction',
       DECON_P2_PORTRAIT_SYSTEM_PROMPT,
       buildDeconPortraitUserPrompt(batch.map((m) => ({ name: m.canonical, aliases: m.aliases, quotes: m.quotes }))),
@@ -952,6 +951,7 @@ async function assembleRecallDomain(
 
   const recall = await callDeconP2LlmParsed(
     ctx,
+    domain,
     'extraction',
     DECON_P2_RECALL_SYSTEM_PROMPT,
     buildDeconRecallUserPrompt(domain, paragraphs),
@@ -1018,6 +1018,7 @@ async function assembleTimelineDomain(
   const eventIds = new Set(selected.map((e) => e.eventId));
   const annotation = await callDeconP2LlmParsed(
     ctx,
+    'timeline',
     'extraction',
     DECON_P2_TIMELINE_SYSTEM_PROMPT,
     buildDeconTimelineUserPrompt(selected),
@@ -1048,6 +1049,7 @@ async function assembleTimelineDomain(
   if (inversions.length > 0) {
     const review = await callDeconP2LlmParsed(
       ctx,
+      'timeline',
       'review-judge',
       DECON_P2_TIMELINE_REVIEW_SYSTEM_PROMPT,
       buildDeconTimelineReviewUserPrompt(annotated, inversions),
@@ -1151,6 +1153,8 @@ export interface DeconP2Deps {
   generateText?: DeconGenerateText;
   /** 派生 .md 读取注入（缺省生产 readDeconDerivedTextFor；测试注入绕过 fs）。 */
   readDerivedText?: (material: Material) => string | null;
+  /** 重试相位 note 注入（C3——runDeconPassSequence 传 stamped notify；直调测试缺省不发）。 */
+  notify?: (event: DeconProgressEvent) => void;
   now?: () => Date;
 }
 
@@ -1215,13 +1219,13 @@ export async function runDeconP2(jobId: string, deps: DeconP2Deps = {}): Promise
   const material = getMaterialRow(extractMaterialId(job.materialRef));
   if (material === null) {
     const message = `材料 ${job.materialRef} 不存在（或已删除）`;
-    failDeconUnit(jobId, 'p2', 'all', message, nowIso());
+    transitionDeconJob(jobId, 'fail', message);
     return { status: 'failed', message, stats: p2EmptyStats() };
   }
   const derived = (deps.readDerivedText ?? readDeconDerivedTextFor)(material);
   if (derived === null) {
     const message = '派生 .md 读取失败（缺失或车道不可解析）——无法锚定 canon 基面';
-    failDeconUnit(jobId, 'p2', 'all', message, nowIso());
+    transitionDeconJob(jobId, 'fail', message);
     return { status: 'failed', message, stats: p2EmptyStats() };
   }
   if (sha256DeconContent(derived) !== job.derivedHash) {
@@ -1232,19 +1236,19 @@ export async function runDeconP2(jobId: string, deps: DeconP2Deps = {}): Promise
   const factsRows = listDeconChapterFacts(job.materialRef, job.derivedHash);
   if (factsRows.length === 0) {
     const message = '逐章 facts 不存在（closure_decon_facts 无同指纹行）——先跑 P1b 再跑 P2';
-    failDeconUnit(jobId, 'p2', 'all', message, nowIso());
+    transitionDeconJob(jobId, 'fail', message);
     return { status: 'failed', message, stats: p2EmptyStats() };
   }
   if (getDeconPassState(jobId, 'p1c', 'all')?.status !== 'done') {
     const message = 'P1c 聚合未完成（pass_state p1c 非 done）——先跑 P1c 再跑 P2';
-    failDeconUnit(jobId, 'p2', 'all', message, nowIso());
+    transitionDeconJob(jobId, 'fail', message);
     return { status: 'failed', message, stats: p2EmptyStats() };
   }
 
   const generate = deps.generateText ?? getDeconLlmCore()?.generateText;
   if (generate === undefined) {
     const message = '拆解 LLM 内核未装配（deconLlmCore 未接线）——已挂起，装配后重试';
-    failDeconUnit(jobId, 'p2', 'all', message, nowIso());
+    transitionDeconJob(jobId, 'fail', message);
     return { status: 'failed', message, stats: p2EmptyStats() };
   }
 
@@ -1258,7 +1262,7 @@ export async function runDeconP2(jobId: string, deps: DeconP2Deps = {}): Promise
   };
   const characterMaterials = collectCharacterMaterials(entities, factsRows, derived);
   const stats: DeconP2Stats = p2EmptyStats();
-  const ctx: DeconP2Ctx = { jobId, job, generate, nowIso, cost: job.cost, audit: {} };
+  const ctx: DeconP2Ctx = { jobId, job, generate, nowIso, cost: job.cost, audit: {}, ...(deps.notify !== undefined ? { notify: deps.notify } : {}) };
 
   for (const domain of DECON_CANON_DOMAINS) {
     // 中断韧性（CR-7：域边界如实判别 paused/cancelled/外部翻态——旧实现一律误报 paused；

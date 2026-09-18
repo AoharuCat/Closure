@@ -104,6 +104,13 @@ export const WRITE_TOOLS = ['chapter_write', 'write_chapter', 'write_file', 'out
   // field), intercepted in AgentMessageItem before the WRITE_TOOLS render branch
   // mirror setting_md_update (agent toolPolicy.ts Story 8.6 note).
   'creative_brief_update',
+  // 09-12 子4 W6（bridge Tier 2 面，design §7）：信息释放地图与承诺台账两写工具的
+  // field_patch envelope 此前漏登（handler 注释言明 intended 路径 = UI patch-review——
+  // 漏登时 suggest 档 envelope 被 toolId 门整条静默丢弃，PatchReview 卡永不出现；HTTP
+  // 车道同款潜在断链，bridge Tier 2 面把它们暴露进对话车道后必须可路由）。Same
+  // three-place sync as above (B01 checklist)。
+  'info_release_map_update',
+  'promise_ledger_update',
   'creative_preferences_update'];
 
 /** A possible target location for an unresolved passage rewrite. */

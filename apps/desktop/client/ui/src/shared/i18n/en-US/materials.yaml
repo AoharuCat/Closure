@@ -87,6 +87,12 @@ materials:
       sensitive: "Source in a sensitive directory"
       missing: "Source file unavailable"
     failedTitle: "Import failed: {message}"
+    source:
+      title: "Label the source (optional — feeds list badges, retrieval, and book study)"
+      skipMedium: "Skip (defaults to Other)"
+      skipTier: "Skip (defaults to Unlabeled)"
+      saved: "Saved"
+    sourceSaveFailed: "Failed to save source label: {message}"
   provenance:
     title: "Provenance"
     nameLabel: "Title"

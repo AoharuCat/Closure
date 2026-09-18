@@ -1,5 +1,7 @@
 import {
+  DECON_ILLEGAL_ALL_UNIT_PASSES,
   DECON_JOB_INFLIGHT_STATUSES,
+  DECON_LEGAL_ALL_UNIT_PASSES,
   DECON_REPORT_KINDS,
   DECON_REVIEW_CHECKPOINTS,
   deconChapterFactsSchema,
@@ -319,6 +321,45 @@ export function listDeconPassStates(jobId: string): DeconPassState[] {
     const state = rowToPassState(r);
     return state === null ? [] : [state];
   });
+}
+
+/**
+ * F16 清理侧：DELETE 本 job 的 `(pass,'all','failed')` **非法形态** pass_state 行（材料级
+ * 前置失败留下的化石——写侧已改 transition-only 不再新产；本函数在 startDeconJob retry 续跑
+ * 时收口历史遗留 + retry 前的失败残行，防 UI 聚合把它计入分母/误报红点）。返回删除行数。
+ *
+ * 非法 pass 清单**单源** = shared-contracts `DECON_ILLEGAL_ALL_UNIT_PASSES`（显式茎 +
+ * `'p4:*'` 前缀约定，经 `DECON_LEGAL_ALL_UNIT_PASSES` 扣除 p4:style——其唯一合法 unit 是
+ * 'all'，绝不误删；与 ui summarizeDeconPassStates 过滤共用同源）。新增逐 unit pass 只改
+ * 契约常量，两侧自动同步。
+ */
+const ILLEGAL_ALL_EXPLICIT_PASSES = DECON_ILLEGAL_ALL_UNIT_PASSES.filter((p) => !p.endsWith('*'));
+const ILLEGAL_ALL_PASS_PREFIXES = DECON_ILLEGAL_ALL_UNIT_PASSES.filter((p) => p.endsWith('*')).map(
+  (p) => p.slice(0, -1),
+);
+
+function illegalAllFailedPassWhereSql(): string {
+  // 值全部来自编译期常量（pass 词形受 deconPassSchema 字符集约束）——字面内联零注入面。
+  const clauses: string[] = [];
+  if (ILLEGAL_ALL_EXPLICIT_PASSES.length > 0) {
+    clauses.push(`pass IN (${ILLEGAL_ALL_EXPLICIT_PASSES.map((p) => `'${p}'`).join(',')})`);
+  }
+  if (ILLEGAL_ALL_PASS_PREFIXES.length > 0) {
+    const prefixSql = ILLEGAL_ALL_PASS_PREFIXES.map((p) => `pass LIKE '${p}%'`).join(' OR ');
+    const exceptions = DECON_LEGAL_ALL_UNIT_PASSES.map((p) => `'${p}'`).join(',');
+    clauses.push(`(${prefixSql}${exceptions.length > 0 ? ` AND pass NOT IN (${exceptions})` : ''})`);
+  }
+  return clauses.length > 0 ? ` AND (${clauses.join(' OR ')})` : '';
+}
+
+export function deleteDeconIllegalAllFailedPassStates(jobId: string): number {
+  const result = getDb()
+    .prepare(
+      `DELETE FROM closure_decon_pass_state
+       WHERE job_id=? AND unit='all' AND status='failed'${illegalAllFailedPassWhereSql()}`,
+    )
+    .run(jobId);
+  return result.changes;
 }
 
 // ── P1b 逐章 facts（材料级）──

@@ -9,8 +9,22 @@ import { useToastStore } from './toastStore';
 import { translate } from '../i18n/useI18n';
 import { WRITE_TOOLS, type PendingDiff, type PendingToolConfirm } from './agentDiffSlice';
 import { bufferStreamDelta, bufferChildStreamDelta, childTagPrefix, discardChildStartedPlaceholder, ensureChildStartedPlaceholder, purgeSessionStreams, settleStreamPlaceholder } from './agentStreamBuffer';
-import { applyChainDelta, applyChainNodeDone, finalizeChainRun, CHAIN_RUN_SENTINEL_NODE_ID, type ChainRunState } from './chainStreamBuffer';
+import { applyChainDelta, applyChainModelFallback, applyChainNodeDone, chainNodeLabel, finalizeChainRun, CHAIN_RUN_SENTINEL_NODE_ID, type ChainRunState } from './chainStreamBuffer';
+// 09-13 子3 W2（design §2.2）：写作页运行时间线 + escalate findings 路由（chainTimeline 模块
+// 持 apply/投影/写入面——本 dispatcher 只接线）。
+import {
+  applyTimelineArtifact,
+  applyTimelineChainDelta,
+  applyTimelineNodeDone,
+  applyTimelineTool,
+  extractEscalateFindingsFromMetadata,
+  finalizeChainTimeline,
+  setEscalateFindings,
+  type ChainTimelineState,
+  type EscalateFindingsEntry,
+} from './chainTimeline';
 import { recoverSelectionAnchorFromMessages } from './passageAnchor';
+import { parseAgyBridgeConsentError, useAgyBridgeStore } from './agyBridgeStore';
 import { randomUUID } from '../util/id';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -56,6 +70,52 @@ export type AgentRunStatePatch = {
 };
 
 /**
+ * 09-12 子2 fallback chains（design §8②）：一次模型切换的 per-session 通知（cap
+ * MODEL_FALLBACK_NOTICE_CAP；每次 send 重置——「本次 run 的切换记录」，随会话 forget 链清）。
+ * scopeLabel = 链车道节点标签 / child 面子代理角色；leader 对话车道缺席。
+ */
+export type ModelFallbackNotice = {
+  id: string;
+  from: { keyId: string; modelId: string };
+  to: { keyId: string; modelId: string };
+  reason: string;
+  attempt: number;
+  at: number;
+  scopeLabel?: string;
+};
+
+export const MODEL_FALLBACK_NOTICE_CAP = 5;
+
+/**
+ * 09-12 子4 W6（design §8）：桥车道运行期通知（bridge-notice 事件的 per-session 记录，
+ * cap BRIDGE_NOTICE_CAP；每次 send 重置——「本次 run 的通知」，随会话 forget 链清，
+ * mirror ModelFallbackNotice 全套生命周期）。三信号：sendback / sendback-missed /
+ * soft-denied（软拒 = 预授权缺失诊断入口，AC7）。
+ */
+export type BridgeNoticeKind = 'sendback' | 'sendback-missed' | 'soft-denied';
+
+export type BridgeNotice = {
+  id: string;
+  notice: BridgeNoticeKind;
+  at: number;
+};
+
+export const BRIDGE_NOTICE_CAP = 5;
+
+/**
+ * 09-12 子5 R6（design §11）：leader 会话上下文窗口占用快照（context-usage 事件的
+ * per-session last 值）。usedTokens/windowTokens/redlinePercent 原样透传 agent 侧估算
+ * （口径与压缩触发同源——prepareContext loadTokens × 校准比）；windowTokens = null =
+ * 注入原值无窗口信息（assignment 未配 limits）——UI 收 null 隐藏条不显示假数。
+ */
+export type ContextUsageSnapshot = {
+  usedTokens: number;
+  windowTokens: number | null;
+  redlinePercent: number;
+  updatedAt: number;
+};
+
+/**
  * dispatcher 所需的 store 结构面（appStore 的 AppState 结构满足；结构性类型避免
  * appStore ↔ slice ↔ dispatcher 循环 import）。
  */
@@ -76,6 +136,37 @@ export type AgentDispatchState = {
    * 最小测试 store 可缺省（anchorChainRun 防御性访问）。
    */
   chainRunAnchorByProject?: Record<string, string>;
+  /**
+   * 09-12 子2 fallback chains（design §8②⑤）：per-session 回退通知（cap 5，send 重置）
+   * + 对话车道「当前模型」chip 翻转源（leader 车道 model-fallback 事件的 to 家）。
+   * 可选面——最小测试 store 可缺省（缺省 = 通知/chip 不写，事件不炸）。
+   */
+  modelFallbackNotices?: Record<string, ModelFallbackNotice[]>;
+  activeModelBySession?: Record<string, { keyId: string; modelId: string }>;
+  /**
+   * 09-12 子4 W6（design §8）：per-session 桥运行期通知（写入方本模块 'bridge-notice'
+   * case；每次 send 重置 + 随 deleteAgentSession 清，mirror modelFallbackNotices）。
+   * 可选面——最小测试 store 可缺省（缺省 = 不写，事件不炸）。
+   */
+  bridgeNoticesBySession?: Record<string, BridgeNotice[]>;
+  /**
+   * 09-12 子5 R6（design §11）：per-session 上下文占用 last 值（写入方本模块
+   * 'context-usage' case）。可选面——最小测试 store 可缺省（缺省 = 不写，事件不炸）。
+   * 随 deleteAgentSession 清（agentSessionSlice，mirror activeModelBySession）。
+   */
+  contextUsageBySession?: Record<string, ContextUsageSnapshot>;
+  /**
+   * 09-13 子3 W2（design §2）：写作页运行时间线（chainTimeline 模块写入——reasoning 节流
+   * flush + artifact/tool/done 直写，经本 dispatcher 接线）。可选面——最小测试 store 可缺省
+   *（缺省 = 时间线不写，链事件不炸，mirror bridgeNoticesBySession 守卫形态）。
+   */
+  chainTimelineBySession?: Record<string, ChainTimelineState>;
+  /**
+   * 09-13 子3 W2（design §2.2/F5）：escalate findings 路由缓存（escalate-pause 不产
+   * pausedReview——裁决卡唯一数据源；写入方 = 本 dispatcher 的 metadata.findings 路由 +
+   * chapterReviewSlice resume IPC fallback）。可选面同上。
+   */
+  escalateFindingsBySession?: Record<string, EscalateFindingsEntry>;
   setPendingToolConfirm: (sessionId: string, value: PendingToolConfirm | null) => void;
   pushPendingDiff: (sessionId: string, diff: PendingDiff) => void;
   setPausedReview: (sessionId: string, meta: ChapterReviewMetadata | null) => void;
@@ -423,6 +514,26 @@ export function handleAgentStreamEvent<S extends AgentDispatchState>(store: Agen
         //（派发→首批输出间的组级信号；首批 delta 经废弃规则自动接管）。后台分支已在上方
         // return（run 态 activity 摘要对 started 同样生效），此处仅活跃视图。
         ensureChildStartedPlaceholder(store, sid, { childSessionId, source, role, depth });
+      } else if (inner.type === 'model-fallback') {
+        // 09-12 子2（design §8②）：子代理循环内的模型切换 → 通知面带子代理角色标签
+        //（scopeLabel）——组头部/通知条可见「谁家换了模型」；chip 不翻（对话占位 chip 是
+        // leader 车道语义，child 面由通知条承载）。
+        if (store.getState().modelFallbackNotices === undefined) return;
+        const notice: ModelFallbackNotice = {
+          id: randomUUID(),
+          from: inner.data.from,
+          to: inner.data.to,
+          reason: inner.data.reason,
+          attempt: inner.data.attempt,
+          at: Date.now(),
+          scopeLabel: role,
+        };
+        writeState(store, (s) => ({
+          modelFallbackNotices: {
+            ...(s.modelFallbackNotices ?? {}),
+            [sid]: [...(s.modelFallbackNotices?.[sid] ?? []), notice].slice(-MODEL_FALLBACK_NOTICE_CAP),
+          },
+        }));
       }
       return;
     }
@@ -460,21 +571,71 @@ export function handleAgentStreamEvent<S extends AgentDispatchState>(store: Agen
         // 视图会话挂载，切回即见实时态）。CR-T1-048：链事件同步登记项目锚（值守卫——高频
         // delta 不产生额外 store 写）。
         anchorChainRun(store, sid, event.projectPath);
+        // 09-13 子3 W2（design §2.2）：时间线双写——reasoning 通道喂 chainTimeline pending
+        // 缓冲（text 不喂——正文流 streamText 单源）。先于 applyChainDelta：时间线的新 run
+        // 边界判定自持 runEnded 记忆（不读 chainRunBySession），此处顺序仅保持「时间线面
+        // 先进」的一致接线纪律。
+        applyTimelineChainDelta(store, sid, event.data);
         applyChainDelta(store, sid, event.data);
       }
+      return;
+    }
+    case 'model-fallback': {
+      // 09-12 子2（design §7/§8②⑤）：模型切换事件。通知面（cap 5）两车道都写；
+      // chip 面 = leader 对话车道（无 nodeId）翻 activeModelBySession，链车道
+      //（带 nodeId）写链卡 modelSwitch + 项目锚（mirror chain-delta 分支）。
+      const data = event.data;
+      if (store.getState().agentRunStates[sid]?.phase !== 'running') {
+        store.getState().setAgentRunState(sid, {
+          phase: 'running',
+          ...(event.projectPath !== undefined ? { projectPath: event.projectPath } : {}),
+        });
+      }
+      const { nodeId } = data;
+      if (nodeId !== undefined) {
+        anchorChainRun(store, sid, event.projectPath);
+        applyChainModelFallback(store, sid, { ...data, nodeId });
+      } else if (store.getState().activeModelBySession !== undefined) {
+        writeState(store, (s) => ({
+          activeModelBySession: { ...(s.activeModelBySession ?? {}), [sid]: data.to },
+        }));
+      }
+      if (store.getState().modelFallbackNotices === undefined) return;
+      const notice: ModelFallbackNotice = {
+        id: randomUUID(),
+        from: data.from,
+        to: data.to,
+        reason: data.reason,
+        attempt: data.attempt,
+        at: Date.now(),
+        ...(nodeId !== undefined ? { scopeLabel: chainNodeLabel(nodeId) } : {}),
+      };
+      writeState(store, (s) => ({
+        modelFallbackNotices: {
+          ...(s.modelFallbackNotices ?? {}),
+          [sid]: [...(s.modelFallbackNotices?.[sid] ?? []), notice].slice(-MODEL_FALLBACK_NOTICE_CAP),
+        },
+      }));
       return;
     }
     case 'chain-node-done': {
       // CR-T1-048：链事件登记项目锚（同 chain-delta 分支）。
       anchorChainRun(store, sid, event.projectPath);
+      // 09-13 子3 W2（design §2.2）：时间线双写——节点 attempt 收口 / 哨兵终态帧（pending
+      // 尾巴 force 落 + runEnded 标记）。先于 applyChainNodeDone（时间线边界判定自持记忆，
+      // 顺序仅保持接线纪律一致）。
+      applyTimelineNodeDone(store, sid, event.data);
       // 哨兵 = run 级终态帧：run 态归位（resume / dogfood 链车道不经 leader streamMessage，
       // 无 done 事件兜底——sentinel 后 phase 'running' 不清会永久占住 isProjectRunActive
       // （生成闸全禁）+ 徽标永久 running）。paused 视作本轮 run 结束（审阅等待由键控槽
       // awaiting_review 承载）；error 归 error 相位（mirror error 事件处理）。
       if (event.data.nodeId === CHAIN_RUN_SENTINEL_NODE_ID) {
         const status = event.data.status;
+        // CR-22（W-CR 批）：'auto_revise_pending' 是 09-13 W1a 前的 legacy 哨兵终态值（环收敛 break
+        // 交 leader 的中转态）——dev 热重载 / 持久化时间线回放会重放旧帧，落 error 会把健康的复跑
+        // 卡错标失败（生产链已不再产该值，此处只是白名单兼容映射）。
         const settle: 'idle' | 'error' =
-          status === 'completed' || status === 'auto_revise_pending' || status === 'paused' || status === 'aborted'
+          status === 'completed' || status === 'paused' || status === 'aborted' || status === 'auto_revise_pending'
             ? 'idle'
             : 'error';
         store.getState().setAgentRunState(sid, {
@@ -515,20 +676,30 @@ export function handleAgentStreamEvent<S extends AgentDispatchState>(store: Agen
       // 至下一 checkpoint/终态）——任何 leader turn 在此期间结束（done）不构成「链被掐」证据
       //（服务端从未 abort，台账「中断原因未上日志」即此机理：UI 侧误终态化，服务端无 abort 可
       // 记）。在途判据（跨 slice 结构面读——AgentDispatchState 不含 review 面，最小测试 store
-      // 可缺省字段，缺省 = 无在途，兜底照旧）：chapterReviewSlice.reviewResuming === true 且
-      // pausedReviewBySession[sid] 存在（resume 车道必有 pause 载荷——双条件防 reviewResuming
-      // 残值误放行）。在途 → 不 finalize（不误标 aborted 不删 chainBuffers）也不归位 run 态
-      //（链事件持续维持 running；终态由哨兵帧 / resume IPC summary 和解定）。
+      // 可缺省字段，缺省 = 无在途，兜底照旧）：chapterReviewSlice.reviewResumingBySession[sid] === true
+      // 且 pausedReviewBySession[sid] **或 escalateFindingsBySession[sid]** 存在（第二条件 = CR-9：
+      // escalate 暂停不产 pausedReview、resume 载荷落 escalate 键——无此腿 escalate 车道的
+      // accept/redo flight 窗口会被 leader done 误标 aborted；双条件防 reviewResuming 残值误放行）。
+      // 在途 → 不 finalize（不误标 aborted 不删 chainBuffers）也不归位 run 态（链事件持续维持
+      // running；终态由哨兵帧 / resume IPC summary 和解定）。
       const resumeProbe = store.getState() as AgentDispatchState & {
-        reviewResuming?: boolean;
+        // 09-13 子3 W4（design §5.3/F2）：reviewResuming 单槽 → BySession 键控同批改读（漏改 =
+        // #105 假中断回归——他会在途 resume 被本会话 done 误终态化）。
+        reviewResumingBySession?: Record<string, boolean | undefined>;
         pausedReviewBySession?: Record<string, unknown>;
+        escalateFindingsBySession?: Record<string, unknown>;
       };
       const resumeInFlight =
-        resumeProbe.reviewResuming === true && resumeProbe.pausedReviewBySession?.[sid] !== undefined;
+        resumeProbe.reviewResumingBySession?.[sid] === true
+        && (resumeProbe.pausedReviewBySession?.[sid] !== undefined
+          || resumeProbe.escalateFindingsBySession?.[sid] !== undefined);
       if (!resumeInFlight) {
         // dogfood T1 Stage 6：链 run 仍 running = 中途被掐（正常完成哨兵帧先到）→ 标「已中断」
         //（abort 半 JSON 不落盘——已流出文本保留在链卡，r1）。
         finalizeChainRun(store, sid, 'aborted');
+        // 09-13 子3 W2：时间线同点兜底终态（pending 尾巴落 + runEnded 标记——entries 保留
+        // 回看；镜像 finalizeChainRun 的调用位/守卫位）。
+        finalizeChainTimeline(store, sid);
         store.getState().setAgentRunState(sid, { phase: 'idle', activity: undefined });
       }
       if (!isActiveView) return;
@@ -552,9 +723,87 @@ export function handleAgentStreamEvent<S extends AgentDispatchState>(store: Agen
       purgeSessionStreams(store, sid);
       // dogfood T1 Stage 6：链 run 兜底标失败（哨兵帧未到即流错误）。
       finalizeChainRun(store, sid, 'error');
+      // 09-13 子3 W2：时间线同点兜底终态（mirror done 兜底——错误终态后不再有终帧）。
+      finalizeChainTimeline(store, sid);
       store.getState().setAgentRunState(sid, { phase: 'error' });
+      // 子4 W6（design §4.3）：桥同意拦截——`agy_bridge_consent|state=...` 前缀错误（lane
+      // rejected / turn 硬门 CR-27）转知情同意对话框，错误条落人话键（前缀串是机器可读
+      // 形态，直出是实现词泄露）。declined 不开对话框——已拒绝是用户的既定选择（AC6：
+      // 不再征询，仅留人话错误条）。对话框是机器级面（与视图无关都开——后台会话的征询
+      // 同样要答）；agentError 只落活跃视图。
+      const consentAsk = parseAgyBridgeConsentError(event.data.message);
+      if (consentAsk !== null) {
+        if (consentAsk.state !== 'declined') {
+          useAgyBridgeStore.getState().openAsk({
+            state: consentAsk.state,
+            conflicts: consentAsk.conflicts,
+          });
+        }
+        if (!isActiveView) return;
+        writeState(store, {
+          agentError: consentAsk.state === 'conflict'
+            ? 'agent.bridgeConsentConflict'
+            : consentAsk.state === 'declined'
+              ? 'agent.bridgeConsentDeclined'
+              : 'agent.bridgeConsentNeeded',
+          activeSessionRunning: false,
+        });
+        return;
+      }
       if (!isActiveView) return;
       writeState(store, { agentError: event.data.message, activeSessionRunning: false });
+      return;
+    }
+    case 'bridge-notice': {
+      // 子4 W6（design §8）：桥车道运行期通知（打回 / 二次未调 / 软拒）——运行阶段可见性
+      // 纪律：不静默。后台会话照写（键控槽，切回可见，mirror 回退通知）；最小测试 store
+      // 缺省字段不炸。
+      if (store.getState().bridgeNoticesBySession === undefined) return;
+      const notice: BridgeNotice = { id: randomUUID(), notice: event.data.notice, at: Date.now() };
+      writeState(store, (s) => ({
+        bridgeNoticesBySession: {
+          ...(s.bridgeNoticesBySession ?? {}),
+          [sid]: [...(s.bridgeNoticesBySession?.[sid] ?? []), notice].slice(-BRIDGE_NOTICE_CAP),
+        },
+      }));
+      return;
+    }
+    case 'context-usage': {
+      // 09-12 子5 R6（design §11）：leader 每步 generate 落定 → per-session last 值刷新
+      //（后台会话照写——切回即见当前占用；AgentPanel 按 agentSessionId 选择器消费）。
+      // 值等跳过 store 写（每 generate 步一事件，重复渲染零收益）；字段缺席（最小测试
+      // store）不写（mirror modelFallbackNotices 守卫——事件不炸）。
+      const state0 = store.getState();
+      if (state0.contextUsageBySession === undefined) return;
+      const { usedTokens, windowTokens, redlinePercent } = event.data;
+      const prev = state0.contextUsageBySession[sid];
+      if (
+        prev
+        && prev.usedTokens === usedTokens
+        && prev.windowTokens === windowTokens
+        && prev.redlinePercent === redlinePercent
+      ) return;
+      writeState(store, (s) => ({
+        contextUsageBySession: {
+          ...(s.contextUsageBySession ?? {}),
+          [sid]: { usedTokens, windowTokens, redlinePercent, updatedAt: Date.now() },
+        },
+      }));
+      return;
+    }
+    case 'chain-node-artifact': {
+      // 09-13 子3 W2（design §2.2）：节点产出快照（五 kind）——写作页时间线首个消费者
+      //（子2 落地时 dispatcher default 忽略；本波接线）。低频直写不经缓冲；attempt 语义
+      //（每 attempt 新 entry / 同 attempt 覆写取末帧）在 chainTimeline。项目锚 mirror 既有
+      // 链事件机制。
+      anchorChainRun(store, sid, event.projectPath);
+      applyTimelineArtifact(store, sid, event.data);
+      return;
+    }
+    case 'chain-tool': {
+      // 09-13 子3 W2（design §2.2）：链内工具调用（调查层累积）——同上接线形态。
+      anchorChainRun(store, sid, event.projectPath);
+      applyTimelineTool(store, sid, event.data);
       return;
     }
     default:
@@ -616,6 +865,14 @@ function handleToolEvent<S extends AgentDispatchState>(
   for (const result of results) {
     const toolId = result.toolName ?? result.toolId ?? '';
     if (!WRITE_TOOLS.includes(toolId)) continue;
+    // 09-13 子3 W2（design §2.2/F5）：escalate findings 松散通道路由——write-chapter.ts 裁决
+    // 载荷 metadata.findings {source:'reader-audit'|'plan-review', route, chapterId?, items}
+    //（escalate-pause 非 stage pause 不产 chapter_review——findings 只走本通道；resume 车道
+    // 走不到时由 chapterReviewSlice 的 IPC summary fallback 补）。三模式恒路由（mirror
+    // chapter_review——裁决卡是 read-class 载荷）+ 后台会话照写（键控，切回再现）。条目级
+    // 防御投影在 chainTimeline（坏条目单独丢，items 空 = 已审核锚点仍写）。
+    const escalateEntry = extractEscalateFindingsFromMetadata(result.metadata);
+    if (escalateEntry) setEscalateFindings(store, sid, escalateEntry);
     const reviewMetaRaw = result.metadata as
       | (ChapterReviewMetadata & { type?: string })
       | undefined;

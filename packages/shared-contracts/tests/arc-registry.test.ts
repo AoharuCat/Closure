@@ -354,6 +354,27 @@ describe('applyArcLedgerActions — bounded action 投影（纯函数，mirror a
     expect(next.beats[0].note).toBe('新推进');
   });
 
+  it('同 actions 双投影幂等（链流程重排 W3——同章重跑 E 段 arc_ledger_update 无重复登记）', () => {
+    // E 段（E5 arc-emergence → arc_ledger_update）重跑场景：同章同 actions 二次投影 beats 数与
+    // id 集不变——自然键 (arcRef, episodeId, action) upsert 覆盖（W0-2 结论回归锚：arc 侧自然键与
+    // LLM 自拟 id 无关，重跑严格幂等）。
+    const actions = [
+      {
+        type: 'add_beat',
+        beat: { episodeId: 'ep-10', episodeIndex: 10, arcRef: 'phase-1', arcKind: 'volume', action: 'advance', note: '审判日开庭' },
+      },
+      {
+        type: 'add_beat',
+        beat: { episodeId: 'ep-10', episodeIndex: 10, arcRef: 'phase-1', arcKind: 'volume', action: 'close', grounding: '「判决生效。」' },
+      },
+    ] as const;
+    const first = applyArcLedgerActions(emptyRegistry, [...actions]);
+    expect(first.beats).toHaveLength(2);
+    const second = applyArcLedgerActions(first, [...actions]);
+    expect(second.beats).toHaveLength(2);
+    expect(second.beats.map((b) => b.id).sort()).toEqual(first.beats.map((b) => b.id).sort());
+  });
+
   it('同弧同章 advance + close 并存（不同 action = 不同自然键槽）', () => {
     const next = applyArcLedgerActions(emptyRegistry, [
       {

@@ -73,6 +73,7 @@ import {
 import { listCraftMergeReviews } from '../main/db/closureCraftMergeReviewRepository';
 import {
   deleteDeconProductsByMaterial,
+  getDeconJob,
   getDeconPassState,
   upsertDeconProduct,
 } from '../main/db/closure-decon';
@@ -821,6 +822,30 @@ describe.skipIf(!sqliteUsable)('deconP6Craft 落卡编排', () => {
     expect(result.stats.newCards).toBe(0);
     expect(genCalls).toHaveLength(2);
     expect(genCalls[1]!.user).toContain('注意：上一次输出不可解析或大类越界');
+  });
+
+  it('CR-16：空回复纠偏重试的 attempt-1 花费不丢——先累计再 continue（cost.calls 含两笔）', async () => {
+    const jobId = seedRunningJob([{ payload: findingsPayload() }]);
+    condenseQueue = [
+      '', // attempt-1 空回复（helper 已记 actual 落 job 行——本地 cost 不跟进会在 attempt-2 覆写丢笔）
+      JSON.stringify({
+        category: 'qidaigan',
+        termId: TERM_QIDAIGAN,
+        condensed: CONDENSED_TEXT,
+        points: ['第一章内埋钩'],
+        scenarios: ['开篇'],
+        counterexamples: [],
+        tags: ['开篇'],
+        confidence: 0.8,
+      }),
+    ];
+    const result = await runDeconP6(jobId, baseDeps());
+    expect(result.status).toBe('done');
+    if (result.status !== 'done') return;
+    expect(result.stats.droppedNoCategory).toBe(0); // 第二次成功——非丢弃
+    expect(genCalls).toHaveLength(2); // 空回复 → 纠偏重试一次
+    // 旧 bug：attempt-2 以旧 cost 快照 writeDeconCost 覆写（replace 语义）→ attempt-1 花费丢、calls 只剩 1。
+    expect(getDeconJob(jobId)?.cost.byPass.p6?.calls).toBe(2);
   });
 
   it('CR-6 分批落库：220 候选（超旧 200 硬 ceiling）分批全落——done 不 fail、零丢弃零截断', async () => {

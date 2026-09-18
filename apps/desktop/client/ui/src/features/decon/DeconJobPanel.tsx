@@ -16,7 +16,7 @@
  * - 产出阅读五 tab（读法/章评/细批/风格/canon）+ 手艺卡跳转区 + 风格导出（写前确认列节——
  *   design §8 风格导出）。
  */
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
   parseDeconMaterialRef,
   type DeconReportKind,
@@ -27,21 +27,28 @@ import { useI18n } from '../../shared/i18n/useI18n';
 import { useAppStore } from '../../shared/store/appStore';
 import { useConfirmStore } from '../../shared/store/confirmStore';
 import { useToastStore } from '../../shared/store/toastStore';
+import { renderMarkdown } from '../../shared/utils/markdown';
 import { listCraftCards } from '../../shared/api/craft';
 import {
   deconBannerKind,
+  deconChapterUnitLabel,
   deconDimensionLabelKey,
+  deconPassEtaMs,
   deconPassLabel,
   deconPendingReview,
-  deconReportUnitLabelKey,
+  deconReportUnitLabel,
+  deconResumeNextChapter,
   deconStatusBadgeClass,
   deconStatusKey,
   deconTierLabelKey,
-  deconUnitLabelKey,
+  deconUnitLabel,
   formatElapsedMs,
+  isDeconCanonPayloadLike,
   isDeconFindingsLike,
   isDeconStylePayloadLike,
+  isDeconStyleStatsLike,
   summarizeDeconPassStates,
+  type DeconUnitLabel,
 } from './deconView';
 
 /** 产出 tab × 报告 kind 映射（canon tab 走 detail.canon 非 report 面）。 */
@@ -83,6 +90,7 @@ export function DeconJobPanel({ materialNames }: { materialNames: Record<string,
   const productsCache = useAppStore((s) => s.deconProducts);
   const fetchDeconProducts = useAppStore((s) => s.fetchDeconProducts);
   const reportMetas = useAppStore((s) => s.deconReportMetas);
+  const reportMetasLoadedFor = useAppStore((s) => s.deconReportMetasLoadedFor);
   const reportContent = useAppStore((s) => s.deconReportContent);
   const reportContentKey = useAppStore((s) => s.deconReportContentKey);
   const reportContentLoading = useAppStore((s) => s.deconReportContentLoading);
@@ -96,6 +104,10 @@ export function DeconJobPanel({ materialNames }: { materialNames: Record<string,
   /** capped 调预算续跑展开态。 */
   const [budgetOpen, setBudgetOpen] = useState(false);
   const [budgetInput, setBudgetInput] = useState('');
+  /** canon 产出 tab「AI 视图」开关（U2/F17——默认人读卡片；开 = JSON 直出，同人消费面）。 */
+  const [canonAiView, setCanonAiView] = useState(false);
+  /** 已自动开过首报告的 jobId:tab（F15 latch——防切 tab 清空后 effect 重置回第一篇劫持用户选择）。 */
+  const autoOpenedRef = useRef<Set<string>>(new Set());
 
   // 详情/报告 meta 装载（belt——selectDeconJob/createDeconJob 主路径之外的自取数面：
   // mirror CraftCardDetail mount effect 形态；slice loadedFor/详情非空守卫去重）。
@@ -298,21 +310,61 @@ export function DeconJobPanel({ materialNames }: { materialNames: Record<string,
     [detail],
   );
 
+  // ── CR-19：U4 pass 覆盖辅行数据面（done===total 的 pass 数 / 聚合后 pass 总数）。──
+  const passesCompleted = useMemo(
+    () => passSummaries.filter((s) => s.done === s.total).length,
+    [passSummaries],
+  );
+
+  // ── U4 总进度条数据面：主条 = 当前 pass done/total（running 事件 pass + passStates 聚合）；
+  //    ETA = 已 done 单位 updatedAt 均摊 × 剩余（诚实线性外推，样本不足/已完成省略）。──
+  const currentPassSummary =
+    liveEvent !== undefined && liveEvent.status === 'running' && liveEvent.pass !== null
+      ? passSummaries.find((s) => s.pass === liveEvent.pass) ?? null
+      : null;
+  const currentPassEtaMs =
+    currentPassSummary !== null && detail !== null
+      ? deconPassEtaMs(detail.passStates, currentPassSummary.pass)
+      : null;
+
+  // ── C7/F11：failed 续跑落点章（CR-8 条件化——仅失败点确在 p1b〔存在非 done 章号行〕时
+  //    带章号；失败在后续 pass → null 中性「继续拆解」。后端 decon:start 对 failed→retry，
+  //    pass_state 重入零重付）。──
+  const resumeNextChapter = detail !== null ? deconResumeNextChapter(detail.passStates) : null;
+
   const passText = (pass: string): string => {
     const label = deconPassLabel(pass);
     return [t(label.stemKey), ...label.suffixKeys.map((k) => t(k))].join('·');
   };
 
-  const unitText = (unit: string): string => {
-    const parsed = deconUnitLabelKey(unit);
-    if (parsed === null) return unit; // 字面 unit（p2 域名等）原样回显
-    return parsed.index !== undefined ? t(parsed.key, { index: parsed.index }) : t(parsed.key);
+  // ── CR-1 拍板 B：章引用标签单制——detail.chapterLabels（真实章标，壳侧 chapterHeadings
+  //    单源）优先；缺键/detail 未装载回落「材料第 {index} 章」（deconChapterUnitLabel 单源）。──
+  const chapterLabels = detail?.chapterLabels;
+
+  const chapterText = (chapterIndex: number): string => {
+    const label = deconChapterUnitLabel(chapterIndex, chapterLabels);
+    return 'literal' in label
+      ? label.literal
+      : label.index !== undefined
+        ? t(label.key, { index: label.index })
+        : t(label.key);
   };
 
-  const reportText = (meta: DeconReportMeta): string => {
-    const label = deconReportUnitLabelKey(meta.unit);
-    return label.index !== undefined ? t(label.key, { index: label.index }) : t(label.key);
+  const unitLabelText = (parsed: DeconUnitLabel): string =>
+    'literal' in parsed
+      ? parsed.literal
+      : parsed.index !== undefined
+        ? t(parsed.key, { index: parsed.index })
+        : t(parsed.key);
+
+  const unitText = (unit: string): string => {
+    const parsed = deconUnitLabel(unit, chapterLabels);
+    if (parsed === null) return unit; // 字面 unit（p2 域名等）原样回显
+    return unitLabelText(parsed);
   };
+
+  const reportText = (meta: DeconReportMeta): string =>
+    unitLabelText(deconReportUnitLabel(meta.unit, chapterLabels));
 
   const kindText = (kind: string): string => t(`decon.reportKind.${kind}`);
 
@@ -332,10 +384,61 @@ export function DeconJobPanel({ materialNames }: { materialNames: Record<string,
     [jobId, fetchDeconReport, showToast, t],
   );
 
-  // ── 报告详情正文（md + 锚点区——CR-25 E2E「锚点可追」落物）：报告行 anchors 的
-  //    章号〔0 基 +1——CR-2〕/段落区间列表 + 引文摘要（有则显示——契约 DeconSpan 今日不带
-  //    quote 字段，防御读留「有则显示」面）。scene_annotation/style_report 的 anchors 同一
-  //    落位（四 kind 共用单取行）。──
+  // ── F15/U3：done 后自动开首报告（latch 防切 tab 劫持用户选择）。条件全齐才触发：
+  //    选中 job + done + 当前 tab 有对应报告 kind + meta 已装载（loadedFor 对齐——防旧 job
+  //    meta 窗口期误开）+ 无已开内容 + 该 jobId:tab 未自动开过。──
+  useEffect(() => {
+    if (jobId === null || job?.status !== 'done') return;
+    const kind = TAB_KINDS[outputTab];
+    if (kind === undefined) return; // canon tab 走 detail.canon 非 report 面
+    if (reportContentKey !== null || reportMetasLoadedFor !== jobId) return;
+    const first = reportMetas.find((m) => m.kind === kind);
+    if (first === undefined) return;
+    const latchKey = `${jobId}:${outputTab}`;
+    if (autoOpenedRef.current.has(latchKey)) return;
+    autoOpenedRef.current.add(latchKey);
+    openReport(first);
+  }, [jobId, job?.status, outputTab, reportContentKey, reportMetas, reportMetasLoadedFor, openReport]);
+
+  // ── U34：完成横幅「打开读法」——切 reading tab + 开首份书级读法（与自动开共用 openReport；
+  //    用户显式点击不受 latch 约束；meta 未装载时由上方 effect 到点接力）。──
+  const handleOpenReading = useCallback(() => {
+    setOutputTab('reading');
+    clearDeconReportContent();
+    const first = reportMetas.find((m) => m.kind === 'book_reading');
+    if (first !== undefined) openReport(first);
+  }, [setOutputTab, clearDeconReportContent, reportMetas, openReport]);
+
+  // ── F18：风格 tab 无 style_report（粗拆档不产）时回落 p3b stats 行的 styleStats 摘要。
+  //    拉取走 fetchDeconProducts 缓存键 `${jobId}:p3b`（handleExportStyle 同款手法）。──
+  const styleMetas = tabMetas('style');
+  const styleStatsKey = `${jobId ?? ''}:p3b`;
+  const styleStatsRows = productsCache[styleStatsKey];
+  useEffect(() => {
+    if (jobId === null || outputTab !== 'style') return;
+    if (styleMetas.length > 0 || styleStatsRows !== undefined) return;
+    void fetchDeconProducts(jobId, { pass: 'p3b' }).catch(() => {
+      // 拉取失败回落 styleEmpty 空态（服务端数据为准）。
+    });
+  }, [jobId, outputTab, styleMetas.length, styleStatsRows, fetchDeconProducts]);
+  const styleStats = useMemo(() => {
+    if (styleMetas.length > 0) return null;
+    const statsRow = (styleStatsRows ?? []).find((row) => row.unit === 'stats');
+    if (statsRow === undefined) return null;
+    if (!isDeconCanonPayloadLike(statsRow.payload)) return null;
+    return isDeconStyleStatsLike(statsRow.payload.styleStats) ? statsRow.payload.styleStats : null;
+  }, [styleMetas.length, styleStatsRows]);
+
+  // ── 报告详情正文（U1——markdown 渲染：renderMarkdown〔shared 单源，必过 DOMPurify〕+
+  //    锚点区——CR-25 E2E「锚点可追」落物）：报告行 anchors 的章标〔chapterText——CR-1 真实
+  //    章标优先，缺键回落材料第 N 章〕/段落区间列表 + 引文摘要（有则显示——契约 DeconSpan
+  //    今日不带 quote 字段，防御读留「有则显示」面）。scene_annotation/style_report 的 anchors
+  //    同一落位（四 kind 共用单取行）。──
+  const reportHtml = useMemo(
+    () => (reportContent !== null ? renderMarkdown(reportContent.contentMd) : null),
+    [reportContent],
+  );
+
   const renderReportBody = () => {
     if (reportContentLoading) {
       return <div className="materials-form-loading">{t('decon.output.loading')}</div>;
@@ -354,7 +457,7 @@ export function DeconJobPanel({ materialNames }: { materialNames: Record<string,
                 <div key={idx} className="decon-anchor" data-decon-anchor={idx}>
                   <span className="decon-anchor-range">
                     {t('decon.output.anchorRow', {
-                      chapter: anchor.chapterIndex + 1,
+                      chapter: chapterText(anchor.chapterIndex),
                       start: anchor.paraStart,
                       end: anchor.paraEnd,
                     })}
@@ -367,7 +470,11 @@ export function DeconJobPanel({ materialNames }: { materialNames: Record<string,
             })}
           </div>
         )}
-        <pre className="decon-reportmd">{reportContent.contentMd}</pre>
+        <div
+          className="decon-reportmd agent-msg-md"
+          data-decon-report-md="true"
+          dangerouslySetInnerHTML={{ __html: reportHtml ?? '' }}
+        />
       </>
     );
   };
@@ -494,6 +601,190 @@ export function DeconJobPanel({ materialNames }: { materialNames: Record<string,
     );
   };
 
+  // ── U2/F17：canon 按域字段卡片。payload 是 `{evidence} + passthrough`（域内形状落注释
+  //    不实施）——逐字段形态守卫，字段不在即折叠，勿假设必在；「AI 视图」开关回 JSON 直出
+  //    （同人消费面）。生产形状（p2Canon）：character 画像字段嵌 `portrait`（无则平铺兜底）、
+  //    relationship 嵌 `pair`、timeline 带 consistency/events/conflictNote。──
+  const canonText = (value: unknown): string | null =>
+    typeof value === 'string' && value.trim().length > 0 ? value.trim() : null;
+
+  const renderCanonField = (slug: string, labelKey: string, value: string) => (
+    <div key={slug} className="decon-canonfield" data-decon-canon-field={slug}>
+      <span className="decon-canonfield-label">{t(labelKey)}</span>
+      <span className="decon-canonfield-value">{value}</span>
+    </div>
+  );
+
+  const CANON_TEXT_FIELDS: ReadonlyArray<readonly [string, string]> = [
+    ['identity', 'decon.canonCard.identity'],
+    ['speechPattern', 'decon.canonCard.speechPattern'],
+    ['abilities', 'decon.canonCard.abilities'],
+    ['arc', 'decon.canonCard.arc'],
+    ['coreTrauma', 'decon.canonCard.coreTrauma'],
+    ['pillars', 'decon.canonCard.pillars'],
+    ['voiceAnchors', 'decon.canonCard.voiceAnchors'],
+    ['antiVoice', 'decon.canonCard.antiVoice'],
+    ['neverDo', 'decon.canonCard.neverDo'],
+  ];
+
+  const renderCanonEntryFields = (domain: string, payload: Record<string, unknown>): ReactNode => {
+    switch (domain) {
+      case 'world': {
+        const summary = canonText(payload.summary);
+        return summary !== null ? renderCanonField('summary', 'decon.canonCard.summary', summary) : null;
+      }
+      case 'rule': {
+        const statement = canonText(payload.statement) ?? canonText(payload.summary);
+        return statement !== null ? renderCanonField('statement', 'decon.canonCard.statement', statement) : null;
+      }
+      case 'tone': {
+        const baseline = canonText(payload.baseline) ?? canonText(payload.summary);
+        return baseline !== null ? renderCanonField('baseline', 'decon.canonCard.baseline', baseline) : null;
+      }
+      case 'relationship': {
+        const pair = isDeconCanonPayloadLike(payload.pair) ? payload.pair : null;
+        if (pair === null) return null;
+        const from = canonText(pair.from);
+        const to = canonText(pair.to);
+        const kind = canonText(pair.kind);
+        if (from === null || to === null) return null;
+        const nodes: ReactNode[] = [
+          renderCanonField('pair', 'decon.canonCard.pair', `${from} → ${to}${kind !== null ? `·${kind}` : ''}`),
+        ];
+        const pairEvidence = isDeconCanonPayloadLike(pair.evidence) ? pair.evidence : null;
+        const edgeCount =
+          pairEvidence !== null &&
+          typeof pairEvidence.edgeCount === 'number' &&
+          Number.isFinite(pairEvidence.edgeCount)
+            ? pairEvidence.edgeCount
+            : null;
+        if (edgeCount !== null) {
+          nodes.push(
+            renderCanonField('edgeCount', 'decon.canonCard.edgeCount', t('decon.canonCard.edgeCountValue', { count: edgeCount })),
+          );
+        }
+        return nodes;
+      }
+      case 'timeline': {
+        const nodes: ReactNode[] = [];
+        const consistency = canonText(payload.consistency);
+        const consistencyKey =
+          consistency === 'exact' ? 'decon.canonCard.consistencyExact'
+            : consistency === 'intentional_loose' ? 'decon.canonCard.consistencyLoose'
+              : consistency === 'conflict' ? 'decon.canonCard.consistencyConflict'
+                : null;
+        if (consistencyKey !== null) {
+          nodes.push(renderCanonField('consistency', 'decon.canonCard.consistency', t(consistencyKey)));
+        }
+        const conflictNote = canonText(payload.conflictNote);
+        if (conflictNote !== null) {
+          nodes.push(renderCanonField('conflictNote', 'decon.canonCard.conflictNote', conflictNote));
+        }
+        if (Array.isArray(payload.events) && payload.events.length > 0) {
+          const rows = payload.events
+            .slice(0, 20)
+            .map((raw): string | null => {
+              if (raw === null || typeof raw !== 'object') return null;
+              const ev = raw as Record<string, unknown>;
+              if (typeof ev.chapterIndex !== 'number' || !Number.isFinite(ev.chapterIndex)) return null;
+              const label = canonText(ev.storyTimeLabel);
+              return label !== null
+                ? t('decon.canonCard.eventRow', { chapter: ev.chapterIndex, label })
+                : t('decon.canonCard.eventUnannotated', { chapter: ev.chapterIndex });
+            })
+            .filter((row): row is string => row !== null);
+          nodes.push(
+            <div className="decon-canonfield" data-decon-canon-field="events" key="events">
+              <span className="decon-canonfield-label">
+                {t('decon.canonCard.events', { count: payload.events.length })}
+              </span>
+              <div className="decon-canonlist">
+                {rows.map((row, i) => (
+                  <div key={i} className="decon-canonlist-row">{row}</div>
+                ))}
+              </div>
+            </div>,
+          );
+          if (payload.events.length > 20) nodes.push(renderTruncated(payload.events.length, 20));
+        }
+        return nodes;
+      }
+      case 'character': {
+        const nodes: ReactNode[] = [];
+        const portrait = isDeconCanonPayloadLike(payload.portrait) ? payload.portrait : payload;
+        for (const [slug, labelKey] of CANON_TEXT_FIELDS) {
+          const value = canonText(portrait[slug]);
+          if (value !== null) nodes.push(renderCanonField(slug, labelKey, value));
+        }
+        const traits: Array<{ name: string; mutability: string; note: string | null }> = [];
+        if (Array.isArray(portrait.traits)) {
+          for (const raw of portrait.traits) {
+            if (raw === null || typeof raw !== 'object') continue;
+            const tr = raw as Record<string, unknown>;
+            const name = canonText(tr.name);
+            if (name === null) continue;
+            traits.push({
+              name,
+              mutability: typeof tr.mutability === 'string' ? tr.mutability : '',
+              note: canonText(tr.note),
+            });
+          }
+        }
+        if (traits.length > 0) {
+          nodes.push(
+            <div className="decon-canonfield" data-decon-canon-field="traits" key="traits">
+              <span className="decon-canonfield-label">{t('decon.canonCard.traits')}</span>
+              <div className="decon-canontraits">
+                {traits.map((tr, i) => (
+                  <div key={`${tr.name}-${i}`} className="decon-canontrait" data-decon-canon-trait={tr.name}>
+                    <span className="decon-canontrait-name">{tr.name}</span>
+                    {(tr.mutability === 'immutable' || tr.mutability === 'evolvable') && (
+                      <span className="materials-chip materials-chip--muted">
+                        {t(
+                          tr.mutability === 'immutable'
+                            ? 'decon.canonCard.traitImmutable'
+                            : 'decon.canonCard.traitEvolvable',
+                        )}
+                      </span>
+                    )}
+                    {tr.note !== null && <span className="decon-canontrait-note">{tr.note}</span>}
+                  </div>
+                ))}
+              </div>
+            </div>,
+          );
+        }
+        const aliases = Array.isArray(payload.aliases)
+          ? payload.aliases.filter((a): a is string => typeof a === 'string' && a.length > 0)
+          : [];
+        if (aliases.length > 0) {
+          nodes.push(renderCanonField('aliases', 'decon.canonCard.aliases', aliases.join('、')));
+        }
+        const mentions = isDeconCanonPayloadLike(payload.mentions) ? payload.mentions : null;
+        if (
+          mentions !== null &&
+          typeof mentions.total === 'number' &&
+          Number.isFinite(mentions.total) &&
+          mentions.total > 0
+        ) {
+          nodes.push(renderCanonField('mentions', 'decon.canonCard.mentions', String(mentions.total)));
+        }
+        if (payload.portraitDegraded === true) {
+          nodes.push(
+            <div className="decon-canonfield" data-decon-canon-field="portraitDegraded" key="portraitDegraded">
+              <span className="decon-canonfield-value decon-canonfield-value--muted">
+                {t('decon.canonCard.portraitDegraded')}
+              </span>
+            </div>,
+          );
+        }
+        return nodes;
+      }
+      default:
+        return null;
+    }
+  };
+
   // ── 产出 tab 内容渲染 ──
   const renderTabContent = () => {
     switch (outputTab) {
@@ -510,6 +801,16 @@ export function DeconJobPanel({ materialNames }: { materialNames: Record<string,
         }
         return (
           <div className="decon-canonbrowse" data-decon-canon-domains={domains.size}>
+            <div className="decon-canonviewtoggle">
+              <button
+                type="button"
+                className={`materials-crafttag${canonAiView ? ' is-active' : ''}`}
+                onClick={() => setCanonAiView((v) => !v)}
+                data-decon-canon-view={canonAiView ? 'ai' : 'human'}
+              >
+                {t('decon.canonCard.aiView')}
+              </button>
+            </div>
             {[...domains.entries()].map(([domain, entries]) => (
               <div key={domain} className="decon-gate-domain">
                 <div className="craft-grouphead">
@@ -517,27 +818,91 @@ export function DeconJobPanel({ materialNames }: { materialNames: Record<string,
                     {t('decon.review.canonEntries', { domain: t(`decon.canonDomain.${domain}`), count: entries.length })}
                   </span>
                 </div>
-                {entries.map((entry) => (
-                  <div key={`${domain}-${entry.name}`} className="decon-canonentry" data-decon-canon-entry={entry.name}>
-                    <span className="decon-canonentry-name">{entry.name}</span>
-                    <span className="decon-canonentry-payload">{JSON.stringify(entry.payload)}</span>
-                  </div>
-                ))}
+                {entries.map((entry) => {
+                  const payloadOk = isDeconCanonPayloadLike(entry.payload);
+                  return (
+                    <div key={`${domain}-${entry.name}`} className="decon-canonentry" data-decon-canon-entry={entry.name}>
+                      <div className="decon-canonentry-head">
+                        <span className="decon-canonentry-name">{entry.name}</span>
+                        <span
+                          className={`materials-chip${entry.payload.evidence === 'exact' ? ' materials-chip--tier' : ' materials-chip--muted'}`}
+                          data-decon-canon-evidence={entry.payload.evidence}
+                        >
+                          {t(
+                            entry.payload.evidence === 'exact'
+                              ? 'decon.canonCard.evidenceExact'
+                              : 'decon.canonCard.evidenceInferred',
+                          )}
+                        </span>
+                      </div>
+                      {canonAiView ? (
+                        <span className="decon-canonentry-payload">{JSON.stringify(entry.payload)}</span>
+                      ) : (
+                        payloadOk && renderCanonEntryFields(domain, entry.payload)
+                      )}
+                      <div className="decon-canonmeta" data-decon-canon-meta="true">
+                        {t('decon.canonCard.anchorsCount', { count: entry.anchors.length })}
+                        {entry.provenance.bookTitle !== null
+                          ? `·${t('decon.canonCard.provenance', { book: entry.provenance.bookTitle })}`
+                          : ''}
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
             ))}
           </div>
         );
       }
       case 'style': {
-        const metas = tabMetas('style');
         return (
           <>
-            {metas.length === 0 ? (
-              <div className="materials-empty" data-decon-tab-empty="style">{t('decon.output.styleEmpty')}</div>
+            {styleMetas.length === 0 ? (
+              // F18：无 style_report（粗拆档不产）→ 回落 p3b stats 行的 styleStats 三数字摘要。
+              styleStats !== null ? (
+                <div className="decon-stylestats" data-decon-style-stats="true">
+                  <div className="craft-grouphead">
+                    <span className="craft-grouphead-name">{t('decon.output.styleStatsTitle')}</span>
+                  </div>
+                  <div className="decon-canonfield" data-decon-style-stat="sentence">
+                    <span className="decon-canonfield-label">{t('decon.output.styleSentenceLabel')}</span>
+                    <span className="decon-canonfield-value">
+                      {t('decon.output.styleDistribution', {
+                        count: styleStats.sentenceChars.count,
+                        avg: Math.round(styleStats.sentenceChars.avg),
+                        max: styleStats.sentenceChars.max,
+                      })}
+                    </span>
+                  </div>
+                  <div className="decon-canonfield" data-decon-style-stat="paragraph">
+                    <span className="decon-canonfield-label">{t('decon.output.styleParagraphLabel')}</span>
+                    <span className="decon-canonfield-value">
+                      {t('decon.output.styleDistribution', {
+                        count: styleStats.paragraphChars.count,
+                        avg: Math.round(styleStats.paragraphChars.avg),
+                        max: styleStats.paragraphChars.max,
+                      })}
+                    </span>
+                  </div>
+                  <div className="decon-canonfield" data-decon-style-stat="dialogue">
+                    <span className="decon-canonfield-label">{t('decon.output.styleDialogueLabel')}</span>
+                    <span className="decon-canonfield-value">
+                      {t('decon.output.styleDialogueRatio', {
+                        ratio: Math.round(styleStats.dialogueLineRatio * 100),
+                      })}
+                    </span>
+                  </div>
+                  <div className="materials-form-loading" data-decon-style-needs-fine="true">
+                    {t('decon.output.styleNeedsFine')}
+                  </div>
+                </div>
+              ) : (
+                <div className="materials-empty" data-decon-tab-empty="style">{t('decon.output.styleEmpty')}</div>
+              )
             ) : (
               <div className="decon-reportview">
                 <div className="decon-reportlist">
-                  {metas.map((meta) => (
+                  {styleMetas.map((meta) => (
                     <button
                       key={`${meta.kind}:${meta.unit}`}
                       type="button"
@@ -580,10 +945,22 @@ export function DeconJobPanel({ materialNames }: { materialNames: Record<string,
             outputTab === 'reading' ? 'decon.output.readingEmpty'
               : outputTab === 'chapters' ? 'decon.output.chaptersEmpty'
                 : 'decon.output.scenesEmpty';
-          return <div className="materials-empty" data-decon-tab-empty={outputTab}>{t(emptyKey)}</div>;
+          return (
+            <div className="materials-empty" data-decon-tab-empty={outputTab}>
+              {t(emptyKey)}
+              {/* U5：粗拆档会话的章评/细批空态注明档位解锁（章评细拆+ / 细批深度档）。 */}
+              {job?.tier === 'coarse' && (outputTab === 'chapters' || outputTab === 'scenes') && (
+                <div className="materials-form-loading" data-decon-coarse-locked="true">
+                  {t('decon.output.coarseLockedHint')}
+                </div>
+              )}
+            </div>
+          );
         }
-        const hintKey = outputTab === 'chapters' ? 'decon.output.selectChapter'
-          : outputTab === 'scenes' ? 'decon.output.selectScene' : null;
+        // U5：reading 正文区空态 hint（点行才加载——F15 自动开为正路，hint 作 belt）。
+        const hintKey = outputTab === 'reading' ? 'decon.output.selectReport'
+          : outputTab === 'chapters' ? 'decon.output.selectChapter'
+            : 'decon.output.selectScene';
         return (
           <div className="decon-reportview">
             <div className="decon-reportlist">
@@ -600,7 +977,7 @@ export function DeconJobPanel({ materialNames }: { materialNames: Record<string,
               ))}
             </div>
             <div className="decon-reportbody">
-              {!reportContentLoading && reportContent === null && hintKey !== null && (
+              {!reportContentLoading && reportContent === null && (
                 <div className="materials-empty">{t(hintKey)}</div>
               )}
               {renderReportBody()}
@@ -635,9 +1012,17 @@ export function DeconJobPanel({ materialNames }: { materialNames: Record<string,
             {t('decon.action.pause')}
           </button>
         )}
-        {(job?.status === 'pending' || job?.status === 'paused' || job?.status === 'capped') && (
+        {(job?.status === 'pending' || job?.status === 'paused' || job?.status === 'capped' || job?.status === 'failed') && (
           <button type="button" className="materials-browsebtn" disabled={actionBusy} onClick={() => { void handleStart(); }} data-decon-action="resume">
-            {job?.status === 'pending' ? t('decon.wizard.start') : t('decon.action.resume')}
+            {job?.status === 'pending'
+              ? t('decon.wizard.start')
+              : job?.status === 'failed'
+                // CR-8：失败点确在 p1b 才带章号（chapterText 真实章标——CR-1）；后续 pass 失败
+                // 用中性「继续拆解」（重入点归后端 pass_state 台账，不假造章号）。
+                ? (resumeNextChapter !== null
+                    ? t('decon.action.resumeFromChapter', { chapter: chapterText(resumeNextChapter) })
+                    : t('decon.action.resumeDecon'))
+                : t('decon.action.resume')}
           </button>
         )}
         {job?.status === 'capped' && (
@@ -655,7 +1040,14 @@ export function DeconJobPanel({ materialNames }: { materialNames: Record<string,
             {t('decon.action.confirmRerun')}
           </button>
         )}
-        <button type="button" className="materials-browsebtn" disabled={actionBusy} onClick={() => { void handleDelete(); }} data-decon-action="delete">
+        {/* 删除降次按钮（U35——失败恢复动线里「继续」是主 CTA，删除是破坏性兜底）。 */}
+        <button
+          type="button"
+          className="materials-browsebtn decon-action--secondary"
+          disabled={actionBusy}
+          onClick={() => { void handleDelete(); }}
+          data-decon-action="delete"
+        >
           {t('decon.action.delete')}
         </button>
       </div>
@@ -701,7 +1093,21 @@ export function DeconJobPanel({ materialNames }: { materialNames: Record<string,
           {banner === 'capped' && t('decon.banner.capped')}
           {banner === 'stale' && t('decon.banner.stale')}
           {banner === 'failed' && t('decon.banner.failed', { message: job?.error ?? '' })}
-          {banner === 'done' && t('decon.banner.done')}
+          {banner === 'done' && (
+            <>
+              {t('decon.banner.done')}
+              {/* U34：完成横幅内嵌「打开读法」——切 reading tab + 开首份书级读法（与 F15
+                  自动开共用 openReport）。 */}
+              <button
+                type="button"
+                className="decon-banner-open"
+                onClick={handleOpenReading}
+                data-decon-action="open-reading"
+              >
+                {t('decon.banner.openReading')}
+              </button>
+            </>
+          )}
           {banner === 'cancelled' && t('decon.banner.cancelled')}
           {/* note 软提示（CR-10——闸门暂停「待人工确认」等常规预期态注记）：事件 best-effort
               可丢——丢则只有上行判定文案；error 只显真失败（failed/capped 横幅），互不混用。 */}
@@ -739,14 +1145,59 @@ export function DeconJobPanel({ materialNames }: { materialNames: Record<string,
             </div>
           )}
 
-          {/* pass 进度（聚合行 + 当前相位）。 */}
+          {/* pass 进度（U4 总进度条 + 聚合行 + 当前相位）。 */}
           <div className="decon-progress" data-decon-progress={passSummaries.length}>
+            {currentPassSummary !== null && (
+              <div className="decon-progress-total" data-decon-progress-total={currentPassSummary.pass}>
+                <div
+                  className="decon-progress-total-bar"
+                  style={{
+                    width: `${
+                      currentPassSummary.total === 0
+                        ? 0
+                        : Math.round((currentPassSummary.done / currentPassSummary.total) * 100)
+                    }%`,
+                  }}
+                />
+                <span className="decon-progress-total-text">
+                  {t('decon.progress.total', {
+                    done: currentPassSummary.done,
+                    total: currentPassSummary.total,
+                  })}
+                  {currentPassEtaMs !== null
+                    ? `·${t('decon.progress.eta', { eta: formatElapsedMs(currentPassEtaMs) })}`
+                    : ''}
+                </span>
+              </div>
+            )}
             {liveEvent !== undefined && liveEvent.status === 'running' && liveEvent.pass !== null && (
               <div className="decon-progress-current" data-decon-progress-current={liveEvent.pass}>
                 <span className="material-symbols-outlined" aria-hidden="true">progress_activity</span>
                 {passText(liveEvent.pass)}
-                {liveEvent.unit != null && liveEvent.unit !== '' ? `·${unitText(liveEvent.unit)}` : ''}
+                {liveEvent.unit != null && liveEvent.unit !== ''
+                  ? `·${
+                      currentPassSummary !== null && /^[0-9]+$/.test(liveEvent.unit)
+                        ? t('decon.progress.unitOfTotal', {
+                            unit: unitText(liveEvent.unit),
+                            total: currentPassSummary.total,
+                          })
+                        : unitText(liveEvent.unit)
+                    }`
+                  : ''}
                 {`·${formatElapsedMs(liveEvent.elapsedMs ?? 0)}`}
+              </div>
+            )}
+            {/* CR-19：U4 pass 覆盖辅行（已完成 pass 数/总 pass 数——X = done===total 的 pass，
+                Y = 聚合后 pass 总数；化石-only pass 已在聚合层滤除）。 */}
+            {passSummaries.length > 0 && (
+              <div
+                className="decon-progress-coverage"
+                data-decon-progress-passes={`${passesCompleted}/${passSummaries.length}`}
+              >
+                {t('decon.progress.passCoverage', {
+                  done: passesCompleted,
+                  total: passSummaries.length,
+                })}
               </div>
             )}
             {passSummaries.map((summary) => (

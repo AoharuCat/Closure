@@ -1,15 +1,19 @@
 /**
  * Story 4.3 Step 4（design §3.6 / §5）：chapterReviewSlice 行为测。
  * Story 7.1 B1（design §4.2）：选区指挥精修扩展（compileIntent / confirmRedoWithIntent / B1 state）测。
+ * 09-13 子3 W4（design §5.3/F2）：五本地态 BySession 键控 + 七动作 sessionId 尾参测
+ * （写作页审批迁移——后台会话直审不切走，两会话本地态不互串）+ metadataFromPausedSummary
+ * final 扩展（reviewSummary/lintReport/'accept' 注入）。
  *
  * 覆盖：
  * - setPausedReview：metadata 落 state。
  * - 三动作（continue/redo/abort）调 shared/api resumeChapterChain（→ closure:resume-chapter-chain IPC）
  *   + 据返回 summary 和解 pausedReview（completed/aborted → clear；paused → 更新下一 checkpoint 载荷；error → clear + 不静默）。
- * - registerProjectReset：项目切换清 pausedReview（跨项目不泄漏，[[state-management]] 硬约束）。
+ * - registerProjectReset：项目切换清无归属键（跨项目不泄漏，[[state-management]] 硬约束）。
  * - Story 7.1 B1：compileIntent 调 compileRevisionIntent IPC + 和解（intent 非空 → compiledIntent；
  *   null/error → intentCompileError）；confirmRedoWithIntent 调 resume redo + revisionIntent 透传 + 清 B1 state；
  *   setReviewSelection / clearCompiledIntent；项目隔离 reset 清 B1 state。
+ * - W4：双会话键控隔离（A 在途 reviewResuming 不挡 B 动作 / B 动作按 B 的 pausedReview 键）。
  *
  * 范式判据：slice 只路由 metadata + 派发机械控制信号；resume 结果和解除纯代码确定性。
  *
@@ -18,7 +22,7 @@
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { create } from 'zustand';
-import { createChapterReviewSlice, type ChapterReviewSlice } from '../src/shared/store/chapterReviewSlice';
+import { createChapterReviewSlice, metadataFromPausedSummary } from '../src/shared/store/chapterReviewSlice';
 import { runProjectResets } from '../src/shared/store/resetRegistry';
 import { __clearAgentEventTracks, rememberSessionProject } from '../src/shared/store/agentEvents';
 import { useToastStore } from '../src/shared/store/toastStore';
@@ -42,13 +46,15 @@ declare global {
   }
 }
 
-type TestState = ChapterReviewSlice & {
+type TestState = import('../src/shared/store/chapterReviewSlice').ChapterReviewSlice & {
   currentProject: { path?: string } | null;
   agentSessionId: string | null;
   resolvedLocale: string;
   /** dogfood T1 CR-T1-027：busy 拒绝 toast 的一键跳转（占用者会话）。 */
   switchAgentSession: (sessionId: string) => Promise<void>;
   setPendingPatch: (sessionId: string, patch: import('@orison/shared-contracts').ProjectFieldPatch | null) => void;
+  /** CR-3：escalate 裁决卡失效清键的读写面（Deps 可选面——测试持真键验证消费失效）。 */
+  escalateFindingsBySession: Record<string, import('../src/shared/store/chainTimeline').EscalateFindingsEntry>;
 };
 
 const pendingPatchSpy = vi.fn();
@@ -61,6 +67,7 @@ const useTestStore = create<TestState>()((...a) => ({
   resolvedLocale: 'en-US',
   switchAgentSession: switchAgentSessionSpy,
   setPendingPatch: pendingPatchSpy,
+  escalateFindingsBySession: {},
 }));
 
 // 文件级单 spy（vitest 4 `vi.spyOn` 对已挂 mock 直接复用 × zustand 快照血缘传播——
@@ -98,6 +105,13 @@ const SAMPLE_INTENT: RevisionIntent = {
   },
 };
 
+// ── W4 键控读 helper（五本地态键缺席 = 缺省态） ──
+const resuming = (sid = 'session-1') => useTestStore.getState().reviewResumingBySession[sid] === true;
+const selection = (sid = 'session-1') => useTestStore.getState().reviewSelectionBySession[sid] ?? null;
+const compiled = (sid = 'session-1') => useTestStore.getState().compiledIntentBySession[sid] ?? null;
+const compiling = (sid = 'session-1') => useTestStore.getState().intentCompilingBySession[sid] === true;
+const compileError = (sid = 'session-1') => useTestStore.getState().intentCompileErrorBySession[sid] ?? null;
+
 beforeEach(() => {
   __clearAgentEventTracks(); // CR-T1-025 用例间隔离（rememberSessionProject 模块级 Map）
   toastSpy.mockClear(); // 文件级 spy 计数按测清
@@ -110,11 +124,12 @@ beforeEach(() => {
   useToastStore.setState({ toasts: [] });
   useTestStore.setState({
     pausedReviewBySession: {},
-    reviewResuming: false,
-    reviewSelection: null,
-    compiledIntent: null,
-    intentCompiling: false,
-    intentCompileError: null,
+    reviewResumingBySession: {},
+    reviewSelectionBySession: {},
+    compiledIntentBySession: {},
+    intentCompilingBySession: {},
+    intentCompileErrorBySession: {},
+    escalateFindingsBySession: {},
     currentProject: { path: '/proj' },
     agentSessionId: 'session-1',
     resolvedLocale: 'en-US',
@@ -150,7 +165,7 @@ describe('chapterReviewSlice — reviewContinue', () => {
     });
     // completed → 清 pausedReview。
     expect((useTestStore.getState().pausedReviewBySession[useTestStore.getState().agentSessionId ?? ''] ?? null)).toBeNull();
-    expect(useTestStore.getState().reviewResuming).toBe(false);
+    expect(resuming()).toBe(false);
   });
 
   it('completed summary → 清 pausedReview（panel 卸载）', async () => {
@@ -170,7 +185,7 @@ describe('chapterReviewSlice — reviewContinue', () => {
 
     // 被动中断不清场（chainSnapshot 滞留可再续）——mirror busy 分支「原样保留」哲学。
     expect(useTestStore.getState().pausedReviewBySession['session-1']).toBeDefined();
-    expect(useTestStore.getState().reviewResuming).toBe(false);
+    expect(resuming()).toBe(false);
     expect(toastSpy).toHaveBeenCalledTimes(1);
     // toast 文案注明重跑起点语义（保留载荷 = 上次审阅快照）。
     expect(String(toastSpy.mock.calls[0][0])).toContain('snapshot from your last review');
@@ -202,7 +217,7 @@ describe('chapterReviewSlice — reviewContinue', () => {
     await useTestStore.getState().reviewContinue();
 
     expect(useTestStore.getState().pausedReviewBySession['session-1']).toBeDefined();
-    expect(useTestStore.getState().reviewResuming).toBe(false);
+    expect(resuming()).toBe(false);
     expect(toastSpy).toHaveBeenCalledTimes(1);
     expect(String(toastSpy.mock.calls[0][0])).toContain('loadProject failed: boom');
   });
@@ -214,7 +229,7 @@ describe('chapterReviewSlice — reviewContinue', () => {
     await expect(useTestStore.getState().reviewContinue()).resolves.toBeUndefined();
 
     expect(useTestStore.getState().pausedReviewBySession['session-1']).toBeDefined();
-    expect(useTestStore.getState().reviewResuming).toBe(false);
+    expect(resuming()).toBe(false);
     expect(toastSpy).toHaveBeenCalledTimes(1);
     expect(String(toastSpy.mock.calls[0][0])).toContain('IPC 下线');
   });
@@ -282,18 +297,291 @@ describe('chapterReviewSlice — reviewAbort', () => {
   });
 });
 
+// ═══════════════════════════════════════════════════════════════════════════
+// 09-13 子3 W5（design §4.1）：终稿 accept slice 化（CR-18 interim 面板 handler 迁入——
+// editedDraft 条件携带 + 和解分支 mirror 三动作 + 完成收尾 i18n 文案 agent.reviewFinalAccepted*）。
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('chapterReviewSlice — reviewAcceptFinal（W5 终稿 accept slice 化）', () => {
+  const finalMeta: ChapterReviewMetadata = {
+    type: 'chapter_review',
+    stage: 'final',
+    chapterId: 'ch_001',
+    draftContent: '终稿正文。',
+    resumeOptions: ['accept', 'redo', 'abort'],
+  };
+  const ACCEPT = {
+    chapterId: 'ch_001',
+    candidate: { title: '第八章', content: '正文…', wordCount: 2800 },
+    runId: 'run_mock',
+  };
+
+  it('携 editedDraft → IPC action=accept + editedDraft 透传；无手改调用 → 不带 editedDraft 字段', async () => {
+    useTestStore.getState().setPausedReview('session-1', finalMeta);
+
+    await useTestStore.getState().reviewAcceptFinal('手改后的全文。');
+    expect(apiMocks.resumeChapterChain.mock.calls[0][0]).toMatchObject({
+      projectPath: '/proj',
+      sessionId: 'session-1',
+      chapterId: 'ch_001',
+      action: 'accept',
+      editedDraft: '手改后的全文。',
+    });
+
+    apiMocks.resumeChapterChain.mockClear();
+    useTestStore.getState().setPausedReview('session-1', finalMeta);
+    await useTestStore.getState().reviewAcceptFinal();
+    expect(apiMocks.resumeChapterChain.mock.calls[0][0].editedDraft).toBeUndefined();
+  });
+
+  it('accept 置 reviewResuming flight 键（#105 done-probe 守卫同享——interim 本地 inFlight 无此覆盖）', async () => {
+    useTestStore.getState().setPausedReview('session-1', finalMeta);
+    let release!: (v: RunChapterChainSummary) => void;
+    apiMocks.resumeChapterChain.mockImplementation(() => new Promise((resolve) => { release = resolve; }));
+
+    const p = useTestStore.getState().reviewAcceptFinal();
+    expect(resuming()).toBe(true);
+    release(makeSummary({ status: 'completed' }));
+    await p;
+    expect(resuming()).toBe(false);
+  });
+
+  it('completed + chapterPersisted（F1a 直落）→ 清面板 + agent.reviewFinalAccepted 文案（en locale 真翻译）', async () => {
+    useTestStore.getState().setPausedReview('session-1', finalMeta);
+    apiMocks.resumeChapterChain.mockResolvedValue(makeSummary({
+      status: 'completed',
+      chapterPersisted: true,
+      draftTitle: '第八章',
+      chapter_accept: ACCEPT,
+    }));
+
+    await useTestStore.getState().reviewAcceptFinal();
+
+    expect(useTestStore.getState().pausedReviewBySession['session-1']).toBeUndefined();
+    expect(pendingPatchSpy).not.toHaveBeenCalled();
+    const toastText = String(toastSpy.mock.calls[0][0]);
+    expect(toastText).toContain('第八章');
+    expect(toastText).toContain('chapters/');
+  });
+
+  it('completed + chapter_accept 未直落 → envelope 进 setPendingPatch（chapter_candidate）+ 待审阅文案', async () => {
+    useTestStore.getState().setPausedReview('session-1', finalMeta);
+    apiMocks.resumeChapterChain.mockResolvedValue(makeSummary({
+      status: 'completed',
+      draftTitle: '第八章',
+      chapter_accept: { ...ACCEPT, storyDecisions: [{ id: 'd1', summary: 's' }] as never },
+    }));
+
+    await useTestStore.getState().reviewAcceptFinal();
+
+    expect(pendingPatchSpy).toHaveBeenCalledTimes(1);
+    const [sid, patch] = pendingPatchSpy.mock.calls[0] as [string, import('@orison/shared-contracts').ProjectFieldPatch];
+    expect(sid).toBe('session-1');
+    expect(patch.patches[0].field).toBe('chapter_candidate');
+    expect((patch.patches[0].data as { storyDecisions?: unknown[] }).storyDecisions).toHaveLength(1);
+    expect(String(toastSpy.mock.calls[0][0])).toContain('第八章');
+  });
+
+  it('aborted/error（accept 被动中断）→ 保留面板可重试 + 中断 toast（mirror continue/redo 分流）', async () => {
+    useTestStore.getState().setPausedReview('session-1', finalMeta);
+    apiMocks.resumeChapterChain.mockResolvedValue(makeSummary({ status: 'aborted' }));
+
+    await useTestStore.getState().reviewAcceptFinal();
+
+    expect(useTestStore.getState().pausedReviewBySession['session-1']).toBeDefined();
+    expect(String(toastSpy.mock.calls[0][0])).toContain('snapshot from your last review');
+  });
+
+  it('IPC throw（accept）→ 保留面板 + 失败 toast（不清场）', async () => {
+    useTestStore.getState().setPausedReview('session-1', finalMeta);
+    apiMocks.resumeChapterChain.mockRejectedValue(new Error('IPC 下线'));
+
+    await expect(useTestStore.getState().reviewAcceptFinal()).resolves.toBeUndefined();
+
+    expect(useTestStore.getState().pausedReviewBySession['session-1']).toBeDefined();
+    expect(String(toastSpy.mock.calls[0][0])).toContain('IPC 下线');
+  });
+
+  it('B1 trigger 态清理（选区/intent 卡不残留到下一 checkpoint）+ 重入 guard', async () => {
+    useTestStore.getState().setPausedReview('session-1', finalMeta);
+    useTestStore.setState({
+      reviewSelectionBySession: { 'session-1': { text: '选区', from: 1, to: 3 } },
+      compiledIntentBySession: { 'session-1': SAMPLE_INTENT },
+    });
+    apiMocks.resumeChapterChain.mockResolvedValue(makeSummary({ status: 'completed' }));
+
+    await useTestStore.getState().reviewAcceptFinal();
+
+    expect(selection()).toBeNull();
+    expect(compiled()).toBeNull();
+
+    // 重入 guard：flight 在途再调 → no-op（mirror confirmRedoWithIntent 哲学）。
+    apiMocks.resumeChapterChain.mockClear();
+    useTestStore.setState({ reviewResumingBySession: { 'session-1': true } });
+    await useTestStore.getState().reviewAcceptFinal('再改');
+    expect(apiMocks.resumeChapterChain).not.toHaveBeenCalled();
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 09-18 CR 批 A：escalate 裁决卡失效（CR-3② 消费清键）+ resume fallback source/route
+// 透传（CR-13，去 reader-audit 硬编码）+ accept 终态静默路径兜底（CR-8 警示 toast）。
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('chapterReviewSlice — CR-3/CR-13/CR-8（escalate 失效 + fallback 透传 + accept 兜底）', () => {
+  const escalateEntry = () => ({
+    source: 'reader-audit' as const,
+    route: 'escalate_user',
+    chapterId: 'ch_001',
+    items: [{ severity: 'block' as const, quote: 'q', location: 'l', explanation: 'e' }],
+    at: 1,
+  });
+  const finalMeta: ChapterReviewMetadata = {
+    type: 'chapter_review',
+    stage: 'final',
+    chapterId: 'ch_001',
+    draftContent: '终稿正文。',
+    resumeOptions: ['accept', 'redo', 'abort'],
+  };
+
+  it('CR-3②：escalate 裁决卡在位 + reviewAcceptFinal 返 completed → 键清（裁决消费失效）', async () => {
+    useTestStore.setState({ escalateFindingsBySession: { 'session-1': escalateEntry() } });
+    useTestStore.getState().setPausedReview('session-1', finalMeta);
+    apiMocks.resumeChapterChain.mockResolvedValue(makeSummary({ status: 'completed', chapterPersisted: true }));
+
+    await useTestStore.getState().reviewAcceptFinal();
+
+    expect(useTestStore.getState().escalateFindingsBySession['session-1']).toBeUndefined();
+  });
+
+  it('CR-3②：escalate 在位 + reviewRedo 返 aborted（被动中断，裁决未消费）→ 键保留（重试时卡还在）', async () => {
+    useTestStore.setState({ escalateFindingsBySession: { 'session-1': escalateEntry() } });
+    useTestStore.getState().setPausedReview('session-1', draftMeta);
+    apiMocks.resumeChapterChain.mockResolvedValue(makeSummary({ status: 'aborted' }));
+
+    await useTestStore.getState().reviewRedo('改', 'session-1');
+
+    expect(useTestStore.getState().escalateFindingsBySession['session-1']).toBeDefined();
+    // busy / IPC throw 同口径不清（未消费）——catch 路径抽验。
+    useTestStore.setState({ escalateFindingsBySession: { 'session-1': escalateEntry() } });
+    useTestStore.getState().setPausedReview('session-1', draftMeta);
+    apiMocks.resumeChapterChain.mockRejectedValue(new Error('IPC 下线'));
+    await useTestStore.getState().reviewRedo('改', 'session-1');
+    expect(useTestStore.getState().escalateFindingsBySession['session-1']).toBeDefined();
+  });
+
+  it('CR-3②+CR-13：redo → 又 paused 且 summary 带 escalateFindings + planEscalate → 清旧写新（source=plan-review 不误标）', async () => {
+    useTestStore.setState({ escalateFindingsBySession: { 'session-1': escalateEntry() } });
+    useTestStore.getState().setPausedReview('session-1', draftMeta);
+    apiMocks.resumeChapterChain.mockResolvedValue({
+      ...makeSummary({
+        status: 'paused',
+        pausedStage: 'draft',
+        escalateFindings: [{ severity: 'warn', quote: 'q2', location: 'l2', explanation: 'e2' }],
+      }),
+      planEscalate: { verdict: 'escalate', loopLabel: '第 2 圈', summary: 's', findings: [] },
+    } as RunChapterChainSummary);
+
+    await useTestStore.getState().reviewRedo('改', 'session-1');
+
+    const entry = useTestStore.getState().escalateFindingsBySession['session-1'];
+    expect(entry?.source).toBe('plan-review');
+    expect(entry?.route).toBe('escalate');
+    expect(entry?.items.map((i) => i.quote)).toEqual(['q2']); // 清旧后重写新载荷
+  });
+
+  it('CR-13：fallback + routeDecision 在场 → source=reader-audit / route=decision（mirror metadata 通道取值）', async () => {
+    useTestStore.getState().setPausedReview('session-1', draftMeta);
+    apiMocks.resumeChapterChain.mockResolvedValue(makeSummary({
+      status: 'paused',
+      pausedStage: 'draft',
+      routeDecision: { decision: 'escalate_user', reason: '灰区' },
+      escalateFindings: [{ severity: 'block', quote: 'q', location: 'l', explanation: 'e' }],
+    }));
+
+    await useTestStore.getState().reviewContinue();
+
+    const entry = useTestStore.getState().escalateFindingsBySession['session-1'];
+    expect(entry?.source).toBe('reader-audit');
+    expect(entry?.route).toBe('escalate_user');
+  });
+
+  it('CR-13：fallback 两推断字段都缺 → source/route 省略（可选字段不造数据），items 照写', async () => {
+    useTestStore.getState().setPausedReview('session-1', draftMeta);
+    apiMocks.resumeChapterChain.mockResolvedValue(makeSummary({
+      status: 'paused',
+      pausedStage: 'draft',
+      escalateFindings: [{ severity: 'warn', quote: 'q', location: 'l', explanation: 'e' }],
+    }));
+
+    await useTestStore.getState().reviewContinue();
+
+    const entry = useTestStore.getState().escalateFindingsBySession['session-1'];
+    expect(entry?.source).toBeUndefined();
+    expect(entry?.route).toBeUndefined();
+    expect(entry?.items).toHaveLength(1);
+  });
+
+  it('CR-8：accept 完成、无 envelope、未持久化、非 skip 文案路径 → 面板清场 + 警示 toast（不静默）', async () => {
+    useTestStore.getState().setPausedReview('session-1', finalMeta);
+    apiMocks.resumeChapterChain.mockResolvedValue(makeSummary({ status: 'completed' }));
+
+    await useTestStore.getState().reviewAcceptFinal();
+
+    expect(useTestStore.getState().pausedReviewBySession['session-1']).toBeUndefined();
+    expect(pendingPatchSpy).not.toHaveBeenCalled();
+    expect(toastSpy).toHaveBeenCalledTimes(1);
+    // store locale = en-US（文件级 fixture）——断言英文文案关键片段。
+    expect(String(toastSpy.mock.calls[0][0])).toContain('no chapter candidate');
+  });
+
+  it('CR-5：reviewAcceptFinal 第三参 feedback → IPC action=accept 载荷透传；缺省不带字段', async () => {
+    useTestStore.getState().setPausedReview('session-1', finalMeta);
+    apiMocks.resumeChapterChain.mockResolvedValue(makeSummary({ status: 'completed', chapterPersisted: true }));
+
+    // escalate 全接受裁决的勾选意见随 accept 透传（feedback 通道无 action 限制）。
+    await useTestStore.getState().reviewAcceptFinal(undefined, 'session-1', '#1 [q] 接受为真相\n补充说明：以正文为准');
+    expect(apiMocks.resumeChapterChain.mock.calls[0][0]).toMatchObject({
+      action: 'accept',
+      feedback: '#1 [q] 接受为真相\n补充说明：以正文为准',
+    });
+
+    // 缺省（终稿卡 accept）→ 载荷不带 feedback 字段（零回归）。
+    apiMocks.resumeChapterChain.mockClear();
+    useTestStore.getState().setPausedReview('session-1', finalMeta);
+    await useTestStore.getState().reviewAcceptFinal();
+    expect(apiMocks.resumeChapterChain.mock.calls[0][0].feedback).toBeUndefined();
+  });
+
+  it('CR-18b：accept toast 标题全链缺名 → i18n 兜底键（不落空串标题）', async () => {
+    const anonMeta: ChapterReviewMetadata = {
+      type: 'chapter_review',
+      stage: 'final',
+      draftContent: '终稿正文。',
+      resumeOptions: ['accept', 'redo', 'abort'],
+    };
+    useTestStore.getState().setPausedReview('session-1', anonMeta);
+    apiMocks.resumeChapterChain.mockResolvedValue(makeSummary({ status: 'completed', chapterPersisted: true }));
+
+    await useTestStore.getState().reviewAcceptFinal();
+
+    // draftTitle / chapter_accept.chapterId / meta.chapterId 全缺 → agent.reviewFinalFallback（en: this chapter）。
+    expect(String(toastSpy.mock.calls[0][0])).toContain('this chapter');
+  });
+});
+
 describe('chapterReviewSlice — CR-004 store guard（程序化双触发单 IPC）', () => {
   it('reviewResuming=true 时再调 reviewContinue → no-op（不二次调 IPC，防快捷键/双 Enter 竞态）', async () => {
     useTestStore.getState().setPausedReview('session-1', draftMeta);
-    // 模拟首 IPC 在 flight：store guard 读 reviewResuming=true 直接 return。
-    useTestStore.setState({ reviewResuming: true });
+    // 模拟首 IPC 在 flight：store guard 读该会话 flight 键直接 return。
+    useTestStore.setState({ reviewResumingBySession: { 'session-1': true } });
     apiMocks.resumeChapterChain.mockClear();
 
     await useTestStore.getState().reviewContinue();
 
-    // guard 挡住：不调 IPC，不改 reviewResuming（保持 true，由首 IPC 释放）。
+    // guard 挡住：不调 IPC，不改 flight 键（保持 true，由首 IPC 释放）。
     expect(apiMocks.resumeChapterChain).not.toHaveBeenCalled();
-    expect(useTestStore.getState().reviewResuming).toBe(true);
+    expect(resuming()).toBe(true);
   });
 
   it('两动作并发触发（reviewContinue + reviewRedo 同步连调，首 IPC 未 set 重渲染前）→ 仅首调 IPC', async () => {
@@ -307,6 +595,99 @@ describe('chapterReviewSlice — CR-004 store guard（程序化双触发单 IPC�
 
     // store guard：第二次调用时 reviewResuming 已被首次 set=true → return → 单 IPC。
     expect(apiMocks.resumeChapterChain).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 09-13 子3 W4（design §5.3/F2）：五本地态 BySession 键控——双会话隔离 + 动作 sessionId 尾参
+//（写作页后台会话直审：A 会话在途/意图态不顶掉 B 会话；动作按目标会话键读写）。
+// ═══════════════════════════════════════════════════════════════════════════
+describe('chapterReviewSlice — W4 双会话键控隔离', () => {
+  it('A 会话 reviewResuming 在途不挡 B 会话动作（guard 按目标会话键判）', async () => {
+    useTestStore.getState().setPausedReview('session-1', draftMeta);
+    useTestStore.getState().setPausedReview('session-2', { ...draftMeta, chapterId: 'ch_002' });
+    // A 的 resume IPC 在 flight。
+    useTestStore.setState({ reviewResumingBySession: { 'session-1': true } });
+    apiMocks.resumeChapterChain.mockResolvedValue(makeSummary({ status: 'completed' }));
+
+    await useTestStore.getState().reviewContinue('session-2');
+
+    // B 会话动作照发（不被 A 的 flight 键挡）。
+    expect(apiMocks.resumeChapterChain).toHaveBeenCalledTimes(1);
+    expect(apiMocks.resumeChapterChain.mock.calls[0][0]).toMatchObject({
+      sessionId: 'session-2',
+      chapterId: 'ch_002',
+      action: 'continue',
+    });
+    // B 的 flight 键已释放，A 的仍在途（各会话各键）。
+    expect(resuming('session-2')).toBe(false);
+    expect(resuming('session-1')).toBe(true);
+  });
+
+  it('动作尾参 sessionId → 按目标会话的 pausedReview 键读写（B 的 continue 清 B 键、A 键不动）', async () => {
+    useTestStore.getState().setPausedReview('session-1', draftMeta);
+    useTestStore.getState().setPausedReview('session-2', { ...draftMeta, chapterId: 'ch_002' });
+    apiMocks.resumeChapterChain.mockResolvedValue(makeSummary({ status: 'completed' }));
+
+    await useTestStore.getState().reviewContinue('session-2');
+
+    expect(useTestStore.getState().pausedReviewBySession['session-2']).toBeUndefined();
+    expect(useTestStore.getState().pausedReviewBySession['session-1']).toBeDefined();
+  });
+
+  it('B1 本地态分键隔离：A 的 compiledIntent/selection/error 不影响 B（写作页多卡并存）', () => {
+    useTestStore.setState({
+      compiledIntentBySession: { 'session-1': SAMPLE_INTENT },
+      reviewSelectionBySession: { 'session-1': { text: '战斗开始了', from: 0, to: 5 } },
+      intentCompileErrorBySession: { 'session-1': 'boom' },
+    });
+
+    // B 会话读各自的键（键缺席 = 缺省态）。
+    expect(compiled('session-2')).toBeNull();
+    expect(selection('session-2')).toBeNull();
+    expect(compileError('session-2')).toBeNull();
+    // A 会话原位。
+    expect(compiled('session-1')).toEqual(SAMPLE_INTENT);
+    expect(selection('session-1')).toEqual({ text: '战斗开始了', from: 0, to: 5 });
+    expect(compileError('session-1')).toBe('boom');
+
+    // clearCompiledIntent 尾参只清目标会话。
+    useTestStore.getState().clearCompiledIntent('session-2');
+    expect(compiled('session-1')).toEqual(SAMPLE_INTENT);
+    useTestStore.getState().clearCompiledIntent('session-1');
+    expect(compiled('session-1')).toBeNull();
+    expect(compileError('session-1')).toBeNull();
+  });
+
+  it('compileIntent 尾参 sessionId → intent 态落目标会话键', async () => {
+    apiMocks.compileRevisionIntent.mockResolvedValue({ intent: SAMPLE_INTENT });
+
+    await useTestStore.getState().compileIntent('战斗开始了', '改紧张点', 0, 5, '前文。战斗开始了。后文。', undefined, 'session-2');
+
+    expect(apiMocks.compileRevisionIntent.mock.calls[0][0]).toMatchObject({ sessionId: 'session-2' });
+    expect(compiled('session-2')).toEqual(SAMPLE_INTENT);
+    expect(compiling('session-2')).toBe(false);
+    expect(compiled('session-1')).toBeNull();
+  });
+
+  it('clearReviewLocalStateFor 清目标会话五键（deleteAgentSession 清理链）', () => {
+    useTestStore.setState({
+      reviewResumingBySession: { 'session-1': true, 'session-9': true },
+      reviewSelectionBySession: { 'session-1': { text: 'x', from: 0, to: 1 } },
+      compiledIntentBySession: { 'session-1': SAMPLE_INTENT },
+      intentCompilingBySession: { 'session-1': true },
+      intentCompileErrorBySession: { 'session-1': 'e' },
+    });
+
+    useTestStore.getState().clearReviewLocalStateFor('session-1');
+
+    expect(resuming('session-1')).toBe(false);
+    expect(selection('session-1')).toBeNull();
+    expect(compiled('session-1')).toBeNull();
+    expect(compiling('session-1')).toBe(false);
+    expect(compileError('session-1')).toBeNull();
+    // 他会话键不动。
+    expect(resuming('session-9')).toBe(true);
   });
 });
 
@@ -335,7 +716,7 @@ describe('chapterReviewSlice — CR-002 项目切换 mid-resume 丢弃老结果'
     // CR-002：老结果丢弃——新项目不该见老链段 pausedReview。
     expect((useTestStore.getState().pausedReviewBySession[useTestStore.getState().agentSessionId ?? ''] ?? null)).toBeNull();
     // guard 释放。
-    expect(useTestStore.getState().reviewResuming).toBe(false);
+    expect(resuming()).toBe(false);
   });
 
   it('await 期间切项目 → IPC 返 error summary 不 toast 老 project 错误到新项目', async () => {
@@ -350,7 +731,7 @@ describe('chapterReviewSlice — CR-002 项目切换 mid-resume 丢弃老结果'
 
     // CR-002：error 也不 toast 到新项目（静默丢弃）。
     expect((useTestStore.getState().pausedReviewBySession[useTestStore.getState().agentSessionId ?? ''] ?? null)).toBeNull();
-    expect(useTestStore.getState().reviewResuming).toBe(false);
+    expect(resuming()).toBe(false);
     expect(toastSpy).not.toHaveBeenCalled();
   });
 
@@ -365,7 +746,7 @@ describe('chapterReviewSlice — CR-002 项目切换 mid-resume 丢弃老结果'
     await inflight;
 
     expect((useTestStore.getState().pausedReviewBySession[useTestStore.getState().agentSessionId ?? ''] ?? null)).toBeNull();
-    expect(useTestStore.getState().reviewResuming).toBe(false);
+    expect(resuming()).toBe(false);
     expect(toastSpy).not.toHaveBeenCalled();
   });
 
@@ -389,12 +770,12 @@ describe('chapterReviewSlice — 项目隔离 reset', () => {
     runProjectResets();
 
     expect((useTestStore.getState().pausedReviewBySession[useTestStore.getState().agentSessionId ?? ''] ?? null)).toBeNull();
-    expect(useTestStore.getState().reviewResuming).toBe(false);
+    expect(resuming()).toBe(false);
   });
 
   // dogfood T1 CR-T1-025：「等待用户」挂起键按定义不再产事件——项目重置销毁 = 切回后审阅面板
   // 永久丢（主进程 run 死等只能 abort 救）。有归属（agentEvents 登记）的键跨项目存活；
-  // 渲染面按 sessionId 键控隔离（ChapterReviewPanel 只读视图会话的键），不靠删除。
+  // 渲染面按 sessionId 键控隔离（ChapterReviewPanel 只读传入会话的键），不靠删除。
   it('CR-T1-025：有归属的挂起键跨项目存活（切回再现）——离开项目不再销毁', () => {
     rememberSessionProject('session-attr', '/proj-a');
     useTestStore.getState().setPausedReview('session-attr', draftMeta);
@@ -404,37 +785,57 @@ describe('chapterReviewSlice — 项目隔离 reset', () => {
     runProjectResets();
 
     expect(useTestStore.getState().pausedReviewBySession['session-attr']).toBeDefined();
-    // 渲染面按 sessionId 键控隔离（ChapterReviewPanel 只读视图会话的键），不靠删除。
+    // 渲染面按 sessionId 键控隔离（ChapterReviewPanel 只读传入会话的键），不靠删除。
+  });
+
+  it('W4：五本地态同 owner 过滤——有归属键跨项目存活、无归属键清（mirror pausedReview）', () => {
+    rememberSessionProject('session-attr', '/proj-a');
+    useTestStore.setState({
+      reviewResumingBySession: { 'session-attr': true, 'session-orphan': true },
+      compiledIntentBySession: { 'session-orphan': SAMPLE_INTENT },
+      reviewSelectionBySession: { 'session-orphan': { text: 'x', from: 0, to: 1 } },
+    });
+    useTestStore.setState({ currentProject: { path: '/proj-b' } });
+
+    runProjectResets();
+
+    // 有归属（在途 resume 键存活——CR-002 丢弃守卫兜结果侧）；无归属残键清。
+    expect(resuming('session-attr')).toBe(true);
+    expect(resuming('session-orphan')).toBe(false);
+    expect(compiled('session-orphan')).toBeNull();
+    expect(selection('session-orphan')).toBeNull();
   });
 
   it('runProjectResets 清 Story 7.1 B1 state（reviewSelection / compiledIntent / compileError）', () => {
     useTestStore.setState({
-      reviewSelection: { text: '战斗开始了', from: 0, to: 5 },
-      compiledIntent: SAMPLE_INTENT,
-      intentCompileError: 'boom',
-      intentCompiling: true,
+      reviewSelectionBySession: { 'session-1': { text: '战斗开始了', from: 0, to: 5 } },
+      compiledIntentBySession: { 'session-1': SAMPLE_INTENT },
+      intentCompileErrorBySession: { 'session-1': 'boom' },
+      intentCompilingBySession: { 'session-1': true },
     });
     runProjectResets();
 
-    expect(useTestStore.getState().reviewSelection).toBeNull();
-    expect(useTestStore.getState().compiledIntent).toBeNull();
-    expect(useTestStore.getState().intentCompileError).toBeNull();
-    expect(useTestStore.getState().intentCompiling).toBe(false);
+    expect(selection()).toBeNull();
+    expect(compiled()).toBeNull();
+    expect(compileError()).toBeNull();
+    expect(compiling()).toBe(false);
   });
 });
 
 // ── Story 7.1 B1：compileIntent / confirmRedoWithIntent / B1 state ──
 
 describe('chapterReviewSlice — setReviewSelection', () => {
-  it('落 SelectionInfo 到 reviewSelection', () => {
-    useTestStore.getState().setReviewSelection({ text: '战斗开始了', from: 0, to: 5 });
-    expect(useTestStore.getState().reviewSelection).toEqual({ text: '战斗开始了', from: 0, to: 5 });
+  it('落 SelectionInfo 到 reviewSelection（键控会话）', () => {
+    useTestStore.getState().setReviewSelection('session-1', { text: '战斗开始了', from: 0, to: 5 });
+    expect(selection()).toEqual({ text: '战斗开始了', from: 0, to: 5 });
+    // 分键：他会话不受影响。
+    expect(selection('session-2')).toBeNull();
   });
 
   it('null 清空 reviewSelection', () => {
-    useTestStore.getState().setReviewSelection({ text: '战斗开始了', from: 0, to: 5 });
-    useTestStore.getState().setReviewSelection(null);
-    expect(useTestStore.getState().reviewSelection).toBeNull();
+    useTestStore.getState().setReviewSelection('session-1', { text: '战斗开始了', from: 0, to: 5 });
+    useTestStore.getState().setReviewSelection('session-1', null);
+    expect(selection()).toBeNull();
   });
 });
 
@@ -468,9 +869,9 @@ describe('chapterReviewSlice — compileIntent', () => {
 
     await useTestStore.getState().compileIntent('战斗开始了', '改紧张点', 0, 5, '前文。战斗开始了。后文。');
 
-    expect(useTestStore.getState().compiledIntent).toEqual(SAMPLE_INTENT);
-    expect(useTestStore.getState().intentCompileError).toBeNull();
-    expect(useTestStore.getState().intentCompiling).toBe(false);
+    expect(compiled()).toEqual(SAMPLE_INTENT);
+    expect(compileError()).toBeNull();
+    expect(compiling()).toBe(false);
   });
 
   it('返 intent=null + error → 落 intentCompileError（graceful，不假信心不静默）', async () => {
@@ -478,9 +879,9 @@ describe('chapterReviewSlice — compileIntent', () => {
 
     await useTestStore.getState().compileIntent('战斗开始了', '改紧张点', 0, 5, '前文。战斗开始了。后文。');
 
-    expect(useTestStore.getState().compiledIntent).toBeNull();
-    expect(useTestStore.getState().intentCompileError).toBe('optimizer timeout');
-    expect(useTestStore.getState().intentCompiling).toBe(false);
+    expect(compiled()).toBeNull();
+    expect(compileError()).toBe('optimizer timeout');
+    expect(compiling()).toBe(false);
   });
 
   it('返 intent=null 无 error → 用默认兜底文案（不静默）', async () => {
@@ -488,9 +889,9 @@ describe('chapterReviewSlice — compileIntent', () => {
 
     await useTestStore.getState().compileIntent('战斗开始了', '改紧张点', 0, 5, '前文。战斗开始了。后文。');
 
-    expect(useTestStore.getState().compiledIntent).toBeNull();
-    expect(useTestStore.getState().intentCompileError).toBeTruthy();
-    expect(useTestStore.getState().intentCompileError).not.toBe('');
+    expect(compiled()).toBeNull();
+    expect(compileError()).toBeTruthy();
+    expect(compileError()).not.toBe('');
   });
 
   it('IPC throw → 落 intentCompileError（graceful，不抛）', async () => {
@@ -500,13 +901,13 @@ describe('chapterReviewSlice — compileIntent', () => {
       useTestStore.getState().compileIntent('战斗开始了', '改紧张点', 0, 5, '前文。战斗开始了。后文。'),
     ).resolves.toBeUndefined();
 
-    expect(useTestStore.getState().compiledIntent).toBeNull();
-    expect(useTestStore.getState().intentCompileError).toBe('IPC 下线');
-    expect(useTestStore.getState().intentCompiling).toBe(false);
+    expect(compiled()).toBeNull();
+    expect(compileError()).toBe('IPC 下线');
+    expect(compiling()).toBe(false);
   });
 
   it('intentCompiling=true 时再调 → no-op（防双触发）', async () => {
-    useTestStore.setState({ intentCompiling: true });
+    useTestStore.setState({ intentCompilingBySession: { 'session-1': true } });
     apiMocks.compileRevisionIntent.mockClear();
 
     await useTestStore.getState().compileIntent('战斗开始了', '改紧张点', 0, 5, '前文。战斗开始了。后文。');
@@ -538,8 +939,8 @@ describe('chapterReviewSlice — compileIntent', () => {
     await inflight;
 
     // CR-002 同款：老结果丢弃——新项目不该见老 compiledIntent。
-    expect(useTestStore.getState().compiledIntent).toBeNull();
-    expect(useTestStore.getState().intentCompiling).toBe(false);
+    expect(compiled()).toBeNull();
+    expect(compiling()).toBe(false);
   });
 });
 
@@ -547,9 +948,9 @@ describe('chapterReviewSlice — confirmRedoWithIntent', () => {
   it('调 resumeChapterChain IPC（action=redo + revisionIntent 透传 + 清 B1 state）', async () => {
     useTestStore.getState().setPausedReview('session-1', draftMeta);
     useTestStore.setState({
-      reviewSelection: { text: '战斗开始了', from: 0, to: 5 },
-      compiledIntent: SAMPLE_INTENT,
-      intentCompileError: 'stale error',
+      reviewSelectionBySession: { 'session-1': { text: '战斗开始了', from: 0, to: 5 } },
+      compiledIntentBySession: { 'session-1': SAMPLE_INTENT },
+      intentCompileErrorBySession: { 'session-1': 'stale error' },
     });
     apiMocks.resumeChapterChain.mockResolvedValue(makeSummary({ status: 'completed' }));
 
@@ -564,9 +965,9 @@ describe('chapterReviewSlice — confirmRedoWithIntent', () => {
       revisionIntent: SAMPLE_INTENT,
     });
     // B1 state 清空。
-    expect(useTestStore.getState().compiledIntent).toBeNull();
-    expect(useTestStore.getState().reviewSelection).toBeNull();
-    expect(useTestStore.getState().intentCompileError).toBeNull();
+    expect(compiled()).toBeNull();
+    expect(selection()).toBeNull();
+    expect(compileError()).toBeNull();
   });
 
   it('不传 feedback（intent 单独触发，C-trigger feedback 路径不混）', async () => {
@@ -582,7 +983,7 @@ describe('chapterReviewSlice — confirmRedoWithIntent', () => {
   it('paused summary → 更新 pausedReview（链段在下一 checkpoint 又停，B1 state 已清）', async () => {
     useTestStore.getState().setPausedReview('session-1', draftMeta);
     useTestStore.setState({
-      compiledIntent: SAMPLE_INTENT,
+      compiledIntentBySession: { 'session-1': SAMPLE_INTENT },
     });
     apiMocks.resumeChapterChain.mockResolvedValue(
       makeSummary({ status: 'paused', pausedStage: 'draft', draftContent: '改后正文…' }),
@@ -594,8 +995,8 @@ describe('chapterReviewSlice — confirmRedoWithIntent', () => {
     expect(next?.stage).toBe('draft');
     expect(next?.draftContent).toBe('改后正文…');
     // B1 state 已清（避免下一 checkpoint 残留旧 intent card）。
-    expect(useTestStore.getState().compiledIntent).toBeNull();
-    expect(useTestStore.getState().reviewResuming).toBe(false);
+    expect(compiled()).toBeNull();
+    expect(resuming()).toBe(false);
   });
 
   it('completed summary → 清 pausedReview', async () => {
@@ -609,26 +1010,94 @@ describe('chapterReviewSlice — confirmRedoWithIntent', () => {
 
   it('reviewResuming=true 时再调 → no-op（防重入）', async () => {
     useTestStore.getState().setPausedReview('session-1', draftMeta);
-    useTestStore.setState({ reviewResuming: true });
+    useTestStore.setState({ reviewResumingBySession: { 'session-1': true } });
     apiMocks.resumeChapterChain.mockClear();
 
     await useTestStore.getState().confirmRedoWithIntent(SAMPLE_INTENT);
 
     expect(apiMocks.resumeChapterChain).not.toHaveBeenCalled();
   });
+
+  it('W4 尾参 sessionId：confirmRedoWithIntent(intent, sid) → 目标会话的 intent 键清理 + IPC sid', async () => {
+    useTestStore.getState().setPausedReview('session-2', { ...draftMeta, chapterId: 'ch_002' });
+    useTestStore.setState({ compiledIntentBySession: { 'session-2': SAMPLE_INTENT } });
+    apiMocks.resumeChapterChain.mockResolvedValue(makeSummary({ status: 'completed' }));
+
+    await useTestStore.getState().confirmRedoWithIntent(SAMPLE_INTENT, 'session-2');
+
+    expect(apiMocks.resumeChapterChain.mock.calls[0][0]).toMatchObject({ sessionId: 'session-2', chapterId: 'ch_002' });
+    expect(compiled('session-2')).toBeNull();
+  });
 });
 
 describe('chapterReviewSlice — clearCompiledIntent', () => {
   it('清 compiledIntent + intentCompileError', () => {
     useTestStore.setState({
-      compiledIntent: SAMPLE_INTENT,
-      intentCompileError: 'stale',
+      compiledIntentBySession: { 'session-1': SAMPLE_INTENT },
+      intentCompileErrorBySession: { 'session-1': 'stale' },
     });
 
     useTestStore.getState().clearCompiledIntent();
 
-    expect(useTestStore.getState().compiledIntent).toBeNull();
-    expect(useTestStore.getState().intentCompileError).toBeNull();
+    expect(compiled()).toBeNull();
+    expect(compileError()).toBeNull();
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 09-13 子3 W4（design §4.3）：metadataFromPausedSummary final 扩展——stage='final' →
+// reviewSummary + lintReport + resumeOptions 注入 'accept'（interim 版缺 accept 注入，单源收敛）。
+// ═══════════════════════════════════════════════════════════════════════════
+describe('chapterReviewSlice — metadataFromPausedSummary final 扩展（W4）', () => {
+  it('paused final summary → stage=final + reviewSummary + lintReport + resumeOptions 含 accept', async () => {
+    useTestStore.getState().setPausedReview('session-1', draftMeta);
+    apiMocks.resumeChapterChain.mockResolvedValue(makeSummary({
+      status: 'paused',
+      pausedStage: 'final',
+      draftContent: '终稿正文…',
+      reviewSummary: { verdict: 'pass', reasons: ['去味干净'], loopCount: 2, capExhausted: false },
+      lintReport: '去味终态：0 命中（干净）。',
+    }));
+
+    await useTestStore.getState().reviewContinue();
+
+    const next = useTestStore.getState().pausedReviewBySession['session-1'];
+    expect(next?.stage).toBe('final');
+    expect(next?.reviewSummary).toEqual({ verdict: 'pass', reasons: ['去味干净'], loopCount: 2, capExhausted: false });
+    expect(next?.lintReport).toBe('去味终态：0 命中（干净）。');
+    // accept 注入（终稿审阅卡动作依赖——interim 版缺，本版补）。
+    expect(next?.resumeOptions).toEqual(['accept', 'redo', 'abort']);
+    // chapterId 保留透传。
+    expect(next?.chapterId).toBe('ch_001');
+  });
+
+  it('final 但 reviewSummary/lintReport 缺席 → 字段不造数据（缺省不写）', () => {
+    const meta = metadataFromPausedSummary(makeSummary({ status: 'paused', pausedStage: 'final' }));
+    expect(meta.stage).toBe('final');
+    expect(meta.reviewSummary).toBeUndefined();
+    expect(meta.lintReport).toBeUndefined();
+    expect(meta.resumeOptions).toEqual(['accept', 'redo', 'abort']);
+  });
+
+  it('非 final paused（draft/verdict）→ resumeOptions 照旧三钮（零回归）', () => {
+    expect(metadataFromPausedSummary(makeSummary({ status: 'paused', pausedStage: 'draft' })).resumeOptions)
+      .toEqual(['continue', 'redo', 'abort']);
+    expect(metadataFromPausedSummary(makeSummary({ status: 'paused', pausedStage: 'verdict' })).resumeOptions)
+      .toEqual(['continue', 'redo', 'abort']);
+  });
+
+  it('挂起（researchSuspension）→ resumeOptions 无 continue 无 accept（#83/#84 语义保持）', () => {
+    const meta = metadataFromPausedSummary(makeSummary({
+      status: 'paused',
+      pausedStage: 'draft',
+      researchSuspension: {
+        kind: 'research_contradiction',
+        rounds: 1,
+        evidence: { contradictions: [], deviations: [] },
+      },
+    }));
+    expect(meta.resumeOptions).toEqual(['redo', 'abort']);
+    expect(meta.researchSuspension?.kind).toBe('research_contradiction');
   });
 });
 
@@ -843,11 +1312,11 @@ describe('chapterReviewSlice — resume 终态反哺路由（storySyncReview / s
   });
 });
 
-// ═════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
 // dogfood T1 CR-T1-027：链 IPC busy 拒绝（机器串）消费——project_run_active / chain_run_active
 // 前缀解析为人话 + 跳转；pausedReview 保留（run 未启动，busy run 结束后可重试——旧实现
 // join(';') 透出机器串 + 误清面板丢 resume 能力）。
-// ═════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
 describe('chapterReviewSlice — CR-T1-027 busy 拒绝（机器串解析）', () => {
   it('project_run_active → pausedReview 保留 + reviewResuming 复位 + busy toast 带跳转（占用会话）', async () => {
     useTestStore.getState().setPausedReview('session-1', draftMeta);
@@ -860,7 +1329,7 @@ describe('chapterReviewSlice — CR-T1-027 busy 拒绝（机器串解析）', ()
 
     // 面板保留（busy run 未动 chainSnapshot——结束后可重试），不透出机器串。
     expect(useTestStore.getState().pausedReviewBySession['session-1']).toBeDefined();
-    expect(useTestStore.getState().reviewResuming).toBe(false);
+    expect(resuming()).toBe(false);
     expect(toastSpy).toHaveBeenCalledTimes(1);
     expect(String(toastSpy.mock.calls[0][0])).not.toContain('project_run_active');
     const action = toastSpy.mock.calls[0][3] as { label: string; onClick: () => void } | undefined;
@@ -879,7 +1348,7 @@ describe('chapterReviewSlice — CR-T1-027 busy 拒绝（机器串解析）', ()
     await useTestStore.getState().reviewContinue();
 
     expect(useTestStore.getState().pausedReviewBySession['session-1']).toBeDefined();
-    expect(useTestStore.getState().reviewResuming).toBe(false);
+    expect(resuming()).toBe(false);
     expect(toastSpy).toHaveBeenCalledTimes(1);
     expect(String(toastSpy.mock.calls[0][0])).not.toContain('chain_run_active');
     expect(toastSpy.mock.calls[0][3]).toBeUndefined(); // 链在跑——跳过去也只能等，无跳转钮
@@ -932,7 +1401,7 @@ describe('chapterReviewSlice — #105 缓① 被动中断保留审阅卡（actio
     await useTestStore.getState().reviewRedo('改开头');
 
     expect(useTestStore.getState().pausedReviewBySession['session-1']).toBeDefined();
-    expect(useTestStore.getState().reviewResuming).toBe(false);
+    expect(resuming()).toBe(false);
     expect(toastSpy).toHaveBeenCalledTimes(1);
     expect(String(toastSpy.mock.calls[0][0])).toContain('interrupted');
   });
@@ -957,7 +1426,7 @@ describe('chapterReviewSlice — #105 缓① 被动中断保留审阅卡（actio
     await useTestStore.getState().reviewAbort();
 
     expect(useTestStore.getState().pausedReviewBySession['session-1']).toBeUndefined();
-    expect(useTestStore.getState().reviewResuming).toBe(false);
+    expect(resuming()).toBe(false);
   });
 
   it('continue 返 completed → 照旧清场（完成非中断，分流不误伤 happy path）', async () => {
@@ -976,7 +1445,7 @@ describe('chapterReviewSlice — #105 缓① 被动中断保留审阅卡（actio
     await useTestStore.getState().reviewAbort();
 
     expect(useTestStore.getState().pausedReviewBySession['session-1']).toBeUndefined();
-    expect(useTestStore.getState().reviewResuming).toBe(false);
+    expect(resuming()).toBe(false);
     expect(String(toastSpy.mock.calls[0][0])).toContain('IPC 下线');
   });
 

@@ -16,7 +16,8 @@ import type { SessionState } from '../src/types';
 // (a) accept + suggest → story_sync_apply 调用不带 autoApply → envelope 组挂 metadata.storySyncPatches + 文案行；
 // (b) accept + auto → 调用带 autoApply:true → applied 文案 + 不挂 storySyncPatches；
 // (c) auto + 超 cap（9 条）→ 强制人审（调用不带 autoApply）+ 文案注明原因；
-// (d) escalate → 不调工具不 stage，patches 随裁决材料文字呈现（mirror escalateFindings 形态）；
+// (d) escalate 采信续跑完成（completed + escalate_user，W3：「随裁决材料」路径退役）→ 按档位分流
+//     （E9 在裁决 accept 续跑后对终稿提取——链 completed 即裁决已采信，反哺与 accept 同路）；
 // (e) 空 patches / 无 storySync → 零痕迹（不调工具、不挂 metadata、不添行）；
 // (f) 工具未注册 → 不崩 tool，文案告知补丁未呈现（永不静默数据丢失）；
 // (g) summarizeRunSnapshot deliverable 豁免：终态抽 story.sync（空 patches 不抽 / auto_revise 不抽）。
@@ -203,25 +204,46 @@ describe('write_chapter story-sync 反哺 applier（Story 2.2 WP-E）', () => {
     expect(meta.storySyncPatches).toHaveLength(1);
   });
 
-  // ─── d) escalate → 只呈现不 stage ───
+  // ─── d) escalate 采信续跑完成 → 按档位分流（W3：「随裁决材料」路径退役）───
+  //
+  // 链流程重排 W3：裁决在终稿前、E9 story-sync 在裁决 accept 续跑后——summary 到达本入口层时
+  // decision='escalate_user' 且 status='completed' 即裁决已采信（链已完成 = E9 已对终稿提取），
+  // 反哺按正常档位分流，不再「随裁决材料」文字呈现不 stage。
 
-  it('escalate → 不调工具不 stage metadata，patches 随裁决材料文字呈现（CR-08-16-102：文案真话——不承诺不存在的自动回收）', async () => {
+  it('escalate 采信续跑完成（suggest）→ 调 story_sync_apply 转 envelope 人审（非随裁决材料退役路径）', async () => {
     runChapterChain.mockResolvedValueOnce(makeEscalateSummary([makePatch('asset_cards')]));
-    const execute = await registerStorySyncTool({ applied: true });
+    const execute = await registerStorySyncTool({
+      patches: [{ type: 'field_patch', field: 'asset_cards', action: 'set', data: [], fieldVersion: 3 }],
+    });
     const { writeChapterTool } = await import('../src/tool/write-chapter');
 
     const result = await writeChapterTool.execute({ episodeId: 'ep1', chapterBrief: { goal: 'g' } }, ctx);
 
-    expect(execute).not.toHaveBeenCalled();
+    // 收尾照常（E9 产物按档位转出，不静默丢弃）。
+    expect(execute).toHaveBeenCalledTimes(1);
+    const callParams = execute.mock.calls[0][0] as { autoApply?: boolean };
+    expect(callParams.autoApply).toBeUndefined(); // suggest 档 envelope 人审
+    const meta = result.metadata as { storySyncPatches?: Array<{ field: string }> };
+    expect(meta.storySyncPatches).toHaveLength(1);
+    expect(result.output).toContain('正文反哺');
+    // 退役路径文案不再出现（旧形态：随裁决材料呈现 + 不自动落地指示）。
+    expect(result.output).not.toContain('随灰区裁决材料');
+    expect(result.output).not.toContain('不会自动落地');
+  });
+
+  it('escalate 采信续跑完成（auto）→ autoApply:true 直落（与 accept 同路）', async () => {
+    setSession('auto');
+    runChapterChain.mockResolvedValueOnce(makeEscalateSummary([makePatch('asset_cards')]));
+    const execute = await registerStorySyncTool({ applied: true, appliedFields: ['asset_cards'] });
+    const { writeChapterTool } = await import('../src/tool/write-chapter');
+
+    const result = await writeChapterTool.execute({ episodeId: 'ep1', chapterBrief: { goal: 'g' } }, ctx);
+
+    const callParams = execute.mock.calls[0][0] as { autoApply?: boolean };
+    expect(callParams.autoApply).toBe(true);
     const meta = result.metadata as { storySyncPatches?: unknown };
     expect(meta.storySyncPatches).toBeUndefined();
-    expect(result.output).toContain('正文反哺');
-    expect(result.output).toContain('asset_cards');
-    expect(result.output).toContain('随灰区裁决材料');
-    // 旧文案「裁决接受后可在下轮回收」不实（下轮提取绑定新章稿无重放机制）——现为明示不自动落地 + 可行动指示。
-    expect(result.output).not.toContain('下轮回收');
-    expect(result.output).toContain('不会自动落地');
-    expect(result.output).toContain('按上方清单补录');
+    expect(result.output).toContain('已自动落盘');
   });
 
   // ─── d2) escalate + 放手采信 accept（check fix）→ 已转 accept 语义，反哺按 accept 落地 ───
@@ -285,7 +307,7 @@ describe('write_chapter story-sync 反哺 applier（Story 2.2 WP-E）', () => {
     expect(result.output).not.toContain('正文反哺');
   });
 
-  it('auto_revise_pending（非终态）→ 不收尾（中间轮提取只喂链内记忆）', async () => {
+  it('auto_revise（非终态；退役 status 防御形态）→ 不收尾（E9 在终稿后一次跑，非终态零反哺）', async () => {
     runChapterChain.mockResolvedValueOnce({
       status: 'auto_revise_pending',
       routeDecision: { decision: 'auto_revise', reason: '需修订' },
@@ -361,7 +383,7 @@ describe('summarizeRunSnapshot storySync 豁免（Story 2.2 WP-E）', () => {
     expect(summary.storySync).toBeUndefined();
   });
 
-  it('route=auto_revise（非终态）→ 不抽（中间轮提取只喂链内连续性记忆）', async () => {
+  it('route=auto_revise（非终态）→ 不抽（E9 在终稿后一次跑，环内中间轮零提取）', async () => {
     const { summarizeRunSnapshot } = await import('../src/runtime/chainRunner');
     const summary = summarizeRunSnapshot({
       status: 'auto_revise_pending',
@@ -382,7 +404,7 @@ describe('summarizeRunSnapshot storySync 豁免（Story 2.2 WP-E）', () => {
     expect(summary.storySync).toBeUndefined();
   });
 
-  it('route=escalate_user → 同样透传（applier 随裁决材料呈现）', async () => {
+  it('route=escalate_user → 同样透传（W3：裁决采信续跑后 E9 产物按档位反哺）', async () => {
     const { summarizeRunSnapshot } = await import('../src/runtime/chainRunner');
     const summary = summarizeRunSnapshot({
       status: 'completed',

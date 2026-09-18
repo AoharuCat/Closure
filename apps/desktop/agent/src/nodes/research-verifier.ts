@@ -5,6 +5,7 @@ import {
   verificationVerdictSchema,
   type AppearanceGapStat,
   type ArcStagnationInfo,
+  type GenerateFallbackEntry,
   type ResearchBrief,
   type ResearchBriefDeviation,
   type SceneGraph,
@@ -251,6 +252,40 @@ export interface ResearchVerifierDeps {
   /** S4c：压缩红线百分比（chapter-chain 链装配时 readContextPolicy() 现读注入，全局一份）。 */
   redlinePercent?: number;
   signal?: AbortSignal;
+  /**
+   * 09-12 agy provider（design §3.1 装配点③）：核实子循环的逻辑会话键（chapter-chain
+   * 装配 `chain:<childSessionId>:verify`——CR-21 与写手循环 `:writer` 分键）——进核实
+   * 子循环 generate opts；'' 与 undefined 同义 = 缺席（单发冷路径，两态纪律）。
+   */
+  sessionKey?: string;
+  /**
+   * 09-12 子2 fallback chains（H2 透传面）：writer-selfcheck 档回退链（核实器随自查档
+   * assignment——chapter-chain 装配处归一注入）。空链不占位。
+   */
+  fallbacks?: GenerateFallbackEntry[];
+  /**
+   * 09-12 usage-panel：任务档位/流程标签（chapter-chain 装配传 'writer-selfcheck'——
+   * 核实子循环与写手自查同档）。undefined = 未标注。
+   */
+  taskType?: string;
+  /**
+   * 09-12 子2（design §7）：模型切换回调（chapter-chain 装配方注入，补 nodeId/role 转
+   * ChainStreamEvent 'model-fallback' 事件）。缺省不传（网关 logger.warn 兜底）。
+   */
+  onFallback?: (event: { from: { keyId: string; modelId: string }; to: { keyId: string; modelId: string }; reason: string; attempt: number }) => void;
+  /**
+   * 09-13 子2 W1（design §1 思考流）：核实子循环流回调——**reasoning-only**（verdict 是
+   * JSON 产物，text 滤除不上行——mirror writer-node 通道政策「text 仅阶段二」）。chapter-chain
+   * 装配注入（补 nodeId/role + phase='research' → workflow onNodeDelta）。缺省不开（零回归）。
+   */
+  onDelta?: (d: { messageId: string; channel: 'text' | 'reasoning'; delta: string }) => void;
+  /**
+   * 09-13 子2 W4（design §3）：链内工具调用观测回调（mirror WriterNodeDeps.onToolCall——
+   * 核实子循环的只读十三件工具调用上行，同节点位 draft-writer-agent）。chapter-chain 装配
+   * 注入（补 nodeId 转 ChainStreamEvent 'chain-tool'）。缺省不开（零回归）。
+   * CR 批 CR-11：payload 可携 `nodeId?`（下方 makeAgentLoop deps 注入归属节点位）。
+   */
+  onToolCall?: (d: { nodeId?: string; toolName: string; inputSummary: string; resultCount: number; status: 'ok' | 'error' }) => void;
   /** 项目路径（弹药取数工具调用 + 核实循环 ToolContext）。 */
   projectPath: string;
   /** 弹药取数 seam（缺省 builtin registry 工具路径——测试注入 fake 免真实 IPC）。 */
@@ -330,7 +365,36 @@ export function createResearchVerifier(deps: ResearchVerifierDeps): WriterVerifi
       const result = await runPhaseWithParse({
         buildLoop: (budget) =>
           makeAgentLoop(
-            { generate: deps.generate, resolveTool, modelRef: deps.modelRef, thinking: deps.thinking, signal: deps.signal },
+            {
+              generate: deps.generate,
+              resolveTool,
+              modelRef: deps.modelRef,
+              thinking: deps.thinking,
+              signal: deps.signal,
+              // 09-12 agy provider CR-23：链 run 会话键随 deps（chapter-chain 装配注入）；
+              // '' 视同缺席（与 writer-node / agent-loop 同款 truthy 展开写法）。
+              ...(deps.sessionKey ? { sessionKey: deps.sessionKey } : {}),
+              // 09-12 子2（H2）：链 + 切换回调透传（空链不占位）。
+              ...(deps.fallbacks?.length ? { fallbacks: deps.fallbacks } : {}),
+              ...(deps.onFallback ? { onFallback: deps.onFallback } : {}),
+              // 09-13 子2 W4（design §3）：链内工具调用观测透传。CR 批 CR-11：携归属节点位——
+              // 核实子循环在 draft-writer 节点内跑（无独立链位），事件消费语义沿用
+              // draft-writer-agent（与 verifyDeltaEmit 的 phase='research' 归组锚同款——子3
+              // 时间线「调查层」与写手自查工具调用同卡归组）。
+              ...(deps.onToolCall ? { onToolCall: deps.onToolCall, nodeId: 'draft-writer-agent' } : {}),
+              // 09-12 usage-panel：taskType 透传（chapter-chain 装配 'writer-selfcheck'）。
+              ...(deps.taskType ? { taskType: deps.taskType } : {}),
+              // 09-13 子2 W1（design §1）：思考流透传——reasoning-only（verdict JSON 不开正文流，
+              // text 在此滤除；channel 投影归装配侧 withNodeStreaming 形态补 nodeId/role/phase）。
+              ...(deps.onDelta
+                ? {
+                    onDelta: (d: { messageId: string; channel: 'text' | 'reasoning'; delta: string }) => {
+                      if (d.channel !== 'reasoning') return;
+                      deps.onDelta!(d);
+                    },
+                  }
+                : {}),
+            },
             {
               toolIds: [...VERIFIER_TOOL_IDS],
               systemPrompt: system,

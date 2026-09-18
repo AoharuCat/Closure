@@ -27,7 +27,7 @@ const apiMocks = vi.hoisted(() => ({
 
 vi.mock('../src/shared/api/agent', () => apiMocks);
 
-import { ChapterReviewPanel } from '../src/features/agent-panel/ChapterReviewPanel';
+import { ChapterReviewPanel } from '../src/features/writing/ChapterReviewPanel';
 import { useAppStore } from '../src/shared/store/appStore';
 import { handleAgentStreamEvent, __clearAgentEventTracks } from '../src/shared/store/agentEvents';
 import type { AgentStreamEvent } from '../src/shared/api/agent';
@@ -63,7 +63,7 @@ describe('Story 4.3 Step 4 — write_chapter chapter_review metadata 路由', ()
       pendingPatchBySession: {},
                   fieldMetadata: {},
       pausedReviewBySession: {},
-      reviewResuming: false,
+      reviewResumingBySession: {},
       resolvedLocale: 'zh-CN',
     } as any);
   });

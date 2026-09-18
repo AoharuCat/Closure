@@ -64,6 +64,32 @@ describe('markdown round-trip', () => {
   });
 });
 
+describe('serializer escape policy (R10: no `_`/`=` byte drift)', () => {
+  it('intraword underscores round-trip byte-exact (R3 实样 book_id)', () => {
+    // 默认 turndown 会把每个 `_` 转义成 `\_`——派生 .md 每保存一次就多一批
+    // 转义污染。词内下划线（两侧字母/数字）永不构成强调，须原样往返。
+    const md = '书名：无法告白：\n\nbook_id=7546823812877143065';
+    expect(roundtrip(md)).toBe(md);
+    expect(roundtrip('snake_case_name 写法')).toBe('snake_case_name 写法');
+  });
+
+  it('does not escape a text-node-start `=` run followed by content', () => {
+    // `= 正文` 不可能被再解析为 setext 下划线（整行纯 `=` 才是），不再产 `\=`。
+    expect(roundtrip('\\= 开头正文')).toBe('= 开头正文');
+  });
+
+  it('still escapes a pure `=` text node (setext-safe conservative form)', () => {
+    expect(roundtrip('\\=====')).toBe('\\=====');
+  });
+
+  it('still escapes word-boundary underscore runs (literal, not emphasis)', () => {
+    // 直接喂 DOM 文本（源里 \_x\_ 会被 marked 解析成 <em>，绕不开解析器）：
+    // 字面 _b_ 序列化必须转义，否则下次解析成强调；词内 book_id 不转义。
+    expect(htmlToMarkdown('<p>a _b_ c</p>')).toBe('a \\_b\\_ c');
+    expect(htmlToMarkdown('<p>book_id=1</p>')).toBe('book_id=1');
+  });
+});
+
 describe('isMarkdownRoundTripLossy', () => {
   it('accepts plain prose and StarterKit constructs', () => {
     const md = [

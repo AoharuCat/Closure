@@ -33,6 +33,9 @@ const MaterialsPage = lazy(() => import('../../features/materials/MaterialsPage'
 const CraftPage = lazy(() => import('../../features/craft/CraftPage').then((m) => ({ default: m.CraftPage })));
 // 「拆书」页（E10.3b W6）：小说拆解管线面——新建拆解/进度 + 人审闸门/产出阅读/风格导出。
 const DeconPage = lazy(() => import('../../features/decon/DeconPage').then((m) => ({ default: m.DeconPage })));
+// 「写作」页（task 09-13-writing-page-ui W1）：写章链运行态面——章节列 + 多会话条 +
+// 运行时间线 + 审阅相位。全幅三区布局（章节列贴边满高），走 --flush 容器非 panel padding。
+const WritingPage = lazy(() => import('../../features/writing/WritingPage').then((m) => ({ default: m.WritingPage })));
 const FileTabBar = lazy(() => import('../../features/editor/FileTabBar').then((m) => ({ default: m.FileTabBar })));
 const FileEditor = lazy(() => import('../../features/editor/FileEditor').then((m) => ({ default: m.FileEditor })));
 const SplitFileEditor = lazy(() => import('../../features/editor/SplitFileEditor').then((m) => ({ default: m.SplitFileEditor })));
@@ -148,6 +151,7 @@ export function WorkspaceLayout() {
       case 'materials': return <div className="workspace-panel-content"><MaterialsPage /></div>;
       case 'craft': return <div className="workspace-panel-content"><CraftPage /></div>;
       case 'decon': return <div className="workspace-panel-content"><DeconPage /></div>;
+      case 'writing': return <div className="workspace-content workspace-content--flush"><WritingPage /></div>;
       default: return <div className="workspace-panel-content"><OverviewPage /></div>;
     }
   };

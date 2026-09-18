@@ -186,15 +186,15 @@ describe('write_chapter：风格卡消费侧装配（B 路 R5）', () => {
     // 且两 yaml 实文件渲染后无「仅空白」残留行（slot 行塌净空行）。──
     const emptyRun = { artifacts: {} } as unknown as RunSnapshot;
     expect(buildDraftWriterVars(emptyRun).styleContext).toBe('');
-    // targeted-revision 同款 slot：真实 yaml（生产 parseAgentPromptYaml + renderTemplate，js-yaml
-    // 剥块缩进）+ 空 styleContext 渲染——断言渲染产物无 /^[ \t]+$/ 行。
-    for (const role of ['draft-writer-agent', 'targeted-revision-agent']) {
-      const raw = readFileSync(path.join(__dirname, '..', 'prompts', `${role}.yaml`), 'utf8');
+    // targeted-revision 同款 slot 校验已随 W4 F-1 清理退役（yaml 已删）；draft-writer 真实 yaml
+    //（生产 parseAgentPromptYaml + renderTemplate，js-yaml 剥块缩进）+ 空 styleContext 渲染——
+    // 断言渲染产物无 /^[ \t]+$/ 行。
+    {
+      const raw = readFileSync(path.join(__dirname, '..', 'prompts', 'draft-writer-agent.yaml'), 'utf8');
       const { userTemplate } = parseAgentPromptYaml(raw);
       const rendered = renderTemplate(userTemplate, {
-        // 两模板共有的 slot 全给占位值，可选块（styleContext/revisionFeedback/revisionIntent）空串。
+        // 模板 slot 全给占位值，可选块（styleContext/revisionFeedback/revisionIntent）空串。
         chapterTask: 'T', storyPlan: 'S', projectContext: 'P',
-        draftText: 'D', reviewResult: 'R',
         styleContext: '', revisionFeedback: '', revisionIntent: '',
       });
       expect(rendered).not.toMatch(/^[ \t]+$/m);

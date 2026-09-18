@@ -28,6 +28,7 @@ import {
   collectCreatedSceneIds,
   collectRelevantDecisions,
   isSceneInEpisode,
+  resolveChapterIdForEpisode,
   storyDecisionSchema,
   transformForeshadowToPromise,
   findSettingCoverageGaps,
@@ -68,7 +69,6 @@ import { extractJson } from '../nodes/extract-json';
 // dogfood R2 #105 缝①（R2.1）：stableStringify 单源复用（writer-node 章档案 briefHash 同款——key 序
 // 无关的稳定序列化，快照 brief 与本次 brief 比对不受 zod parse 后 key 插入序漂移影响）。
 import { stableStringify } from '../nodes/writer-node';
-import { dispatchRevisionOptimizer } from './revision-optimizer';
 import { buildStyleContext, readStyleCardBody } from './style-card';
 import { registry } from './registry';
 import { findActiveBatchRun, upsertBatchRun } from './batch-state';
@@ -148,6 +148,122 @@ function briefFromChapterBriefInput(
   const obj = input as Record<string, unknown>;
   if ('brief' in obj && obj.brief && typeof obj.brief === 'object') return obj.brief as ChapterBrief;
   return obj as ChapterBrief;
+}
+
+// ── 链流程重排（09-13 W1a + W2 激活，W0-5 结论）：旧 stage 停点快照废弃拦截 ──
+//
+// 旧链的 draft 停（currentNodeId='draft-writer-agent'，checkpointStage='draft'）与 verdict 停
+// （currentNodeId='route-agent'，checkpointStage='verdict'）在重排后的链序/档位映射下退役。拦截在
+// resume 分派前（clearChainSnapshot + 废弃提示重跑）；W2 档位重映射（draft/verdict 退出全部
+// deriveCheckpointPolicy 输出）后激活。**W2 与新停点的区分**（防误拦活形态）：
+// - draft-writer-agent 停：挂起动态 pause（research_brief.suspended 在）是**活**形态（W2 后仍全档位
+//   挂起暂停）——仅「无挂起载荷的纯 stage 停」是 legacy draft 停。
+// - route-agent 停：新终稿 checkpoint（W2，stage='final'）停在此且**不带 chapter_accept**（onAccept 已
+//   移 E 段完成后）；escalate-pause（escalatePause=true）也是活形态（其 chapter_accept 是裁决材料）。
+//   仅「非 escalate-pause 且 artifacts 带 chapter_accept」= legacy verdict 停（旧 onAccept-先于-pause 产物）。
+const LEGACY_PAUSE_STAGES_BY_NODE: Partial<Record<string, 'draft' | 'verdict'>> = {
+  'draft-writer-agent': 'draft',
+  'route-agent': 'verdict',
+};
+
+/** 全部档位的活 scheduled 停点集合（deriveCheckpointPolicy 单源派生；动态 revision-guard 不属 stage 停点）。 */
+function liveCheckpointStages(): Set<string> {
+  return new Set<string>([
+    ...deriveCheckpointPolicy('auto').pauseStages,
+    ...deriveCheckpointPolicy('suggest').pauseStages,
+    ...deriveCheckpointPolicy('readonly').pauseStages,
+  ]);
+}
+
+/**
+ * 判 paused 快照是否落在已废弃的旧 stage 停点（true = 应 clearChainSnapshot + 废弃提示重跑，
+ * 必须在 resume 分派前调用）。W2 细化判据（见上方块注释）：挂起 pause 与终稿/escalate-pause 是活形态
+ * 不拦——只拦「纯 legacy stage 停」。 currentNodeId 非 legacy 停点 node → false（正常分派）。
+ */
+function isDiscardedLegacyPause(
+  snapshot: { status?: string; currentNodeId?: string | null; escalatePause?: true; artifacts?: Record<string, unknown> } | undefined,
+): boolean {
+  if (!snapshot || snapshot.status !== 'paused') return false;
+  // escalate-pause（灰区裁决暂停）是活形态（W1a 起常驻），永不拦。
+  if (snapshot.escalatePause === true) return false;
+  const nodeId = typeof snapshot.currentNodeId === 'string' ? snapshot.currentNodeId : null;
+  if (!nodeId) return false;
+  const stage = LEGACY_PAUSE_STAGES_BY_NODE[nodeId];
+  if (stage === undefined) return false;
+  if (nodeId === 'draft-writer-agent') {
+    // 挂起动态 pause（suspended 在）是活形态——仅纯 stage 停（无挂起载荷）是 legacy；且 'draft' 已退出
+    // 活停点集（W2 重映射激活点）。
+    const suspended = (snapshot.artifacts?.['research_brief'] as { suspended?: unknown } | undefined)?.suspended;
+    return suspended === undefined && !liveCheckpointStages().has('draft');
+  }
+  // route-agent：legacy verdict 停 = 旧 onAccept-先于-pause 产物（chapter_accept 在）；新终稿 pause 无候选
+  // （onAccept 移 E 段后）。
+  return (
+    Object.prototype.hasOwnProperty.call(snapshot.artifacts ?? {}, 'chapter_accept') &&
+    !liveCheckpointStages().has('verdict')
+  );
+}
+
+// ── 链流程重排 CR-8（09-13 CR 修复批）：环 cap 耗尽判定精确化 ──
+//
+// chainRunner 环 cap error 形态 = `loop cap (<cap>) reached at "<through 节点 id>"; forced escalate`
+// （chainRunner.ts pushError）——自审环 through = route-agent、规划环 through = brief-reviewer-node。
+// 旧子串匹配 `e.includes('loop cap')` 会把**规划环** cap 误当**自审环** capExhausted 处置
+// （auto-resume / 终弃文案错环）——规划环 cap 走 planEscalate 路径（CR-2b），勿入 capExhausted 分支。
+// 🔁 平行实现纪律：closureChainIpc leader-notify 的 loopUnconverged 投影同判据（agent index 未导出
+// 本 helper——簇文件边界，两处同步；mirror run.ts/ipc.ts 平行 type B01 纪律）。
+const AUDIT_LOOP_THROUGH_NODE_ID = 'route-agent';
+const PLAN_LOOP_THROUGH_NODE_ID = 'brief-reviewer-node';
+
+/** 自审环（route-agent through）cap 耗尽判定——精确匹配 loop 节点 id，规划环 cap 不误报。 */
+function isAuditLoopCapError(error: string): boolean {
+  return error.includes('loop cap') && error.includes(`"${AUDIT_LOOP_THROUGH_NODE_ID}"`);
+}
+
+/** 规划环（brief-reviewer through）cap 耗尽判定（planEscalate 硬停信号，CR-2b）。 */
+function isPlanLoopCapError(error: string): boolean {
+  return error.includes('loop cap') && error.includes(`"${PLAN_LOOP_THROUGH_NODE_ID}"`);
+}
+
+// ── 链流程重排 CR-2b（R4b 补全）：规划环 escalate-pause 载荷读取 ──
+//
+// 簇 1 在 summarizeRunSnapshot 新增 summary.planEscalate（规划环 escalate-pause 载荷，additive）：
+// `{verdict:'escalate', summary, findings, loopLabel:'plan'}`——findings = plan_review 保留版
+// （brief-reviewer-node PlanReviewFinding：dimension/severity('hard'|'soft')/grounding/note）。
+// 规划环灰区无 routeDecision（route-agent 未跑），老 gate（routeDecision==='escalate_user'）对齐
+// 旧形态零消费 → 真全自动档在规划环 pause 停摆。此处防御式读取（簇 1 类型未落地前编译零依赖），
+// per-element 守性投影（坏条目单独丢，mirror summarizeRunSnapshot 投影哲学）。
+interface PlanEscalateRawPayload {
+  verdict?: unknown;
+  summary?: unknown;
+  findings?: unknown;
+  loopLabel?: unknown;
+}
+
+/** planEscalate.findings 守性投影形态（PlanReviewFinding 对齐）。 */
+interface PlanEscalateFinding {
+  dimension: string;
+  severity: string;
+  grounding: string;
+  note: string;
+}
+
+function readPlanEscalate(summary: RunSnapshotSummary): { summary: string; findings: PlanEscalateFinding[] } | null {
+  const raw = (summary as { planEscalate?: PlanEscalateRawPayload }).planEscalate;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  if (raw.verdict !== 'escalate') return null;
+  const findings = (Array.isArray(raw.findings) ? raw.findings : []).flatMap((f): PlanEscalateFinding[] => {
+    if (!f || typeof f !== 'object' || Array.isArray(f)) return [];
+    const o = f as Record<string, unknown>;
+    if (typeof o.dimension !== 'string' || typeof o.note !== 'string') return [];
+    return [{
+      dimension: o.dimension,
+      severity: typeof o.severity === 'string' ? o.severity : 'soft',
+      grounding: typeof o.grounding === 'string' ? o.grounding : '',
+      note: o.note,
+    }];
+  });
+  return { summary: typeof raw.summary === 'string' ? raw.summary : '', findings };
 }
 
 /**
@@ -1612,9 +1728,10 @@ async function commitRevisionNode(message: string, ctx: ToolContext): Promise<vo
  * 构建修订版本节点 message（design §4.1 + §4.2 FR-293 精神）。
  *
  * 格式：`revision: <类型> (<触发源>)` + 可选 findings 摘要（drift/findings 可查回溯）。
- * - 类型 = 段落级保义改稿（auto_revise）/ 结构编辑（Director-atomic-edit）。
- * - findings 摘要从 summary 抽（autoReviseFindings——触发改稿的 Reader-Audit findings；context isolation 不破，
- *   revision_guard 6 类 drift findings 留链段 artifact 可检视，**不入 message 也不入 feedback_ledger**）。
+ * - 现存触发源 = 结构编辑（Director-atomic-edit，环 B 落盘点）；「段落级保义改稿 (auto_revise)」变体
+ *   随 leader redo 编排段退役（09-13 W1a）——修订落定的版本节点收口随新链落盘拆两步（F1a/F1b）归
+ *   后续波次，届时按需复用。
+ * - revision_guard 6 类 drift findings 留链段 artifact 可检视，**不入 message 也不入 feedback_ledger**。
  *
  * 纯代码机械拼接（范式判据 ✓）。findings 数量 cap（5 条）防 message 过长。
  */
@@ -1868,17 +1985,19 @@ function formatChapterCoverageGaps(
   return `\n本章设定缺口（warning 附注）：\n${[...shown, ...unanchored].join('\n')}`;
 }
 
-// ── Story 2.2 WP-E（design §5.5.2）：route 终态 story-sync 反哺 applier ──
+// ── Story 2.2 WP-E（design §5.5.2）：story-sync 反哺 applier（链流程重排 W3 收尾时序适配）──
 //
-// 链上 story-sync-agent 节点（本 story 激活真跑 LLM 提取）产的 story.sync patches 经
-// summarizeRunSnapshot deliverable 豁免透传终态（summary.storySync）——此处收尾转出：
-// - **落盘时机 gate 在 route 终态**（accept_as_truth / escalate+放手采信 accept）：auto_revise 中间轮
-//   draft 会被重写，回收须针对最终接受的正文（design §5.5.2）；paused 不收尾（resume 路径非本 tool 职域）。
+// 链上 story-sync-agent 节点（E9，提取段——对终稿一次提取）产的 story.sync patches 经
+// summarizeRunSnapshot deliverable 豁免透传（summary.storySync）——此处收尾转出：
+// - **收尾时序 = E 段完成后**（链流程重排 W3：提取后移 E9，summary 到达本入口层时提取已发生——
+//   patches 天然针对最终接受的正文，旧「route 终态 gate」前提〔auto_revise 中间轮重提取〕随环内
+//   收敛 + E9 单次执行消失）；paused 不收尾（escalate-pause 时 E9 未跑 patches 恒空；stage pause
+//   resume 经 IPC 车道，非本 tool 职域）。
 // - **档位映射**（R6，KD1 复用 permissionMode 同源推导——与 Director autoApplyFlag 同一 session 信号）：
-//   auto → story_sync_apply(autoApply=true) 直落（语义背书 = route accept_as_truth「接受正文为真相」 +
-//   shell handler 机械门兜底）；suggest → envelope 组挂 metadata.storySyncPatches 走 PatchReview 人审；
-//   readonly → 只文字呈现（R6）；escalate → patches 随裁决材料呈现不 stage（裁决 reject=改稿时旧稿补丁
-//   不应落地，mirror escalateFindings 呈现形态）。
+//   auto → story_sync_apply(autoApply=true) 直落；suggest → envelope 组挂 metadata.storySyncPatches
+//   走 PatchReview 人审；readonly → 只文字呈现（R6）。**escalate 档「随裁决材料」路径已退役**
+//   （W3：裁决在终稿前、E9 在裁决 accept 续跑后——decision='escalate_user' 且链 completed 即裁决已
+//   采信，反哺按正常档位分流，与 accept 同路）。
 // - **patch 条数 cap**（上限 8，mirror 3.5 成本 cap）：超 cap 强制转 envelope 人审并注明原因——
 //   auto 直落批量上限的机械兜底。
 // - 转译层在 shell handler（storySyncHandlers：asset_cards → update_card/add_card 浅合并 mirror
@@ -1905,22 +2024,13 @@ export function formatStorySyncChapterLabel(label: string): string {
 interface StorySyncOutcome {
   /** suggest / 超 cap 强制人审档：投影 envelope 组（挂 metadata.storySyncPatches → UI PatchReview）。 */
   patches?: Array<{ type: 'field_patch'; field: string; action: string; data: unknown; fieldVersion?: number; note?: string }>;
-  /** leader 文案行（auto 落盘结果 / escalate 裁决材料呈现 / readonly 文字建议 / 降级告知）。 */
+  /** leader 文案行（auto 落盘结果 / readonly 文字建议 / 降级告知）。 */
   lines: string[];
 }
 
-/** patch 数据的机械摘要（escalate/readonly 文字呈现用；id 优先，否则首几个 key——不判语义）。 */
-function describeStorySyncPatchData(data: unknown): string {
-  if (!data || typeof data !== 'object' || Array.isArray(data)) return '';
-  const record = data as Record<string, unknown>;
-  if (typeof record.id === 'string' && record.id.length > 0) return `id=${record.id}`;
-  const keys = Object.keys(record).slice(0, 3);
-  return keys.length > 0 ? keys.join('/') : '';
-}
-
 /**
- * route 终态 story-sync 反哺收尾（见上方块注释）。纯机械调度（范式判据 ADR-3：提取/落盘语义已归链段
- * LLM + shell handler 机械门，此处只判终态/档位/上限）。
+ * story-sync 反哺收尾（收尾时序 = E9 提取段完成后，见上方块注释）。纯机械调度（范式判据 ADR-3：
+ * 提取/落盘语义已归链段 LLM + shell handler 机械门，此处只判终态/档位/上限）。
  */
 async function applyStorySyncFeedback(args: {
   summary: RunSnapshotSummary;
@@ -1928,38 +2038,23 @@ async function applyStorySyncFeedback(args: {
   permissionMode: 'readonly' | 'suggest' | 'auto';
   chapterId: string | undefined;
   isPaused: boolean;
-  /** 放手档 auto-trust 采信裁决器 accept（escalate 语义已转 accept，反哺按 accept 落地）。 */
-  autoTrustAccepted: boolean;
 }): Promise<StorySyncOutcome | null> {
-  const { summary, ctx, permissionMode, chapterId, isPaused, autoTrustAccepted } = args;
+  const { summary, ctx, permissionMode, chapterId, isPaused } = args;
   const patches = summary.storySync?.patches;
   // 空 patches 零痕迹（不添行不挂 metadata——空提取是常态非事件）。
   if (!patches || patches.length === 0) return null;
-  // paused 不收尾（resume 经 IPC 路径续跑，非本 tool 职域）。
+  // paused 不收尾（escalate-pause 时 E9 未跑、patches 恒空——此守卫防御 mock/旧路径；stage pause
+  // resume 经 IPC 路径续跑，非本 tool 职域）。
   if (isPaused) return null;
   const decision = summary.routeDecision?.decision;
-  const isEscalate = decision === 'escalate_user' && !autoTrustAccepted;
-  // 只在终态收尾：accept_as_truth / escalate+放手采信（已转 accept 语义）/ escalate 待裁决（随裁决材料呈现）。
-  // ⚠️ escalate+autoTrustAccepted 时 isEscalate=false——终态判定不可走 `!isEscalate` 分支（会把放手采信的
-  // escalate 误判非终态静默丢补丁）；decision 非 accept 且非 escalate 的只有 auto_revise 中间轮/缺省。
+  // 只在终态收尾：accept_as_truth / escalate_user（链流程重排后者的链 completed 形态 = 裁决已采信
+  // 续跑完成——E9 对裁决后终稿提取，反哺按正常档位分流，W3 退役「随裁决材料」路径）。
+  // 非 accept/escalate 的只有 auto_revise 中间轮（链内回环，summary 不会以此态到达）/ 缺省。
   if (decision !== 'accept_as_truth' && decision !== 'escalate_user') return null;
 
   const label = chapterId ?? (summary.storySync?.chapterId || '');
   const note = `${formatStorySyncChapterLabel(label)} story-sync 提取`;
   const fieldList = [...new Set(patches.map((p) => p.field))].join(', ');
-
-  // escalate 档：patches 随裁决材料一并呈现（不 stage / 不落盘——reject=改稿时旧稿补丁不应落地）。
-  // CR-08-16-102：旧文案「裁决接受后可在下轮回收」不实——下轮提取绑定新章稿，无重放机制。清单已在
-  // chat 呈现（含数据摘要），修为可行动指示：裁决接受后让 leader 按清单补录（对话即恢复路径）。
-  if (isEscalate) {
-    const lines = [
-      '',
-      `正文反哺：本章提取 ${patches.length} 条设定补丁（${fieldList}）——随灰区裁决材料一并呈现；**不会自动落地**。`,
-      `若你裁决「接受为真相」且要回收这些设定，裁决后直接让我按上方清单补录进知识库（asset_cards_update / setting_md_update / genre_contract_update）；裁决改稿则忽略（新稿会重新提取）。`,
-      ...patches.map((p) => `  · ${p.field} ${describeStorySyncPatchData(p.data)}`.trimEnd()),
-    ];
-    return { lines };
-  }
 
   // readonly 档（R6）：只文字建议，不调工具不 stage。
   if (permissionMode === 'readonly') {
@@ -2120,13 +2215,126 @@ async function markSuspendedChapterInBatch(
   ];
 }
 
+// ── 链流程重排 W2（R4 / hardEscalate 处置矩阵）：auto 档挂起跳章 + 同章连续挂起计数 ──
+//
+// auto 档安全自决（prd R4 拍板，翻 8.4 全档位暂停）：单次 researchSuspension → **跳章+标记**（终止链
+// 释放租约 + markSuspendedChapterInBatch 复用 + 上报——批量 suspendedSceneIds 机械记账，单章场景 =
+// 终止即终态）；suggest/readonly 维持暂停叫人（8.4 原语义，现状零变化）。
+//
+// **同章连续挂起 ≥2**（design §3「强难 = 收敛失败机械信号」）：跨 write_chapter 调用计数（内存
+// module-level Map，key=`${sessionId}:${episodeId}`——挂起跳章 +1 / 该章成功落地清零）。≥2 时按
+// hardEscalatePolicy 分流：'ask'（缺省）→ 不再跳章，暂停叫人（快照保留，人决断）；'auto'（真全自动）
+// → 终弃+标记上报（mirror cap 超限终弃形态）。计数是 best-effort 内存态（进程重启归零——重跑计数
+// 保守偏低，安全向）。测试隔离：__resetSuspensionStreaks 清表。
+//
+// CR-15（09-13）：计数条目带 lastAt 时间戳 + 24h 衰减窗——「连续」按时间邻接判：上次挂起距今超
+// 24h 的条目视为过期清零后再计（防跨月旧计数把新一次挂起直接顶到 hard-stop/终弃）。终弃
+// （abandonChapterForHardStop）时 clearSuspensionStreak——终弃已把问题上报作者，重跑须从满额
+// 计数重启（否则重跑首次挂起即再 hard-stop/终弃，章永久不可写）。
+interface SuspensionStreakEntry {
+  count: number;
+  /** 最近一次挂起时间戳（Date.now()）——24h 衰减窗判据。 */
+  lastAt: number;
+}
+
+/** 挂起「连续」语义的时间邻接窗：上次挂起距今超此时长 → 计数过期清零（CR-15）。 */
+const SUSPENSION_STREAK_DECAY_MS = 24 * 60 * 60 * 1000;
+
+const suspensionStreaks = new Map<string, SuspensionStreakEntry>();
+
+/** 测试 helper：清挂起连续计数（module 状态隔离）。 */
+export function __resetSuspensionStreaks(): void {
+  suspensionStreaks.clear();
+}
+
+/**
+ * 测试 helper：注入挂起连续计数（CR-15 测试面——衰减窗 / 终弃清零 / 文案分派用例的 seeding；
+ * lastAtAgeMs 缺省 0 = 刚发生）。生产代码不调。
+ */
+export function __seedSuspensionStreak(sessionId: string, episodeId: string, count: number, lastAtAgeMs = 0): void {
+  suspensionStreaks.set(`${sessionId}:${episodeId}`, { count, lastAt: Date.now() - lastAtAgeMs });
+}
+
+/** 挂起连续计数查询（含测试观察面）；衰减感知——过期条目惰性清零后返 0（CR-15）。 */
+export function peekSuspensionStreak(sessionId: string, episodeId: string): number {
+  return readSuspensionStreak(sessionId, episodeId);
+}
+
+/** 衰减感知读：过期（上次挂起 > 24h）→ 清条目返 0（「连续」按时间邻接判，跨天旧挂起不算）。 */
+function readSuspensionStreak(sessionId: string, episodeId: string, now = Date.now()): number {
+  const key = `${sessionId}:${episodeId}`;
+  const entry = suspensionStreaks.get(key);
+  if (!entry) return 0;
+  if (now - entry.lastAt > SUSPENSION_STREAK_DECAY_MS) {
+    suspensionStreaks.delete(key);
+    return 0;
+  }
+  return entry.count;
+}
+
+function bumpSuspensionStreak(sessionId: string, episodeId: string): number {
+  const key = `${sessionId}:${episodeId}`;
+  const next = readSuspensionStreak(sessionId, episodeId) + 1; // 衰减感知：过期先归零再 +1
+  suspensionStreaks.set(key, { count: next, lastAt: Date.now() });
+  return next;
+}
+
+/** 该章成功落地（或人决断重跑）→ 连续计数清零（「连续」语义：成功即断链）。 */
+function clearSuspensionStreak(sessionId: string, episodeId: string): void {
+  suspensionStreaks.delete(`${sessionId}:${episodeId}`);
+}
+
+/**
+ * 终弃该章（hardEscalate='auto' 收敛失败处置：去味门禁未过的 cap 超限 / 连续矛盾≥2）：
+ * 不产 chapter_accept + 清链快照（释放租约）+ 批量挂起标记（复用 suspendedSceneIds 机械记账）+ 上报文案。
+ * 返回 leader 呈现行（机械投影，永不静默——无孤儿发现红线）。
+ *
+ * CR-15：终弃时 clearSuspensionStreak——终弃已把问题完整上报作者，作者改卡/改设定后重跑须从满额
+ * 计数重启（终弃前 streak 常已 ≥2，不清则重跑首次挂起即再 hard-stop/终弃，章永久不可写）。
+ */
+async function abandonChapterForHardStop(args: {
+  ctx: ToolContext;
+  chapterId: string | undefined;
+  episodeId: string;
+  reason: string;
+}): Promise<string[]> {
+  const { ctx, chapterId, episodeId, reason } = args;
+  ctx.skillExecutor?.clearChainSnapshot?.(ctx.sessionId);
+  clearSuspensionStreak(ctx.sessionId, episodeId);
+  const active = findActiveBatchRun(ctx.projectPath, ctx.sessionId);
+  if (chapterId && active) {
+    const scenes = Object.entries(active.chapterMap)
+      .filter(([, ch]) => ch === chapterId)
+      .map(([sceneId]) => sceneId)
+      .filter((s) => !(active.suspendedSceneIds ?? []).includes(s));
+    if (scenes.length > 0) {
+      try {
+        upsertBatchRun(ctx.projectPath, {
+          ...active,
+          suspendedSceneIds: [...(active.suspendedSceneIds ?? []), ...scenes],
+          updatedAt: Date.now(),
+        });
+      } catch (err) {
+        logger.warn(
+          { chapterId, err: err instanceof Error ? err.message : String(err) },
+          'write_chapter: batch abandon mark failed → graceful skip（batch_status 对账仍可见）',
+        );
+      }
+    }
+  }
+  return [
+    '',
+    `【本章已终弃】${reason}——按真全自动档（强难停点关）的安全处置：未落盘、无章节候选。作者过目决断后可重跑该章（调整任务卡或切回强难停点开档让系统停下叫人）。`,
+  ];
+}
+
 export const writeChapterTool = defineTool({
   id: 'write_chapter',
   description:
-    '为指定 episode 触发写章战术链段（subgraph）：brief 编译 → draft-writer 生成初稿 → storySync → ' +
-    'multi-review 5 维审核 → LLM route_decision（auto_revise/accept_as_truth/escalate_user）+ revision 闭环。' +
-    '链段只回 RunSnapshot 摘要（标题/字数/verdict/route_decision）。scene_graph/设定/promise_registry 从 ' +
-    'project.yaml 自动读取；chapterBrief 传本章 LLM 段（目标/参数/信息控制/节奏/禁写/情绪目标）。',
+    '为指定 episode 触发写章战术链段（subgraph）：brief 编译 → draft-writer 生成初稿 → 自审环链内收敛' +
+    '（审读 → route 判 auto_revise/accept_as_truth/escalate_user，环内改稿不假人手）→ 终态（accept 候选 / ' +
+    '灰区 escalate-pause 裁决）。链段只回 RunSnapshot 摘要（标题/字数/verdict/route_decision）。' +
+    'scene_graph/设定/promise_registry 从 project.yaml 自动读取；chapterBrief 传本章 LLM 段（目标/参数/信息控制/节奏/禁写/情绪目标）。',
   parameters: writeChapterParams,
   async execute(params, ctx) {
     if (!ctx.skillExecutor?.runChapterChain) {
@@ -2287,7 +2495,7 @@ export const writeChapterTool = defineTool({
     // ── 风格卡片 MVP（task 08-28-style-card-mvp B 路，R5/D7 注入面矩阵）：settings/style.md 存在 →
     // 产 `style_context` artifact（mirror world_state_snapshot post-assemble optional 注入模式）：
     // ①-⑫ 节全量（⑫ 禁则 CR-003 纳入）+ ⑬ fenced 节选（cap 2000 常量，D2）——draft-writer /
-    // targeted-revision / writer-selfcheck 消费（chapter-nodes buildDraftWriterVars `{{styleContext}}`
+    // writer-selfcheck 消费（chapter-nodes buildDraftWriterVars `{{styleContext}}`
     // slot；selfcheck 复用同一稳定前缀天然同供，writer-node.ts 两阶段同一 buildVars 单源）。
     // **不产 style_context_brief**（CR-006）：精简版的真实消费路径是 dispatch-planners **派发时
     // 现读 settings/style.md 现编**（executePlannerDispatch 内 readStyleCardBody → buildStyleBrief →
@@ -2424,8 +2632,8 @@ export const writeChapterTool = defineTool({
       const sessionPermissionMode = getSession(ctx.sessionId)?.permissionMode ?? 'suggest';
       const policy = deriveCheckpointPolicy(sessionPermissionMode);
       // dogfood T1 Stage 6（design §4）：链事件转发——ctx.emitChainEvent（streamMessage 装配的 sendEvent
-      // 包装）透传给 runChapterChain（chain-delta / chain-node-done 同通道广播）。三次 run 调用共用
-      //（首跑 + auto_revise redo + auto-trust revise redo——redo 重跑同样要流）。缺省不开（零回归）。
+      // 包装）透传给 runChapterChain（chain-delta / chain-node-done 同通道广播）。多次 run 调用共用
+      //（首跑 + escalate 裁决 resume/redo 续跑——resume/redo 重跑同样要流）。缺省不开（零回归）。
       const emitChainEvent = ctx.emitChainEvent;
       // `let`：Story 4.3 Step 6 auto-trust revise 可能 redo 重跑后重新赋值（mirror redo，design §3.8）。
       let summary = await ctx.skillExecutor.runChapterChain(ctx.sessionId, initialArtifacts, {
@@ -2446,15 +2654,20 @@ export const writeChapterTool = defineTool({
       // - 他 session 持有 → 维持 busy 早退（busy 无链产物——不进 auto_revise 循环与 post-settle，也
       //   **不发链哨兵**——另一条链的链卡/流不得被本次拒绝误终态化）。
       // - 自家租约（heldBy === ctx.sessionId，即本会话 paused 链滞留）→ 按分派规则转 resume/fresh：
-      //   ① 本次带 chapterBrief 且与快照 chapter_brief_input.brief 有差异（stableStringify 比对）=
+      //   ① 链流程重排 W1a（W0-5）：快照停在已废弃的旧 stage 停点（draft/verdict，重排后档位映射退出）→
+      //     clearChainSnapshot（释放租约）+ fresh 重跑 + 文案告知废弃（必须在 resume 分派前拦截——verdict
+      //     快照带 chapter_accept 候选，不拦会机械走完绕过新终稿停点；draft 停旧稿另有章档案安全副本，
+      //     重跑成本 = 自审环起不伤正文）。
+      //   ② 本次带 chapterBrief 且与快照 chapter_brief_input.brief 有差异（stableStringify 比对）=
       //     指引①②「改了任务卡/改设定」语义 → clearChainSnapshot（abort 释放租约）+ 用本次已装配的
       //     initialArtifacts（含新 brief）fresh 重跑——briefHash 变 → writer-node cardChanged=true → 全量重查。
-      //   ② 无 brief / 无差异 / 拿不到快照 brief = 指引③「维持原案」默认语义 → resume:{fromSnapshot:true}
+      //   ③ 无 brief / 无差异 / 拿不到快照 brief = 指引③「维持原案」默认语义 → resume:{fromSnapshot:true}
       //     裸 continue 重调（**不显式 redo**——挂起态由 workflow continue-belt 自动转 draft-writer 重查 +
       //     approvedDeviations 绑定（挂起无正文可续，重查重写是唯一合法继续形态）；普通 checkpoint pause
       //     带草稿续审（不动草稿的自然语义）；显式 redo 对 draft-pause 会丢草稿重写，语义错）。
       //   残留风险（design §6 权衡）：改设定但未改 brief 的暗变走 resume 拿旧 settings_context——指引
       //   文案已注明「改了设定请在重调时同步更新任务卡摘要」，不引入设定 diff 探测。
+      let discardedLegacyPauseStage: string | null = null;
       if (summary.status === 'error' && (summary.errors ?? []).some((e) => e.startsWith(CHAIN_RUN_ACTIVE_ERROR_PREFIX))) {
         const heldBy = parseChainRunActiveHolder(summary.errors);
         if (heldBy !== ctx.sessionId) {
@@ -2472,13 +2685,25 @@ export const writeChapterTool = defineTool({
         // 自家租约 → 分派（快照经 ctx.skillExecutor seam 读，runtime 已实现 getChainSnapshot/
         // clearChainSnapshot；mock/旧 runtime 缺方法 → 拿不到快照 → 保守走 resume，维持原案默认语义）。
         const pausedSnapshot = ctx.skillExecutor.getChainSnapshot?.(ctx.sessionId);
+        // W1a W0-5：旧 stage 停点废弃拦截（详上方块注释①）——在 resume 分派前。
+        if (isDiscardedLegacyPause(pausedSnapshot)) {
+          discardedLegacyPauseStage =
+            LEGACY_PAUSE_STAGES_BY_NODE[typeof pausedSnapshot?.currentNodeId === 'string' ? pausedSnapshot.currentNodeId : ''] ?? null;
+          ctx.skillExecutor.clearChainSnapshot?.(ctx.sessionId);
+          logger.info(
+            { sessionId: ctx.sessionId, episodeId: params.episodeId, stage: discardedLegacyPauseStage, currentNodeId: pausedSnapshot?.currentNodeId },
+            'write_chapter: paused chain at retired legacy stage → snapshot discarded + fresh rerun（W0-5 迁移拦截）',
+          );
+        }
         const snapBrief = briefFromChapterBriefInput(pausedSnapshot);
         const nextBrief = params.chapterBrief as ChapterBrief | undefined;
         const briefChanged =
           nextBrief !== undefined &&
           snapBrief !== undefined &&
           stableStringify(nextBrief) !== stableStringify(snapBrief);
-        if (briefChanged) {
+        if (discardedLegacyPauseStage !== null) {
+          // 废弃拦截 → fresh 重跑（resume 车道不走——快照已清）；文案在 output 段统一告知。
+        } else if (briefChanged) {
           ctx.skillExecutor.clearChainSnapshot?.(ctx.sessionId);
           logger.info(
             { sessionId: ctx.sessionId, episodeId: params.episodeId },
@@ -2495,7 +2720,7 @@ export const writeChapterTool = defineTool({
           abort: ctx.abort,
           onAccept,
           mode: policy,
-          ...(briefChanged ? {} : { resume: { fromSnapshot: true } }),
+          ...(briefChanged || discardedLegacyPauseStage !== null ? {} : { resume: { fromSnapshot: true } }),
           ...(emitChainEvent ? { emitChainEvent } : {}),
         });
         // 重试后仍 busy（防御性：理论上自家 resume/fresh 入口必放行，此为异常路径兜底）→ 早退 busy 文案。
@@ -2512,256 +2737,268 @@ export const writeChapterTool = defineTool({
         }
       }
 
-      // Story 7.4（design §1.3 候选④）：auto_revise leader 驱动 redo 闭环。
-      // chainRunner auto_revise 不再 loopFromIdx 裸跑 targeted-revision（旧 7.3 状态），改 break
-      // （status='auto_revise_pending'）让 leader 驱动 redo：revision-optimizer 编译 RevisionIntent
-      // （A-trigger audit-finding source）→ runChapterChain redo 闭环四节点（draft-writer 段落级重写 +
-      // revision-guard 护栏 + multi-review 再审 + route 再判）。
+      // ── 链流程重排（09-13 W1a）：auto_revise leader 驱动 redo 编排段退役（翻 7.4 候选④）──
       //
-      // **cap 兜底**：leader 循环 cap=AUTO_REVISE_CAP（mirror chainRunner cap 语义；chainRunner break 后
-      // revisionCount 单 runChain 内重置，leader 跨 redo 累计防无限循环）。超限 → 强制 escalate（ADR-17）。
+      // chainRunner loops 链内回环取代 break 交 leader——环体（新链 C1-C7 含意图编译 + 保义护栏）在链内
+      // 收敛，leader 侧 AUTO_REVISE cap 编排 / revision-optimizer dispatch 一轮 / CR-004 splice 落盘收尾
+      // 随之退役。环收敛后 route 终态直达本入口层：accept → chapter_accept 候选；escalate / cap 超限 →
+      // escalate-pause（status='paused' + escalatePause 标记，R4b）。W0-4 核实：suggest 档旧
+      // auto_revise_pending surface 无「不经 redo 的接受」路径（无结构化卡无候选），退役无数据面损失；
+      // 修订落定的 git 版本节点收口随新链落盘拆两步（F1a/F1b）归后续波次。
+
+      // ── 链流程重排（09-13 W1a，R4b）：escalate-pause 裁决 resume 分派（入口层裁决编排改造）──
       //
-      // **mode-gating**：auto mode（escalateMode='auto-trust'）自动编译下发 + redo 循环；non-auto
-      // （suggest/readonly escalateMode='ask'）不进循环（RevisionIntent 人确认关 defer dogfood），surface
-      // auto_revise findings 给 leader（人可后续手触发改稿）。
+      // escalate_user 从「链终结 + 入口层裁决」改为链内暂停形态（chainRunner escalatePause 标记）——
+      // 本段消费 escalate summary（escalate-pause 优先；completed+escalate 旧形态兼容）：派裁决器
+      // （adjudicator agent 本体零触碰）→ 裁决结果驱动 resume 而非链后补处理：
+      // - accept → escalate-pause 时 resume:{fromSnapshot} 续跑（旧链无剩节点即完成；新链续 D→E→F）；
+      //   链已终态（completed+escalate）则只打透明文案（无 resume 可做）。
+      // - revise → resume + redo（nodeId=draft-writer-agent 断 completed 前缀 → 环体到链尾重跑；
+      //   feedback=裁决 analysis 注入 {{revisionFeedback}}；A1/A2 规划环节点保留 completed——人审反馈
+      //   针对正文非任务卡，design §2 M3）。
+      // - 未 opt-in / 裁决器 null（dispatch 缺/抛/parse 失败——W0-7：机械可判）→ **不假 pass**，呈
+      //   findings + 裁决建议给 leader/用户裁决；resume 由用户决断驱动（接受=重调 write_chapter 即续跑
+      //   收尾 / 改稿=工作台 redo 或告知意见）。
+      // redo re-escalate 不再 auto-trust（autoTrustAction 已定不重入，防死循环）。
       //
-      // 范式判据（ADR-3）：route 判 auto_revise = LLM（既有 route 节点）；revision-optimizer 编译 intent = LLM
-      // （既有子 agent）；redo 调度/节点移除/findings 抽取 = 纯代码机械。
-      const AUTO_REVISE_CAP = 3;
-      let autoReviseCount = 0;
-      // graceful：leader redo 任何失败（intent 编译 / runChapterChain）→ escalate 给人裁（不假 pass，R6①）。
-      let autoReviseEscalated = false;
-      // 保留 auto_revise findings 给循环后 commit message（redo summary 替换 summary，accept summary 无 findings）。
-      let lastAutoReviseFindings: RunSnapshotSummary['autoReviseFindings'];
-      while (
-        summary.routeDecision?.decision === 'auto_revise' &&
-        summary.status === 'auto_revise_pending' &&
-        policy.escalateMode === 'auto-trust' &&  // auto mode only；non-auto defer dogfood（surface findings）
-        !autoReviseEscalated
-      ) {
-        if (autoReviseCount >= AUTO_REVISE_CAP) {
-          // cap 超限 → 强制 escalate（ADR-17，mirror chainRunner cap 逻辑；chainRunner break 后 leader 兜底计数）。
-          // 复用 escalateFindings 字段供下游 4.6 findings 呈现（autoReviseFindings → escalateFindings）。
-          logger.warn({ autoReviseCount, cap: AUTO_REVISE_CAP }, 'write_chapter: auto_revise cap reached → escalate to user');
-          summary.routeDecision = {
-            decision: 'escalate_user',
-            reason: `revision loop cap (${AUTO_REVISE_CAP}) reached; escalating to user`,
-          };
-          if (summary.autoReviseFindings && !summary.escalateFindings) {
-            summary.escalateFindings = summary.autoReviseFindings;
-          }
-          autoReviseEscalated = true;
-          break;
-        }
-        autoReviseCount++;
-
-        // BMad CR-008：空 auditFindings（review 全 info / autoReviseFindings undefined 或空数组）→ route 误判
-        // （无 block/warn finding 不该 auto_revise）→ 编译无意义 intent 浪费 redo 迭代。强制 escalate 给人裁
-        // （R6① 不假 pass：route 判分存疑时 surface 而非自动空跑）。在 revision-optimizer 调用前守卫。
-        {
-          const findings = summary.autoReviseFindings;
-          if (!findings || findings.length === 0) {
-            logger.warn(
-              { autoReviseCount },
-              'write_chapter: auto_revise with empty findings → escalate (route 误判，无 block/warn finding)',
-            );
-            summary.routeDecision = {
-              decision: 'escalate_user',
-              reason: 'auto_revise 但无 block/warn finding（route 判分存疑），请你裁决改稿',
-            };
-            autoReviseEscalated = true;
-            break;
-          }
-        }
-
-        // 保留 findings 给循环后 commit message（redo summary 替换 summary，accept/escalate summary 无 autoReviseFindings）。
-        if (summary.autoReviseFindings) {
-          lastAutoReviseFindings = summary.autoReviseFindings;
-        }
-
-        // A-trigger：revision-optimizer 编译 RevisionIntent（读 autoReviseFindings → audit-finding source）。
-        // selectedPassage = 整稿（route 判 auto_revise 是全章级明确缺陷非人选段；revision-optimizer 据全稿 +
-        // findings 编译段落级 intent，draft-writer buildPrompt 消费 scope.anchor 做段落级 splice）。
-        // userInstruction = 机械指令（A-trigger 非人指令；audit-finding source 在 rationale 标注来源）。
-        const intent = await dispatchRevisionOptimizer(
-          {
-            sessionId: ctx.sessionId,
-            ...(ctx.abort ? { abort: ctx.abort } : {}),
-            ...(ctx.spawnDepth !== undefined ? { spawnDepth: ctx.spawnDepth } : {}),
-            skillExecutor: ctx.skillExecutor,
-          },
-          {
-            selectedPassage: summary.draftText ?? '',
-            userInstruction: '据 Reader-Audit 审核发现修订本章明确缺陷（auto_revise route decision）',
-            chapterContext: JSON.stringify(params.chapterBrief ?? {}),
-            auditFindings: JSON.stringify(summary.autoReviseFindings ?? []),
-          },
-        );
-
-        if (!intent) {
-          // graceful：revision-optimizer 失败（dispatch/parse）→ 不假信心编造 intent（违保义初衷），escalate 给人裁。
-          logger.warn({ autoReviseCount }, 'write_chapter: auto_revise revision-optimizer failed → escalate to user');
-          summary.routeDecision = {
-            decision: 'escalate_user',
-            reason: 'revision-optimizer 编译失败（auto_revise），请你裁决改稿',
-          };
-          if (summary.autoReviseFindings && !summary.escalateFindings) {
-            summary.escalateFindings = summary.autoReviseFindings;
-          }
-          autoReviseEscalated = true;
-          break;
-        }
-
-        // redo 闭环四节点（draft-writer 段落级重写 + revision-guard 护栏 + multi-review 再审 + route 再判）。
-        // loopNodes 移除四节点出 resumedCompletedNodes；chainRunner resume 只跳**连续 completed 前缀** →
-        // 实际从 draft-writer 重跑到链尾全部（orchestration-pattern 语义 2）：revision-guard / world-extractor
-        // ×5（稳定 slice.id idempotent 替换不累积）/ world-merge / emotion-verify / promise-emergence /
-        // story-sync（每轮重提取——中间轮喂该轮 multi-review 连续性记忆，终轮提取供 WP-E 反哺 applier，
-        // redo 产新 draft 本需新提取）都重跑；targeted-revision 也在重跑范围内但经 shouldSkip 跳过
-        // （review.latest 已清 CR-003，不走裸改稿旧路径）。revisionIntent 注入 revision_intent
-        // artifact（draft-writer buildPrompt 段落级 + revision-guard splice 消费）。
-        try {
-          summary = await ctx.skillExecutor.runChapterChain(ctx.sessionId, initialArtifacts, {
-            requirement: params.episodeId,
-            abort: ctx.abort,
-            onAccept,
-            mode: policy,
-            resume: { fromSnapshot: true },
-            redo: {
-              nodeId: 'draft-writer-agent',
-              revisionIntent: intent,
-              loopNodes: ['draft-writer-agent', 'revision-guard-agent', 'multi-review-agent', 'route-agent'],
-            },
-            ...(emitChainEvent ? { emitChainEvent } : {}),
-          });
-        } catch (redoErr) {
-          // redo 失败 → graceful escalate（不崩 tool）：告知 leader 改稿重跑失败需人裁。
-          const redoMsg = redoErr instanceof Error ? redoErr.message : String(redoErr);
-          logger.warn({ err: redoMsg, autoReviseCount }, 'write_chapter: auto_revise redo runChapterChain failed → escalate to user');
-          summary.routeDecision = {
-            decision: 'escalate_user',
-            reason: `改稿重跑失败（${redoMsg}），请你裁决`,
-          };
-          autoReviseEscalated = true;
-          break;
-        }
-      }
-
-      // Story 7.4 Step 6 环 A + BMad CR-004 fix（2026-08-13）：auto_revise redo 落定后 splice 落盘 + git 版本节点。
-      // 只在确实发生 redo 时（autoReviseCount > 0）commit——首写/无修订不 commit（零回归）。
-      //
-      // CR-004 fix：splice 后 draft.initial 落盘 chapters/*.md。revision-guard splicePassage 只 mutate 内存
-      // draft.initial artifact（无 writeFileSync/onFieldEdited）→ git_status 查无磁盘变更 → skip commit。
-      // 修法（prd MEDIUM-4 最小版）：redo 后 summary.draftText 含 splice 后正文（summarizeRunSnapshot 抽），
-      // 经 chapter_write builtin 写 chapters/{chapterId}.md → git_status 找到变更 → commit 建版本节点。
-      // auto mode only（redo 循环 escalateMode='auto-trust' 条件守卫，非 auto 不进循环）→ 自动写盘语义正确。
-      // chapter_accept 路径（L1689+）仍产 chapter_candidate field_patch 供 UI 审 StoryDecision + project.yaml meta；
-      // .md 内容已写（idempotent——acceptChapterCandidateCore 再写同内容 .md 无害）。
-      //
-      // revision_guard 6 类 drift findings 留链段 artifact（可检视），不入 feedback_ledger（design §4.2 语义不混）；
-      // message 含 autoReviseFindings 摘要（触发改稿的 Reader-Audit findings，FR-293 可查回溯精神）。
-      if (autoReviseCount > 0) {
-        // CR-004: splice 落盘 chapters/*.md（mirror chapter_write tool handler 路径）。
-        const splicedText = summary.draftText;
-        const spliceChapterId = summary.chapter_accept?.chapterId ?? params.chapterId;
-        if (splicedText && spliceChapterId) {
-          const chapterWrite = registry.get('chapter_write');
-          if (chapterWrite) {
-            try {
-              await chapterWrite.execute(
-                { chapterId: spliceChapterId, content: splicedText },
-                { sessionId: ctx.sessionId, projectPath: ctx.projectPath, abort: ctx.abort },
-              );
-              logger.info(
-                { chapterId: spliceChapterId, autoReviseCount },
-                'write_chapter: auto_revise spliced draft persisted to chapters/*.md (CR-004 fix)',
-              );
-            } catch (err) {
-              // chapter_write 失败 → warn 不阻断（splice 已在 chapter_accept 候选，accept 路径会再写）。
-              logger.warn(
-                { chapterId: spliceChapterId, err: err instanceof Error ? err.message : String(err) },
-                'write_chapter: chapter_write failed for splice persistence → graceful skip (accept path will persist)',
-              );
-            }
-          }
-        }
-        await commitRevisionNode(
-          buildRevisionCommitMessage('段落级保义改稿', 'auto_revise', lastAutoReviseFindings),
-          ctx,
-        );
-      }
-
-      // Story 7.4：non-auto mode auto_revise surface（RevisionIntent 人确认关 defer dogfood）。
-      // auto_revise_pending + ask 模式 → 不自动循环，surface findings 给 leader（人可后续手触发改稿）。
-      // 文案告知 Reader-Audit 判明确缺陷 + 列 findings（人决策是否改稿，非静默跳过）。
-      const isAutoReviseSurface =
-        summary.routeDecision?.decision === 'auto_revise' &&
-        summary.status === 'auto_revise_pending' &&
-        policy.escalateMode !== 'auto-trust';
-
-      // Story 4.3 Step 6（design §3.8）：escalate mode-gating。
-      // route=escalate_user 时读 policy.escalateMode：
-      // - ask（半自动/微操）→ 4.6 既有路径不动（裁决器建议呈 leader chat，PatchReviewPanel 人裁决）。
-      // - auto-trust（全自动）→ 自动采信裁决器 recommendation（skip 人裁决 PatchReview）：
-      //   · accept → 复用 accept 路径（chapter_accept → field_patch metadata），透明文案告知。
-      //   · revise → 触发改稿重跑（mirror redo：re-call runChapterChain resume+redo，feedback=adjudication.analysis），
-      //     用 redo summary 替代原 escalate summary。
-      //   · 裁决器 null（parse 失败/超时/方法缺）→ graceful fallback（4.6 既有 escalate 文本，**不假 pass**——
-      //     全自动采信失败时降级告知 leader，绝不静默 accept，decision-principles + AC7）。
-      // 范式判据（ADR-3 / creative-vs-mechanical）：mode-gating 分派（auto-trust vs ask）= 纯代码机械；
-      // recommendation = LLM 语义判断（4.6 裁决器产，不改）；auto-trust 应用 recommendation = 机械执行 LLM 判定。
-      // chainRunner 不消费 escalateMode（escalate 处理在 write_chapter 入口层，design §3.8）。
-      // CR-001 fix（2026-08-14）：auto-trust 改双机械门——① 仅会话 hands_off+trust=true 显式 opt-in 才采信
-      // （smart/steer/balanced 及 hands_off+trust=false 一律走 4.6 上呈路径，裁决器建议仍呈 leader chat
-      // 但不自动执行）；② escalate findings 含 severity='block' 级 → 任何配置永不 auto-trust，必走 4.6 上呈
-      // （硬违规不豁免，与 §4 硬性打断穿透纪律一致）。
-      // 🔑 语义转移：4.3 时「用户配」挂着 permissionMode='auto' 上（模糊 auto 权限可触发 escalateMode='auto-trust'
-      // 自动采信），3.5 之后**显式 opt-in** = `participationGear==='hands_off' && trustAdjudication===true`，
-      // escalateMode 仍管派发（cap 超限→强制 escalate 等仍发生）但采信权归档位组合。
-      // session 缺（getSession undefined）→ 兜底 smart（最保守——必须上呈）。
+      // CR-001 fix（2026-08-14）双机械门保留前置：① 仅会话 hands_off+trust=true 显式 opt-in 才采信
+      // （smart/steer/balanced 及 hands_off+trust=false 一律上呈，裁决器建议仍呈 leader chat 但不自动执行）；
+      // ② escalate findings 含 severity='block' 级 → 任何配置永不 auto-trust，必走上呈（硬违规不豁免，
+      // 与 §4 硬性打断穿透纪律一致）。session 缺（getSession undefined）→ 兜底 smart（最保守——必须上呈）。
+      // 范式判据（ADR-3 / creative-vs-mechanical）：resume 分派 / opt-in 判定 = 纯代码机械；
+      // recommendation = LLM 语义判断（4.6 裁决器产，不改）；应用 recommendation = 机械执行 LLM 判定。
+      const escalatePauseAtDispatch = summary.status === 'paused' && summary.escalatePause === true;
       const autoTrustSession = getSession(ctx.sessionId);
       const autoTrustGear = autoTrustSession?.participationGear ?? 'smart';
       const autoTrustTrust = autoTrustSession?.trustAdjudication ?? false;
       const hasBlockFinding = (summary.escalateFindings ?? []).some((f) => f.severity === 'block');
+      // ── 链流程重排 W2（R4 / design §3 矩阵）：hardEscalatePolicy 子开关 + 强难（收敛失败）信号 ──
+      //
+      // 强难 = 收敛失败机械信号（纯代码判，范式判据友好）：环 cap 超限（errors 含 loop cap）/
+      // 同章连续 researchSuspension ≥2（suspensionStreaks 跨调用计数）。裁决失败空输出（adjudication
+      // null）在下方 auto-trust 分支内判（W0-7：dispatchAdjudicator 返 null 即机械信号）。
+      //
+      // 处置（**仅 auto 档消费**——hardEscalatePolicy 是 auto 档子开关，suggest/readonly escalate-pause
+      // 恒上呈）：
+      // - 'ask'（缺省，强难停点开）：强难 → 停下叫人（不 auto-trust、不派裁决器——链以 escalate-pause
+      //   滞留，快照保留，人决断驱动 resume）。
+      // - 'auto'（真全自动）：cap 超限两支——去味门禁未过（summary.lintUnresolved = 终轮 review 含
+      //   L2 确认的 lint 来源条目，W3 真判决——判真伪归 multi-review L2，summarize 判源不判义）→
+      //   **终弃该章**+标记上报（永不带病落盘红线）；已过 → **采信终稿**（resume 续跑落盘）+
+      //   标「环未收敛」上报；连续矛盾 ≥2 → 终弃。**BLOCK 永不 auto-trust 机械门前置**（CR-001 既有
+      //   门，两分支共用）：block findings 到达 → 任何配置走上呈。
+      const hardEscalate = sessionPermissionMode === 'auto' ? (autoTrustSession?.hardEscalatePolicy ?? 'ask') : 'ask';
+      // CR-8：capExhausted 精确匹配自审环 through 节点 id（route-agent）——规划环 cap
+      // （brief-reviewer-node）走 planEscalate 路径（CR-2b），勿入本矩阵（旧 'loop cap' 子串
+      // 匹配会把两环混同 → auto-resume/终弃文案错环）。
+      const capExhausted = (summary.errors ?? []).some(isAuditLoopCapError);
+      const planCapExhausted = (summary.errors ?? []).some(isPlanLoopCapError);
+      const suspensionStreakAtDispatch = peekSuspensionStreak(ctx.sessionId, params.episodeId);
+      const hardStopSignal = capExhausted || suspensionStreakAtDispatch >= 2;
       const autoTrustOptIn = autoTrustGear === 'hands_off' && autoTrustTrust && !hasBlockFinding;
       let autoTrustAction: 'accept' | 'revise' | null = null;
+      let loopUnconvergedAccepted = false;
+      let chapterAbandoned = false;
       let adjudication: AdjudicationSuggestion | null = null;
+      // ── 链流程重排 CR-2b（R4b 补全）：规划环 escalate-pause 裁决编排 ──
+      //
+      // 规划环（brief-reviewer）灰区/cap 超限 → escalate-pause **无 routeDecision**（route-agent 未跑），
+      // 上方 gate 只认 routeDecision==='escalate_user' → 裁决器不派发 / findings 不透传 / auto-trust
+      // 不 resume / hardEscalate 矩阵不可达——真全自动档在规划环 pause 停摆。此处消费簇 1 的
+      // planEscalate 载荷触发**同一套老裁决编排**（裁决器派发 / findings metadata / 引导行 /
+      // auto-trust resume / hardEscalatePolicy 矩阵）；裁决材料 = planEscalate.findings（plan_review
+      // 保留版——环判据/重编 hints 各自消费 plan_review artifact 不受影响）。redo 目标按 pauseKind
+      // 分派（CR-2c）：规划环 revise 回 A1（brief-compiler-node），audit revise 回 draft-writer（上方）。
+      // hard finding（plan_review 软硬划界的 hard 维）mirror CR-001 BLOCK 门：永不 auto-trust。
+      const planEscalateAtDispatch = readPlanEscalate(summary);
+      let planAdjudication: AdjudicationSuggestion | null = null;
+      let planAutoTrustAction: 'accept' | 'revise' | null = null;
+      let planUnconvergedAccepted = false;
+      if (planEscalateAtDispatch && escalatePauseAtDispatch && summary.routeDecision?.decision !== 'escalate_user') {
+        const planHardStop = planCapExhausted;
+        const planHasHardFinding = planEscalateAtDispatch.findings.some((f) => f.severity === 'hard');
+        if (planHardStop && hardEscalate === 'auto' && !planHasHardFinding) {
+          // 真全自动：规划环 cap 耗尽不停摆——保守采信当前任务卡 resume 续跑（进 B 写稿）+
+          // 「规划环未收敛」标记上报（终弃不适用于规划环：无正文可弃，任务卡两轮未收敛按
+          // best-available 卡继续写 + 告知作者）。resume 失败 → degrade 上呈（不假 pass）。
+          try {
+            summary = await ctx.skillExecutor.runChapterChain(ctx.sessionId, initialArtifacts, {
+              requirement: params.episodeId,
+              abort: ctx.abort,
+              onAccept,
+              mode: policy,
+              resume: { fromSnapshot: true },
+              ...(emitChainEvent ? { emitChainEvent } : {}),
+            });
+            planUnconvergedAccepted = summary.status === 'completed';
+            planAutoTrustAction = 'accept';
+          } catch (resumeErr) {
+            const resumeMsg = resumeErr instanceof Error ? resumeErr.message : String(resumeErr);
+            logger.warn({ err: resumeMsg }, 'write_chapter: hardEscalate=auto plan-cap conservative accept resume failed → degrade to escalate surface');
+          }
+        } else {
+          // 其余规划灰区（普通灰区 / 强难+'ask' 停下叫人）——派裁决器供呈现参考（mirror audit 路）；
+          // auto-trust 行为 gate 排除「强难+'ask'」（停下叫人）与 hard finding（BLOCK 同族门）。
+          planAdjudication = await dispatchAdjudicator(
+            { ...summary, escalateFindings: planEscalateAtDispatch.findings as unknown as RunSnapshotSummary['escalateFindings'] },
+            params.chapterBrief as ChapterBrief | undefined,
+            ctx,
+            initialArtifacts,
+          );
+          const planTrustEligible = autoTrustOptIn && !(planHardStop && hardEscalate === 'ask') && !planHasHardFinding;
+          if (planTrustEligible && planAdjudication) {
+            if (planAdjudication.recommendation === 'accept') {
+              // 裁决 accept → resume 续跑（A2 的进 B 写稿；链内收尾照常）。
+              try {
+                summary = await ctx.skillExecutor.runChapterChain(ctx.sessionId, initialArtifacts, {
+                  requirement: params.episodeId,
+                  abort: ctx.abort,
+                  onAccept,
+                  mode: policy,
+                  resume: { fromSnapshot: true },
+                  ...(emitChainEvent ? { emitChainEvent } : {}),
+                });
+                planAutoTrustAction = 'accept';
+              } catch (resumeErr) {
+                const resumeMsg = resumeErr instanceof Error ? resumeErr.message : String(resumeErr);
+                logger.warn({ err: resumeMsg }, 'write_chapter: plan auto-trust accept resume failed → degrade to escalate surface');
+              }
+            } else {
+              // 裁决 revise → resume redo 回规划环 A1（brief-compiler-node——重编任务卡，plan_review
+              // hard findings 作 recompileHints 机械投影）。CR-2c：redoFrom 落点 = resume 载荷（簇 1
+              // workflow 消费：redo 边界节点移除〔A1/A2 之后全部重跑〕+ redo 清理集；与 options.redo
+              // 可共存——nodeId 同 target 双保险 + feedback 走 redo 注入）。types.ts 签名未同步该字段
+              // ——spread 透传不依赖类型在位。
+              planAutoTrustAction = 'revise';
+              const planRedoFromExtra: Record<string, unknown> = { redoFrom: 'brief-compiler-node' };
+              try {
+                summary = await ctx.skillExecutor.runChapterChain(ctx.sessionId, initialArtifacts, {
+                  requirement: params.episodeId,
+                  abort: ctx.abort,
+                  onAccept,
+                  mode: policy,
+                  resume: { fromSnapshot: true, ...planRedoFromExtra },
+                  redo: { nodeId: 'brief-compiler-node', feedback: planAdjudication.analysis },
+                  ...(emitChainEvent ? { emitChainEvent } : {}),
+                });
+              } catch (redoErr) {
+                const redoMsg = redoErr instanceof Error ? redoErr.message : String(redoErr);
+                logger.warn({ err: redoMsg }, 'write_chapter: plan auto-trust revise redo failed → degrade to escalate surface');
+                planAutoTrustAction = null;
+              }
+            }
+          }
+        }
+      }
       if (summary.routeDecision?.decision === 'escalate_user') {
-        adjudication = await dispatchAdjudicator(summary, params.chapterBrief as ChapterBrief | undefined, ctx, initialArtifacts);
-        if (autoTrustOptIn && adjudication) {
-          if (adjudication.recommendation === 'accept') {
-            autoTrustAction = 'accept';
+        if (hardStopSignal && hardEscalate === 'auto' && !hasBlockFinding && escalatePauseAtDispatch) {
+          // W2：真全自动（强难停点关）收敛失败安全处置——**机械分派不派裁决器**（两支判定全是机械
+          // 信号：lint 门禁代理 + 连续计数；范式判据 ✓），永不停但**永不带病落盘**。
+          if (suspensionStreakAtDispatch >= 2 || summary.lintUnresolved === true) {
+            // 同章连续矛盾 ≥2（挂起明细在下方 suspension 分支已呈现——escalate 路径 belt）/ cap 超限 +
+            // 去味门禁未过（AI 味清不掉就是卡点）→ 终弃该章 + 标记上报。
+            chapterAbandoned = true;
           } else {
-            // recommendation === 'revise' → 触发改稿重跑（mirror redo，design §3.8）。
-            // resume 读 chainSnapshot（verdict checkpoint 持久，含已完成节点）+ redo 移除 draft-writer-agent
-            // 出 resumedCompletedNodes 让其重跑 + feedback 注入 draft-writer {{revisionFeedback}}。
-            // redo 后用 redo summary 替代原 escalate summary（后续 lines/metadata 按 redo 结果）。
-            // redo 再次 escalate 不再 auto-trust（autoTrustAction 已标 'revise' 不重入本块；fall through 呈 findings）。
-            autoTrustAction = 'revise';
+            // cap 超限但去味门禁已过（审读仍不满）→ 采信终稿：resume 续跑（E 段 + 完成收尾 + 落盘）
+            // + 章 status 标「环未收敛」（loopUnconvergedAccepted 上报行；不改链行为）。
             try {
-              // CR-005：传真 initialArtifacts（write_chapter assemble 的，在 scope）非 {}——runChapterChain
-              // 内 resumeArtifacts ?? initialArtifacts（workflow.ts:778）：snapshot 在则覆盖（resume 续跑），
-              // snapshot 缺则真 from-head（非 blocked——空 {} 致 brief-compiler requiredArtifactKeys 缺 status='blocked'）。
               summary = await ctx.skillExecutor.runChapterChain(ctx.sessionId, initialArtifacts, {
                 requirement: params.episodeId,
                 abort: ctx.abort,
                 onAccept,
                 mode: policy,
                 resume: { fromSnapshot: true },
-                redo: { nodeId: 'draft-writer-agent', feedback: adjudication.analysis },
                 ...(emitChainEvent ? { emitChainEvent } : {}),
               });
-            } catch (redoErr) {
-              // redo 失败 → graceful fallback（不崩 tool）：撤销 autoTrustAction，用原 escalate summary 走 4.6 既有路径。
-              const redoMsg = redoErr instanceof Error ? redoErr.message : String(redoErr);
-              logger.warn({ err: redoMsg }, 'write_chapter: auto-trust revise redo failed → degrade to 4.6 escalate path');
-              autoTrustAction = null;
+              loopUnconvergedAccepted = summary.status === 'completed';
+            } catch (resumeErr) {
+              const resumeMsg = resumeErr instanceof Error ? resumeErr.message : String(resumeErr);
+              logger.warn({ err: resumeMsg }, 'write_chapter: hardEscalate=auto cap-accept resume failed → degrade to escalate surface');
+            }
+          }
+        } else {
+          // 其余 escalate（普通灰区 / 强难+'ask' 停下叫人形态）——**派裁决器供呈现参考**（ask 模式 4.6
+          // 既有初审块消费；强难+'ask' 的裁决建议同样呈人参考，不自动执行）。auto-trust 行为 gate 在
+          // autoTrustEligible：强难 + 'ask'（缺省，强难停点开）→ 不 auto-trust——收敛失败停下叫人，
+          // resume 由人决断驱动；普通灰区维持 hands_off+trust 显式 opt-in 既有语义。
+          adjudication = await dispatchAdjudicator(summary, params.chapterBrief as ChapterBrief | undefined, ctx, initialArtifacts);
+          const autoTrustEligible = autoTrustOptIn && !(hardStopSignal && hardEscalate === 'ask');
+          if (autoTrustEligible && adjudication) {
+            if (adjudication.recommendation === 'accept') {
+              // 裁决 accept → resume 续跑（链内收尾：旧链 route 后无剩节点即完成；新链 D→E→F）。
+              // CR-005：传真 initialArtifacts（write_chapter assemble 的，在 scope）非 {}——runChapterChain
+              // 内 resumeArtifacts ?? initialArtifacts：snapshot 在则覆盖（resume 续跑），snapshot 缺则真
+              // from-head（空 {} 会致 brief-compiler requiredArtifactKeys 缺 status='blocked'）。
+              // escalatePauseAtDispatch gate：completed+escalate 旧形态（链已终态，测试/mock 路径）无
+              // resume 可做——只置 autoTrustAction（mirror W1a 既有行为）。
+              if (escalatePauseAtDispatch) {
+                try {
+                  summary = await ctx.skillExecutor.runChapterChain(ctx.sessionId, initialArtifacts, {
+                    requirement: params.episodeId,
+                    abort: ctx.abort,
+                    onAccept,
+                    mode: policy,
+                    resume: { fromSnapshot: true },
+                    ...(emitChainEvent ? { emitChainEvent } : {}),
+                  });
+                } catch (resumeErr) {
+                  // resume 失败 → graceful fallback（不崩 tool）：维持原 escalate summary 走上呈路径。
+                  const resumeMsg = resumeErr instanceof Error ? resumeErr.message : String(resumeErr);
+                  logger.warn({ err: resumeMsg }, 'write_chapter: auto-trust accept resume failed → degrade to escalate surface');
+                }
+              }
+              autoTrustAction = 'accept';
+            } else {
+              // 裁决 revise → resume redo 回环（feedback=裁决 analysis；draft-writer 断前缀，规划环节点保留）。
+              // CR-2c：redoFrom = resume 载荷 additive 参数（簇 1 workflow 消费：redo 边界节点移除 +
+              // redo 清理集生效——resume.redoFrom 落点，与 options.redo 可共存）。types.ts（skillExecutor
+              // 签名）未同步该字段——spread 透传不依赖类型在位。
+              autoTrustAction = 'revise';
+              const auditRedoFromExtra: Record<string, unknown> = { redoFrom: 'draft-writer-agent' };
+              try {
+                summary = await ctx.skillExecutor.runChapterChain(ctx.sessionId, initialArtifacts, {
+                  requirement: params.episodeId,
+                  abort: ctx.abort,
+                  onAccept,
+                  mode: policy,
+                  resume: { fromSnapshot: true, ...auditRedoFromExtra },
+                  redo: { nodeId: 'draft-writer-agent', feedback: adjudication.analysis },
+                  ...(emitChainEvent ? { emitChainEvent } : {}),
+                });
+              } catch (redoErr) {
+                // redo 失败 → graceful fallback（不崩 tool）：撤销 autoTrustAction，用原 escalate summary 走上呈路径。
+                const redoMsg = redoErr instanceof Error ? redoErr.message : String(redoErr);
+                logger.warn({ err: redoMsg }, 'write_chapter: auto-trust revise redo failed → degrade to escalate surface');
+                autoTrustAction = null;
+              }
+            }
+          } else if (autoTrustEligible && !adjudication && hardEscalate === 'auto' && escalatePauseAtDispatch) {
+            // W2：真全自动 + 裁决失败/空输出（W0-7 机械信号：dispatchAdjudicator 返 null）→ **保守采信**
+            // + 标记（design §3「裁决器判不了→保守采信+标记」）——loopUnconvergedAccepted 上报行标注
+            // 保守采信。resume 失败 → degrade 上呈（不假 pass）。
+            try {
+              summary = await ctx.skillExecutor.runChapterChain(ctx.sessionId, initialArtifacts, {
+                requirement: params.episodeId,
+                abort: ctx.abort,
+                onAccept,
+                mode: policy,
+                resume: { fromSnapshot: true },
+                ...(emitChainEvent ? { emitChainEvent } : {}),
+              });
+              loopUnconvergedAccepted = summary.status === 'completed';
+              autoTrustAction = 'accept';
+            } catch (resumeErr) {
+              const resumeMsg = resumeErr instanceof Error ? resumeErr.message : String(resumeErr);
+              logger.warn({ err: resumeMsg }, 'write_chapter: hardEscalate=auto adjudication-null conservative accept resume failed → degrade to escalate surface');
             }
           }
         }
       }
 
       // 链段只回摘要（context isolation）——把 routeDecision/draft/verdict 摘要格式化给 leader。
+      // W1a：裁决 resume/redo 可能已替换 summary——escalate-pause 判定按**当前** summary 重算
+      //（escalatePauseAtDispatch 只服务裁决分派时刻的决策）。
+      const isEscalatePause = summary.status === 'paused' && summary.escalatePause === true;
       const lines: string[] = [`status: ${summary.status}`];
       if (summary.draftTitle) lines.push(`draft: ${summary.draftTitle} (${summary.draftWordCount ?? 0} 字)`);
       if (summary.reviewVerdict) lines.push(`review verdict: ${summary.reviewVerdict}`);
@@ -2769,6 +3006,13 @@ export const writeChapterTool = defineTool({
         lines.push(`route: ${summary.routeDecision.decision} — ${summary.routeDecision.reason}`);
       }
       if (summary.errors.length > 0) lines.push(`errors: ${summary.errors.join('; ')}`);
+
+      // 链流程重排 W1a（W0-5）：旧 stage 停点快照废弃告知——该链停点已随链序/档位重排退役，快照已
+      // 清并 fresh 重跑本章（不resume 旧快照——verdict 快照带旧候选，机械续跑会绕过新终稿停点）。
+      if (discardedLegacyPauseStage !== null) {
+        lines.push('');
+        lines.push(`【快照迁移】上一条暂停链停在旧 ${discardedLegacyPauseStage} 停点（链流程重排后已退役）——已废弃该快照并按本次任务卡重新开跑本章。`);
+      }
 
       // dogfood R2 #21B：零角色卡回顾行（机械计数 countCharacterCards 单源）。leader 侧雷达行是开写
       // 前主信号；此行是链结算时的兜底可见性——写手本章对人物的把握全凭大纲/集纲转述，作者看到
@@ -2789,11 +3033,13 @@ export const writeChapterTool = defineTool({
       }
 
       // Story 4.3 Step 3：paused summary（半自动/微操模式 checkpoint pause）→ chapter_review metadata + 文案。
-      // paused 与 completed/escalate 互斥（checkpoint pause 发生在 route 前/后但 route 终结处理在 checkpoint 后，
-      // 故 paused 时无 chapter_accept）。leader 文案告知用户在工作台审阅 + 三动作（continue/redo/abort）。
-      // metadata.chapter_review 供 Step 4 chapterReviewSlice 渲染 review 面板 + 派发动作（mirror 4.6 chapter_accept
-      // → field_patch metadata 模式）。resume/redo/abort 走结构化 IPC（resumeChapterChain），非 leader 解释消息。
+      // 链流程重排 W1a：paused 有两形态——**stage 人审暂停**（brief/draft/verdict checkpoint，ChapterReviewPanel
+      // 三动作 continue/redo/abort 消费）与 **escalate-pause**（灰区裁决暂停，R4b——裁决 accept→resume 续跑 /
+      // revise→redo 回环，不走 chapter_review 卡）。isStagePause 门槛据此区分两条 resume 路径。
       const isPaused = summary.status === 'paused';
+      const isStagePause = isPaused && !isEscalatePause;
+      // W2：auto 档挂起跳章后链快照已清——chapter_review 审阅卡（三动作）不再产（链已终态）。
+      let suspensionDisposedInAuto = false;
       if (isPaused && summary.researchSuspension) {
         // Story 8.4 Step 4（A8）：出发核查挂起 pause——文案 = 挂起明细 + 建议动作（替代通用 pause 文案：
         // continue 对挂起非法——draft.initial 不存在，恢复只有 redo）。挂起全档位发生（含全自动——结构性
@@ -2804,47 +3050,82 @@ export const writeChapterTool = defineTool({
           `【本章挂起——出发核查${suspension.kind === 'research_contradiction' ? '发现任务卡与资料矛盾 / 写前偏离' : '多轮仍未通过'}，本章尚未动笔】`,
         );
         lines.push(...formatResearchSuspensionDetail(suspension));
-        // R2-盲2：选项③「维持原案」措辞与系统行为对齐——不改任务卡直接重调 = 已亮牌偏离获批
-        // （decision.approvedDeviations 机械绑定），重跑同偏离不再挂起、新偏离照常上报；此前文案
-        // 只承诺「重新调查」而系统会因同偏离再挂起（结构性死循环 + 激励写手隐瞒申报）。
-        // dogfood R2 #105 缝①（R2.1）：重调已可行（自家租约自动转 resume/fresh 车道）——①② 的
-        // fresh 车道靠 chapterBrief 差异触发，故补残留风险一句：改设定须同步更新任务卡摘要一并
-        // 传入，否则走 resume 沿用快照上的旧设定上下文（design §6 权衡：不引入设定 diff 探测）。
-        lines.push(
-          '请核实以上证据后呈给作者决断：① 改任务卡（怎么改）② 改设定（先修档案）③ 维持原案（写手重新调查，已亮牌的偏离按批准方案写）。' +
-          '决断后重调 write_chapter 重写本章：①②改了会自动重新调查——改了设定请同步更新任务卡（chapterBrief）摘要一并传入，否则重跑会沿用快照上的旧任务卡/设定上下文；③维持原案也会重新调查，但你未改任务卡即视为已亮牌偏离获批——同一偏离不会再触发挂起（新的偏离仍会照常上报）；工作台可改稿重跑（redo）/ 放弃（abort），不可直接续写。',
-        );
-        lines.push(...(await markSuspendedChapterInBatch(ctx, params.chapterId, suspension)));
-      } else if (isPaused) {
-        const stageLabel =
-          summary.pausedStage === 'draft' ? '草稿'
-            : summary.pausedStage === 'brief' ? 'brief'
-              : summary.pausedStage === 'verdict' ? '裁决'
-                : 'checkpoint';
-        lines.push(`链段在 ${stageLabel} checkpoint 暂停，等待你审阅：继续写（continue）/ 改稿重跑（redo）/ 放弃（abort）。`);
-      }
-
-      // Story 7.4：auto_revise surface 文案。
-      // - non-auto mode（isAutoReviseSurface）：RevisionIntent 人确认关 defer dogfood，surface findings 给 leader
-      //   （人决策是否改稿，非静默跳过）。
-      // - auto mode cap 超限 escalate（autoReviseEscalated）：auto 循环改不动 → escalate 文案（findings 在下方
-      //   escalate 块呈现，mirror 4.6 既有路径）。
-      if (isAutoReviseSurface) {
-        lines.push('');
-        lines.push('Reader-Audit 判定本章存在明确缺陷（auto_revise）——半自动/微操模式下需你确认改稿意图。');
-        if (summary.autoReviseFindings && summary.autoReviseFindings.length > 0) {
-          lines.push('审核发现（带正文原句）：');
-          for (const f of summary.autoReviseFindings) {
-            lines.push(`  · [${f.severity}] "${f.quote}"（${f.location}）—— ${f.explanation}`);
+        // ── 链流程重排 W2（R4 auto 档安全自决，翻 8.4 全档位暂停）：挂起按档位分流 ──
+        //
+        // - suggest/readonly：维持暂停叫人（现状零变化）——快照保留，人决断驱动 resume。
+        // - auto 单次挂起：**跳章+标记**（clearChainSnapshot 终止链释放租约 + 批量 suspendedSceneIds
+        //   机械标记 + 上报）——批量继续他章，单章场景 = 终止即终态。
+        // - auto 同章连续 ≥2（suspensionStreaks 跨调用计数）：'ask'（缺省）→ 不再跳章，保持暂停叫人
+        //   （强难停点）；'auto'（真全自动）→ 终弃该章 + 标记上报（abandonChapterForHardStop 共用）。
+        if (sessionPermissionMode === 'auto') {
+          const nextStreak = bumpSuspensionStreak(ctx.sessionId, params.episodeId);
+          if (nextStreak >= 2 && hardEscalate === 'ask') {
+            lines.push('');
+            lines.push(
+              `本章已是第 ${nextStreak} 次挂起（同章连续矛盾 ≥2——强难信号）：按强难停点设置（缺省）停下叫人，不再自动跳章。请作者决断（改任务卡 / 改设定 / 工作台 redo 重跑 / abort 放弃）。`,
+            );
+          } else if (nextStreak >= 2) {
+            // 真全自动：连续矛盾 ≥2 → 终弃（mirror cap 超限终弃形态，abandonChapterForHardStop 上报）。
+            lines.push(...(await abandonChapterForHardStop({
+              ctx,
+              chapterId: params.chapterId,
+              episodeId: params.episodeId,
+              reason: `同章连续 ${nextStreak} 次出发核查挂起（任务卡与资料反复矛盾）`,
+            })));
+            suspensionDisposedInAuto = true;
+          } else {
+            // 单次挂起：跳章 + 标记（快照清——章节恢复靠作者决断后重跑，非 resume 续跑）。
+            ctx.skillExecutor.clearChainSnapshot?.(ctx.sessionId);
+            lines.push(...(await markSuspendedChapterInBatch(ctx, params.chapterId, suspension)));
+            lines.push(
+              '本章已按全自动档安全自决跳过（挂起章标记完成）：批量继续其他章；作者决断后重调 write_chapter 重写本章。',
+            );
+            suspensionDisposedInAuto = true;
           }
+        } else {
+          // suggest/readonly：维持暂停叫人——R2-盲2 措辞与系统行为对齐（选项③「维持原案」= 已亮牌
+          // 偏离获批，重跑同偏离不再挂起、新偏离照常上报）。
+          // dogfood R2 #105 缝①（R2.1）：重调已可行（自家租约自动转 resume/fresh 车道）——①② 的
+          // fresh 车道靠 chapterBrief 差异触发，故补残留风险一句：改设定须同步更新任务卡摘要一并
+          // 传入，否则走 resume 沿用快照上的旧设定上下文（design §6 权衡：不引入设定 diff 探测）。
+          lines.push(
+            '请核实以上证据后呈给作者决断：① 改任务卡（怎么改）② 改设定（先修档案）③ 维持原案（写手重新调查，已亮牌的偏离按批准方案写）。' +
+            '决断后重调 write_chapter 重写本章：①②改了会自动重新调查——改了设定请同步更新任务卡（chapterBrief）摘要一并传入，否则重跑会沿用快照上的旧任务卡/设定上下文；③维持原案也会重新调查，但你未改任务卡即视为已亮牌偏离获批——同一偏离不会再触发挂起（新的偏离仍会照常上报）；工作台可改稿重跑（redo）/ 放弃（abort），不可直接续写。',
+          );
+          lines.push(...(await markSuspendedChapterInBatch(ctx, params.chapterId, suspension)));
         }
-        lines.push('可告知我如何修改，或在工作台手触发改稿重跑。');
+      } else if (isStagePause) {
+        // 链流程重排 W2：终稿 checkpoint（stage='final'）= 唯一正文人审停点——动作 accept（可携
+        // editedDraft 手改全文，编辑面归子3）/ redo（带意见回环 C1）/ abort。其余 stage（brief /
+        // revision-guard）沿用 continue/redo/abort。
+        const stageLabel =
+          summary.pausedStage === 'final' ? '终稿'
+            : summary.pausedStage === 'draft' ? '草稿'
+              : summary.pausedStage === 'brief' ? 'brief'
+                : summary.pausedStage === 'verdict' ? '裁决'
+                  : 'checkpoint';
+        if (summary.pausedStage === 'final') {
+          const loopCount = summary.reviewSummary?.loopCount ?? 0;
+          lines.push(
+            `终稿 checkpoint：自审环已收敛（迭代 ${loopCount} 轮${summary.reviewSummary ? `，审读结论 ${summary.reviewSummary.verdict || '（无）'}` : ''}）。请终审正文：接受（accept，可在审阅卡直接手改正文——手改稿将先落盘再提取）/ 带意见打回（redo）/ 放弃（abort）。`,
+          );
+        } else {
+          lines.push(`链段在 ${stageLabel} checkpoint 暂停，等待你审阅：继续写（continue）/ 改稿重跑（redo）/ 放弃（abort）。`);
+        }
       }
 
       // Story 4.3 Step 6：auto-trust 透明文案（显式 opt-in 采信裁决器建议，非静默）。
       // CR-001：auto-trust 现为一个“放手档 + trustAdjudication”组合中的 hands-off 选项。“全自动采信”标签保留以兼容
       // 既有测试与用户认知（从 auto-trust 时代沿用），但行为仅由 participationGear+hands_off+trust 驱动。
-      if (autoTrustAction === 'accept') {
+      // W2：保守采信路径（loopUnconvergedAccepted 且无裁决建议）走下方「环未收敛」行——本块只呈裁决器
+      // 建议驱动的采信。CR-2b：规划环同款透明文案（planAutoTrustAction 与 audit autoTrustAction 互斥）。
+      if (planAutoTrustAction === 'accept' && !planUnconvergedAccepted) {
+        lines.push('');
+        lines.push(`【全自动采信】规划灰区裁决器初审建议「接受当前任务卡」——已按放手档（hands_off + 信裁决器初审）采信续跑写稿（${planAdjudication?.recommendationReason || '无理由'}）。`);
+      } else if (planAutoTrustAction === 'revise') {
+        lines.push('');
+        lines.push(`【全自动采信】规划灰区裁决器初审建议「改任务卡」——已按放手档触发规划环重编重跑（反馈：${planAdjudication?.analysis ?? ''}），重跑结果 route=${summary.routeDecision?.decision ?? '?'}。`);
+      } else if (autoTrustAction === 'accept' && !loopUnconvergedAccepted) {
         lines.push('');
         lines.push(`【全自动采信】灰区裁决器初审建议「接受为真相」——已按放手档（hands_off + 信裁决器初审）采信（${adjudication?.recommendationReason || '无理由'}）。`);
       } else if (autoTrustAction === 'revise') {
@@ -2911,6 +3192,147 @@ export const writeChapterTool = defineTool({
           lines.push('');
           lines.push('【灰区上发】裁决器初审暂不可用（parse 失败/超时）——未自动采信，请你裁决。');
         }
+        // 链流程重排 W1a（R4b）：escalate-pause 待裁决指引——链以暂停形态滞留（快照已持久），裁决驱动
+        // resume：接受 → 重调 write_chapter（自家租约自动转 resume 续跑收尾，收尾后章节候选照常呈现落盘）；
+        // 改稿 → 工作台改稿重跑（redo）或告知修改意见由我转达重调。
+        if (isEscalatePause && autoTrustAction === null) {
+          lines.push('');
+          lines.push('本章链段已暂停待裁决（快照已保存）：裁决「接受为真相」→ 直接重调 write_chapter 即续跑收尾并生成章节候选；裁决「改稿」→ 在工作台改稿重跑（redo）或告知我修改意见。');
+        }
+      }
+
+      // ── 链流程重排 CR-2b：规划环 escalate-pause 呈现（mirror audit escalate 块形态）──
+      //
+      // planAutoTrustAction='accept'（含 cap 耗尽保守采信）→ 已采信（跳过 findings 噪声，决策已定）；
+      // 其余（ask 档 / 无 opt-in / 裁决器 null / hard finding 拦采信 / redo 后再 escalate）→ 呈
+      // plan findings + 裁决建议 + 待裁决指引（不假 pass，永不静默）。findings 行形态按 plan_review
+      // 字段（dimension/severity/grounding/note——无正文 quote，对照源是任务卡字段）。
+      const planEscalateCurrent = readPlanEscalate(summary);
+      if (planEscalateCurrent && planAutoTrustAction !== 'accept') {
+        lines.push('');
+        if (planEscalateCurrent.findings.length > 0) {
+          lines.push('规划审核灰区（brief-reviewer 对任务卡判 escalate，带对照与重编方向）：');
+          for (const f of planEscalateCurrent.findings) {
+            lines.push(`  · [${f.severity}] ${f.dimension} — ${f.note}${f.grounding ? `（对照：${f.grounding}）` : ''}`);
+          }
+        } else {
+          lines.push('规划审核灰区：brief-reviewer 判任务卡 escalate（难断灰区），但未抓出具体 findings（载荷空/解析降级）——见裁决器初审。');
+        }
+        if (planAdjudication) {
+          lines.push('');
+          lines.push('【规划灰区裁决器初审】');
+          lines.push(`分析：${planAdjudication.analysis}`);
+          lines.push(`倾向：${planAdjudication.recommendation === 'accept' ? '接受当前任务卡' : '改任务卡'} —— ${planAdjudication.recommendationReason || '（无理由）'}`);
+          lines.push('选项（供你裁决）：');
+          for (const opt of planAdjudication.options) {
+            lines.push(`  · ${opt.label}：${opt.reason}`);
+          }
+        } else if (autoTrustOptIn) {
+          lines.push('');
+          lines.push('【放手采信失败】规划灰区裁决器初审无有效建议（parse 失败/超时）——未自动采信，请你裁决。');
+        } else {
+          lines.push('');
+          lines.push('【规划灰区上发】裁决器初审暂不可用（parse 失败/超时）——未自动采信，请你裁决。');
+        }
+        if (planEscalateCurrent.findings.some((f) => f.severity === 'hard') && autoTrustOptIn) {
+          // mirror CR-001 BLOCK 门透明文案：hard 维度（红线一致/可写性/信息差指令自相矛盾）拦截
+          // auto-trust 时明确告知「未自动采信」（不静默跳过）——裁决建议仅参考不替代用户。
+          lines.push('');
+          lines.push('【硬维度不豁免】plan findings 含 hard 级（红线一致/可写性/信息差指令自相矛盾家族）——任何档位均未自动采信，请你裁决。');
+        }
+        if (isEscalatePause && planAutoTrustAction === null) {
+          lines.push('');
+          lines.push('本章链段已暂停待裁决（规划环，快照已保存）：裁决「接受任务卡」→ 直接重调 write_chapter 即续跑写稿；裁决「改任务卡」→ 告知我修改意见（将回规划环重编任务卡）。');
+        }
+      }
+      if (planUnconvergedAccepted) {
+        lines.push('');
+        lines.push('【规划环未收敛·保守采信】brief-reviewer 两轮重编仍未收敛——按真全自动档（强难停点关）采信当前任务卡续跑写稿；作者过目后可决定重跑。');
+      }
+
+      // ── 链流程重排 W2（R4 hardEscalate 处置矩阵上报面）──
+      //
+      // 终弃（chapterAbandoned）：不产 chapter_accept + 链快照已清（abandonChapterForHardStop 内）+
+      // 批量标记 + 本上报行（leader 呈作者）——永不静默（无孤儿发现红线）。采信终稿（'auto' 形态
+      // cap 超限去味已过 / 裁决失败保守采信）：resume 已续跑，本章按采信落盘 + 「环未收敛」上报行
+      // （作者可过目后决定重跑）。强难+'ask'（缺省）停下叫人：强难停点说明行。
+      if (chapterAbandoned) {
+        // CR-16：终弃文案按**实际触发信号**分派（旧三元 capExhausted 优先——streak≥2 且 lint 干净
+        // 时误报「去味门禁未过」）。终弃内分支的可达条件 = lintUnresolved（去味卡点）或 streak≥2
+        // （连续矛盾），两信号可并存（文案并陈）。
+        const abandonReasons: string[] = [];
+        if (summary.lintUnresolved === true) abandonReasons.push('自审环迭代上限耗尽且去味门禁未过（AI 味未清）');
+        if (suspensionStreakAtDispatch >= 2) abandonReasons.push(`同章连续出发核查挂起 ${suspensionStreakAtDispatch} 次（任务卡与资料反复矛盾）`);
+        lines.push(...(await abandonChapterForHardStop({
+          ctx,
+          chapterId: summary.chapter_accept?.chapterId ?? params.chapterId,
+          episodeId: params.episodeId,
+          reason: abandonReasons.join('；') || '自审环收敛失败（强难信号）',
+        })));
+      }
+      if (loopUnconvergedAccepted) {
+        lines.push('');
+        lines.push(
+          `【环未收敛·保守采信】${capExhausted ? '自审环达迭代上限（去味门禁已过）' : '灰区裁决器初审不可用'}——按真全自动档（强难停点关）采信终稿续跑落盘；章状态已标「环未收敛」，作者过目后可决定重跑。`,
+        );
+      }
+      if (
+        hardStopSignal && hardEscalate === 'ask' && sessionPermissionMode === 'auto' &&
+        summary.routeDecision?.decision === 'escalate_user' && autoTrustAction === null
+      ) {
+        // CR-16：强难停点说明行同款按实际信号列（两信号并存时并陈，不偏报其一）。
+        const hardStopSignals = [
+          ...(capExhausted ? ['自审环迭代上限耗尽'] : []),
+          ...(suspensionStreakAtDispatch >= 2 ? [`同章连续挂起 ${suspensionStreakAtDispatch} 次`] : []),
+        ].join(' + ');
+        lines.push('');
+        lines.push(
+          `【强难停点】收敛失败信号到达（${hardStopSignals}）——按强难停点设置（缺省）未自动采信，请你裁决。`,
+        );
+      }
+
+      // ── 链流程重排 W2（R4c 落盘拆两步 / AC2c）：E 段提取失败 post-hoc 兜底 ──
+      //
+      // derivationStale = route accept 已过（终稿已定）但 E 节点 error 中断（summarize 机械判）。处置：
+      // 正文 post-hoc 落盘（chapter_write body-only——handler preserveChapterFrontmatter 守 frontmatter，
+      // #107 同款通道）+ 章标 stale 上报 + 重提取指路（re-extract-chapter 修复通道，W4 落地；E 段幂等
+      // 重跑也可从快照 resume）。仅落**已注册**章（chapterId 映射 + novel.chapters 命中）——未注册章
+      // 无 frontmatter 载体，维持报告指路（#107 建章路径不经此处）。auto/suggest 同处置（正文安全
+      // 优先于档位语义——人审成果〔终稿〕已定，不带病丢失）。
+      if (summary.derivationStale === true) {
+        const landedChapterId = directChapterId ??
+          resolveChapterIdForEpisode(episodeOutlines, novelChapters, params.episodeId);
+        const chapterRegistered = landedChapterId !== undefined &&
+          (novelChapters ?? []).some((ch) => ch?.id === landedChapterId);
+        let landedNote = '';
+        if (landedChapterId && chapterRegistered && summary.draftText !== undefined) {
+          const chapterWrite = registry.get('chapter_write');
+          if (chapterWrite) {
+            try {
+              await chapterWrite.execute(
+                { chapterId: landedChapterId, content: summary.draftText },
+                { sessionId: ctx.sessionId, projectPath: ctx.projectPath, abort: ctx.abort },
+              );
+              landedNote = `正文已先落盘 chapters/${landedChapterId}.md（终稿不随提取中断丢失）`;
+              logger.info(
+                { sessionId: ctx.sessionId, episodeId: params.episodeId, chapterId: landedChapterId },
+                'write_chapter: derivationStale → post-hoc prose landing（F1a 兜底：E 段失败正文先落盘）',
+              );
+            } catch (landErr) {
+              logger.warn(
+                { err: landErr instanceof Error ? landErr.message : String(landErr), chapterId: landedChapterId },
+                'write_chapter: derivationStale post-hoc chapter_write failed → report only（正文在链快照/摘要中，可重试）',
+              );
+            }
+          }
+        }
+        lines.push('');
+        lines.push(
+          `【提取中断】终稿已定（route accept）但提取段中途失败——${landedNote || '正文仍在链快照与摘要中（draftText），未被丢弃'}。世界事件/伏笔/弧/摘要等衍生状态未更新（章标 stale）：待修复后对该章触发重提取（re-extract-chapter，W4 落地）或重跑收尾。`,
+        );
+        if (summary.errors.length > 0) {
+          lines.push(`提取段错误：${summary.errors.join('; ')}`);
+        }
       }
 
       // 4.1 Step 4（CR-15b）：route=accept_as_truth 且 chapter_accept 存在 → 转 field_patch metadata
@@ -2923,16 +3345,15 @@ export const writeChapterTool = defineTool({
       // Story 4.6 D4：escalate_user 且有 draft 时 chain 也产 chapter_accept（chainRunner D4 扩展）→ 此处同样
       // 转 field_patch。PatchReview 作裁决 UI：accept=接受为真相（+StoryDecision）/ reject=改稿。chapter_accept
       // 是候选载荷，StoryDecision 登记在 acceptChapterCandidateCore（PatchReview accept 后），reject 不登记。
-      // Story 2.2 WP-E：route 终态 story-sync 反哺收尾（applier 详 applyStorySyncFeedback 块注释）。
-      // permissionMode 复用 Director 同源推导（KD1——同一 session 信号，不二次 getSession）；autoTrustAccepted
-      // = 放手档采信裁决器 accept（escalate 语义已转 accept，反哺按 accept 落地）。null = 零痕迹。
+      // Story 2.2 WP-E（链流程重排 W3 收尾时序）：story-sync 反哺收尾（E9 提取段完成后的 summary 到达
+      // 此处——applier 详 applyStorySyncFeedback 块注释）。permissionMode 复用 Director 同源推导
+      // （KD1——同一 session 信号，不二次 getSession）。null = 零痕迹。
       const storySyncOutcome = await applyStorySyncFeedback({
         summary,
         ctx,
         permissionMode: directorPermissionMode,
         chapterId: summary.chapter_accept?.chapterId ?? params.chapterId,
         isPaused,
-        autoTrustAccepted: autoTrustAction === 'accept',
       });
 
       // ── dogfood R2 #107 / R1.1：no-chapter 链侧自动建章（首章冷启动修复）──
@@ -3033,19 +3454,13 @@ export const writeChapterTool = defineTool({
       // Story 3.7 #2（design D5）：Reader-Audit findings 结构化透传——tool result metadata 附
       // findings 字段（additive：leader 文字呈现一字不动，上方文案块零改动；UI 侧 AgentMessageItem
       // 判 metadata.findings?.source==='reader-audit' 渲染 ReviewFindingsCard per-finding InsightCard）。
-      // 覆盖 auto_revise surface（non-auto 半自动/微操）与 escalate 呈现路径（含放手采信失败降级）；
-      // **paused 路径不加**（ChapterReviewPanel 已结构化呈现 chapter_review，卡内重复列 findings 双源）。
+      // 覆盖 escalate 呈现路径（含 escalate-pause 待裁决 / 放手采信失败降级；auto_revise surface 已随
+      // 链内回环退役）；**stage pause 路径不加**（ChapterReviewPanel 已结构化呈现 chapter_review，卡内
+      // 重复列 findings 双源）——escalate-pause 不是 stage pause，findings 照附（裁决 UI 消费面，子3）。
       // findings 空时仍附（items: []）——「已审核」锚点：UI 新鲜度门（D5b）按 chapterId 取同章最新卡，
       // 空审核结果也让旧卡降级。EscalateFinding 既有 schema 零改动；metadata 是松散透传通道
       // （mirror chapter_review/field_patch 消费侧判别，不进 shared-contracts zod——不造平行结构）。
-      if (!isPaused && isAutoReviseSurface) {
-        metadata.findings = {
-          source: 'reader-audit',
-          route: summary.routeDecision?.decision ?? 'auto_revise',
-          ...(params.chapterId ? { chapterId: params.chapterId } : {}),
-          items: summary.autoReviseFindings ?? [],
-        };
-      } else if (!isPaused && isEscalate && autoTrustAction !== 'accept') {
+      if (!isStagePause && isEscalate && autoTrustAction !== 'accept') {
         // route 取（可能 redo 后的）当前 decision——redo 仍 escalate 时 UI 应挂 redo 的 findings。
         metadata.findings = {
           source: 'reader-audit',
@@ -3053,12 +3468,25 @@ export const writeChapterTool = defineTool({
           ...(params.chapterId ? { chapterId: params.chapterId } : {}),
           items: summary.escalateFindings ?? [],
         };
+      } else if (!isStagePause && planEscalateCurrent && planAutoTrustAction !== 'accept') {
+        // CR-2b：规划环 escalate-pause 的 findings metadata（mirror reader-audit 通道形态；source 区分
+        // 规划审核家族——items = plan_review 保留版 findings 投影，裁决 UI 消费面归子3）。
+        metadata.findings = {
+          source: 'plan-review',
+          route: 'escalate',
+          ...(params.chapterId ? { chapterId: params.chapterId } : {}),
+          items: planEscalateCurrent.findings,
+        };
       }
-      if (isPaused) {
-        // Story 4.3 Step 3（design §3.5 / §3.6）：paused → chapter_review metadata（UI Step 4 消费）。
+      if (isStagePause && !suspensionDisposedInAuto) {
+        // Story 4.3 Step 3（design §3.5 / §3.6）：stage pause → chapter_review metadata（UI Step 4 消费）。
         // shape = ChapterReviewMetadata（shared-contracts）：type/stage/chapterId/draftContent|briefContent/resumeOptions。
-        // draftContent（draft pause 的正文）/ briefContent（brief pause 的 chapter_brief）豁免 context isolation
-        // （同 CR-15a prose 是 deliverable）。resumeOptions 三档机械控制信号（UI 渲染按钮）。
+        // draftContent（draft/final pause 的正文）/ briefContent（brief pause 的 chapter_brief）豁免 context isolation
+        // （同 CR-15a prose 是 deliverable）。resumeOptions 机械控制信号（UI 渲染按钮）。
+        // 链流程重排 W1a：escalate-pause 不产 chapter_review（resume 路径是裁决分派非三动作审阅卡）。
+        // 链流程重排 W2：final pause——resumeOptions = accept/redo/abort（accept 可携 editedDraft 手改全文，
+        // resumeChapterChainInputSchema refine 守卫）；载荷附 reviewSummary（审读摘要）+ lintReport（去味
+        // 终态，子3 终稿卡消费面）。auto 档挂起跳章/终弃（suspensionDisposedInAuto）不产卡——链已终态。
         metadata.type = 'chapter_review';
         if (summary.pausedStage) metadata.stage = summary.pausedStage;
         if (params.chapterId) metadata.chapterId = params.chapterId;
@@ -3070,10 +3498,21 @@ export const writeChapterTool = defineTool({
         if (summary.researchSuspension) {
           metadata.researchSuspension = summary.researchSuspension;
           metadata.resumeOptions = ['redo', 'abort'];
+        } else if (summary.pausedStage === 'final') {
+          // W2（R3）：终稿卡——draftContent 是可编辑正文源（TipTap editable 归子3）；reviewSummary +
+          // lintReport 字段级 additive 清单（plan-review M5）。
+          if (summary.reviewSummary) metadata.reviewSummary = summary.reviewSummary;
+          if (summary.lintReport !== undefined && summary.lintReport.length > 0) {
+            metadata.lintReport = summary.lintReport;
+          }
+          metadata.resumeOptions = ['accept', 'redo', 'abort'];
         } else {
           metadata.resumeOptions = ['continue', 'redo', 'abort'];
         }
-      } else if (summary.chapter_accept || autoCreatedAccept) {
+      } else if (!isEscalatePause && !suspensionDisposedInAuto && (summary.chapter_accept || autoCreatedAccept)) {
+        // 链流程重排 W2：章节候选产出 = 该章成功落地路径——同章连续挂起计数清零（「连续」语义：成功
+        // 即断链）。
+        clearSuspensionStreak(ctx.sessionId, params.episodeId);
         // #107 R1.1：autoCreatedAccept = no-chapter 自动建章后补产的候选（与正常 chapter_accept 同形，
         // 走同一 field_patch 通道——PatchReview 人审 / meta 收口现成）。
         const ca = summary.chapter_accept ?? autoCreatedAccept!;

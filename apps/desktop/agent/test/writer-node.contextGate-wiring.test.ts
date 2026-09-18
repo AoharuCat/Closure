@@ -7,6 +7,8 @@ import type { ResearchBrief } from '@orison/shared-contracts';
 import { setTaskSlotResolver } from '../src/runtime/taskModelRouting';
 import { setContextPolicyProvider } from '../src/runtime/contextPolicy';
 import { registry } from '../src/tool/registry';
+// CR-24：beforeEach 注入 / afterEach 还原配对（见 describe 内注释）。
+import { setExecuteToolFn } from '../src/tool/remote';
 import type { GenerateResult } from '../src/provider/ipc-provider';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -136,7 +138,6 @@ describe('S4c 接线 — writer/核实循环 pre-gate 窗口/红线（makeAgentL
     registry.__clearForTest();
     const { registerBuiltinTools } = await import('../src/tool/builtin');
     registerBuiltinTools();
-    const { setExecuteToolFn } = await import('../src/tool/remote');
     setExecuteToolFn(async (toolId) => ({ title: toolId, output: `(${toolId} unset)` }));
     setContextPolicyProvider(() => ({ redlinePercent: 80 }));
     makeAgentLoopSpy.mockClear();
@@ -146,6 +147,8 @@ describe('S4c 接线 — writer/核实循环 pre-gate 窗口/红线（makeAgentL
     rmBestEffort(dir);
     setTaskSlotResolver(undefined);
     setContextPolicyProvider(undefined);
+    // CR-24（09-12 agy provider CR 批）：执行 seam 注入/还原配对——stub 不跨 describe 残留。
+    setExecuteToolFn(undefined);
   });
 
   it('窗口随各自 loop 的 assignment（Phase1/核实=selfcheck 档、Phase2/2.5=draft 档）+ 红线注入', async () => {

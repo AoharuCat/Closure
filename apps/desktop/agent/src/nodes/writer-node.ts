@@ -10,6 +10,7 @@ import {
   researchSuspensionSchema,
   verificationVerdictSchema,
   type CastDeclaration,
+  type GenerateFallbackEntry,
   type ResearchBrief,
   type ResearchBriefDeviation,
   type ResearchSuspension,
@@ -673,6 +674,19 @@ function tryParseCastDeclaration(content: string): CastDeclaration {
 
 // ── 节点 deps ──
 
+/**
+ * 09-13 子2 W1（design §1 H2 定案）：写手节点流载荷——phase union（'research' = 阶段一
+ * 自查/补查 + 核实子循环、'writing' = 阶段二写作、'declaration' = 阶段 2.5 出场申报）+
+ * channel 双通道。子3「写作三层」模板（思考+调查+正文流）靠 phase 区分调查思考与写作
+ * 思考。additive union：旧消费形态（只认 'writing'+text）照旧。
+ */
+export interface WriterNodeDeltaPayload {
+  phase: 'research' | 'writing' | 'declaration';
+  channel: 'text' | 'reasoning';
+  messageId: string;
+  delta: string;
+}
+
 export interface WriterNodeDeps extends ChapterLlmNodeDeps {
   /**
    * C3.2 任务路由：自查档模型（Phase1 自查/补查回合用；design §2 writer-selfcheck 档）。
@@ -705,6 +719,31 @@ export interface WriterNodeDeps extends ChapterLlmNodeDeps {
   redlinePercent?: number;
   /** 工具解析 seam（缺省 builtin registry.get——测试注入 fake 绕开全局单例）。 */
   resolveTool?: (id: string) => ToolDefinition | undefined;
+  /**
+   * 09-12 agy provider（design §3.1 装配点②）：写手 agent 循环的逻辑会话键（chapter-chain
+   * 装配 `chain:<childSessionId>:writer`——CR-21 与核实子循环 `:verify` 分键）。两阶段
+   * 循环（自查/写作/申报）同键进 generate opts；'' 与 undefined 同义 = 缺席（单发冷路径，
+   * 两态纪律）。声明在 WriterNodeDeps 而非 LlmNodeDeps——单发 llm-node 族结构性忽略。
+   */
+  sessionKey?: string;
+  /**
+   * 09-12 子2 fallback chains（H2 透传面）：writer-draft 档回退链——Phase2 写作/2.5 申报
+   * 循环 + 降级直写引擎（legacy createLlmNode 面，ChapterLlmNodeDeps.fallbacks 继承）
+   * 消费。Phase1 自查走 selfcheckFallbacks（assignment 粒度，不杂交）。
+   */
+  fallbacks?: GenerateFallbackEntry[];
+  /**
+   * 09-12 子2：writer-selfcheck 档回退链（与 selfcheckModelRef/selfcheckThinking 同
+   * assignment 成对——chapter-chain 装配处 `selfcheck ?? draft` 回退取整）。直构形态
+   * 缺省 fallback = deps.fallbacks（mirror selfcheckModelRef 的 `?? deps.modelRef`）。
+   */
+  selfcheckFallbacks?: GenerateFallbackEntry[];
+  /**
+   * 09-12 子2（design §7）：模型切换回调——两阶段循环 + 核实子循环的 onFallback 发射面
+   *（chapter-chain 装配方注入，补 nodeId/role 转 ChainStreamEvent 'model-fallback' 事件）。
+   * 缺省不传（直构测试零事件；网关 logger.warn 兜底）。
+   */
+  onModelFallback?: (event: { from: { keyId: string; modelId: string }; to: { keyId: string; modelId: string }; reason: string; attempt: number }) => void;
   /** 核实 seam（缺省 no-op 直通；Step 3 注入资料员核实子循环）。 */
   verifier?: WriterVerifier;
   /** 章档案 IO seam（缺省 .orison/chapter-archive fs 实现——测试注入内存 fake）。 */
@@ -714,13 +753,24 @@ export interface WriterNodeDeps extends ChapterLlmNodeDeps {
   /** 查询轮上限（缺省 WRITER_MAX_ROUNDS=50——测试收窄验熔断，生产不传）。 */
   maxRounds?: number;
   /**
-   * dogfood T1 Stage 6（design §4 / r1 甄别）：draft-writer 阶段二（写作）正文增量回调——
-   * 仅阶段二的 generate 轮开流（makeAgentLoop deps.onDelta 注入）；阶段一自查简报 /
-   * 补查回合 / 阶段 2.5 出场申报是 JSON 产物**不开流**（流裸 JSON 无意义）。降级直写引擎
-   * （工具环境不可用 / 段落级修订走 legacy 单发）同样不调用——caller 按 phase 字段区分。
+   * dogfood T1 Stage 6（design §4 / r1 甄别）→ 09-13 子2 W1 全相位开流（design §1 H2
+   * 签名定格）：写手节点流回调——reasoning 双通道全相位转发；**text 通道维持「仅阶段二
+   * 写作」**（正文流语义与既有 UI 解信封依赖不变，design §1「text 不扩」——阶段一自查
+   * 简报 / 补查 / 阶段 2.5 申报是 JSON 产物，裸 text 不上行）。phase 标注按调用相位
+   * （research/writing/declaration，WriterNodeDeltaPayload）。降级直写引擎（工具环境不可
+   * 用 / 段落级修订走 legacy 单发）不调用——caller 按 phase 字段区分。
    * 缺省不开（测试 / 非流式车道零事件，零回归）。
    */
-  onNodeDelta?: (data: { phase: 'writing'; messageId: string; delta: string }) => void;
+  onNodeDelta?: (data: WriterNodeDeltaPayload) => void;
+  /**
+   * 09-13 子2 W4（design §3）：链内工具调用观测回调——写手三循环（自查/补查/写作/申报）经
+   * makeAgentLoop deps.onToolCall 发射（工具调用不分相位，循环全阶段同回调）；降级直写引擎
+   * （createLlmNode 形态 tools=[]）零调用零事件。chapter-chain 装配注入（补 nodeId 转
+   * ChainStreamEvent 'chain-tool'）。缺省不开（测试 / 非流式车道零事件，零回归）。
+   * CR 批 CR-11：payload 可携 `nodeId?`（buildLoop 注入节点位常量，agent-loop 发射并入——
+   * 装配侧 wrapper 读透传值不硬编码）。
+   */
+  onToolCall?: (d: { nodeId?: string; toolName: string; inputSummary: string; resultCount: number; status: 'ok' | 'error' }) => void;
 }
 
 // ── 节点 ──
@@ -747,7 +797,8 @@ export function createWriterNode(deps: WriterNodeDeps): AgentNode {
       const { run } = input;
 
       // 边界①：段落级改稿（revision_intent 带 scope.anchor）→ 修订轮不复走自查（design §1.1 边界：
-      // targeted-revision 基于 findings 修稿，简报首轮已成立仍有效；新实体靠写完审核+实体归并兜底）。
+      // 环内改稿基于编译意图修稿（targeted-revision 退役后 = C1 意图 + 写手 directive 重跑），简报首轮
+      // 已成立仍有效；新实体靠写完审核+实体归并兜底）。
       // 整章 redo（无 anchor，含 structuralEdit-only / revisionFeedback）不走此分支——走 D2 失效判定。
       // CR-002：legacy 直写前清 stale suspended——段落级修复 = 用户已决断继续写，悬挂态与它互斥；
       // 残留 suspended 会被 decideCheckpointPause presence 判定在 draft checkpoint 再 pause（成环死路）。
@@ -809,22 +860,40 @@ export function createWriterNode(deps: WriterNodeDeps): AgentNode {
         const selfcheckThinking = deps.selfcheckThinking ?? deps.thinking;
         // S4c：自查循环窗口同对回退（同上——assignment 粒度回退在装配处，此处兜直构形态）。
         const selfcheckWindowTokens = deps.selfcheckContextWindowTokens ?? deps.contextWindowTokens;
-        // dogfood T1 Stage 6（design §4 / r1 甄别）：阶段二（写作）开流——deps.onNodeDelta 存在时
-        // 注入 makeAgentLoop deps.onDelta（每轮预分配 assistantId，text 增量转发；reasoning 增量
-        // 不转发——事件载荷无 channel 字段且链 UI 只呈现正文）。阶段一/补查/阶段 2.5 的 buildLoop
-        // 调用不传 → JSON 产物零事件。
-        const writingOnDelta = deps.onNodeDelta
-          ? (d: { messageId: string; channel: 'text' | 'reasoning'; delta: string }) => {
-              if (d.channel !== 'text') return;
-              deps.onNodeDelta!({ phase: 'writing', messageId: d.messageId, delta: d.delta });
+        // 09-12 子2：自查档回退链同对回退（mirror selfcheckModelRef 的 `?? deps.modelRef`
+        // 语义——装配处已按 assignment 粒度回退，此处兜直构/测试形态）。
+        const selfcheckFallbacks = deps.selfcheckFallbacks ?? deps.fallbacks;
+        // 09-13 子2 W1（design §1）：全相位开流——各相位回调工厂。reasoning 双通道全放行；
+        // **text 通道维持「仅阶段二」**（allowText——JSON 阶段裸 text 无意义且会污染正文流
+        // 车道语义）。phase 标注：阶段一/补查 = 'research' / 阶段二 = 'writing' / 申报 =
+        // 'declaration'（WriterNodeDeltaPayload union；核实子循环的 'research' 在装配侧
+        // 标注——chapter-chain verifier onDelta 接线）。messageId 是 makeAgentLoop 预分配的
+        // 轮 assistantId（UI 轮次分段既有机制，channel 维度免费搭车）。
+        const makePhaseOnDelta = deps.onNodeDelta
+          ? (phase: 'research' | 'writing' | 'declaration', allowText: boolean) => {
+              const emit = deps.onNodeDelta!;
+              return (d: { messageId: string; channel: 'text' | 'reasoning'; delta: string }) => {
+                if (!allowText && d.channel === 'text') return;
+                emit({ phase, channel: d.channel, messageId: d.messageId, delta: d.delta });
+              };
             }
           : undefined;
+        const writingOnDelta = makePhaseOnDelta?.('writing', true);
+        const researchOnDelta = makePhaseOnDelta?.('research', false);
+        const declarationOnDelta = makePhaseOnDelta?.('declaration', false);
         const buildLoop = (
           stopMarker: string,
           modelRef: { keyId: string; modelId: string } | undefined = deps.modelRef,
           onDelta?: (d: { messageId: string; channel: 'text' | 'reasoning'; delta: string }) => void,
           thinking: ThinkingControl | undefined = deps.thinking,
           contextWindowTokens: number | undefined = deps.contextWindowTokens,
+          // 09-12 子2（H2）：链随 phase 的 assignment（Phase1 = selfcheck 档链，Phase2/2.5 =
+          // draft 档链）——缺省 deps.fallbacks 覆盖直构形态，装配处显式传 selfcheck 链。
+          fallbacks: GenerateFallbackEntry[] | undefined = deps.fallbacks,
+          // 09-12 usage-panel：taskType 随 phase（Phase1 自查/补查 = 'writer-selfcheck'，
+          // Phase2 写作/2.5 申报 = 缺省 deps.taskType〔= chapter-chain llmDepsFor('writer-draft')〕
+          // ——与 modelRef 的 per-phase 取值同型）。
+          taskType: string | undefined = deps.taskType,
         ) => (budget: number) =>
           makeAgentLoop(
             {
@@ -832,8 +901,20 @@ export function createWriterNode(deps: WriterNodeDeps): AgentNode {
               resolveTool,
               modelRef,
               thinking,
+              taskType,
               signal: deps.signal,
+              // 09-12 agy provider CR-23：链 run 会话键随 deps（chapter-chain 装配注入）——
+              // 两阶段循环（自查/写作/申报）同键进 generate opts；'' 视同缺席（与
+              // research-verifier / agent-loop 同款 truthy 展开写法，'' 与 undefined 一致）。
+              ...(deps.sessionKey ? { sessionKey: deps.sessionKey } : {}),
               ...(onDelta ? { onDelta } : {}),
+              // 09-12 子2（H2）：链 + 切换回调透传（空链不占位）。
+              ...(fallbacks?.length ? { fallbacks } : {}),
+              ...(deps.onModelFallback ? { onFallback: deps.onModelFallback } : {}),
+              // 09-13 子2 W4（design §3）：链内工具调用观测透传（phase 无关——直接读 deps，
+              // 不作 buildLoop 参数）。CR 批 CR-11：携节点位元数据（上方 nodeId 常量——
+              // agent-loop 发射并入载荷，装配侧 wrapper 读透传值不硬编码）。
+              ...(deps.onToolCall ? { onToolCall: deps.onToolCall, nodeId } : {}),
             },
             {
               toolIds: [...WRITER_READONLY_TOOL_IDS],
@@ -1019,8 +1100,9 @@ export function createWriterNode(deps: WriterNodeDeps): AgentNode {
         if (!brief) {
           // 阶段一·自查（收束产物 = 调查简报）。R2-盲2：approvedDeviations 非空（维持原案重跑）→
           // 指令附「已批准偏离」段（按批准方案写、不再重复申报——消除激励隐瞒）。
+          // 09-13 子2 W1：researchOnDelta 注入（reasoning-only——调查思考流，text 滤）。
           const phase1 = await runPhaseWithParse({
-            buildLoop: buildLoop(PHASE1_STOP_MARKER, selfcheckModelRef, undefined, selfcheckThinking, selfcheckWindowTokens),
+            buildLoop: buildLoop(PHASE1_STOP_MARKER, selfcheckModelRef, researchOnDelta, selfcheckThinking, selfcheckWindowTokens, selfcheckFallbacks, 'writer-selfcheck'),
             firstPrompt: buildPhase1Prompt(approvedDeviations),
             retryPrompt: briefRetryPrompt,
             budget: maxRounds,
@@ -1057,7 +1139,7 @@ export function createWriterNode(deps: WriterNodeDeps): AgentNode {
             // 补查回合：gaps（缺什么+出处线索）附进阶段一续指令，工具继续可用（继续 makeAgentLoop），
             // 重新收束产新简报 → 再交核实。
             const followUp: PhaseRunOk<ResearchBrief> | PhaseRunFailed = await runPhaseWithParse({
-              buildLoop: buildLoop(PHASE1_STOP_MARKER, selfcheckModelRef, undefined, selfcheckThinking, selfcheckWindowTokens),
+              buildLoop: buildLoop(PHASE1_STOP_MARKER, selfcheckModelRef, researchOnDelta, selfcheckThinking, selfcheckWindowTokens, selfcheckFallbacks, 'writer-selfcheck'),
               firstPrompt: gapFollowUpPrompt(verification.verdict.gaps),
               retryPrompt: briefRetryPrompt,
               priorMessages,
@@ -1147,8 +1229,9 @@ export function createWriterNode(deps: WriterNodeDeps): AgentNode {
         }
 
         // 阶段二·写作（priorMessages = 阶段一 messages〔含补查轮〕/ 复用回填；stablePrefix 恒定重携）。
-        // dogfood T1 Stage 6：writingOnDelta 注入——本阶段 generate 轮的 text 增量经 onNodeDelta 上行
-        //（runChapterChain 包装成 chain-delta 事件；阶段 2.5 申报轮不注入，JSON 产物不开流）。
+        // dogfood T1 Stage 6 → 09-13 子2 W1：writingOnDelta 注入——本阶段 generate 轮增量经
+        // onNodeDelta 上行（text 正文流 + reasoning 思考流；runChapterChain 包装成 chain-delta
+        // 事件——text 正文流语义与 r1 甄别前完全一致）。
         const phase2 = await runPhaseWithParse({
           buildLoop: buildLoop(PHASE2_STOP_MARKER, undefined, writingOnDelta),
           firstPrompt: phase2Prompt(brief),
@@ -1173,7 +1256,9 @@ export function createWriterNode(deps: WriterNodeDeps): AgentNode {
         // / revision_guard——chainRunner :177 单 key 赋值不覆盖其他 key）。
         try {
           const declarationPhase = await runPhaseWithParse({
-            buildLoop: buildLoop(CAST_DECLARATION_STOP_MARKER),
+            // 09-13 子2 W1：declarationOnDelta 注入（reasoning-only——申报思考流；modelRef
+            // 显式 undefined = 缺省 deps.modelRef〔writer-draft 档，Phase2/2.5 同档既有语义〕）。
+            buildLoop: buildLoop(CAST_DECLARATION_STOP_MARKER, undefined, declarationOnDelta),
             firstPrompt: castDeclarationPrompt(),
             retryPrompt: castDeclarationRetryPrompt,
             priorMessages: phase2.messages,

@@ -10,7 +10,7 @@
     "dev": "tsx watch src/index.ts --env-file=.env.agent",
     "test": "vitest --run",
     "lint": "echo agent lint placeholder",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.fixtures.json --noEmit"
   },
   "dependencies": {
     "@node-rs/jieba": "2.0.1",

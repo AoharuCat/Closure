@@ -28,6 +28,7 @@ import { generateEmbeddings } from '@orison/model-protocols';
 import { getDb } from './index';
 import { isSqliteVecAvailable } from './sqliteVecLoader';
 import { getCurrentCraftVecDim } from './closureCraftIndexer';
+import { buildChapterHeadings, chapterShortLabel, type ChapterHeadingInfo } from './chapterHeadings';
 import {
   floatArrayToBuffer,
   getCurrentVecDim,
@@ -806,6 +807,10 @@ async function runRegisterMaterial(
     // 人工编辑」的跳过覆写判定生产激活（materialIngest 侧 never-throws 包壳 + 幂等语义
     // 注记见 materialIngest.ts 模块头）。缺行/抛错 → null → 退回既有自动路径（无回归）。
     getRegisteredContentHash: (materialId) => getMaterialRow(materialId)?.contentHash ?? null,
+    // C2 防清 belt 生产装配（mirror 上缝接线形态）：markers=0 重摄取（CR-001 路径）时既有
+    // 章界非空则保留——0 章中间行不落库（F1 假态/F12 cleared 窗口根因；materialIngest 不查
+    // db——依赖边界）。零章/缺行由 ingest 侧缝读取包壳判空，belt 不触发。
+    getRegisteredMaterial: (materialId) => getMaterialRow(materialId),
   });
   if (!result.ok) {
     if (result.reason === 'missing') {
@@ -917,9 +922,19 @@ function countParagraphBlocks(text: string): number {
   return count;
 }
 
-/** chunk 行展示名（章级基础名）：常规章 `${材料名}·第${i+1}章`；零章伪章 `${材料名}·全文`（F-09 诚实标注）。全局车道在 INSERT 处追 `·c${n}` 段号消歧（design §3.2 取值表——项目车道不缀）。 */
-function chunkDisplayName(materialName: string, c: IndexedChunk): string {
-  return `${materialName}·${c.unit.pseudo ? '全文' : `第${c.unit.index + 1}章`}`;
+/**
+ * chunk 行展示名（章级基础名）：常规章 = 章标真值短标签（chapterHeadings 单源——C5/F19：
+ * `第${index+1}章` 序号算术在简介伪章/漏检章形态下整体错位，展示一律真实章标行原词/语义回落
+ * 标签，零序号算术）；零章伪章 `${材料名}·全文`（F-09 诚实标注）。全局车道在 INSERT 处追
+ * `·c${n}` 段号消歧（design §3.2 取值表——项目车道不缀）。展示名**不进**组料 hash（hash =
+ * 章标题集 + chunk texts，见步骤 6）——改展示名不 stale 既有 chunk，旧行按内容变更节律换新。
+ */
+function chunkDisplayName(
+  materialName: string,
+  headings: ReadonlyMap<number, ChapterHeadingInfo>,
+  c: IndexedChunk,
+): string {
+  return `${materialName}·${c.unit.pseudo ? '全文' : chapterShortLabel(headings.get(c.unit.index), c.unit.index)}`;
 }
 
 /**
@@ -1064,6 +1079,10 @@ async function runReindexMaterial(
       pseudo: true,
     });
   }
+
+  // 4b. C5：chunk 展示名 = 章标真值映射（buildChapterHeadings——章正文首行命中分章正则库/
+  //      含章题即章标行；零序号算术）。伪章分支在 chunkDisplayName 内短路，不入映射消费。
+  const headings = buildChapterHeadings(derived, units);
 
   // 5. 逐章分块 + 全局 span 平移 + schema 校验（fail-loud，mirror B5：分块器自产恒过是契约，
   //    静默丢弃会让 indexTexts/vectors 按位 zip 错位）。
@@ -1248,7 +1267,7 @@ async function runReindexMaterial(
           projectId,
           'material', // entry_type = 'material'（来源即类型惯例，F-15）
           MATERIAL_SOURCE_KIND,
-          chunkDisplayName(material.name, c),
+          chunkDisplayName(material.name, headings, c),
           c.chunk.text,
           'known',
           null, // 材料无卡状态（mirror 章行 NULL；vec0 侧 '' sentinel）
@@ -1298,7 +1317,7 @@ async function runReindexMaterial(
           craftId,
           'material', // craft_type = 'material'（design §3.2 取值表）
           MATERIAL_CHUNK_SOURCE_KIND,
-          `${chunkDisplayName(material.name, c)}·c${c.chunkNo}`, // 全局车道 name 追段号消歧
+          `${chunkDisplayName(material.name, headings, c)}·c${c.chunkNo}`, // 全局车道 name 追段号消歧
           c.chunk.text,
           null,
           material.name, // source = 材料名

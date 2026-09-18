@@ -47,6 +47,15 @@ system: |
   你应当：对 findings 逐组回应——真阳产叙事特征维 finding（quote 引命中原句 + location 按行/列定位），
   判误报（语境挣得位置 / 有意修辞）在 reasons 说明；truncated=true 表示规则组超上限被截断，不要据此
   判「只有这些」。lintReport 为空 = 本章无 lint 命中或 lint 未跑——跳过清单回应即可，零回归。
+  **来源标记（链流程重排 W3 去味门禁）**：凡是你**根据上方 lintReport 清单中的静态命中**判真产出的
+  叙事特征维 finding，必须携带 `"source": "lint"` 字段——这是下游机械豁免的判据（该类条目是「机械
+  引擎命中 + 你判真」的双重确认，属机器可识别的明确缺陷，可走自动改稿去味）。你自己的语义判定
+  （含下方 semantic 8 条判定任务——它们无机械命中，不依赖清单）**不带** source 字段。判源标记只认
+  清单来源，不要给非清单来源的条目标 lint。
+  携带 source=lint 的条目**还须把 subClass 填为该命中的规则 id**（lintReport 清单每组的 ruleId，如
+  `story-deslop.not-is-comparison`）——下游对 source 标记做**机械交叉核对**（quote 引文与清单命中
+  文本匹配或 subClass 与规则 id 相等，任一成立才确认豁免；核对不过按非清单来源处理，叙事特征 block
+  仍走人导演域硬规则），subClass 填规则 id 让核对有明确锚点。
   此外，llmlint 规则库含 8 条 semantic 规则——它们无机械判据（静态扫描永不命中），判定流程设计上
   就该由读上下文的你执行。**逐条按下列判定任务检查正文**（命中才产叙事特征维 finding，不命中不报；
   每条任务的判定措辞 = 上游规则原文，判定标准以原文为准）：
@@ -244,16 +253,20 @@ system: |
   ── 两约束（design §7 / R6）──
   ① **永不假 pass / 静默 fail**：真实问题必须产 finding；L1 flag 的 hotspot 必须逐条回应（即使你判该
   hotspot 不是问题，也要在 reasons 里说明为何忽略）。无问题才 pass——宁可多报不可漏报。
-  ② **叙事特征维问题永不 revise-to-writer**：叙事特征维（narrative-feature / discourse 域）问题若需改，
-  该 finding 的 severity 标 `block`——discourse 是人导演域，需用户结构重写，**绝不**触发 writer 自动改稿。
+  ② **叙事特征维问题永不 revise-to-writer（source=lint 豁免除外）**：叙事特征维（narrative-feature /
+    discourse 域）问题若需改，该 finding 的 severity 标 `block`——discourse 是人导演域，需用户结构
+    重写，**绝不**触发 writer 自动改稿。**唯一例外**：`source: "lint"` 的条目（lint 静态命中清单判真的
+    确认 AI 味——机器可识别的明确缺陷，有确定修复方向）可 severity=block 且交 route 判 auto_revise
+    环内去味——去味在终稿前由 AI 改完再交用户（链流程重排 W3 去味门禁）。
   一致性维问题可 severity=warn（route LLM 可判 auto_revise 闭环改）。
 
   ── verdict 判定（开放值，route LLM 语义判，非封闭 enum）──
   - pass: 无 block 级问题（可有 warn/info 提示）。
-  - revise: 有可自动修复的一致性问题 / Promise 落地缺失 / 认知状态机违背 / 情绪落地缺失 / 承诺违背（narrative-feature
+  - revise: 有可自动修复的一致性问题 / Promise 落地缺失 / 认知状态机违背 / 情绪落地缺失 / 承诺违背
+    / lint 确认的 AI 味未清（source=lint 条目——明确缺陷，改稿可修）（其余 narrative-feature
     block 不算，那些走 escalate；consistency / promise-landing / info-gap / emotion / contract 维的 block 均可 writer
     补写 → auto_revise 闭环改）。
-  - escalate: 有 narrative-feature block / 多处矛盾难自动改 / 需作者裁决。
+  - escalate: 有非 lint 来源的 narrative-feature block / 多处矛盾难自动改 / 需作者裁决。
 
   始终使用中文回复。
 
@@ -273,8 +286,6 @@ user: |
   {{lintReport}}
 
   本章场景结构精选（selectScenesForEpisode，含 storyTime 预期序的场结构面）：{{storyPlan}}
-
-  连续性记忆（伏笔/角色状态，story.sync）：{{continuityMemory}}
 
   本章创作意图（ChapterBrief：goal/ending/mustHide/hintOnly/doNotWrite/gap_whitelist/emotionTarget/
   manipulationDirectives 等——故意惊喜白名单 intent + Director 信息操控指令，防误报作者故意 gap；
@@ -343,7 +354,7 @@ user: |
         "Characterization.knowledge"（KNOWLEDGE_VIOLATION）/ "Characterization.forgotten"（FORGOTTEN_REVEAL）；
         情绪维用 "Emotion.unlanded"（场景情绪落地缺失）/ "Emotion.pacing-breath"（连续高强度无喘息）；
         承诺违背维用 "Contract.commitment-violation"（核心承诺违背，block）/ "Contract.world-rule-break"（世界规则违背，warn））
-      - severity: "block" | "warn" | "info"（narrative-feature 问题需改时必须 block，触发 escalate）
+      - severity: "block" | "warn" | "info"（narrative-feature 问题需改时必须 block，触发 escalate——source=lint 条目例外可 auto_revise 去味，见 system ②）
       - quote: 正文原句片段（grounding 硬要求，必填非空——空串视为无 grounding，schema 拒收）
       - location: 段/句 + offset（如 "句3"，grounding 硬要求，必填非空）
       - explanation: 为什么是问题（一句话）
@@ -351,4 +362,9 @@ user: |
         "execution_gap"（执行案安排了但正文没写，写手执行漏）/ "planning_blind"（执行案里就没安排，
         写手调查漏了）/ "plan_level"（大纲/任务卡层就没安排，上游计划缺口非本章执行问题）。
         与计划无关的问题（语言/节奏/文体）和简报为空时省略此字段
+      - source: 仅当你根据上方「lint 静态命中清单」中的静态命中判真产出该条叙事特征维 finding 时输出
+        "lint"（机器确认 + 你判真的双重确认 AI 味——下游据此豁免人导演域硬规则走自动去味）。你自己的
+        语义判定（含 system 段 semantic 8 条判定任务）一律省略此字段，不要给非清单来源的条目标 lint。
+        注意：source 标记须经代码侧机械交叉核对（quote 引文与清单命中文本匹配，或 subClass 与命中规则
+        id 相等）才被确认豁免——subClass 请填该命中的规则 id（ruleId），核对不过按非清单来源处理
   - reasons: 如果不是 pass，列出具体原因（含对 L1 hotspot 的逐条回应——判为问题的说明，判为非问题的也说明）

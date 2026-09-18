@@ -27,12 +27,12 @@ import {
   listDeconProducts,
   upsertDeconProduct,
 } from '../db/closure-decon';
-import { getMaterialRow } from '../db/materialIndexer';
 import { splitParagraphBlocks, stripChapterMarkerLines, type MaterialParagraphBlock } from '../ipc/toolHandlers/materialIngest';
 import {
   DECON_STALE_NOTE,
   checkDeconRunBoundary,
   failDeconUnit,
+  loadExtractableMaterial,
   loadRunningDeconJob,
   readDeconDerivedTextFor,
   sha256DeconContent,
@@ -523,6 +523,8 @@ export interface DeconP3bDeps {
   readDerivedText?: (material: Material) => string | null;
   /** 逐 unit running 进度事件注入（CR-8）。 */
   notify?: (event: DeconProgressEvent) => void;
+  /** 材料读重试等待注入（C4-F12——测试零延迟；缺省 ~1s×10 实时钟）。 */
+  waitMs?: (ms: number) => Promise<void>;
   now?: () => Date;
 }
 
@@ -556,16 +558,17 @@ export async function runDeconP3b(jobId: string, deps: DeconP3bDeps = {}): Promi
   }
   const job: DeconJob = gate.job;
 
-  const material = getMaterialRow(extractMaterialId(job.materialRef));
-  if (material === null || material.chapters.length === 0) {
-    const message = `材料 ${job.materialRef} 不存在或零章——P3b 无可统计章`;
-    failDeconUnit(jobId, 'p3b', 'arcs', message, nowIso());
-    return { status: 'failed', message, stats: emptyStats(0) };
+  // C4-F12 材料读重试 + C4-F16 写侧（材料级前置失败只 transitionDeconJob——job 行 error 承载）。
+  const loaded = await loadExtractableMaterial(extractMaterialId(job.materialRef), { waitMs: deps.waitMs });
+  if (!loaded.ok) {
+    transitionDeconJob(jobId, 'fail', loaded.message);
+    return { status: 'failed', message: loaded.message, stats: emptyStats(0) };
   }
+  const material = loaded.material;
   const derived = (deps.readDerivedText ?? readDeconDerivedTextFor)(material);
   if (derived === null) {
     const message = '派生 .md 读取失败（缺失或车道不可解析）——无法计算章字数与 style_stats';
-    failDeconUnit(jobId, 'p3b', 'arcs', message, nowIso());
+    transitionDeconJob(jobId, 'fail', message);
     return { status: 'failed', message, stats: emptyStats(material.chapters.length) };
   }
   if (sha256DeconContent(derived) !== job.derivedHash) {
@@ -575,7 +578,7 @@ export async function runDeconP3b(jobId: string, deps: DeconP3bDeps = {}): Promi
   const blocks = splitParagraphBlocks(derived);
   if (blocks.length === 0) {
     const message = '材料无有效段落（派生 .md 全空白）——不可统计';
-    failDeconUnit(jobId, 'p3b', 'arcs', message, nowIso());
+    transitionDeconJob(jobId, 'fail', message);
     return { status: 'failed', message, stats: emptyStats(material.chapters.length) };
   }
 

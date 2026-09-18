@@ -59,15 +59,15 @@ import {
 import { atomicWriteFileSync } from '@orison/shared-contracts/fs/atomicWrite';
 import {
   aggregateFullReport,
+  assignmentFallbackChain,
   assignmentThinkingControl,
   getLintEngine,
   projectLintReportForL2,
   resolveTaskModel,
   writeLintChapterLedger,
 } from '@orison/desktop-agent';
-import { generateText } from '@orison/model-protocols';
 import { readModelConfigFromDisk } from './configIpc';
-import { resolveModel } from './modelGatewayIpc';
+import { handleGenerateText, ModelResolutionError, resolveModel } from './modelGatewayIpc';
 import { assertSafePath } from './pathGuard';
 import { decodeFileToUtf8 } from '../fs/decodeText';
 import { withProjectLock } from '../fs/projectWriteLock';
@@ -256,13 +256,16 @@ type ClassifyCallResult =
   | { kind: 'unparseable' }
   | { kind: 'terminal' };
 
-/** 单次 classify 调用（resolved 模型已解出；thinking = review-judge 档思考策略，未配 = undefined 不注入）。 */
+/** 单次 classify 调用（ref 驱动——经网关环入口 handleGenerateText，链/无链同路）。 */
 async function callLintClassify(
-  resolved: ReturnType<typeof resolveModel>,
+  ref: import('@orison/shared-contracts').ModelRef,
   userPrompt: string,
   knownRuleIds: Set<string>,
   withRetryNudge: boolean,
   thinking?: import('@orison/shared-contracts').ThinkingControl,
+  fallbacks?: Array<import('@orison/shared-contracts').GenerateFallbackEntry>,
+  /** CR-19：降级日志上下文（原预检 try/catch 持有的 projectPath 随预检撤除移入本参）。 */
+  projectPath?: string,
 ): Promise<ClassifyCallResult> {
   const messages = [
     { role: 'system' as const, content: LINT_CLASSIFY_SYSTEM_PROMPT },
@@ -274,23 +277,43 @@ async function callLintClassify(
   let text: string;
   let finishReason: unknown;
   try {
-    const response = await generateText(resolved, {
-      model: resolved.modelId,
-      messages,
-      temperature: 0.2,
-      maxTokens: LINT_CLASSIFY_MAX_TOKENS,
-      // S4c（task 08-25 design「lintIpc review-judge 同链」）：思考策略随档——agent 链的
-      // review-judge 档节点经 assignmentThinkingControl 归一注入，本直调面同链同源；
-      // 未配 → undefined 不带字段 = auto（字节级不变）。
-      ...(thinking ? { thinking } : {}),
+    // 09-12 子2（复核 H1 重接）：classify 直调面改经网关环入口（in-process handleGenerateText）
+    // ——无链快径字节级现行为；配链时 review-judge 档回退链生效。resolveModel 上移进环
+    //（per-attempt 解析，配置腐化可跳家）。
+    const response = await handleGenerateText({
+      ref,
+      request: {
+        model: ref.modelId,
+        messages,
+        temperature: 0.2,
+        maxTokens: LINT_CLASSIFY_MAX_TOKENS,
+        // 09-12 usage-panel：lint 语境判断 = review-judge 档（与路由同 slot 名，design §0 表）。
+        taskType: 'review-judge',
+        // S4c（task 08-25 design「lintIpc review-judge 同链」）：思考策略随档——agent 链的
+        // review-judge 档节点经 assignmentThinkingControl 归一注入，本直调面同链同源；
+        // 未配 → undefined 不带字段 = auto（字节级不变）。
+        ...(thinking ? { thinking } : {}),
+      },
+      ...(fallbacks?.length ? { fallbacks } : {}),
     });
     text = response.text ?? '';
     finishReason = (response as { finishReason?: unknown }).finishReason;
   } catch (err) {
-    getLogger().warn(
-      { err: err instanceof Error ? err.message : String(err) },
-      'lintIpc classify: generateText failed → degraded',
-    );
+    // CR-19（09-12 子2 CR 批）：「没配模型」distinct 降级日志收编到失败点——预检已撤
+    //（原预检 resolveModel 结果丢弃 + 双解析双读盘 TOCTOU），ModelResolutionError
+    //（resolveModel 的纯配置失败类型：键删/模型缺失/禁用/缺凭据）在此甄别同一条
+    // distinct 日志路径，语义与原预检等价（resolveModel 在环入口同步抛，零网络）。
+    if (err instanceof ModelResolutionError) {
+      getLogger().warn(
+        { err: err.message, projectPath },
+        'lintIpc classify: no model resolvable (review-judge slot / auto-pick) → degraded',
+      );
+    } else {
+      getLogger().warn(
+        { err: err instanceof Error ? err.message : String(err) },
+        'lintIpc classify: generateText failed → degraded',
+      );
+    }
     // design §4：重试只针对 JSON 解析，调用失败直接降级。
     return { kind: 'terminal' };
   }
@@ -459,23 +482,17 @@ export function registerLintIpc(): void {
       // 模型解析（C3.2 任务档语义，CR-026 单源）：resolveTaskModel = agent 包导出的 slot 解析
       // 函数（agentIpc setTaskSlotResolver 注入同一函数——手写复刻已撤，防语义 drift）。
       // review-judge 档显式配置优先；缺档/未注入 resolver → undefined → default 哨兵 →
-      // resolveModel 自动选择（首个启用模型）。未配置任何模型 → resolveModel 抛 → degraded。
+      // resolveModel 自动选择（首个启用模型）。
       // S4c：assignment 单次解析——ref 与思考策略同源（thinking 未配 → undefined = auto）。
-      let resolved: ReturnType<typeof resolveModel>;
-      let classifyThinking: ReturnType<typeof assignmentThinkingControl>;
-      try {
-        const config = readModelConfigFromDisk();
-        const assignment = resolveTaskModel('review-judge');
-        const ref = assignment ?? { keyId: 'default', modelId: 'default' };
-        resolved = resolveModel(ref, config);
-        classifyThinking = assignmentThinkingControl(assignment);
-      } catch (err) {
-        getLogger().warn(
-          { err: err instanceof Error ? err.message : String(err), projectPath },
-          'lintIpc classify: no model resolvable (review-judge slot / auto-pick) → degraded',
-        );
-        return LINT_CLASSIFY_DEGRADED;
-      }
+      // 09-12 子2：ref + 回退链透传给环入口（callLintClassify 内 handleGenerateText）。
+      // CR-19（09-12 子2 CR 批）：可用性预检撤除——原预检跑完整 resolveModel 后丢弃结果
+      //（双解析 + 双读盘 TOCTOU）；真实解析在环内 per-attempt 权威进行，「没配模型」的
+      // distinct 降级日志改由失败点按 ModelResolutionError 甄别（callLintClassify catch），
+      // 语义等价且零二次解析。
+      const assignment = resolveTaskModel('review-judge');
+      const classifyRef = assignment ?? { keyId: 'default', modelId: 'default' };
+      const classifyThinking = assignmentThinkingControl(assignment);
+      const classifyFallbacks = assignmentFallbackChain(assignment);
 
       // 幻觉防线白名单含 density 规则 id（CR-013：density-only 稿的 verdict 不被当幻觉丢弃）。
       const knownRuleIds = new Set([
@@ -496,9 +513,9 @@ export function registerLintIpc(): void {
 
       // 单次判定；仅 **不可解析** 一次重试（design §4——重试只针对 JSON 解析；调用失败/截断
       // 是终态失败，同输入重跑无意义，直接降级）。
-      let outcome = await callLintClassify(resolved, userPrompt, knownRuleIds, false, classifyThinking);
+      let outcome = await callLintClassify(classifyRef, userPrompt, knownRuleIds, false, classifyThinking, classifyFallbacks, projectPath);
       if (outcome.kind === 'unparseable') {
-        outcome = await callLintClassify(resolved, userPrompt, knownRuleIds, true, classifyThinking);
+        outcome = await callLintClassify(classifyRef, userPrompt, knownRuleIds, true, classifyThinking, classifyFallbacks, projectPath);
       }
       if (outcome.kind !== 'ok') {
         getLogger().warn(

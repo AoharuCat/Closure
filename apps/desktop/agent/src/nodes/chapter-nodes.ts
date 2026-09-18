@@ -23,7 +23,7 @@ import {
   collectRelevantDecisions,
   REVIEW_ATTRIBUTION_VALUES,
 } from '@orison/shared-contracts';
-import type { StoryDecision } from '@orison/shared-contracts';
+import type { GenerateFallbackEntry, StoryDecision } from '@orison/shared-contracts';
 import { createLlmNode, isAbortError, MAX_ATTEMPTS, type GenerateFn, type LlmNodeDeps } from './llm-node';
 import { collectChapterSceneIds, filterPromiseRegistryForChapter } from './brief-compiler-node';
 import { extractJson } from './extract-json';
@@ -33,22 +33,26 @@ import { isPosTaggerAvailable } from '../audit/pos-tagger';
 import { projectLintReportForL2 } from '../lint/lintL2Signal';
 import { logger } from '../logger';
 import type { SessionMessage } from '../types';
+import type { GenerationDelta } from '../provider/ipc-provider';
 import type { AgentNode, NodeResult, RunSnapshot } from '../contracts/run';
 
-// ── Story 4.0 写章战术链段：四 LLM 节点实例化（design §4.2/§4.4 / implement.md 3.2/3.5）──
+// ── Story 4.0 写章战术链段：LLM 节点实例化（design §4.2/§4.4 / implement.md 3.2/3.5）──
 //
-// draft-writer / multi-review / targeted-revision / route 四节点 = createLlmNode 工厂实例化。每节点只
-// 提供 {role, contract, buildPrompt, parseOutput}，复用 createLlmNode 的「load yaml system + renderTemplate
-// user 段 + 单次 generate + parse 失败重试 + 兜底 error artifact」骨架（Step 2 已建）。
+// draft-writer / multi-review / route = createLlmNode 工厂实例化。
+// 每节点只提供 {role, contract, buildPrompt, parseOutput}，复用 createLlmNode 的「load yaml system +
+// renderTemplate user 段 + 单次 generate + parse 失败重试 + 兜底 error artifact」骨架（Step 2 已建）。
+// 链流程重排（09-13 W1d + CR 批清理）：targeted-revision-agent 已全量退役删除（「读 review.latest
+// 整段改稿」职能被环内 C1 revision-optimizer 编译 + 写手 directive 重跑覆盖——新节点工厂在
+// brief-reviewer-node.ts / revision-optimizer-node.ts；dormant 工厂 / CONTRACTS 条目 / yaml 已一并清零）。
 //
 // artifact key 约定（design §4 数据流 / STATE_KEY_MAP）：
 // - draft-writer 读 chapter_brief + scene_graph + settings_context → 产 'draft.initial' {title,text,wordCount,chapterId}
-// - multi-review 读 draft.initial + scene_graph + story.sync → 产 'review.latest' {verdict,summary,dimensions,reasons}
+// - multi-review 读 draft.initial + scene_graph + chapter_brief → 产 'review.latest' {verdict,summary,dimensions,reasons}
+//   （'story.sync' 已随链流程重排 W1d 移出 requiredArtifactKeys——story-sync 后移 E9，W0-3）
 // - route 读 review.latest + chapter_brief + draft.initial → 产 'route_decision' {decision,reason}
-// - targeted-revision 读 review.latest + draft.initial → 产 'revision.output'（revised draft shape）
 //
 // STATE_KEY_MAP（engine/registry.ts）：'draft-writer-agent'→'draft.initial' / 'multi-review-agent'→'review.latest' /
-// 'targeted-revision-agent'→'revision.output'。route-agent STATE_KEY_MAP 条目 Step 5 装配时加（'route_decision'）。
+// 'route-agent'→'route_decision'（'targeted-revision-agent'→'revision.output' 条目已随 09-13 W1d 退役删除）。
 //
 // 范式判据（ADR-3 / .trellis/spec/core/creative-vs-mechanical.md）：四节点全 LLM 创造性/裁判节点
 // （生成 / 审核 / 改稿 / 路由判决）——非确定性工作。纯代码段（brief 编译 / storySync）在别处。
@@ -66,8 +70,9 @@ import type { AgentNode, NodeResult, RunSnapshot } from '../contracts/run';
  * 四 LLM 节点共享的 deps 形态（透传给 createLlmNode + createReaderAuditNode）。
  *
  * Story 4.2：加 `tagChinese` + `compress` 两 DI seams——仅 Reader-Audit composite 节点消费（L1 stylometry
- * 注入，ADR-2）。draft-writer / targeted-revision / route 经 createLlmNode 只读 generate/modelRef/signal，
- * 忽略这两个字段（结构兼容）。chapter-chain 装配处从 agent native 模块（pos-tagger）+ node:zlib 注入。
+ * 注入，ADR-2）。draft-writer / route 经 createLlmNode
+ * 只读 generate/modelRef/signal，忽略这两个字段（结构兼容）。chapter-chain 装配处从 agent native
+ * 模块（pos-tagger）+ node:zlib 注入。
  */
 export interface ChapterLlmNodeDeps extends LlmNodeDeps {
   generate: GenerateFn;
@@ -162,7 +167,7 @@ const draftOutputSchema = z
     { message: 'draft-writer 输出 text 与 passageText 均空——正文核心缺失（段落级改稿时 passageText 必填）' },
   );
 
-/** draft artifact shape（draft.initial + revision.output 共用，targeted-revision 加 revisionNotes）。 */
+/** draft artifact shape（draft.initial；段落级改稿形态 text=改前整章 + passageText=改后段）。 */
 export type DraftArtifact = z.infer<typeof draftOutputSchema>;
 
 /**
@@ -233,6 +238,55 @@ export function parseDraftOutput(content: string, run: RunSnapshot): NodeResult 
     };
   }
   return { stateKey: 'draft.initial', artifact: parsed };
+}
+
+// ── 链流程重排 W2（R3 终稿手改通道 + R4c 落盘拆两步）：editedDraft 覆写单源 ──
+
+/**
+ * W2（plan-review L2）：editedDraft 覆写后的 wordCount 机械重算——终稿卡编辑面只有正文全文，
+ * LLM 自报 wordCount 对手改稿必 stale。非空白字符计数（CJK 习惯口径）。纯代码机械。
+ */
+export function recountDraftWordCount(text: string): number {
+  return text.replace(/\s+/g, '').length;
+}
+
+/**
+ * W2（R3）：终稿 checkpoint 人手改正文全文 → 覆写 artifacts 集（resume.editedDraft 消费单源——
+ * workflow.ts resume 读回与 shell resume IPC F1a 候选组装共用）。
+ *
+ * 机械动作（mirror「stale 清理不变式」）：
+ * 1. `draft.initial`：text = editedDraft + wordCount = recountDraftWordCount + 剥 passageText
+ *    （段落级残留对终稿无意义——终稿是整稿形态）。draft.initial 缺（防御：终稿 pause 必有）→ 不覆写
+ *    （caller 语义 = 无稿可改，resume 续跑原稿）。
+ * 2. **申报类 stale 清理**：人改正文后写手上一轮的申报不再可信——清 `cast_declaration`（写手阶段
+ *    2.5 的登场申报，mention-ledger 申报通道降级保守账 = 设计意图）+ 剥 `research_brief.suspended`
+ *    （挂起载荷与终稿互斥，防御性清理）。title 保留（终稿卡编辑面只有正文，title 不 stale）。
+ *
+ * 范式判据（ADR-3）：整稿覆写 + 字段删除 = 纯机械（人改是最高权威，不走 optimizer 意图编译）。
+ */
+export function applyEditedDraft(
+  artifacts: Record<string, unknown>,
+  editedText: string,
+): Record<string, unknown> {
+  const next: Record<string, unknown> = { ...artifacts };
+  const draft = next['draft.initial'];
+  if (draft && typeof draft === 'object' && !Array.isArray(draft)) {
+    const { passageText: _stale, ...restDraft } = draft as Record<string, unknown>;
+    void _stale;
+    next['draft.initial'] = {
+      ...restDraft,
+      text: editedText,
+      wordCount: recountDraftWordCount(editedText),
+    };
+  }
+  delete next['cast_declaration'];
+  const researchBrief = next['research_brief'];
+  if (researchBrief && typeof researchBrief === 'object' && !Array.isArray(researchBrief)) {
+    const { suspended: _s, ...restBrief } = researchBrief as Record<string, unknown>;
+    void _s;
+    next['research_brief'] = restBrief;
+  }
+  return next;
 }
 
 /**
@@ -396,7 +450,11 @@ const READER_AUDIT_CONTRACT: ReusableAgentNodeContract = {
   inputSchemaName: 'reviewInput',
   outputSchemaName: 'reviewOutputSchema',
   // design §3：加 chapter_brief（喂 gap 白名单 intent——mustHide/hintOnly/doNotWrite + gap_whitelist）。
-  requiredArtifactKeys: ['draft.initial', 'scene_graph', 'story.sync', 'chapter_brief'],
+  // 链流程重排 W1d（W0-3 断链级适配）：移除 'story.sync'——story-sync 后移提取段 E9（route 后），
+  // hard required 会让每章在 C5 审读位 blocked 断链。
+  // 链流程重排 W3（R5 提取段后移适配）：continuityMemory var 已删（buildPrompt 不再读 story.sync——
+  // 审读对照源 = 启动前快照 + 计划；本章自提物对照本章是循环论证，E9 在审读后也不存在本章提取物）。
+  requiredArtifactKeys: ['draft.initial', 'scene_graph', 'chapter_brief'],
   producedArtifactKeys: ['review.latest'],
   sideEffects: ['call_model'],
 };
@@ -405,7 +463,7 @@ const READER_AUDIT_CONTRACT: ReusableAgentNodeContract = {
 // worldStateContext var。**不在 requiredArtifactKeys**：snapshot 是增强基底（前章已建立状态供一致性对照），
 // 首章 / 测试环境 / fetch 失败 / 工具未注册时 artifact 缺——hard required 会让 chainRunner DAG check 阻塞链段
 // （status='blocked'），违 graceful。optional 消费 + buildPrompt graceful 缺失处理（?? '' → 空段，零回归），
-// 照「现有 artifact 缺失处理」惯例（同 continuityMemory/briefIntent 缺失降级）。范式判据（ADR-3）：snapshot
+// 照「现有 artifact 缺失处理」惯例（同 briefIntent 缺失降级）。范式判据（ADR-3）：snapshot
 // 注入 = 数据流（reduce 已在前章纯代码算），「prose vs 已建立状态是否矛盾」归 L2 LLM 语义裁判（非纯代码 diff）。
 //
 // Story 6.5：Reader-Audit 加 promise-landing 维（落地公理）——`promise_registry` artifact（assembleChapterChainArtifacts
@@ -489,6 +547,14 @@ const reviewOutputSchema = z.object({
               // 无关的 finding 不带；.catch(undefined) mirror severity E9 容忍——非法值降级「无归因」丢字段
               // 不丢 finding（单坏值不掀翻整个 review）。
               attribution: z.enum(REVIEW_ATTRIBUTION_VALUES).optional().catch(undefined),
+              // 链流程重排 W3（R2 去味门禁 H2）：finding 来源标记。'lint' = 该条是 Reader-Audit 对
+              // lintReport 静态命中清单（lint-node 产）逐组判真后的确认条目——prompt 契约约束 L2 只对
+              // 清单来源的真阳携带（机械豁免判据：hasNarrativeFeatureBlock 与 summarize.lintUnresolved
+              // 按 source==='lint' 判源不判义——豁免依据是「来源=机械引擎命中」非内容判断，范式安全）。
+              // 非 lint 来源（L2 自判 / semantic 8 条判定任务）不携带——semantic 判定无机械确认，仍归
+              // 人导演域硬规则。optional + .catch(undefined) mirror attribution 容忍——非法值降级
+              // 「无来源」丢字段不丢 finding（单坏值不掀翻整个 review）。
+              source: z.enum(['lint', 'agent']).optional().catch(undefined),
             }),
           )
           .default([]),
@@ -508,7 +574,7 @@ export type ReviewArtifact = z.infer<typeof reviewOutputSchema>;
  *  1. draft = artifacts['draft.initial'].text
  *  2. l1 = computeL1SignalReport({draftText, sceneGraph, episodeId, deps:{tagChinese, compress}})
  *     ——纯代码（POS/CR/句长/词汇/cliché/crutch/filter/标点/storyTime fold），soft signal hotspot。
- *  3. userPrompt = renderTemplate(yaml.user, {draftText, l1Hotspots, storyPlan, continuityMemory, briefIntent})
+ *  3. userPrompt = renderTemplate(yaml.user, {draftText, l1Hotspots, storyPlan, briefIntent})
  *  4. generate(system, userPrompt, modelRef) ——复用 createLlmNode 的 generate+retry+abort 骨架（design §3）。
  *  5. parsed = reviewOutputSchema.parse(JSON.parse(extractJson(content)))
  *  6. parse 失败 ×MAX_ATTEMPTS → **fallback verdict='escalate'**（R6① 永不假 pass / 静默 fail）。
@@ -519,15 +585,16 @@ export type ReviewArtifact = z.infer<typeof reviewOutputSchema>;
  * contract requiredArtifactKeys 加 chapter_brief（喂 gap 白名单 intent）。episodeId 从 chapter_brief_input
  * 解析（optional——缺则 storyTimeContext 缺省，L1 一致性 hint 降级，L2 仍跑）。
  *
- * stateKey='review.latest'（STATE_KEY_MAP 不变）。route/targeted-revision 契约不变（仍读 review.latest）。
+ * stateKey='review.latest'（STATE_KEY_MAP 不变）。
  *
  * expected_downstream_consumers:
  * - route 节点：读 review.latest.verdict + dimensions（R6② defense guard 查 narrative-feature block）。
- * - targeted-revision：读 review.latest 改稿（闭环 auto_revise 时）。
+ * - revision-optimizer（链流程重排 C1，revision-optimizer-node.ts）：读 review.latest block/warn
+ *   findings 编译 RevisionIntent（targeted-revision 退役后的环内改稿继任）。
  * - 4.6 裁决器 / Epic 7 改稿护栏：消费 findings[]{quote,location,severity} 定位改稿（grounding 复用）。
  */
 export function createReaderAuditNode(deps: ChapterLlmNodeDeps): AgentNode {
-  const { generate, modelRef, thinking, signal, compress } = deps;
+  const { generate, modelRef, thinking, signal, compress, fallbacks, taskType, onDelta } = deps;
   const nodeId = 'multi-review-agent';
   // B2（CR patch）：tagger 注入前查可用性——binding 不可用时 tagChinese=undefined → stylometry `!tagger` 分支
   // 给诚实 'skipped: tagger 未注入' note（否则 tagger 返 [] 产伪 '文本过短' / lexical 'word-level' note，撒谎）。
@@ -570,7 +637,8 @@ export function createReaderAuditNode(deps: ChapterLlmNodeDeps): AgentNode {
       // computePacingBreathHotspot 结构兼容消费（只需 {id, pacingRole?}）。
       const chapterScenes = selectScenesForEpisode(sceneGraph, episodeId);
       const storyPlan = JSON.stringify(chapterScenes);
-      const continuityMemory = JSON.stringify(run.artifacts['story.sync'] ?? '');
+      // 链流程重排 W3（R5）：continuityMemory（story.sync 序列化）var 已删——story-sync 后移 E9（审读
+      // 后），C5 位无本章提取物；审读对照源 = 启动前快照（world_state/promise/cognition）+ 计划（brief）。
       const briefIntent = JSON.stringify(run.artifacts['chapter_brief'] ?? ({} as ChapterBrief));
       // Story 6.6 Phase D：world_state_snapshot 一致基底（chapter-level，前章已建立状态）—— caller 在 chain
       // 启动前取 snapshot 注入 initialArtifacts（write_chapter tool / closureChainIpc）。graceful：artifact 缺
@@ -698,7 +766,6 @@ export function createReaderAuditNode(deps: ChapterLlmNodeDeps): AgentNode {
         draftText,
         l1Hotspots,
         storyPlan,
-        continuityMemory,
         briefIntent,
         worldStateContext,
         promiseLedger,
@@ -720,7 +787,26 @@ export function createReaderAuditNode(deps: ChapterLlmNodeDeps): AgentNode {
       let lastErr: unknown = null;
       for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
         try {
-          const result = await generate(messages, system, [], abortSignal, { modelRef, thinking });
+          // 09-12 子2（H2）：fallbacks 透传（空链不占位）。
+          // 09-12 usage-panel：taskType 透传（未标注不占位）。
+          // 09-13 子2 W2b（思考流，design §1）：onDelta 随 opts 透传——每次尝试预分配轮 messageId
+          //（mirror llm-node attemptMessageId：重试轮换 id，UI 侧按轮分段防重试混流）；tool 通道
+          // 滤除（R2 #30 同款——链卡正文只有文本）。缺省不占位（非流式路径零回归）。
+          const attemptMessageId = randomUUID();
+          const result = await generate(messages, system, [], abortSignal, {
+            modelRef,
+            thinking,
+            taskType,
+            ...(fallbacks?.length ? { fallbacks } : {}),
+            ...(onDelta
+              ? {
+                  onDelta: (d: GenerationDelta) => {
+                    if (d.type === 'tool') return;
+                    onDelta({ messageId: attemptMessageId, channel: d.type, delta: d.delta });
+                  },
+                }
+              : {}),
+          });
           const parsed = reviewOutputSchema.parse(JSON.parse(extractJson(result.content)));
           return { stateKey: 'review.latest', artifact: parsed };
         } catch (err) {
@@ -763,93 +849,12 @@ export function createReaderAuditNode(deps: ChapterLlmNodeDeps): AgentNode {
   };
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// targeted-revision 节点（revision 闭环自适应：首跑 skip / 闭环重跑改稿 overwrite）
-// ════════════════════════════════════════════════════════════════════════════
-
-//
-// 链序决断（controller 2026-07-31 / design §4 实现决断）：链数组序 =
-// [brief-compiler, draft-writer, storySync, targeted-revision, multi-review, route]
-// （非 DAG 直觉序）。chainRunner revisionLoop 是连续前向切片 [from..through]，故 targeted-revision
-// 排在 multi-review 前 → 首跑时 review.latest 缺。
-//
-// 自适应节点（implement.md 5.1b）：
-// - requiredArtifactKeys = ['draft.initial']（**drop review.latest**——它现在 optional 内部判，
-//   放 required 里首跑会 blocked）。
-// - 首跑（无 review.latest）→ shouldSkip=true → skipResult 返 pass-through draft.initial（不 generate）。
-// - 闭环重跑（review.latest 在，auto_revise 触发）→ loadAgentPrompt + renderTemplate + generate + parse
-//   → **overwrite draft.initial**（stateKey='draft.initial'）。这样 multi-review/route 读 draft.initial = 最新稿，
-//   闭环真正「改了再审」（design §4 决断）。
-//
-// producedArtifactKeys = ['draft.initial']（与 draft-writer 同 key；runChain 写 artifacts[stateKey] 直接覆盖，
-// 訡式同纯代码节点覆写）。STATE_KEY_MAP 的 'targeted-revision-agent'→'revision.output' 是 legacy DEFAULT_CHAIN
-// 映射，链段不用（链段用节点契约 producedArtifactKeys）。
-//
-// 注：E7 保义护栏（meaning-preservation + 词级 diff）defer Epic 7——本节点基础改稿（design out of scope）。
-const TARGETED_REVISION_CONTRACT: ReusableAgentNodeContract = {
-  nodeId: 'targeted-revision-agent',
-  displayName: 'Targeted Revision Node',
-  inputSchemaName: 'revisionInput',
-  outputSchemaName: 'revisionOutputSchema',
-  requiredArtifactKeys: ['draft.initial'],
-  producedArtifactKeys: ['draft.initial'],
-  sideEffects: ['call_model'],
-};
-
-/**
- * targeted-revision 输出 shape（prompts/targeted-revision-agent.yaml：revised draft + revisionNotes）。
- *
- * CR-8：wordCount `z.coerce.number().optional()`（同 draftOutputSchema，LLM 常省略/返字符串）。
- */
-const revisionOutputSchema = z.object({
-  title: z.string(),
-  text: z.string(),
-  wordCount: z.coerce.number().optional(),
-  chapterId: z.string().optional(),
-  revisionNotes: z.array(z.string()).default([]),
-});
-
-/**
- * targeted-revision 节点：revision 闭环自适应（首跑 skip / 重跑改稿 overwrite draft.initial）。
- *
- * - 首跑（run.artifacts['review.latest'] 缺）→ skip：pass-through draft.initial（return 同 artifact），
- *   不调 generate。多消费 revisionNotes 不在 draft.initial 上（初稿无修订说明）。
- * - 重跑（review.latest 在）→ 读 draft.initial.text + review.latest → 改稿 → overwrite draft.initial
- *   （stateKey='draft.initial'，revised shape = DraftArtifact + 可选 revisionNotes）。
- *
- * buildPrompt（仅重跑时调）抽 draftText/reviewResult 二 var（对齐 prompts/targeted-revision-agent.yaml
- * 的 {{draftText}}/{{reviewResult}}）。
- */
-export function createTargetedRevisionNode(deps: ChapterLlmNodeDeps): AgentNode {
-  return createLlmNode(
-    {
-      nodeId: 'targeted-revision-agent',
-      role: 'targeted-revision-agent',
-      contract: TARGETED_REVISION_CONTRACT,
-      shouldSkip: (run: RunSnapshot) => !run.artifacts['review.latest'],
-      skipResult: (run: RunSnapshot) => {
-        const draft = run.artifacts['draft.initial'];
-        return { stateKey: 'draft.initial', artifact: draft };
-      },
-      buildPrompt: (run: RunSnapshot) => {
-        const draft = artifactAsRecord(run, 'draft.initial');
-        return {
-          draftText: scalarOf(draft?.text),
-          reviewResult: JSON.stringify(run.artifacts['review.latest'] ?? {}),
-          // 风格卡片 MVP（B 路 D7）：精修同 writer 全量版风格上下文（改写段贴原声音）——style_context
-          // artifact（write_chapter post-assemble 注入）→ yaml `{{styleContext}}` slot；无卡空串零回归。
-          styleContext: scalarOf(run.artifacts['style_context']),
-        };
-      },
-      parseOutput: (content: string) => {
-        const parsed = revisionOutputSchema.parse(JSON.parse(extractJson(content)));
-        // overwrite draft.initial（design §4 决断：multi-review/route 读 draft.initial = 最新稿）
-        return { stateKey: 'draft.initial', artifact: parsed };
-      },
-    },
-    deps,
-  );
-}
+// ═════════════════════════════════════════════════════════════════════════════
+// targeted-revision 节点——已随链流程重排（09-13 W1d）+ CR 批清理全量退役删除：
+// dormant 工厂 createTargetedRevisionNode / TARGETED_REVISION_CONTRACT / revisionOutputSchema
+// 连同 agentContracts.ts CONTRACTS 条目一并清零（职能 = 环内 C1 revision-optimizer 编译 +
+// 写手 directive 重跑，见 revision-optimizer-node.ts / chapter-chain.ts 头注）。
+// ═════════════════════════════════════════════════════════════════════════════
 
 // ════════════════════════════════════════════════════════════════════════════
 // revision-guard 节点（Story 7.2 meaning-preservation 护栏，design §1.3）
@@ -910,7 +915,7 @@ const REVISION_GUARD_CONTRACT: ReusableAgentNodeContract = {
  *             L1 零依赖；结构兼容 mirror createReaderAuditNode 装配处统一传 llmDeps）。
  */
 export function createRevisionGuardNode(deps: ChapterLlmNodeDeps): AgentNode {
-  const { generate, modelRef, thinking, signal } = deps;
+  const { generate, modelRef, thinking, signal, fallbacks, taskType, onDelta } = deps;
   const nodeId = 'revision-guard-agent';
   return {
     contract: REVISION_GUARD_CONTRACT,
@@ -992,7 +997,13 @@ export function createRevisionGuardNode(deps: ChapterLlmNodeDeps): AgentNode {
         generate,
         modelRef,
         thinking,
+        taskType,
         signal,
+        // 09-12 子2（H2）：fallbacks 透传进 L2 调用。
+        ...(fallbacks?.length ? { fallbacks } : {}),
+        // 09-13 子2 W2b（思考流）：onDelta 透传进 L2 调用（每次尝试预分配轮 messageId + tool
+        // 通道滤除，mirror llm-node；条件执行位——整章路径 skip L2 零事件是 no-op 语义非接线缺失）。
+        ...(onDelta ? { onDelta } : {}),
         nodeId,
       });
 
@@ -1198,7 +1209,17 @@ async function runGuardL2(args: {
   modelRef: { keyId: string; modelId: string } | undefined;
   /** S4b：档位思考策略（ChapterLlmNodeDeps.thinking 透传）。 */
   thinking?: ThinkingControl;
+  /** 09-12 子2（H2）：回退链透传（ChapterLlmNodeDeps.fallbacks）。 */
+  fallbacks?: GenerateFallbackEntry[];
+  /** 09-12 usage-panel：任务档位/流程标签（ChapterLlmNodeDeps.taskType 透传）。 */
+  taskType?: string;
   signal?: AbortSignal;
+  /**
+   * 09-13 子2 W2b（思考流，design §1）：节点流回调——generate opts 透传 provider onDelta（每次
+   * 尝试**预分配轮 messageId**，mirror llm-node attemptMessageId 模式；tool 通道滤除）。装配侧由
+   * chapter-chain `withNodeStreaming` 注入（补 nodeId/role → workflow onNodeDelta）。缺省不开（零回归）。
+   */
+  onDelta?: (d: { messageId: string; channel: 'text' | 'reasoning'; delta: string }) => void;
   nodeId: string;
 }): Promise<{ verdict: GuardVerdict; findings: GuardFinding[]; summary: string } | null> {
   const { system, userTemplate } = await loadAgentPrompt('revision-guard-agent');
@@ -1229,7 +1250,24 @@ async function runGuardL2(args: {
   let lastErr: unknown = null;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
     try {
-      const result = await args.generate(messages, system, [], abortSignal, { modelRef: args.modelRef, thinking: args.thinking });
+      // 09-12 子2（H2）：fallbacks 透传（空链不占位）+ 09-12 usage-panel：taskType 透传。
+      // 09-13 子2 W2b（思考流）：onDelta 透传——每次尝试预分配轮 messageId（mirror llm-node
+      // attemptMessageId：重试轮换 id，UI 侧按轮分段）；tool 通道滤除。缺省不占位（零回归）。
+      const attemptMessageId = randomUUID();
+      const result = await args.generate(messages, system, [], abortSignal, {
+        modelRef: args.modelRef,
+        thinking: args.thinking,
+        taskType: args.taskType,
+        ...(args.fallbacks?.length ? { fallbacks: args.fallbacks } : {}),
+        ...(args.onDelta
+          ? {
+              onDelta: (d: GenerationDelta) => {
+                if (d.type === 'tool') return;
+                args.onDelta!({ messageId: attemptMessageId, channel: d.type, delta: d.delta });
+              },
+            }
+          : {}),
+      });
       const parsed = parseRevisionGuard(result.content);
       if (parsed) return parsed;
       // parse 返 null（无合法 JSON / shape 不符）→ 视为 parse 失败重试（mirror createReaderAuditNode）。
@@ -1337,6 +1375,71 @@ export function normalizeRouteDecision(raw: unknown): 'auto_revise' | 'accept_as
 }
 
 /**
+ * CR-5（W-CR 批）：lint 来源标记**机械交叉核对**（design H2「机械标注非 LLM 自报」的落地面）。
+ *
+ * Reader-Audit L2 按 yaml 契约给清单来源真阳携带 `source:'lint'`——但 source 是 LLM 自报字段，
+ * 直接信任它豁免（hasNarrativeFeatureBlock 的 lint 豁免 + summarize.lintUnresolved）= LLM 自贴
+ * 「机器确认」标签绕过人导演域硬规则。本函数对 claim 做**机械确认**：finding 必须与 lint_report
+ * 的机械命中清单匹配（任一命中即确认——判源不判义，范式判据 ADR-3）：
+ * - **quote 互含**：finding.quote 与 issue 的 `match`（命中原句）/ `context.current`（命中行）/
+ *   densityIssue 的 `samples`（密度样本）**任一**剥空白后互含（L2 引文包住机械命中片段，或
+ *   恰引用命中片段本身；CJK 散文空白无语义——容忍 LLM 引文换行/空格排版漂移）；
+ * - **rule id 相等**：finding.subClass（yaml 契约：lint 来源条目 subClass 填规则 id）与 issue/
+ *   densityIssue 的 `ruleId` 相等。
+ *
+ * 不匹配（LLM 给非清单来源条目误标/自造 lint 标签）→ false（caller 按非 lint 来源处理——叙事特征
+ * block 维持强制 escalate）。lint_report artifact 缺/坏形态 → false（无机械清单可核对 = 无机械确认，
+ * 保守不豁免）。纯代码字符串匹配，零语义。
+ *
+ * expected_downstream_consumers:
+ * - hasNarrativeFeatureBlock（本文件，route 侧 R6② guard 的 lint 豁免）。
+ * - chainRunner hasConfirmedLintFinding（summarize.lintUnresolved 判据）——同款机械核对接线归
+ *   chainRunner 改造波（本函数单源供消费，防两处判据漂移）。
+ */
+export function isLintSourceMechanicallyConfirmed(
+  finding: { quote?: unknown; subClass?: unknown },
+  lintReportArtifact: unknown,
+): boolean {
+  const quote = typeof finding.quote === 'string' ? finding.quote.replace(/\s+/g, '') : '';
+  const subClass = typeof finding.subClass === 'string' ? finding.subClass.trim() : '';
+  if (!quote && !subClass) return false;
+  if (!lintReportArtifact || typeof lintReportArtifact !== 'object' || Array.isArray(lintReportArtifact)) {
+    return false;
+  }
+  const report = lintReportArtifact as { issues?: unknown; densityIssues?: unknown };
+  const contains = (a: string, b: string): boolean =>
+    a.length > 0 && b.length > 0 && (a.includes(b) || b.includes(a));
+  const matchText = (candidate: unknown): boolean => {
+    if (typeof candidate !== 'string') return false;
+    // CJK 散文空白无语义——全剥后互含（容忍 LLM 引文换行/加空格的排版漂移，非语义判断）。
+    const norm = candidate.replace(/\s+/g, '');
+    return norm.length > 0 && quote.length > 0 && contains(quote, norm);
+  };
+  if (Array.isArray(report.issues)) {
+    for (const raw of report.issues) {
+      if (!raw || typeof raw !== 'object') continue;
+      const issue = raw as { ruleId?: unknown; match?: unknown; context?: { current?: unknown } };
+      if (subClass && typeof issue.ruleId === 'string' && subClass === issue.ruleId) return true;
+      if (matchText(issue.match)) return true;
+      if (matchText(issue.context?.current)) return true;
+    }
+  }
+  if (Array.isArray(report.densityIssues)) {
+    for (const raw of report.densityIssues) {
+      if (!raw || typeof raw !== 'object') continue;
+      const density = raw as { ruleId?: unknown; samples?: unknown };
+      if (subClass && typeof density.ruleId === 'string' && subClass === density.ruleId) return true;
+      if (Array.isArray(density.samples)) {
+        for (const sample of density.samples) {
+          if (matchText(sample)) return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+/**
  * R6② defense-in-depth guard：review.latest 是否含「叙事特征维」block 级 finding（design §7②）。
  *
  * 产品硬约束：叙事特征维（discourse 域）问题永不 auto_revise 给 writer——discourse 是人导演域，
@@ -1349,11 +1452,19 @@ export function normalizeRouteDecision(raw: unknown): 'auto_revise' | 'accept_as
  * 启发式映射（OOC bug-vs-feature / consistency finding 仍归 route LLM 语义判）。不机械扩到其他维——
  * 仅 narrative-feature 维的 block finding 触发强制 escalate（warn/info 不触发，仍走 route LLM 判）。
  *
+ * 链流程重排 W3（R2 去味门禁 H2 机械门豁免）+ CR-5（W-CR 批机械交叉核对）：source==='lint' 条目
+ * 须经 `isLintSourceMechanicallyConfirmed` 机械核对（quote/ruleId 对 lint_report 命中清单匹配）才豁免
+ * ——lint 来源的叙事特征 block 是「llmlint 静态命中经 L2 判真」的确认 AI 味，属机器可识别的明确缺陷
+ * （有确定修复方向，writer 可自动修），走环内 auto_revise 去味非 escalate。**判源不判义**：豁免依据是
+ * 「来源=机械引擎命中」经代码侧核对成立，非 LLM 自报 source 字段（design H2「机械标注非 LLM 自报」）；
+ * 自报不匹配机械清单的条目按 agent 来源处理。非 lint 来源的叙事特征 block 维持强制 escalate（人导演域
+ * 硬规则不动）；同维混有多种来源时，任一非 lint block 即触发（豁免只放行 lint 条目，不放行整个维度）。
+ *
  * dim name 开放匹配（reviewOutputSchema dimensions[].name 为 z.string() 开放值，LLM 可能写中文/变体）：
  * E7（CR patch）：含 narrative / 叙事 / discourse / 话语 / anti-slop / 风格 / 文风 / imagery / agency / 骨架
  * 即视为叙事特征维（防 LLM 用同义词作 dim 名时 guard 漏触发）。severity='block' 为封闭 enum（机械控制信号）。
  */
-function hasNarrativeFeatureBlock(reviewArtifact: unknown): boolean {
+function hasNarrativeFeatureBlock(reviewArtifact: unknown, lintReportArtifact: unknown): boolean {
   if (!reviewArtifact || typeof reviewArtifact !== 'object') return false;
   const review = reviewArtifact as { dimensions?: unknown };
   if (!Array.isArray(review.dimensions)) return false;
@@ -1365,6 +1476,13 @@ function hasNarrativeFeatureBlock(reviewArtifact: unknown): boolean {
     if (!Array.isArray(d.findings)) continue;
     for (const f of d.findings) {
       if (!f || typeof f !== 'object') continue;
+      // W3 H2 + CR-5：lint 来源条目豁免（机械核对确认后才豁免——判源不判义，去味门禁）。
+      if (
+        (f as { source?: unknown }).source === 'lint' &&
+        isLintSourceMechanicallyConfirmed(f as { quote?: unknown; subClass?: unknown }, lintReportArtifact)
+      ) {
+        continue;
+      }
       if ((f as { severity?: unknown }).severity === 'block') return true;
     }
   }
@@ -1414,7 +1532,13 @@ export function createRouteNode(deps: ChapterLlmNodeDeps): AgentNode {
         // 详 hasNarrativeFeatureBlock 注释）。route LLM 通常已据 prompt 约束判对，本 guard 是兜底防 LLM 误判。
         // E2（CR patch）：guard 覆盖任何**非 escalate_user** decision（auto_revise **或** accept_as_truth）——
         // narrative-feature block 时 accept_as_truth 也不该静默接受（discourse 问题需用户结构重写），强制 escalate。
-        if (decision !== 'escalate_user' && hasNarrativeFeatureBlock(run.artifacts['review.latest'])) {
+        // 链流程重排 W3（R2 去味门禁 H2）+ CR-5：source='lint' 条目经 isLintSourceMechanicallyConfirmed
+        // 机械核对后在 helper 内豁免（LLM 自报须对 lint_report 命中清单匹配——机械确认 AI 味可环内
+        // auto_revise 去味；自报不匹配按 agent 来源强制 escalate）。
+        if (
+          decision !== 'escalate_user' &&
+          hasNarrativeFeatureBlock(run.artifacts['review.latest'], run.artifacts['lint_report'])
+        ) {
           decision = 'escalate_user';
         }
         // 4.1 Step 4：deviation 透传（LLM 判正文偏离计划；accept 分支 buildChapterAccept 读此登记 StoryDecision）。

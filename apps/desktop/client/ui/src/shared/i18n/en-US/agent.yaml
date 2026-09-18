@@ -34,7 +34,6 @@ agent:
     multi-review-agent: "Multi-Review"
     revision-guard-agent: "Revision Guard"
     revision-optimizer-agent: "Revision Optimizer"
-    targeted-revision-agent: "Targeted Revision"
     adjudicator-agent: "Adjudicator"
     arc-audit-agent: "Arc Audit"
     arc-emergence-agent: "Arc Emergence"
@@ -110,14 +109,36 @@ agent:
   reviewStageDraft: "Draft checkpoint"
   reviewStageBrief: "Brief checkpoint"
   reviewStageVerdict: "Verdict checkpoint"
+  # 链流程重排 W2 + CR-18 interim: final checkpoint (ChapterReviewPanel final stage).
+  reviewStageFinal: "Final checkpoint"
   reviewContinue: "Continue"
   reviewRedo: "Redo draft"
   reviewAbort: "Abort"
+  reviewAcceptFinal: "Accept final draft"
   reviewRedoFeedback: "Revision feedback (optional)"
+  # 09-13 子3 W5 (design §4.2 / D-c required notes): suspension redo + brief send-back require notes.
+  reviewRedoRequired: "Empty notes cannot be submitted — describe the direction (no blind guessing)"
+  suspensionRedoPlaceholder: "State how the contradiction resolves (revise the task card / timeline / which side wins); empty notes cannot rerun"
+  briefRedo: "Send plan loop back"
+  briefRedoPlaceholder: "State the direction for the plan send-back (e.g.: Hook swap / one scene fewer); empty notes cannot send back"
+  guardAnchorNote: "Zero edits outside the anchor — the diff covers only the anchored passage; the rest of the prose is preserved byte-for-byte."
   reviewResuming: "Resuming..."
   reviewWordCount: "{count} characters"
   reviewEmpty: "No content at this checkpoint."
   reviewVerdictHint: "Verdict review is in the patch review above."
+  reviewFinalAccepted: "Final draft accepted: \"{title}\" saved to chapters/"
+  reviewFinalAcceptedReview: "Final draft accepted: \"{title}\" — chapter candidate pending review (see review card)"
+  reviewAcceptFailed: "Final accept failed"
+  # CR-8: silent-path fallback for the accept terminal state (no envelope, not persisted, not the
+  # skip copy) — warn instead of faking success.
+  reviewAcceptNoOutcome: "Final-draft accept was submitted, but the chain returned no chapter candidate and no save confirmation — check whether the chapter landed in the Writing page outcome area"
+  reviewFinalFallback: "this chapter"
+  # 09-13 子3 W4: dialogue-bar slim notice card (ReviewPendingNotice — full review cards moved to the Writing page).
+  reviewPendingReviewTitle: "Chapter review waiting"
+  reviewPendingReviewBody: "The chapter chain is paused for review — the full review card lives on the Writing page."
+  reviewPendingPatchTitle: "Chapter draft awaiting review"
+  reviewPendingPatchBody: "The chain-produced chapter candidate is reviewed and landed on the Writing page."
+  reviewPendingJump: "Open Writing page"
   # dogfood R2 #83/#84 (2026-08-28): pre-write suspension card (ChapterReviewPanel suspension branch) —
   # research contradiction/deviation pause has no draft; not a draft review. Mirrors formatResearchSuspensionDetail.
   suspensionTitle: "Chapter suspended"
@@ -486,3 +507,27 @@ agent:
   diffFoldedTitle: "Large change, word diff folded"
   diffFoldedStats: "{added} lines added · {removed} lines removed · {total} chars of new content"
   diffFoldedHint: "Full content is written to the file unchanged (no truncation); open the file in the tree to review line by line."
+
+  # 09-12 子2 fallback chains: runtime model visibility (notice strips / current-model chip / terminal badge / chain switch line)
+  currentModel: "Current model"
+  modelAuto: "Auto"
+  modelFallbackNotice: "{from} failed ({reason}) → switched to {to}"
+  fallbackKindAuth: "auth failure"
+  fallbackKindQuota: "quota or rate limit"
+  fallbackKindTimeout: "timeout"
+  fallbackKindServer: "server error"
+  fallbackKindNetwork: "connection lost"
+  fallbackKindConfig: "config unavailable"
+  messageGeneratedBy: "Served by {model}"
+  messageGeneratedByFallback: "fallback from {from}"
+  chainModelSwitch: "{node}: {from} failed → switched to {to}"
+
+  # 09-12 子4 W6: agy MCP tool bridge runtime visibility (notice strips / bridge badge / consent-gate error bar)
+  bridgeNoticeSendback: "This turn skipped the required closing declaration — automatically sent back for one retry"
+  bridgeNoticeSendbackMissed: "Retry still skipped the closing declaration — result accepted, no further retries"
+  bridgeNoticeSoftDenied: "A writing tool call was blocked by the authorization policy — check Settings → Models → MCP Tool Bridge"
+  bridgeToolBadge: "bridge"
+  bridgeToolBadgeTitle: "This tool call runs through the MCP tool bridge (inside the model's turn)"
+  bridgeConsentNeeded: "The MCP tool bridge is not authorized yet — this message was not executed (authorize, then resend)"
+  bridgeConsentConflict: "The MCP tool bridge is blocked by your agy permission rules — this message was not executed"
+  bridgeConsentDeclined: "The MCP tool bridge stays off per your choice — this message was not executed"

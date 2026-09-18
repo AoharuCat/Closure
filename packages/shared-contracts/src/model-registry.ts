@@ -1,5 +1,6 @@
 import type {
   ModelCapability,
+  ModelDefaults,
   ModelLimits,
   ModelRegistry,
   ModelRegistryEntry,
@@ -177,6 +178,41 @@ export function resolveModelInfo(modelId: string): {
     return { capability: 'text', alias: base };
   }
   return { capability: 'text', alias: modelId };
+}
+
+/**
+ * Per-field limits synthesis over the registry entry (09-12 子3, design §4.1):
+ * a user-supplied `defaults.contextWindow`/`maxOutputTokens` overrides ONLY
+ * that field — the registry sibling survives (fill contextWindow alone →
+ * registry maxOutputTokens kept; registry has no limits + one field filled →
+ * a SINGLE-KEY limits — the explicit-override shape for unknown models). The
+ * declared type is therefore per-field partial (`Partial<ModelLimits>`): a
+ * missing sibling means "unknown", and every consumer already reads limits
+ * per-field with optional chaining (unknown maxOutputTokens → protocol
+ * guardrail fallback). No defaults (or none of the two fields) → the plain
+ * resolveModelInfo result, limits staying ABSENT when both sources lack them.
+ * The single synthesis point for shell resolveModel's limits projection.
+ */
+export function resolveModelInfoWithDefaults(
+  modelId: string,
+  defaults?: Pick<ModelDefaults, 'contextWindow' | 'maxOutputTokens'>,
+): {
+  capability: ModelCapability;
+  alias: string;
+  thinking?: ThinkingKind;
+  limits?: Partial<ModelLimits>;
+  vision?: boolean;
+} {
+  const base = resolveModelInfo(modelId);
+  const contextWindow = defaults?.contextWindow;
+  const maxOutputTokens = defaults?.maxOutputTokens;
+  if (contextWindow === undefined && maxOutputTokens === undefined) return base;
+  const limits: Partial<ModelLimits> = {
+    ...(base.limits ?? {}),
+    ...(contextWindow !== undefined ? { contextWindow } : {}),
+    ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
+  };
+  return { ...base, limits };
 }
 
 /**

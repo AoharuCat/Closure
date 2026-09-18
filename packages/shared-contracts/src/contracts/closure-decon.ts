@@ -212,6 +212,39 @@ export const deconPassSchema = z.string().regex(DECON_PASS_PATTERN);
 export const DECON_PASS_UNIT_ALL = 'all';
 
 /**
+ * unit='all' 为**非法形态**的 pass 清单（F16 化石判据单源——CR-6）：这些 pass 的合法 unit 是
+ * 章号/域名/ch:/arc:/scene: 等**多 unit 形态**，`(pass,'all','failed')` 行是材料级前置失败
+ * 留下的化石（写侧已改 transition-only 不再新产；R3 遗留 ('p1b','all','failed') 同族）——
+ * UI 聚合不计分母/不触发红点，startDeconJob retry 时 DELETE 收口。
+ *
+ * `'p4:*'` = 前缀约定（全部 `p4:<手艺维>`——经 `DECON_LEGAL_ALL_UNIT_PASSES` 例外扣除
+ * p4:style）。**⚠️ 新增逐 unit pass 须同步本清单**；反向亦然——p1a/p1c/p6/p4:style/
+ * p5:book_reading 的 'all' 是唯一合法 unit（上方 unit 约定注释单源），绝不进本表。
+ * 双端消费：shell `deleteDeconIllegalAllFailedPassStates`（DELETE）+ ui
+ * `summarizeDeconPassStates`（聚合过滤）。
+ */
+export const DECON_ILLEGAL_ALL_UNIT_PASSES: readonly string[] = [
+  'p1b',
+  'p2',
+  'p3a',
+  'p3b',
+  'p4:*',
+  'p5:chapter_review',
+  'p5:scene_annotation',
+];
+
+/** 前缀约定的合法例外（p4:style 唯一合法 unit = 'all'——'p4:*' 展开的扣除面）。 */
+export const DECON_LEGAL_ALL_UNIT_PASSES: readonly string[] = ['p4:style'];
+
+/** (pass,'all') 行是否非法形态（前缀展开 + 例外扣除——UI 聚合过滤共用单源谓词）。 */
+export function isIllegalDeconAllUnitPass(pass: string): boolean {
+  if (DECON_LEGAL_ALL_UNIT_PASSES.includes(pass)) return false;
+  return DECON_ILLEGAL_ALL_UNIT_PASSES.some((entry) =>
+    entry.endsWith('*') ? pass.startsWith(entry.slice(0, -1)) : entry === pass,
+  );
+}
+
+/**
  * pass×unit 断点行。**断点续跑语义（W2 deconJob）**：重入时 done 且 output_hash 与产物
  * 现值一致 → 跳过（不重付 LLM）；capped → 保留挂起态等预算调整后续跑（不静默截断）。
  */

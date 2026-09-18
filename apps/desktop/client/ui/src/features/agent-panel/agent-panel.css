@@ -3076,6 +3076,60 @@
 
 /* ── Chapter Review (Story 4.3 + Story 7.1 B1 selection-driven revision) ── */
 
+/* 09-13 子3 W4：对话栏审阅瘦身轻量提示卡（ChapterReviewPanel/chapter_candidate 审阅迁写作页，
+   对话栏只留提示 + 跳转；mirror chapter-review 卡的钉底形态但单行紧凑）。 */
+.review-pending-notice {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: var(--space-xs) var(--space-lg);
+  border-top: 1px solid var(--outline-variant);
+  background: var(--surface);
+}
+
+.review-pending-notice-icon {
+  font-size: var(--text-lg);
+  color: var(--warning);
+}
+
+.review-pending-notice-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3xs);
+  min-width: 0;
+  flex: 1;
+}
+
+.review-pending-notice-title {
+  font-size: var(--text-xs);
+  color: var(--on-surface);
+}
+
+.review-pending-notice-text {
+  font-size: var(--text-xs);
+  color: var(--on-surface-variant);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.review-pending-notice-jump {
+  flex-shrink: 0;
+  padding: var(--space-3xs) var(--space-sm);
+  font-size: var(--text-xs);
+  color: var(--on-surface);
+  background: var(--surface-container-low);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: background var(--duration-fast) var(--ease-standard);
+}
+
+.review-pending-notice-jump:hover {
+  background: var(--hover-overlay);
+}
+
 .chapter-review {
   flex-shrink: 0;
   display: flex;
@@ -3187,6 +3241,23 @@
 
 .chapter-review-feedback:disabled {
   opacity: 0.5;
+}
+
+/* 09-13 子3 W5（design §4.2 / D-c 意见必填）：feedback 块容器 + 必填提示行 + guard 锚外说明。 */
+.chapter-review-feedback-block {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3xs);
+}
+
+.chapter-review-feedback-required {
+  margin: 0;
+  font-size: var(--text-3xs);
+  color: var(--error);
+}
+
+.chapter-review-guard-anchor-note {
+  margin: var(--space-3xs) 0 0;
 }
 
 .chapter-review-actions {
@@ -3944,4 +4015,203 @@
 .agent-panel-main--dragging {
   outline: 2px dashed var(--accent);
   outline-offset: -4px;
+}
+
+/* ── 09-12 子2 fallback chains：运行期模型可见性（design §8②⑤）──
+   通知条（mirror .agent-stream-stalled 细条形态）；当前模型 chip（生成中）。 */
+.agent-fallback-notices {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  margin: 0.25rem 0;
+}
+
+.agent-fallback-notice {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.25rem 0.5rem;
+  border-radius: 6px;
+  background: var(--surface-variant, rgba(0, 0, 0, 0.05));
+  font-size: var(--text-xs, 12px);
+  color: var(--outline);
+  line-height: 1.4;
+}
+
+.agent-fallback-notice .material-symbols-outlined {
+  font-size: 14px;
+  flex-shrink: 0;
+}
+
+.agent-fallback-notice-scope {
+  opacity: 0.8;
+}
+
+.agent-current-model-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  align-self: flex-start;
+  margin: 0.2rem 0;
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  background: var(--surface-variant, rgba(0, 0, 0, 0.05));
+  font-size: var(--text-xs, 12px);
+  color: var(--outline);
+}
+
+.agent-current-model-chip .material-symbols-outlined {
+  font-size: 14px;
+}
+
+.agent-current-model-value {
+  font-weight: 500;
+}
+
+/* ── 09-12 子4 W6（design §8）：桥运行期通知条 + 「桥」徽标 ──
+   通知条 mirror .agent-fallback-notice 细条形态；warn 档换 warning 色（soft-denied
+   指向授权机制 / sendback-missed 接受降级——可辨识但克制）。全部 theme token。 */
+.agent-bridge-notices {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  margin: 0.25rem 0;
+}
+
+.agent-bridge-notice {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.25rem 0.5rem;
+  border-radius: 6px;
+  background: var(--surface-variant, rgba(0, 0, 0, 0.05));
+  font-size: var(--text-xs, 12px);
+  color: var(--outline);
+  line-height: 1.4;
+}
+
+.agent-bridge-notice .material-symbols-outlined {
+  font-size: 14px;
+  flex-shrink: 0;
+}
+
+.agent-bridge-notice--warn {
+  color: var(--warning);
+  /* CR-19（子4 CR 批）：token 缺席时回落 token 自身的光色基线（mirror 上面
+     .agent-bridge-notice 的 surface-variant 字面回落形态——不留裸无底色态）。 */
+  background: var(--warning-bg, rgba(230, 167, 0, 0.13));
+}
+
+/* 「桥」徽标：工具卡头（AgentToolCard）与工具参数流指示（live badge 内 chip）共用
+   词汇——中性小 pill（chip-bg/chip-text），标注「本次调用经 MCP 工具桥执行」。 */
+.agent-tool-card-bridge-badge,
+.agent-tool-call-bridge-chip {
+  display: inline-block;
+  padding: 0 var(--space-2xs);
+  border-radius: var(--radius-pill);
+  background: var(--chip-bg);
+  color: var(--chip-text);
+  font-size: var(--text-3xs);
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+/* 终态徽标（AgentMessageItem：「实际模型 B · 回退自 A」）。 */
+.agent-msg-generated-by {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2rem;
+  align-self: flex-start;
+  margin: -0.1rem 0 0.15rem;
+  padding: 0.05rem 0.45rem;
+  border-radius: 999px;
+  background: var(--surface-variant, rgba(0, 0, 0, 0.05));
+  font-size: var(--text-xs, 12px);
+  color: var(--outline);
+}
+
+.agent-msg-generated-by .material-symbols-outlined {
+  font-size: 13px;
+}
+
+.agent-msg-generated-by-from {
+  opacity: 0.85;
+}
+
+/* 链卡模型切换行（chainStreamBuffer.modelSwitch）。 */
+.chain-run-card-model-switch {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  margin: 0.2rem 0 0;
+  font-size: var(--text-xs, 12px);
+  color: var(--outline);
+  line-height: 1.4;
+}
+
+.chain-run-card-model-switch .material-symbols-outlined {
+  font-size: 14px;
+  flex-shrink: 0;
+}
+
+/* ── 09-12 子5 R6（design §11）：leader 上下文余量条（header 与 body 之间细条）──
+ * 三态隐藏：无快照 / windowTokens null / 无会话（AgentPanel 判定，无 DOM 即无样式）。
+ * ≥红线（is-redline）变色——把「到红线自动压缩」语义前置可视化（运行阶段可见性同族）。
+ * 高度克制（细条不抢对话区）；全部 theme token，深浅主题同源。 */
+.agent-context-usage {
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs);
+  padding: 0.2rem var(--space-lg, 12px);
+  border-bottom: 1px solid var(--outline-variant);
+  flex-shrink: 0;
+  font-size: var(--text-2xs, 11px);
+  color: var(--on-surface-variant);
+}
+
+.agent-context-usage-label {
+  white-space: nowrap;
+}
+
+.agent-context-usage-track {
+  flex: 1;
+  height: 4px;
+  min-width: 40px;
+  border-radius: var(--radius-pill, 999px);
+  background: var(--surface-variant, rgba(0, 0, 0, 0.08));
+  overflow: hidden;
+}
+
+/* 进度色 = --accent（品牌动作色）。不用 --primary——那是前景文字色 token
+ * （深浅主题互反），误用会让亮色主题渲染出近黑进度条。 */
+.agent-context-usage-fill {
+  height: 100%;
+  border-radius: var(--radius-pill, 999px);
+  background: var(--accent);
+  transition: width var(--duration-base, 200ms) var(--ease-standard, ease);
+}
+
+.agent-context-usage-percent {
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+  white-space: nowrap;
+  min-width: 3ch;
+  text-align: right;
+}
+
+/* 「估算」小标——比标签/百分比再降一档（--outline），口径限定不喧宾。 */
+.agent-context-usage-est {
+  white-space: nowrap;
+  color: var(--outline);
+}
+
+/* 红线态：占用 ≥ 压缩红线——条与百分比转错误色（压缩即将自动触发）；
+ * 仅语义三处着色（fill/label/percent），不动条高与背景，温和不刺眼。 */
+.agent-context-usage.is-redline .agent-context-usage-fill {
+  background: var(--error, #e5484d);
+}
+.agent-context-usage.is-redline .agent-context-usage-percent,
+.agent-context-usage.is-redline .agent-context-usage-label {
+  color: var(--error, #e5484d);
+  font-weight: 600;
 }

@@ -9,16 +9,28 @@ vi.mock('../src/skill/discovery', () => ({
 }));
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Story 2.6 R2/⑥：loadOpenDecisionsForLeader + buildInteractionModeSegment
-// 创作决策登记引导段（常驻）+ open 决策三态注入测试。
+// Story 2.6 R2/⑥：loadOpenDecisionsForLeader + buildSessionStateSnapshot
+//（system 稳定化 09-12 + CR-D1 拆分 09-13：静态登记能力段回 system 恒定区，
+// 注记 = 纯动态状态快照，以 user-role 状态注记消息追加在消息尾）
+// 创作决策登记引导段（system）+ open 决策三态注入（注记）测试。
 //
-// 1. has open（decided/superseded/dropped 排除 + newestFirst top-3 + 截断标注）→ 注入提醒。
-// 2. no open（全 decided / 无 story_decisions）→ 零噪音（不注入提醒段）。
+// 1. has open（decided/superseded/dropped 排除 + newestFirst top-3 + 截断标注）→ 快照注入提醒。
+// 2. no open（全 decided / 无 story_decisions）→ 零噪音（快照不注入提醒段）。
 // 3. degraded（project.yaml 不可读 / story_decisions 非数组）→ 「暂不可用」。
 // 4. per-element safeParse：一条坏决策（缺 risk）不清空整个数组（mirror CR-4.1-07）。
 //
-// 测试方法 mirror setting-assistant-segment.test.ts：非 exported 函数经 sendMessage end-to-end 验。
+// 测试方法 mirror setting-assistant-segment.test.ts：非 exported 函数经 sendMessage end-to-end 验
+//（generate mock 2 参回调：1 参 messages 捕获 kind='session_state_note' 状态注记断动态快照文本；
+// 2 参 system 取 capabilityOnly 隔离段断静态登记能力段文本）。
 // ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * CR-D1 拆分后静态能力段 = system 尾 `---` 块（buildMainRunConfig 拼）——剥 DEFAULT_ORISON_PROMPT /
+ * path 行 / skills 与 runLoop 追加的工具描述，能力段断言打在此隔离段。
+ */
+function capabilityOnly(system: string): string {
+  return system.split('# Available Tools')[0].split('\n\n---\n').pop() ?? '';
+}
 
 function decision(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -51,10 +63,13 @@ describe('Story 2.6 — 创作决策登记引导段 + open 三态注入', { time
     writeFileSync(path.join(projectPath, 'project.yaml'), JSON.stringify(doc), 'utf8');
   }
 
-  async function runTurn(expectSystem: (system: string) => void): Promise<void> {
+  /** runLoop generate 捕获投影：1 参 messages（取注记）+ 2 参 system（取能力段隔离段）。 */
+  type TurnMessage = { kind?: string; content: string };
+
+  async function runTurn(expectTurn: (system: string, note: TurnMessage | undefined) => void): Promise<void> {
     const { createWorkflowRuntime } = await import('../src/runtime/workflow');
-    const generate = vi.fn(async (_messages: unknown, system: string) => {
-      expectSystem(system);
+    const generate = vi.fn(async (messages: TurnMessage[], system: string) => {
+      expectTurn(system, messages.find((m) => m.kind === 'session_state_note'));
       return { content: 'ok', finishReason: 'stop' };
     });
     const runtime = createWorkflowRuntime({ generate });
@@ -67,17 +82,18 @@ describe('Story 2.6 — 创作决策登记引导段 + open 三态注入', { time
     expect(generate).toHaveBeenCalledOnce();
   }
 
-  // ── 登记引导段（常驻注入）──
+  // ── 登记引导段（system 恒定区常驻）──
 
-  it('引导段常驻：登记时机 + 三语义 + user-source 保护 + 档位映射', async () => {
+  it('引导段常驻注入（system 恒定区）：登记时机 + 三语义 + user-source 保护 + 档位映射', async () => {
     writeProjectYaml({ name: 'Test' });
     await runTurn((system) => {
-      expect(system).toContain('创作决策登记能力（StoryDecision ADR）');
-      expect(system).toContain('story_decisions_update');
-      expect(system).toContain('open→decided');
-      expect(system).toContain('supersede');
-      expect(system).toContain('受保护');
-      expect(system).toContain('不双登记'); // ⑦ 边界：设定卡/承诺不重复登记
+      const seg = capabilityOnly(system);
+      expect(seg).toContain('创作决策登记能力（StoryDecision ADR）');
+      expect(seg).toContain('story_decisions_update');
+      expect(seg).toContain('open→decided');
+      expect(seg).toContain('supersede');
+      expect(seg).toContain('受保护');
+      expect(seg).toContain('不双登记'); // ⑦ 边界：设定卡/承诺不重复登记
     });
   });
 
@@ -95,17 +111,17 @@ describe('Story 2.6 — 创作决策登记引导段 + open 三态注入', { time
         ],
       },
     });
-    await runTurn((system) => {
-      expect(system).toContain('未决创作决策');
-      expect(system).toContain('[open-1]');
-      expect(system).toContain('女主背叛线待拍板');
-      expect(system).toContain('风险：铺垫不足读者弃书');
-      expect(system).not.toContain('[decided-1]');
-      expect(system).not.toContain('[superseded-1]');
+    await runTurn((_system, note) => {
+      expect(note?.content).toContain('未决创作决策');
+      expect(note?.content).toContain('[open-1]');
+      expect(note?.content).toContain('女主背叛线待拍板');
+      expect(note?.content).toContain('风险：铺垫不足读者弃书');
+      expect(note?.content).not.toContain('[decided-1]');
+      expect(note?.content).not.toContain('[superseded-1]');
     });
   });
 
-  it('no open（全 decided）→ 零噪音（不注入提醒段）', async () => {
+  it('no open（全 decided）→ 零噪音（快照不注入提醒段）', async () => {
     writeProjectYaml({
       name: 'Test',
       novel: {
@@ -113,15 +129,17 @@ describe('Story 2.6 — 创作决策登记引导段 + open 三态注入', { time
         story_decisions: [decision({ id: 'd1', status: 'decided' })],
       },
     });
-    await runTurn((system) => {
-      expect(system).not.toContain('未决创作决策');
+    await runTurn((_system, note) => {
+      expect(note).toBeDefined(); // 注记在轮（防 not.toContain 空过）
+      expect(note?.content).not.toContain('未决创作决策');
     });
   });
 
   it('no story_decisions（合法空）→ 零噪音', async () => {
     writeProjectYaml({ name: 'Test', novel: { chapters: [] } });
-    await runTurn((system) => {
-      expect(system).not.toContain('未决创作决策');
+    await runTurn((_system, note) => {
+      expect(note).toBeDefined(); // 注记在轮（防 not.toContain 空过）
+      expect(note?.content).not.toContain('未决创作决策');
     });
   });
 
@@ -130,9 +148,10 @@ describe('Story 2.6 — 创作决策登记引导段 + open 三态注入', { time
     // 都出假「检查暂不可用」行。（断言锚定决策段专属文案「未决创作决策……检查暂不可用」——
     // 泛「检查暂不可用」会命中 2.2 设定覆盖段 fresh project 的既有降级行，非本段 concern。）
     writeProjectYaml({ name: 'Test' });
-    await runTurn((system) => {
-      expect(system).not.toContain('未决创作决策');
-      expect(system).not.toContain('未决创作决策（novel.story_decisions open）：检查暂不可用');
+    await runTurn((_system, note) => {
+      expect(note).toBeDefined(); // 注记在轮（防 not.toContain 空过）
+      expect(note?.content).not.toContain('未决创作决策');
+      expect(note?.content).not.toContain('未决创作决策（novel.story_decisions open）：检查暂不可用');
     });
   });
 
@@ -149,17 +168,17 @@ describe('Story 2.6 — 创作决策登记引导段 + open 三态注入', { time
         ],
       },
     });
-    await runTurn((system) => {
-      expect(system).toContain('[scoped-1]');
-      expect(system).toContain('第 7 章魔法规则待定');
-      expect(system).toContain('[global-1]');
+    await runTurn((_system, note) => {
+      expect(note?.content).toContain('[scoped-1]');
+      expect(note?.content).toContain('第 7 章魔法规则待定');
+      expect(note?.content).toContain('[global-1]');
     });
   });
 
   it('degraded（story_decisions 非数组）→ 「暂不可用」', async () => {
     writeProjectYaml({ name: 'Test', novel: { chapters: [], story_decisions: 'oops' } });
-    await runTurn((system) => {
-      expect(system).toContain('检查暂不可用');
+    await runTurn((_system, note) => {
+      expect(note?.content).toContain('检查暂不可用');
     });
   });
 
@@ -174,9 +193,9 @@ describe('Story 2.6 — 创作决策登记引导段 + open 三态注入', { time
         ],
       },
     });
-    await runTurn((system) => {
-      expect(system).toContain('[good-1]');
-      expect(system).not.toContain('[bad]');
+    await runTurn((_system, note) => {
+      expect(note?.content).toContain('[good-1]');
+      expect(note?.content).not.toContain('[bad]');
     });
   });
 
@@ -193,11 +212,11 @@ describe('Story 2.6 — 创作决策登记引导段 + open 三态注入', { time
         ],
       },
     });
-    await runTurn((system) => {
-      expect(system).toContain('前 3 条 / 共 4 条');
-      expect(system).toContain('[newest]');
-      expect(system).toContain('[d3]');
-      expect(system).not.toContain('[old]');
+    await runTurn((_system, note) => {
+      expect(note?.content).toContain('前 3 条 / 共 4 条');
+      expect(note?.content).toContain('[newest]');
+      expect(note?.content).toContain('[d3]');
+      expect(note?.content).not.toContain('[old]');
     });
   });
 });

@@ -56,11 +56,18 @@ import {
   rememberSessionMode,
   rememberSessionProject,
   forgetSessionTrack,
+  getSessionProject,
   type AgentRunState,
   type AgentRunStatePatch,
+  type ModelFallbackNotice,
+  type BridgeNotice,
+  type ContextUsageSnapshot,
 } from './agentEvents';
 import { forgetSessionStreams } from './agentStreamBuffer';
 import { forgetChainRunBuffer } from './chainStreamBuffer';
+// 09-13 子3 W2：写作页运行时间线 + escalate findings 路由缓存（chainTimeline 模块持写入面，
+// 本 slice 只持字段 + 清理钩）。
+import { forgetChainTimeline, type ChainTimelineState, type EscalateFindingsEntry } from './chainTimeline';
 import { sameProjectPath, showRunBusyToast } from './projectRunBusy';
 
 const AGENT_MODE_KEY = 'agentMode';
@@ -248,6 +255,52 @@ export type AgentSessionSlice = {
    */
   chainRunAnchorByProject: Record<string, string>;
 
+  /**
+   * 09-13 子3 W2（design §2.1）：写作页运行时间线（写入方 chainTimeline 模块——reasoning
+   * 节流 flush + artifact/tool/done 直写，经 agentEvents dispatcher 接线；此 slice 只持字段）。
+   * **不注册项目重置**（mirror chainRunBySession——session 维度 run 态跨项目切换存活，切回
+   * 回看；渲染面按 sessionId 键控隔离）；随 deleteAgentSession 清（forgetChainTimeline 同点
+   * + 本键删除）。
+   */
+  chainTimelineBySession: Record<string, ChainTimelineState>;
+
+  /**
+   * 09-13 子3 W2（design §2.2/F5）：escalate findings 路由缓存（escalate-pause 不产
+   * pausedReview——写作页裁决卡唯一数据源；写入方 agentEvents metadata.findings 路由 +
+   * chapterReviewSlice resume IPC fallback）。**项目重置按 owner 归属保留**（mirror
+   * pausedReview——挂起态按定义不再产事件，销毁即永久丢）：有归属键跨项目存活，仅清无归属
+   * 残键；随 deleteAgentSession 清。
+   */
+  escalateFindingsBySession: Record<string, EscalateFindingsEntry>;
+
+  /**
+   * 09-12 子2 fallback chains（design §8②⑤）：per-session 回退通知（cap 5；写入方
+   * agentEvents 'model-fallback' / child 冒泡分支）+ 对话车道「当前模型」chip 翻转源
+   *（activeModelBySession——leader 车道切换事件的 to 家）。通知每次 send 重置（本次
+   * run 的切换记录）；两图随 deleteAgentSession 清。**不注册项目重置**（mirror
+   * agentRunStates——session 维度态跨项目切换存活）。
+   */
+  modelFallbackNotices: Record<string, ModelFallbackNotice[]>;
+  activeModelBySession: Record<string, { keyId: string; modelId: string }>;
+
+  /**
+   * 09-12 子4 W6（design §8）：per-session 桥运行期通知（bridge-notice 事件面；写入方
+   * agentEvents 'bridge-notice' case，此 slice 只持字段）。每次 send 重置（本次 run 的
+   * 通知）+ 随 deleteAgentSession 清（mirror modelFallbackNotices）；**不注册项目重置**
+   * （session 维度态跨项目切换存活，同族）。
+   */
+  bridgeNoticesBySession: Record<string, BridgeNotice[]>;
+
+  /**
+   * 09-12 子5 R6（design §11）：per-session leader 上下文占用 last 值（写入方
+   * agentEvents 'context-usage' case，此 slice 只持字段）。会话重载后无事件 → 条隐藏
+   *（MVP：首条消息后出现）；windowTokens null = 无窗口信息（AgentPanel 隐藏条）。
+   * 每次 sendAgentMessage 重置（CR-14——mirror 回退通知重置位：新 run 的首帧未到前
+   * 不显示上轮余量 stale bar）+ 随 deleteAgentSession 清（mirror activeModelBySession）；
+   * **不注册项目重置**（session 维度态跨项目切换存活，同 agentRunStates 族）。
+   */
+  contextUsageBySession: Record<string, ContextUsageSnapshot>;
+
   pendingAttachments: Attachment[];
   addAttachment: (attachment: Attachment) => void;
   removeAttachment: (id: string) => void;
@@ -300,6 +353,8 @@ type Deps = AgentSessionSlice & {
   clearSessionPending: (sessionId: string) => void;
   clearPausedReviewFor: (sessionId: string) => void;
   clearPendingPatchFor: (sessionId: string) => void;
+  /** 09-13 子3 W4：五审阅本地态键（reviewResuming/selection/intent 族）随会话消亡清理。 */
+  clearReviewLocalStateFor: (sessionId: string) => void;
 };
 
 /**
@@ -531,6 +586,20 @@ export const createAgentSessionSlice: StateCreator<Deps, [], [], AgentSessionSli
     get().resetAgentForProjectSwitch();
   });
 
+  // 09-13 子3 W2：escalate findings 挂起键按 owner 归属保留（mirror pausedReview 的
+  // CR-T1-025 语义——escalate-pause 链停在等裁决，清了就永久丢：主进程 run 死等只能 abort
+  // 救）。有归属（getSessionProject 已知）的键跨项目存活，渲染面按 sessionId 键控隔离；
+  // 仅清无归属残键。
+  registerProjectReset(() => {
+    set((s) => {
+      const next: Record<string, EscalateFindingsEntry> = {};
+      for (const sid of Object.keys(s.escalateFindingsBySession)) {
+        if (getSessionProject(sid) !== undefined) next[sid] = s.escalateFindingsBySession[sid];
+      }
+      return { escalateFindingsBySession: next };
+    });
+  });
+
   return {
   agentMode: initialMode,
   setAgentMode: (mode) => {
@@ -723,6 +792,18 @@ export const createAgentSessionSlice: StateCreator<Deps, [], [], AgentSessionSli
   chainRunBySession: {},
   // dogfood T1 CR-T1-048：项目级链锚（写入方 agentEvents.anchorChainRun，此 slice 只持字段）。
   chainRunAnchorByProject: {},
+  // 09-13 子3 W2：写作页运行时间线（写入方 chainTimeline 模块，此 slice 只持字段）。
+  chainTimelineBySession: {},
+  // 09-13 子3 W2：escalate findings 路由缓存（写入方 agentEvents / chapterReviewSlice
+  // fallback，此 slice 只持字段 + 项目重置 owner 过滤）。
+  escalateFindingsBySession: {},
+  // 09-12 子2：回退通知 + 当前模型 chip（写入方 agentEvents，此 slice 只持字段）。
+  modelFallbackNotices: {},
+  activeModelBySession: {},
+  // 09-12 子4：桥运行期通知（写入方 agentEvents，此 slice 只持字段）。
+  bridgeNoticesBySession: {},
+  // 09-12 子5 R6：上下文占用 last 值（写入方 agentEvents，此 slice 只持字段）。
+  contextUsageBySession: {},
 
   setAgentRunState: (sessionId, patch) => set((s) => {
     const prev = s.agentRunStates[sessionId];
@@ -1010,6 +1091,35 @@ export const createAgentSessionSlice: StateCreator<Deps, [], [], AgentSessionSli
     // 残留 sessionSwitching 卡输入）。
     autoResumeToken += 1;
     set({ activeSessionRunning: true, agentError: null, sessionSwitching: false });
+    // 09-12 子2：新 run 起——清本会话回退通知 + 当前模型 chip（通知是「本次 run 的切换
+    // 记录」；chip 回落 UI 派生初值）。仅清现有会话的条目（新建会话路径无旧条目）；
+    // delete 语义（键控图不残留 undefined 条目）。子4：桥通知同批清（本次 run 的记录）；
+    // 子5（CR-14，子4 CR 批）：上下文占用 last 值同批清——新一轮开始时上轮余量条是
+    // stale bar（新 run 的首帧未到前不得显示旧值）。
+    const resetSid = get().agentSessionId;
+    if (resetSid !== null) {
+      set((s) => {
+        const nextNotices = { ...s.modelFallbackNotices };
+        const nextActive = { ...s.activeModelBySession };
+        const nextBridge = { ...s.bridgeNoticesBySession };
+        const nextContext = { ...s.contextUsageBySession };
+        const hadNotices = resetSid in nextNotices;
+        const hadActive = resetSid in nextActive;
+        const hadBridge = resetSid in nextBridge;
+        const hadContext = resetSid in nextContext;
+        if (hadNotices) delete nextNotices[resetSid];
+        if (hadActive) delete nextActive[resetSid];
+        if (hadBridge) delete nextBridge[resetSid];
+        if (hadContext) delete nextContext[resetSid];
+        if (!hadNotices && !hadActive && !hadBridge && !hadContext) return {};
+        return {
+          ...(hadNotices ? { modelFallbackNotices: nextNotices } : {}),
+          ...(hadActive ? { activeModelBySession: nextActive } : {}),
+          ...(hadBridge ? { bridgeNoticesBySession: nextBridge } : {}),
+          ...(hadContext ? { contextUsageBySession: nextContext } : {}),
+        };
+      });
+    }
 
     // Structured selection/chapter/file references pinned for this turn. They are
     // passed through the IPC channel (not flattened into text); the runtime renders
@@ -1474,12 +1584,50 @@ confirmedGear = participationGear;
       get().clearSessionPending(sessionId);
       get().clearPausedReviewFor(sessionId);
       get().clearPendingPatchFor(sessionId);
+      // 09-13 子3 W4：五审阅本地态键同点清理（键控化后随会话消亡，mirror clearPausedReviewFor）。
+      get().clearReviewLocalStateFor(sessionId);
       get().clearAgentRunState(sessionId);
       // CR-T1-029/033：模块级追踪/缓冲 + 链运行态 + tombstone 一并清理（dispatcher 丢弃该
       // id 后续事件——不清理则已删会话的事件重建条目「僵尸复活」+ UUID 键纯慢泄漏）。
       forgetSessionTrack(sessionId);
       forgetSessionStreams(sessionId);
       forgetChainRunBuffer(sessionId);
+      // 09-13 子3 W2：时间线模块缓冲 + 两键控面同点清理（防悬空条目 / 跨 run 泄漏）。
+      forgetChainTimeline(sessionId);
+      set((s) => {
+        const hadTimeline = sessionId in s.chainTimelineBySession;
+        const hadEscalate = sessionId in s.escalateFindingsBySession;
+        if (!hadTimeline && !hadEscalate) return s;
+        const nextTimeline = { ...s.chainTimelineBySession };
+        const nextEscalate = { ...s.escalateFindingsBySession };
+        if (hadTimeline) delete nextTimeline[sessionId];
+        if (hadEscalate) delete nextEscalate[sessionId];
+        return { chainTimelineBySession: nextTimeline, escalateFindingsBySession: nextEscalate };
+      });
+      // 09-12 子2：回退通知 + 当前模型 chip 随会话消亡（防悬空条目）。
+      set((s) => {
+        const hadNotices = sessionId in s.modelFallbackNotices;
+        const hadActive = sessionId in s.activeModelBySession;
+        // 09-12 子5 R6：上下文占用 last 值同批清（同一防悬空语义）。
+        const hadContext = sessionId in s.contextUsageBySession;
+        // 09-12 子4：桥运行期通知同批清（mirror 回退通知）。
+        const hadBridge = sessionId in s.bridgeNoticesBySession;
+        if (!hadNotices && !hadActive && !hadContext && !hadBridge) return s;
+        const nextNotices = { ...s.modelFallbackNotices };
+        const nextActive = { ...s.activeModelBySession };
+        const nextContext = { ...s.contextUsageBySession };
+        const nextBridge = { ...s.bridgeNoticesBySession };
+        if (hadNotices) delete nextNotices[sessionId];
+        if (hadActive) delete nextActive[sessionId];
+        if (hadContext) delete nextContext[sessionId];
+        if (hadBridge) delete nextBridge[sessionId];
+        return {
+          modelFallbackNotices: nextNotices,
+          activeModelBySession: nextActive,
+          contextUsageBySession: nextContext,
+          bridgeNoticesBySession: nextBridge,
+        };
+      });
       set((s) => {
         if (!(sessionId in s.chainRunBySession)) return s;
         const next = { ...s.chainRunBySession };

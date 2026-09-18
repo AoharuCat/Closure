@@ -252,7 +252,6 @@ describe('ipc-provider user images parts（B2 R2.3）', () => {
     ];
 
     await generate(messages, 'SYS', [], SIGNAL, {}, {
-      enablePromptCache: false,
       pinnedContent: 'pinned',
       compactedSummary: 'summary',
     });

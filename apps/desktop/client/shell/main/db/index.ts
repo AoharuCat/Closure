@@ -1170,4 +1170,51 @@ function initSchema(db: Database.Database): void {
       PRIMARY KEY (job_id, checkpoint)
     );
   `);
+
+  // ─── 09-12 usage-panel W1：closure_llm_log 生成调用计量账（machine 级全局账，design §2）──────────
+  // 与 closure-* 派生索引家族不同：本表不是 project 派生面（无 project_id，R5 拍板——与项目
+  // 切换无关的机器级账本），不可 drop 重建（drop 即丢账）。写入单源 = main/index.ts whenReady
+  // 装配的协议层 sink 适配（insertUsageLog，never-throws）；读取 = usageIpc 聚合查询（W3）。
+  //
+  // 两处对 db-repository 惯例的刻意偏离（design §2 偏离注记）：
+  // ① 时间戳 epoch ms INTEGER（非 datetime('now')/ISO）——「今日/近 7 日」是用户本地时区
+  //   语义，UTC 文本切日与用户日界错位；epoch + 查询侧 JS 算本地午夜边界单源解决。
+  // ② protocol 不设 CHECK——provider 形态族正处演进期（刚加第三形态 antigravity-cli），
+  //   SQLite CHECK 无法内省移除（须整表重建）；类型单源 = ResolvedModel.protocol（TS 已
+  //   强类型）。success CHECK 保留（二值封闭）。
+  //
+  // CR-18 NULL 语义：五个 token 列全 NULLable——「计数器未上报」落 NULL、「上报 0」落 0，
+  // 二者不混淆；聚合 SUM 对 NULL 天然跳过（空集 COALESCE→0）。task_type/lane/session_key/
+  // first_delta_ms/失败行 error 列同理 NULL = 缺席。新表首建即全列（IF NOT EXISTS）——旧库
+  // zero-touch、零内省 ALTER 需求（无 fallback_trace 列：回退环在网关层、协议层 wrapper 永远
+  // 看不到 fallbackTrace，无写入方的死列不留——2026-09-12 复核拍板；call_id 归 C3.1 届时 ALTER）。
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS closure_llm_log (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts            INTEGER NOT NULL,            -- epoch ms（调用起始；日界查询侧 JS 算）
+      protocol      TEXT NOT NULL,               -- ResolvedModel.protocol（不设 CHECK，见上方偏离②）
+      key_id        TEXT NOT NULL,
+      model_id      TEXT NOT NULL,
+      task_type     TEXT,                        -- 档位名/流程标签；NULL = 未标注（自由值不 CHECK）
+      lane          TEXT,                        -- 'dialogue' | 'background'；NULL = 缺省
+      session_key   TEXT,                        -- agy 会话键；NULL = 单发冷路径/HTTP
+      stream        INTEGER NOT NULL DEFAULT 0,  -- 入口形态（1 = generateTextStream）
+      success       INTEGER NOT NULL CHECK(success IN (0,1)),
+      error_kind    TEXT,                        -- classifyGenerationFailure kind 族；成功行 NULL
+      error_message TEXT,                        -- 错误摘要 ≤500 字符；本地 db 无外发
+      input_tokens       INTEGER,                -- 以下五列 NULL = 未上报（CR-18：缺席 ≠ 0）
+      output_tokens      INTEGER,
+      thinking_tokens    INTEGER,                -- agy driver 唯一来源
+      cache_read_tokens  INTEGER,                -- agy driver 唯一来源
+      total_tokens       INTEGER,                -- 缺席不由 input+output 合成
+      latency_ms     INTEGER NOT NULL,
+      first_delta_ms INTEGER                      -- 流式首 delta 耗时；非流式/无 delta NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_closure_llm_log_ts
+      ON closure_llm_log (ts DESC);
+    CREATE INDEX IF NOT EXISTS idx_closure_llm_log_model_ts
+      ON closure_llm_log (model_id, ts DESC);
+    CREATE INDEX IF NOT EXISTS idx_closure_llm_log_task_ts
+      ON closure_llm_log (task_type, ts DESC);
+  `);
 }

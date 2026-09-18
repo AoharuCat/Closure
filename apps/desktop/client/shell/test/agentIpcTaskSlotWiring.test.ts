@@ -1,8 +1,8 @@
 import path from 'node:path';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { rmBestEffort } from './rmBestEffort';
 import { beforeAll, beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
-import type { ModelConfig, TaskModelSlot } from '@orison/shared-contracts';
+import type { ModelConfig } from '@orison/shared-contracts';
 
 const { handle, warn, info } = vi.hoisted(() => ({
   handle: vi.fn(),
@@ -43,6 +43,7 @@ import { resolveTaskModel, readContextPolicy } from '@orison/desktop-agent';
 import { registerAgentIpc } from '../main/ipc/agentIpc';
 import { _setModelConfigDirForTest, readTaskModelSlots, readUserPreferencesFromDisk } from '../main/ipc/configIpc';
 import { resolveModel } from '../main/ipc/modelGatewayIpc';
+import { taskModelSlotSchema } from '@orison/shared-contracts';
 
 const TEST_MODEL_DIR = path.join(process.cwd(), 'test-tmp-agent-slot-wiring');
 const SIDECAR = () => path.join(TEST_MODEL_DIR, 'task-models.yaml');
@@ -95,12 +96,27 @@ describe('agentIpc task-slot resolver wiring (C3.2 / CR-001)', () => {
   });
 
   it('no sidecar on disk → the injected resolver yields undefined for every slot (auto-pick)', () => {
-    const slots: TaskModelSlot[] = [
-      'writer-selfcheck', 'writer-draft', 'review-judge', 'extraction', 'dispatch', 'dialogue',
-    ];
-    for (const slot of slots) {
+    // 09-13 R1b：枚举驱动全量迭代（十档含四个审核细档）——细档回落链在无 sidecar
+    // 形态下同样落 undefined（回落不凭空造 assignment）。
+    for (const slot of taskModelSlotSchema.options) {
       expect(resolveTaskModel(slot)).toBeUndefined();
     }
+  });
+
+  // 09-13 R1b：审核族细档回落链——shell 注入闭包是单槽直查（readTaskModelSlots()?.[slot]），
+  // 档间回落由 agent 侧 resolveTaskModel 单点实现。只配 review-judge 时四个细档经真实
+  // 注入 resolver 落到 review-judge assignment（enrichment 同 ride）。
+  it('only review-judge on disk → the four fine review slots fall back to its assignment (09-13 R1b)', () => {
+    writeFileSync(
+      SIDECAR(),
+      ['review-judge.keyId: key_001', 'review-judge.modelId: judge-model'].join('\n') + '\n',
+      'utf8',
+    );
+    for (const fine of ['plan-review', 'multi-review', 'route-judge', 'revision-guard'] as const) {
+      expect(resolveTaskModel(fine)).toEqual({ keyId: 'key_001', modelId: 'judge-model' });
+    }
+    // 非审核族槽位不受回落影响。
+    expect(resolveTaskModel('extraction')).toBeUndefined();
   });
 
   it('a sidecar change becomes visible without re-registration (fresh-query semantics)', () => {
@@ -171,6 +187,51 @@ describe('agentIpc task-slot resolver wiring (C3.2 / CR-001)', () => {
       ],
     };
     expect(() => resolveModel(ref!, configWithDisabled)).toThrow(/disabled/);
+  });
+
+  // ── 09-12 子3 §4.4：resolver 闭包的 contextWindow enrichment 接线钉（mirror CR-001
+  // 姿态——删掉闭包上的 enrichSlotAssignment 调用即红）。enrichment 是 runtime-only：
+  // 读侧（readTaskModelSlots / load-model 盘上原样）零污染，sidecar 永不落盘此字段。──
+  it('key defaults.contextWindow → 注入闭包返回 contextWindowTokens；读侧与盘面零污染', () => {
+    mkdirSync(path.join(TEST_MODEL_DIR, 'keys'), { recursive: true });
+    writeFileSync(
+      path.join(TEST_MODEL_DIR, 'keys', 'key_001.yaml'),
+      [
+        'id: key_001',
+        'name: Enrich relay',
+        'protocol: openai-compatible',
+        'baseUrl: https://relay.example.com/v1',
+        'apiKey: sk-test',
+        'models.0.id: m-window',
+        'models.0.capability: text',
+        'models.0.alias: m-window',
+        'models.0.enabled: true',
+        'models.0.defaults.contextWindow: 131072',
+        'models.1.id: m-plain',
+        'models.1.capability: text',
+        'models.1.alias: m-plain',
+        'models.1.enabled: true',
+      ].join('\n') + '\n',
+      'utf8',
+    );
+    writeFileSync(
+      SIDECAR(),
+      'dialogue.keyId: key_001\ndialogue.modelId: m-window\nwriter-draft.keyId: key_001\nwriter-draft.modelId: m-plain\n',
+      'utf8',
+    );
+
+    // enriched：key 的 defaults.contextWindow 注入 assignment（AC3 接线面）。
+    expect(resolveTaskModel('dialogue')).toEqual({
+      keyId: 'key_001',
+      modelId: 'm-window',
+      contextWindowTokens: 131_072,
+    });
+    // 无 defaults 的模型恒等（无 contextWindowTokens 键）。
+    expect(resolveTaskModel('writer-draft')).toEqual({ keyId: 'key_001', modelId: 'm-plain' });
+    expect('contextWindowTokens' in (resolveTaskModel('writer-draft') ?? {})).toBe(false);
+    // 读侧零污染：readTaskModelSlots 盘上原样（UI load-model 同源不受 enrichment 影响）。
+    expect(readTaskModelSlots()?.dialogue).toEqual({ keyId: 'key_001', modelId: 'm-window' });
+    expect(readFileSync(SIDECAR(), 'utf-8')).not.toContain('contextWindowTokens');
   });
 });
 

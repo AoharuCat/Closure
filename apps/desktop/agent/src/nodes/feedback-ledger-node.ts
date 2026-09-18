@@ -37,8 +37,14 @@ import { logger } from '../logger';
 /** 节点产出 artifact key（链段 pass-through，mirror story.sync 非下游消费的 summary key）。 */
 const FEEDBACK_LEDGER_NODE_KEY = 'feedback_ledger';
 
+/**
+ * 节点 id 单源——chapter-chain 链装配（CHAPTER_CHAIN_NODE_IDS + 装配行）与 workflow reExtractChapter
+ * 的 standalone 过滤（链外重提取不产环终态输入，剔除该节点）两侧共用，防字面量漂移。
+ */
+export const FEEDBACK_LEDGER_NODE_ID = 'feedback-ledger-node' as const;
+
 const FEEDBACK_LEDGER_CONTRACT: ReusableAgentNodeContract = {
-  nodeId: 'feedback-ledger-node',
+  nodeId: FEEDBACK_LEDGER_NODE_ID,
   displayName: 'Feedback Ledger Node',
   inputSchemaName: 'feedbackLedgerInput',
   outputSchemaName: 'feedbackLedgerOutput',

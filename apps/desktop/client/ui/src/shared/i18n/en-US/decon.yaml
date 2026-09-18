@@ -31,6 +31,21 @@ decon:
     fubi: "Foreshadowing"
     duizhao: "Echo & Variation"
     style: "Style"
+  # ── Dimension granularity notes (CR-14 — i18n mirror of the contract field) ──
+  dimGranularity:
+    huoke: "Opening chapters (first 12, or the whole book if shorter) — feeds the book-level reading map"
+    qidaigan: "Per chapter and per arc"
+    jiegou: "Per arc — feeds the book-level reading map"
+    renshe: "Per arc (appearance/exit table pre-filled from facts)"
+    shijieguan: "Per arc — feeds the reading map; layer/word-count evidence from statistics"
+    qingxu: "Per chapter and per arc"
+    wenbi: "Sampled chapters (Deep tier adds scene close reads)"
+    zaogeng: "Per chapter and per arc"
+    xinxicha: "Per chapter plus the arc-level reader-knowledge curve"
+    shijian: "Per chapter and per arc (frequency view)"
+    fubi: "Per arc (plant-payoff pairing, payoffs always anchored)"
+    duizhao: "Per arc (clusters similar scenes, then studies the variation)"
+    style: "Book-level sampling (14-section style card + style report)"
   # ── Job statuses ──
   status:
     pending: "Not Started"
@@ -52,6 +67,7 @@ decon:
     failed: "Study failed: {message}"
     done: "Study complete — see outputs below"
     cancelled: "Cancelled — start a new study to retry"
+    openReading: "Open reading map"
   # ── Pass labels ──
   pass:
     p1a: "Entity Dictionary"
@@ -63,15 +79,24 @@ decon:
     p4: "Craft Layer"
     p5: "Output Assembly"
     p6: "Card Landing"
-  # ── Unit labels ──
+  # ── Unit labels (C5/F19 — zero index arithmetic: numeric/ch: units are 0-based
+  #     material indexes; the UI has no chapter-heading source, so chapters are
+  #     referenced material-relative, never claimed as book chapter numbers) ──
   unit:
-    chapter: "Chapter {index}"
+    materialChapter: "Material ch. {index}"
     arc: "Arc {index}"
     scene: "Scene {index}"
     all: "Whole book"
     arcs: "Arc Split"
     stats: "Statistics"
     literal: "{unit}"
+  # ── U4 overall progress bar ──
+  progress:
+    total: "{done}/{total}"
+    eta: "~{eta} left"
+    unitOfTotal: "{unit} of {total}"
+    # CR-19: pass coverage line (completed passes / total passes).
+    passCoverage: "{done}/{total} passes complete"
   # ── New-study wizard ──
   wizard:
     title: "New Study"
@@ -85,6 +110,9 @@ decon:
     dimFineCount: "{count}/3 craft dimensions chosen (style optional, not counted)"
     dimCoarseHint: "Skim tier offers only the style dimension (skip it for a pure skeleton pass)"
     dimDeepHint: "Deep tier requires all 12 craft dimensions (pre-filled) — style optional"
+    dimCoarseMore: "{count} more craft dimensions unlock at Focused tier"
+    dimPreviewShow: "Preview all"
+    dimPreviewHide: "Hide preview"
     invalidDims: "Dimension selection violates tier rules"
     reviewGates: "Review gates (dictionary / canon / craft — pauses for your sign-off)"
     gatesOn: "On (recommended for the first book)"
@@ -98,6 +126,19 @@ decon:
     estimateTitle: "Cost Estimate"
     estimateTotal: "About {tokens} tokens total"
     estimateInherited: "P1 reused (zero re-cost) — same-fingerprint facts inherited"
+    # CR-17: one plain-language note per pass (what the money buys / what drives the cost).
+    estimateNote:
+      p1a: "Classify the book's candidate entities in one pass — fixed cost"
+      p1b: "Chapter-by-chapter fact extraction — chapters × per-chapter cost, the biggest line"
+      p1c: "Cluster and disambiguate accumulated entities — fixed cost"
+      p2: "Assemble canon across six domains — billed per domain"
+      p3a: "Per-chapter labeling (hooks/turns/beats) — scales with chapter count"
+      p4: "One pass per craft dimension you picked — more dimensions and chapters cost more"
+      p4style: "Book-level style sampling (not per-chapter) — billed per arc"
+      p5book: "One whole-book reading map — fixed cost"
+      p5chapter: "Per-chapter reviews — scales with chapter count"
+      p5scene: "Close reads of selected scenes — Deep tier only"
+      p6: "Land craft findings into cards — billed per candidate"
     start: "Start Study"
     createFailed: "Create failed: {message}"
   # ── Review gate card ──
@@ -132,9 +173,18 @@ decon:
     chaptersEmpty: "No chapter reviews yet — produced at Focused tier and above"
     scenesEmpty: "No scene close-reads yet — produced at Deep tier"
     styleEmpty: "No style report yet — pick the style dimension to generate"
+    styleStatsTitle: "Style statistics (available at Skim tier)"
+    styleSentenceLabel: "Sentence length"
+    styleParagraphLabel: "Paragraph length"
+    styleDialogueLabel: "Dialogue line share"
+    styleDistribution: "{count} items · avg {avg} chars · max {max}"
+    styleDialogueRatio: "{ratio}%"
+    styleNeedsFine: "The full style report requires the Focused tier with the style dimension selected"
     canonEmpty: "Canon domains are empty"
+    selectReport: "Pick a reading entry on the left to read"
     selectChapter: "Pick a chapter review to read"
     selectScene: "Pick a scene close-read to read"
+    coarseLockedHint: "This session is Skim tier — chapter reviews and close reads unlock at higher tiers"
     styleExport: "Export to current project's style card"
     styleExportNoProject: "No project open — pick a target project before exporting"
     styleExportConfirmTitle: "Write style card"
@@ -147,7 +197,7 @@ decon:
     craftZoneJump: "Open craft review page"
     reportFailed: "Failed to fetch report: {message}"
     anchorsTitle: "Anchors (traceable to source)"
-    anchorRow: "Chapter {chapter} · paragraphs {start}–{end}"
+    anchorRow: "{chapter} · paragraphs {start}–{end}"
   # ── Report kinds ──
   reportKind:
     book_reading: "Reading Map"
@@ -169,11 +219,50 @@ decon:
     tone: "Tone"
     timeline: "Timeline"
     relationship: "Relationships"
+  # ── Canon output cards (U2/F17 — per-domain field cards + AI view toggle) ──
+  canonCard:
+    aiView: "AI view (raw JSON)"
+    evidenceExact: "Text-confirmed"
+    evidenceInferred: "Inferred"
+    anchorsCount: "{count} anchors"
+    provenance: "from “{book}”"
+    summary: "Summary"
+    statement: "Rule statement"
+    baseline: "Baseline"
+    identity: "Identity"
+    speechPattern: "Speech pattern"
+    traits: "Traits"
+    traitImmutable: "Immutable core"
+    traitEvolvable: "Evolvable"
+    abilities: "Abilities"
+    arc: "Growth arc"
+    coreTrauma: "Core trauma"
+    pillars: "Behavior pillars"
+    voiceAnchors: "Voice anchors"
+    antiVoice: "Anti-voice"
+    neverDo: "Never does"
+    aliases: "Aliases"
+    mentions: "Chapters seen"
+    portraitDegraded: "Portrait degraded (thin excerpts)"
+    consistency: "Timeline"
+    consistencyExact: "Consistent"
+    consistencyLoose: "Intentionally loose"
+    consistencyConflict: "True conflict"
+    events: "Events ({count})"
+    eventRow: "Material ch. {chapter} · {label}"
+    eventUnannotated: "Material ch. {chapter} · unannotated"
+    conflictNote: "Conflict note"
+    pair: "Pair"
+    edgeCount: "Evidence"
+    edgeCountValue: "{count} evidence edges"
   # ── Actions ──
   action:
     refresh: "Refresh"
     pause: "Pause"
     resume: "Continue"
+    # CR-8: neutral failed-state resume (failure point outside chapter extraction).
+    resumeDecon: "Resume Study"
+    resumeFromChapter: "Continue from {chapter}"
     resumeWithBudget: "Adjust budget & continue"
     cancel: "Cancel"
     delete: "Delete"

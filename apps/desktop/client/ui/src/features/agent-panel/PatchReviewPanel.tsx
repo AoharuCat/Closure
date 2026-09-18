@@ -25,6 +25,11 @@ import { isStructuredDiffable, firstAddedPhaseId, prettyPatchData, diffOutline }
  * chat view; renders nothing when `pendingPatch` is null (double guard — the
  * mount site also conditionally renders).
  *
+ * 09-13 子3 W4（design §5.2 / 拍板 D-g 切分）：props `sessionId?`（缺省兜底 = 视图会话——
+ * 写作页产物区按链会话挂载 chapter_candidate 审阅时传目标会话）+ `excludeChapterCandidate`
+ * （对话栏挂载过滤：链产物 chapter_candidate 不在对话栏渲染——轻量提示跳写作页；混合批只渲染
+ * 非链行，apply 经 excludeFields 排除集不静默落盘隐藏 patch）。
+ *
  * A4 enhancement (design §4 optional): scene_graph rows surface
  * `pendingPatchIssues` error/warning counts (the Story 1.3 data channel) so the
  * author sees validation status before Apply. Non-scene_graph patches produce
@@ -35,7 +40,14 @@ import { isStructuredDiffable, firstAddedPhaseId, prettyPatchData, diffOutline }
  * (already computed by the slice) and persists author intent (accept/reject).
  * No semantic judgement here —选址/线型/情绪归 LLM agent.
  */
-export function PatchReviewPanel() {
+export function PatchReviewPanel({
+  sessionId: propsSessionId,
+  excludeChapterCandidate = false,
+}: {
+  sessionId?: string;
+  /** D-g 切分：对话栏挂载过滤 chapter_candidate（链产物归写作页产物区审阅落盘）。缺省渲染全部。 */
+  excludeChapterCandidate?: boolean;
+}) {
   const {
     sessionId,
     pendingPatch,
@@ -53,9 +65,11 @@ export function PatchReviewPanel() {
     setOutlineFocusTarget,
   } = useAppStore(useShallow((s) => {
     // dogfood T1 Stage 3（r8 键控）：只渲染当前视图会话的挂起 patch；dismiss 也按该会话清键。
-    const entry = s.agentSessionId ? s.pendingPatchBySession[s.agentSessionId] : undefined;
+    // W4（D-g 切分）：props.sessionId 优先（写作页产物区按链会话挂载），兜底视图会话。
+    const sid = propsSessionId ?? s.agentSessionId;
+    const entry = sid ? s.pendingPatchBySession[sid] : undefined;
     return {
-      sessionId: s.agentSessionId,
+      sessionId: sid,
       pendingPatch: entry?.patch,
       patchSelections: entry?.selections ?? EMPTY_PATCH_SELECTIONS,
       pendingPatchIssues: entry?.issues ?? EMPTY_PATCH_ISSUES,
@@ -121,7 +135,12 @@ export function PatchReviewPanel() {
     const outlineStats = outlineEntry && !outlineLocked
       ? diffOutline(creativeFields.outline, outlineEntry.data).stats
       : null;
-    const applied = applySelectedPatches();
+    // W4（D-g 切分）：对话栏过滤挂载时传排除集——隐藏的 chapter_candidate 不随「Apply Selected」
+    // 静默落盘（slice 侧重 stage 供写作页产物区审阅）；sid 尾参按目标会话键控 apply。
+    const applied = applySelectedPatches(
+      sessionId ?? undefined,
+      excludeChapterCandidate ? ['chapter_candidate'] : undefined,
+    );
     if (!applied) return;
     if (outlineEntry && !outlineLocked) {
       const outlineVersion = useAppStore.getState().fieldMetadata.outline?.version ?? 0;
@@ -161,7 +180,35 @@ export function PatchReviewPanel() {
     }
   };
 
+  // CR-1：Reject All 在对话栏过滤挂载（excludeChapterCandidate）且本批含被隐藏的
+  // chapter_candidate 时，整键 setPendingPatch(sid, null) 会把隐藏的链产物 envelope 一并静默
+  // 丢弃（apply 路径已有重 stage 保护，reject 路径此前漏）——mirror applySelectedPatches
+  // settlePending 的 re-stage 语义：先清键再重 stage 被排除集（经 setPendingPatch 新批语义
+  // selections 默认选中 + issues 清空；runId/createdAt 保持原批）。纯链挂载（无排除/无隐藏批）
+  // 维持整键清场不变。
+  const handleRejectAll = () => {
+    if (!sessionId || !pendingPatch) return;
+    const hiddenChapterCandidates = excludeChapterCandidate
+      ? pendingPatch.patches.filter((entry) => (entry.field as string) === 'chapter_candidate')
+      : [];
+    setPendingPatch(sessionId, null);
+    if (hiddenChapterCandidates.length > 0) {
+      setPendingPatch(sessionId, {
+        runId: pendingPatch.runId,
+        createdAt: pendingPatch.createdAt,
+        patches: hiddenChapterCandidates,
+      });
+    }
+  };
+
   if (!pendingPatch) return null;
+
+  // W4（D-g 切分）：对话栏过滤挂载——chapter_candidate（链产物）不渲染行；全批被滤空 → 整卡
+  // 不渲染（AgentPanel 挂载位换 ReviewPendingNotice 轻量提示跳写作页）。
+  const visiblePatches = excludeChapterCandidate
+    ? pendingPatch.patches.filter((entry) => (entry.field as string) !== 'chapter_candidate')
+    : pendingPatch.patches;
+  if (visiblePatches.length === 0) return null;
 
   const actionLabels: Record<string, string> = {
     set: t('creative.patch.set'),
@@ -182,7 +229,7 @@ export function PatchReviewPanel() {
       <h4 className="patch-review-title">{t('creative.patch.title')}</h4>
       <p className="patch-review-meta">Run: {pendingPatch.runId}</p>
       <div className="patch-review-list">
-        {pendingPatch.patches.map((entry, idx) => {
+        {visiblePatches.map((entry, idx) => {
           const canShowIssues = entry.field === 'scene_graph' && entry.action !== 'delete';
           // Story 3.1 WP5: lock toggle only for real creative fields. chapter_candidate
           // is a transient chapter draft (not a CreativeFieldKey), locking it is meaningless.
@@ -217,7 +264,7 @@ export function PatchReviewPanel() {
                 <input
                   type="checkbox"
                   checked={patchSelections[entry.field] ?? false}
-                  onChange={() => togglePatchSelection(entry.field)}
+                  onChange={() => togglePatchSelection(entry.field, sessionId ?? undefined)}
                 />
                 <span className="patch-review-field">{t(`creative.tabs.${entry.field}`)}</span>
                 <span className="patch-review-action">{actionLabels[entry.action] ?? entry.action}</span>
@@ -320,7 +367,7 @@ export function PatchReviewPanel() {
         <button
           type="button"
           className="patch-review-reject-btn"
-          onClick={() => sessionId && setPendingPatch(sessionId, null)}
+          onClick={handleRejectAll}
         >
           {t('creative.patch.rejectAll')}
         </button>

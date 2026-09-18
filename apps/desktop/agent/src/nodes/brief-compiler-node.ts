@@ -734,6 +734,39 @@ function compileCharacterProgressions(
   return out.length > 0 ? out : undefined;
 }
 
+/** W2 遗留①：recompileHints 注入上限（防坏 plan_review 大 findings 阵列撑爆 brief；reviewer 输出本就少）。 */
+const RECOMPILE_HINTS_CAP = 8;
+
+/**
+ * W2 遗留①：从上一轮 `plan_review` artifact 抽 hard findings 作重编意图（规划环 revise 回环的实质
+ * 输入——brief-compiler 纯代码确定性，无注入则原样重编空转）。仅 verdict='revise' 时注入（pass/escalate
+ * 无回环语义；soft-only revise 已被 A2 parseOutput 归一为 pass）；坏形态防御性丢（mirror per-element
+ * 哲学）。纯机械投影（dimension/grounding/note 三字段直取）。
+ */
+function collectRecompileHints(
+  planReview: unknown,
+): Array<{ dimension: string; grounding: string; note: string }> {
+  if (!planReview || typeof planReview !== 'object' || Array.isArray(planReview)) return [];
+  const review = planReview as { verdict?: unknown; findings?: unknown };
+  if (review.verdict !== 'revise' || !Array.isArray(review.findings)) return [];
+  const hints: Array<{ dimension: string; grounding: string; note: string }> = [];
+  for (const f of review.findings) {
+    if (!f || typeof f !== 'object' || Array.isArray(f)) continue;
+    const finding = f as { severity?: unknown; dimension?: unknown; grounding?: unknown; note?: unknown };
+    if (finding.severity !== 'hard') continue;
+    if (
+      typeof finding.dimension !== 'string' || finding.dimension.length === 0 ||
+      typeof finding.grounding !== 'string' || finding.grounding.length === 0 ||
+      typeof finding.note !== 'string' || finding.note.length === 0
+    ) {
+      continue;
+    }
+    hints.push({ dimension: finding.dimension, grounding: finding.grounding, note: finding.note });
+    if (hints.length >= RECOMPILE_HINTS_CAP) break;
+  }
+  return hints;
+}
+
 /**
  * brief 编译节点工厂。读 chapter_brief_input + scene_graph（+ 可选 episode_outlines）→ 输出 chapter_brief。
  * 纯函数（无 LLM/fs/db）—— chapterBriefSchema.parse 确保 shape（leader brief 可能带额外字段，parse 剥离）。
@@ -821,6 +854,17 @@ export function createBriefCompilerNode(): AgentNode {
       const settingsContext = run.artifacts['settings_context'];
       const settingsPresent = typeof settingsContext === 'string' && settingsContext.trim().length > 0;
 
+      // ── 链流程重排 W2（遗留①：规划环 revise 重编意图注入）──
+      //
+      // brief-compiler 是纯代码编译器（同输入确定性重编）——规划环 revise 回环若不注入新输入，只会
+      // 原样重编 → A2 复判 → 空转到 cap（W1d parsePlanReviewOutput 注释已标）。本处读上一轮
+      // `plan_review` artifact 的 **hard findings**（revise verdict 时）机械投影为 chapter_brief
+      // .recompileHints（shared schema additive 字段）——A2 复审在卡面可见（brief JSON 自带）+ 写手
+      // 随 chapterTask JSON 同读（据 hints 自查/规避），环有实质输入。首圈 plan_review 缺 → 零注入
+      // （零回归）；软维度 findings 不注入（revise 归一已保证 revise verdict 必有 hard finding）。
+      // 纯投影不判语义（范式判据 ✓——判分归 A2 LLM）。
+      const recompileHints = collectRecompileHints(run.artifacts['plan_review']);
+
       // 组装：LLM 段 #1-5,10 透传 leaderBrief + #6 plotPoints 汇编 + #7 promiseTasks 汇编（6.5）
       // + #8 openDecisions 汇编（4.1 Step 3）+ readiness（4.1 §3.2 就绪阶梯，纯代码算）。
       // #3 merge precedence（6.3 design §6，CRITICAL）：leader 已填字段优先（人意图硬约束），
@@ -848,6 +892,8 @@ export function createBriefCompilerNode(): AgentNode {
         // （brief 二态「缺失=无弧走向，主笔照写」；空 [] schema 合法但本编译不产——episode 无 progressions
         // 与字段缺失同态，统一 undefined，见 compileCharacterProgressions JSDoc）。
         characterProgressions,
+        // W2 遗留①：规划环 revise 回环的重编意图（上一轮 plan_review hard findings 机械投影）。
+        ...(recompileHints.length > 0 ? { recompileHints } : {}),
       };
 
       // Zod safeParse 确保 shape（CR-6：失败返 error artifact 走 runChain error-artifact 路径，链段不崩——

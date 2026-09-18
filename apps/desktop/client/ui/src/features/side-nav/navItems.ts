@@ -19,8 +19,13 @@ export const materialsItem: PageNavItem = { id: 'materials', icon: 'inventory_2'
 export const craftItem: PageNavItem = { id: 'craft', icon: 'science', i18nKey: 'nav.craft' };
 // 「拆书」页（E10.3b W6）：小说拆解管线面——新建拆解（档位/维度/预算预估）/pass 进度 +
 // 人审闸门 / 产出阅读（读法·章评·细批·风格）/ 风格卡导出。紧邻手艺页（拆书产物 craft 落卡
-// 跳转的手艺人审面）。
-export const deconItem: PageNavItem = { id: 'decon', icon: 'auto_stories', i18nKey: 'nav.decon' };
+// 跳转的手艺人审面）。icon = school（U9——向书学习/研究；与 outline 的 auto_stories 错位，
+// 消除撞车）。
+export const deconItem: PageNavItem = { id: 'decon', icon: 'school', i18nKey: 'nav.decon' };
+// 「写作」页（task 09-13-writing-page-ui W1）：写章链运行态专门面——章节列 + 多会话条 +
+// 运行时间线 + 审阅相位（审批迁入宽区 + 终稿手改）。原 SideNav 直开稿件 tab 的「写作」
+// 按钮升级为页面路由；openWriting 本体保留（OverviewPage/世界面板/写作页章节列 caller）。
+export const writingItem: PageNavItem = { id: 'writing', icon: 'edit_note', i18nKey: 'nav.writing' };
 
 /** Group 2: Production tools */
 export const productionItems: PageNavItem[] = [

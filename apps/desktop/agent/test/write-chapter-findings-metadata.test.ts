@@ -11,18 +11,18 @@ import type { SessionState } from '../src/types';
 // （design D5，additive——leader 文字呈现一字不动）。
 //
 // 验：
-// a) auto_revise surface（non-auto 半自动/微操）→ metadata.findings = { source:'reader-audit',
-//    route:'auto_revise', chapterId, items } + 文字输出 byte 级不变（与既有格式逐字相等）
-// b) escalate 呈现路径 → metadata.findings route='escalate_user' + items + 文字输出不变
+// a) escalate-pause（W1a 灰区裁决暂停）→ metadata.findings = { source:'reader-audit',
+//    route:'escalate_user', chapterId, items } + 无 chapter_review 卡（裁决路径非 stage 审阅）
+// b) escalate 呈现路径（completed+escalate 旧形态兼容）→ findings route='escalate_user' + 文字输出不变
 // c) escalate 但 findings 空 → items: []（「已审核」锚点——UI 新鲜度门 D5b 按 chapterId 降级旧卡）
 // d) 放手档 auto-trust accept（显式 opt-in 采信）→ findings 不透传（决策已定，跳过噪声——mirror 文字路径）
-// e) paused → 不加 findings（ChapterReviewPanel 已结构化呈现 chapter_review，双源冗余）
+// e) stage pause → 不加 findings（ChapterReviewPanel 已结构化呈现 chapter_review，双源冗余）
 // f) accept_as_truth 终态 → 无 findings（零回归）
-// g) auto mode cap 超限强制 escalate → autoReviseFindings 复制进 escalateFindings → findings 透传
-// h) 不传 chapterId → findings 无 chapterId 键（optional，mirror paused metadata 形态）
+// g) cap 超限 escalate-pause（W1a 链内产出）→ findings 透传
+// h) escalate-pause 不传 chapterId → findings 无 chapterId 键（optional，mirror paused metadata 形态）
 //
 // mock skillExecutor.runChapterChain（控制 summary 返值）+ runAgentWithExplicitSystem（role-aware：
-// director 空 entries / revision-optimizer 返 intent JSON / adjudicator 可控）。
+// director 空 entries / adjudicator 可控）。
 
 vi.mock('../src/agent/session', () => ({
   getSession: vi.fn(),
@@ -132,21 +132,22 @@ describe('write_chapter Story 3.7 findings metadata 透传', () => {
     }), 'utf8');
   }
 
-  function makeAutoReviseSummary(): RunSnapshotSummary {
-    return {
-      status: 'auto_revise_pending',
-      routeDecision: { decision: 'auto_revise', reason: '明确缺陷需修订' },
-      draftText: '正文内容',
-      autoReviseFindings: FINDINGS,
-      errors: [],
-    };
-  }
-
   function makeEscalateSummary(withFindings = true): RunSnapshotSummary {
     return {
       status: 'completed',
       routeDecision: { decision: 'escalate_user', reason: '灰区难断' },
       ...(withFindings ? { escalateFindings: FINDINGS } : {}),
+      errors: [],
+    };
+  }
+
+  /** W1a escalate-pause summary（chainRunner 灰区暂停形态——非 stage pause）。 */
+  function makeEscalatePauseSummary(): RunSnapshotSummary {
+    return {
+      status: 'paused',
+      escalatePause: true,
+      routeDecision: { decision: 'escalate_user', reason: '灰区难断' },
+      escalateFindings: FINDINGS,
       errors: [],
     };
   }
@@ -170,17 +171,6 @@ describe('write_chapter Story 3.7 findings metadata 透传', () => {
     };
   }
 
-  /** 既有（3.7 前）auto_revise surface 文案，逐字复刻（文字输出不变断言的基准）。 */
-  const PRECHANGE_AUTO_REVISE_OUTPUT = [
-    'status: auto_revise_pending',
-    'route: auto_revise — 明确缺陷需修订',
-    '',
-    'Reader-Audit 判定本章存在明确缺陷（auto_revise）——半自动/微操模式下需你确认改稿意图。',
-    '审核发现（带正文原句）：',
-    `  · [${FINDINGS[0].severity}] "${FINDINGS[0].quote}"（${FINDINGS[0].location}）—— ${FINDINGS[0].explanation}`,
-    '可告知我如何修改，或在工作台手触发改稿重跑。',
-  ].join('\n');
-
   /** 既有（3.7 前）escalate 文案（suggest + 裁决器 parse 失败降级分支），逐字复刻。 */
   const PRECHANGE_ESCALATE_OUTPUT = [
     'status: completed',
@@ -194,12 +184,12 @@ describe('write_chapter Story 3.7 findings metadata 透传', () => {
     '灰区裁决：但无章节候选（章未在 project.yaml 注册或映射歧义，且不满足链侧自动建章条件（多章同 sort_order / 落位守卫未过 / 显式指定了 chapterId）——请先在工作台建章（章节列表空态「新建第一章」或 chapters/ 目录新建 .md 文件））——无法裁决落盘。',
   ].join('\n');
 
-  // ─── a) auto_revise surface ───
+  // ─── a) W1a：escalate-pause（灰区裁决暂停）→ findings 透传（裁决 UI 消费面）───
 
-  it('suggest mode + auto_revise → metadata.findings 透传 + 文字输出与既有格式逐字相等', async () => {
+  it('suggest mode + escalate-pause → metadata.findings 透传 + 无 chapter_review 卡（escalate-pause ≠ stage pause）', async () => {
     writeReadyProject();
     setSession('suggest');
-    runChapterChain.mockResolvedValueOnce(makeAutoReviseSummary());
+    runChapterChain.mockResolvedValueOnce(makeEscalatePauseSummary());
 
     const { writeChapterTool } = await import('../src/tool/write-chapter');
     const result = await writeChapterTool.execute(
@@ -207,22 +197,23 @@ describe('write_chapter Story 3.7 findings metadata 透传', () => {
       ctx,
     );
 
-    // additive metadata：findings 结构化透传（route + chapterId + items 原样）。
-    const meta = result.metadata as { findings?: { source: string; route: string; chapterId?: string; items: unknown[] }; summary?: RunSnapshotSummary };
+    const meta = result.metadata as { type?: string; findings?: { source: string; route: string; chapterId?: string; items: unknown[] } };
+    // escalate-pause 不产 chapter_review（resume 路径是裁决分派非三动作审阅卡）
+    expect(meta.type).toBeUndefined();
     expect(meta.findings).toEqual({
       source: 'reader-audit',
-      route: 'auto_revise',
+      route: 'escalate_user',
       chapterId: 'ch-7',
       items: FINDINGS,
     });
-    // 文字输出一字不动（byte 级与 3.7 前格式相等）。
-    expect(result.output).toBe(PRECHANGE_AUTO_REVISE_OUTPUT);
+    // 待裁决指引文案在（R4b）
+    expect(result.output).toContain('已暂停待裁决');
   });
 
-  it('不传 chapterId → findings 无 chapterId 键（optional，mirror paused metadata 形态）', async () => {
+  it('escalate-pause 不传 chapterId → findings 无 chapterId 键（optional，mirror paused metadata 形态）', async () => {
     writeReadyProject();
     setSession('suggest');
-    runChapterChain.mockResolvedValueOnce(makeAutoReviseSummary());
+    runChapterChain.mockResolvedValueOnce(makeEscalatePauseSummary());
 
     const { writeChapterTool } = await import('../src/tool/write-chapter');
     const result = await writeChapterTool.execute({ episodeId: 'ep1', chapterBrief: { goal: 'g' } }, ctx);
@@ -316,13 +307,13 @@ describe('write_chapter Story 3.7 findings metadata 透传', () => {
     expect(meta.findings).toBeUndefined();
   });
 
-  // ─── g) auto mode cap 超限强制 escalate ───
+  // ─── g) W1a：cap 超限 escalate-pause（链内 cap 防御直达入口层，leader 兜底循环退役）───
 
-  it('auto mode + auto_revise 持续 cap 超限 → 强制 escalate 且 findings 透传（escalateFindings ← autoReviseFindings 既有复制）', async () => {
+  it('cap 超限强制 escalate-pause（chainRunner 产）→ findings 透传（escalateFindings 链内已抽）', async () => {
     writeReadyProject();
     setSession('auto'); // gear 缺省 smart → 非 optIn → 不 auto-trust，走 escalate 呈现
-    // 每次都返 auto_revise_pending（持续不收敛 → leader cap 兜底强制 escalate）。
-    runChapterChain.mockResolvedValue(makeAutoReviseSummary());
+    // W1a：cap 耗尽的强制 escalate 由 chainRunner 链内产出（escalate-pause 形态）——入口层直接消费。
+    runChapterChain.mockResolvedValue(makeEscalatePauseSummary());
 
     const { writeChapterTool } = await import('../src/tool/write-chapter');
     const result = await writeChapterTool.execute({ episodeId: 'ep1', chapterBrief: { goal: 'g' } }, ctx);

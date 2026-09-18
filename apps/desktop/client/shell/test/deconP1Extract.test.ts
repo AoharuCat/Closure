@@ -454,7 +454,7 @@ maybe('runDeconP1b（db 编排）', () => {
     };
     const first = await runDeconP1b(jobId, { generateText: failing, readDerivedText: () => DERIVED, now: () => NOW });
     expect(first.status).toBe('failed');
-    if (first.status === 'failed') expect(first.message).toContain('第 1 章');
+    if (first.status === 'failed') expect(first.message).toContain('第 2 章'); // C5：index 1 的真实章标
     expect(getDeconJob(jobId)?.status).toBe('failed');
     expect(listDeconChapterFacts(MAT_REF, DERIVED_HASH)).toHaveLength(1); // 章 0 已落
     expect(getDeconPassState(jobId, 'p1b', '0')?.status).toBe('done');
@@ -509,7 +509,7 @@ maybe('runDeconP1b（db 编排）', () => {
     };
     const first = await runDeconP1b(jobId, { generateText: gen, readDerivedText: () => DERIVED, now: () => NOW });
     expect(first.status).toBe('capped');
-    if (first.status === 'capped') expect(first.message).toContain('第 1 章');
+    if (first.status === 'capped') expect(first.message).toContain('第 2 章'); // C5：index 1 的真实章标
     expect(capped).toBe(1); // 章 0 恰一次；章 1 预算门前置拦截不烧 token
     expect(getDeconJob(jobId)?.status).toBe('capped');
     expect(getDeconPassState(jobId, 'p1b', '0')?.status).toBe('done');
@@ -531,6 +531,60 @@ maybe('runDeconP1b（db 编排）', () => {
     expect(second.status).toBe('done');
     expect(resumed).toBe(2);
     expect(listDeconChapterFacts(MAT_REF, DERIVED_HASH)).toHaveLength(3);
+  });
+
+  it('C4-F16 写侧：材料级前置失败（行删）只 transitionDeconJob——不写 (p1b,all,failed) 化石行', async () => {
+    seedDict();
+    const created = createDeconJob({ materialId: MAT_ID, tier: 'coarse' }, jobDeps());
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    const jobId = created.job.jobId;
+    expect(startDeconJob(jobId, jobDeps()).ok).toBe(true);
+    getDb().exec('DELETE FROM closure_material'); // 材料行删（真删除——重试窗口耗尽后诚实失败）
+    const result = await runDeconP1b(jobId, {
+      readDerivedText: () => DERIVED,
+      now: () => NOW,
+      waitMs: async () => {},
+    });
+    expect(result.status).toBe('failed');
+    if (result.status === 'failed') expect(result.message).toContain('不存在');
+    expect(getDeconJob(jobId)?.status).toBe('failed');
+    expect(getDeconJob(jobId)?.error).toContain('不存在');
+    // 'all' 非 p1b 合法 unit（章号十进制串）——材料级失败不再产生化石行（job 行 error 已承载）。
+    expect(getDeconPassState(jobId, 'p1b', 'all')).toBeNull();
+  });
+
+  it('C4-F12 读重试：中间态零章（pending）在重试窗口内回填 → 照常提取零失败', async () => {
+    seedDict();
+    const created = createDeconJob({ materialId: MAT_ID, tier: 'coarse' }, jobDeps());
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    const jobId = created.job.jobId;
+    expect(startDeconJob(jobId, jobDeps()).ok).toBe(true);
+    // 相 A 中间行：pending + 零章（reingest 在途形态——F12 竞态窗口）。
+    upsertMaterialRow({ ...mkMaterial([]), status: 'pending' });
+    let converged = false;
+    const waitMs = async (): Promise<void> => {
+      if (converged) return;
+      converged = true;
+      upsertMaterialRow(mkMaterial()); // 相 B 回填：wait 窗口内收敛
+    };
+    const flat = flatCalls();
+    let idx = 0;
+    const gen = async (): Promise<{ text: string }> => {
+      const { ci, seg } = flat[idx]!;
+      idx += 1;
+      return { text: factsJsonFor(DERIVED, BLOCKS, ci, seg) };
+    };
+    const result = await runDeconP1b(jobId, {
+      generateText: gen,
+      readDerivedText: () => DERIVED,
+      now: () => NOW,
+      waitMs,
+    });
+    expect(result.status).toBe('done');
+    expect(idx).toBe(flat.length); // 收敛后全章照常提取
+    expect(getDeconJob(jobId)?.status).toBe('running'); // 未被翻 failed/capped
   });
 
   it('超长章：段内串行多调用 + 段 synopsis 合并落库', async () => {

@@ -26,11 +26,9 @@
  * wiring 测试 craftDistillLlmWiring.test.ts 钉死：档位 key、default 哨兵链、温度随档、
  * finishReason 透传。
  */
-import { assignmentThinkingControl, resolveTaskModel } from '@orison/desktop-agent';
+import { assignmentFallbackChain, assignmentThinkingControl, resolveTaskModel } from '@orison/desktop-agent';
 import type { ThinkingControl } from '@orison/shared-contracts';
-import { generateText } from '@orison/model-protocols';
-import { readModelConfigFromDisk } from '../configIpc';
-import { resolveModel } from '../modelGatewayIpc';
+import { handleGenerateText } from '../modelGatewayIpc';
 import {
   installCraftDistillLlmCore,
   type CraftDistillGenerateSlot,
@@ -52,17 +50,26 @@ const generateCraftDistill: CraftDistillGenerateText = async (input) => {
   const ref = assignment
     ? { keyId: assignment.keyId, modelId: assignment.modelId }
     : { keyId: 'default', modelId: 'default' };
-  const resolved = resolveModel(ref, readModelConfigFromDisk());
   const thinking: ThinkingControl | undefined = assignmentThinkingControl(assignment);
-  const response = await generateText(resolved, {
-    model: resolved.modelId,
-    messages: [
-      ...(input.system ? [{ role: 'system' as const, content: input.system }] : []),
-      { role: 'user' as const, content: input.user },
-    ],
-    temperature: TEMPERATURE_BY_SLOT[input.slot],
-    maxTokens: input.maxTokens ?? CRAFT_DISTILL_DEFAULT_MAX_TOKENS,
-    ...(thinking ? { thinking } : {}),
+  // CR-14（09-12 子2 CR 批）：链投影单次求值再 spread。
+  const fallbacks = assignmentFallbackChain(assignment);
+  // 09-12 子2（复核 H1 重接）：直调面改经网关环入口（in-process handleGenerateText）——
+  // 无链快径字节级现行为；档位配链时生效（resolveModel 上移进环 per-attempt 解析）。
+  const response = await handleGenerateText({
+    ref,
+    request: {
+      model: ref.modelId,
+      messages: [
+        ...(input.system ? [{ role: 'system' as const, content: input.system }] : []),
+        { role: 'user' as const, content: input.user },
+      ],
+      temperature: TEMPERATURE_BY_SLOT[input.slot],
+      maxTokens: input.maxTokens ?? CRAFT_DISTILL_DEFAULT_MAX_TOKENS,
+      // 09-12 usage-panel：taskType = 蒸馏档位名（extraction / review-judge——与路由同 slot 单源）。
+      taskType: input.slot,
+      ...(thinking ? { thinking } : {}),
+    },
+    ...(fallbacks?.length ? { fallbacks } : {}),
   });
   // CR-2：透传 provider 停因（TextGenerationResponse.finishReason——GenerationFinishReason，
   // OpenAI/Anthropic 双协议路径均产出；undefined = 端点未回报）。切条截断判定的权威信号。

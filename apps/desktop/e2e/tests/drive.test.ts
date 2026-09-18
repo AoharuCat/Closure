@@ -61,6 +61,8 @@ interface MockOptions {
         calls.push({ fn: 'loc.isChecked', args: [o] });
         return opts.checked ?? false;
       }),
+    setInputFiles: (files: unknown, o?: unknown) =>
+      Promise.resolve(calls.push({ fn: 'loc.setInputFiles', args: [files, o] })),
     first: () => {
       calls.push({ fn: 'loc.first', args: [] });
       return mockLoc;
@@ -512,6 +514,34 @@ test.describe('dispatchRoute: POST /press-key', () => {
     const { win } = makeMockWindow();
     const { ctx } = makeCtx(win);
     const res = await dispatchRoute('POST', '/press-key', new URLSearchParams(), {}, ctx);
+    expect(res.ok).toBe(false);
+  });
+});
+
+test.describe('dispatchRoute: POST /set-input-files', () => {
+  test('sets files on the located input', async () => {
+    const { win, calls } = makeMockWindow();
+    const { ctx } = makeCtx(win);
+    const files = ['D:/a/novel.txt', 'D:/a/other.epub'];
+    const res = await dispatchRoute('POST', '/set-input-files', new URLSearchParams(), { selector: '.materials-fileinput', files }, ctx);
+    expect(res).toEqual({ ok: true });
+    const c = callsOf(calls, 'loc.setInputFiles')[0];
+    expect(c.args[0]).toEqual(files);
+  });
+
+  test('missing/empty files -> {ok:false}', async () => {
+    const { win } = makeMockWindow();
+    const { ctx } = makeCtx(win);
+    const empty = await dispatchRoute('POST', '/set-input-files', new URLSearchParams(), { selector: '.a', files: [] }, ctx);
+    expect(empty.ok).toBe(false);
+    const missing = await dispatchRoute('POST', '/set-input-files', new URLSearchParams(), { selector: '.a' }, ctx);
+    expect(missing.ok).toBe(false);
+  });
+
+  test('non-string file entry -> {ok:false}', async () => {
+    const { win } = makeMockWindow();
+    const { ctx } = makeCtx(win);
+    const res = await dispatchRoute('POST', '/set-input-files', new URLSearchParams(), { selector: '.a', files: ['ok', ''] }, ctx);
     expect(res.ok).toBe(false);
   });
 });

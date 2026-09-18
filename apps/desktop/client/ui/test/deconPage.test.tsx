@@ -73,6 +73,8 @@ function detailFixture(over: Partial<DeconJobDetail> = {}): DeconJobDetail {
       { jobId: 'decon-aaaaaaaaaaaa', pass: 'p1b', unit: '2', status: 'running', outputRef: null, outputHash: null, updatedAt: '2026-09-05T00:00:00.000Z' },
       { jobId: 'decon-aaaaaaaaaaaa', pass: 'p2', unit: 'world', status: 'done', outputRef: 'canon:world', outputHash: null, updatedAt: '2026-09-05T00:00:00.000Z' },
     ],
+    // CR-1 拍板 B：章标标签表（缺省空表 = 旧载荷形态——UI 回落「材料第 N 章」）。
+    chapterLabels: {},
     fresh: true,
     canon: [],
     dictionary: null,
@@ -263,7 +265,7 @@ describe('列表 + 详情装载', () => {
     expect(reportsSpy).toHaveBeenCalledWith({ jobId: 'decon-aaaaaaaaaaaa' });
   });
 
-  it('running 横幅 = progress 事件驱动（当前 pass + elapsed）+ 暂停动作；章号 1 基（CR-2）/arcs 专项键（CR-17 progress 路径）', async () => {
+  it('running 横幅 = progress 事件驱动（当前 pass + elapsed）+ 暂停动作；章号材料相对引用（C5/F19 零序号算术）/arcs 专项键（CR-17 progress 路径）', async () => {
     await openJob(detailFixture());
     await act(async () => {
       useAppStore.setState({
@@ -273,7 +275,8 @@ describe('列表 + 详情装载', () => {
       } as any);
     });
     expect(query('[data-decon-banner="running"]').textContent).toContain('decon.banner.running');
-    expect(query('[data-decon-progress-current="p3a"]').textContent).toContain('decon.unit.chapter:13'); // 0 基 '12' → 第 13 章
+    // C5/F19：0 基 '12' → 「材料第 12 章」（原始 index——不再 +1 冒充书内章号）。
+    expect(query('[data-decon-progress-current="p3a"]').textContent).toContain('decon.unit.materialChapter:12');
     // running 态动作排：暂停在位。
     expect(query('[data-decon-action="pause"]')).toBeTruthy();
     // p3b 单行哨兵 unit（'arcs'）走专项键——progress 路径不再泄漏字面量（CR-17）。
@@ -422,7 +425,7 @@ describe('人审闸门（design §6——闸门暂停优先 + 确认即续跑）
 });
 
 describe('产出阅读五 tab', () => {
-  it('章评列表（meta）→ 单取全文（decon:reports kind+unit）+ 锚点区（CR-25——章号 1 基/段落区间/引文有则显示）', async () => {
+  it('章评列表（meta）→ 单取全文（decon:reports kind+unit）+ 锚点区（CR-25——CR-1 真实章标/段落区间/引文有则显示）', async () => {
     reportsSpy.mockResolvedValue({
       fresh: true,
       list: [
@@ -431,7 +434,8 @@ describe('产出阅读五 tab', () => {
       ],
       report: null,
     });
-    await openJob();
+    // CR-1 拍板 B：章评行与锚点区消费 chapterLabels 真实章标（材料 index 1/2）。
+    await openJob(detailFixture({ chapterLabels: { 1: '第 2 章遇袭', 2: '第 3 章夜雨' } }));
     fireEvent.click(query('[data-decon-tab="chapters"]'));
     await waitFor(() => {
       expect(query('[data-decon-report-row="chapter_review:ch:1"]')).toBeTruthy();
@@ -446,7 +450,7 @@ describe('产出阅读五 tab', () => {
         unit: 'ch:1',
         contentMd: '# 第 1 章导读\n这章做对了什么…',
         anchors: [
-          // 章号 0 基（chapterIndex 1 = 第 2 章——CR-2 呈现 +1）。
+          // 章号材料 index 0 基（CR-1 拍板 B：呈现用 chapterLabels 真实章标，缺键回落材料第 N 章）。
           { chapterIndex: 1, charStart: 0, charEnd: 120, paraStart: 3, paraEnd: 5 },
           // 带引文摘要（「有则显示」面——契约行今日无 quote，防御读兼容）。
           { chapterIndex: 2, charStart: 40, charEnd: 80, paraStart: 1, paraEnd: 2, quote: '刀光落在她肩上的一瞬' },
@@ -466,34 +470,118 @@ describe('产出阅读五 tab', () => {
     await waitFor(() => {
       expect(query('.decon-reportmd').textContent).toContain('第 1 章导读');
     });
-    // 锚点区（E2E「锚点可追」落物）：章号/段落区间行 + 引文摘要。
+    // 锚点区（E2E「锚点可追」落物）：章标/段落区间行 + 引文摘要。
     expect(query('[data-decon-report-anchors="2"]')).toBeTruthy();
     const anchor0 = query('[data-decon-anchor="0"]');
     expect(anchor0.textContent).toContain('decon.output.anchorRow');
-    expect(anchor0.textContent).toContain('2,3,5'); // 第 2 章·段落 3–5（chapterIndex+1）
+    // CR-1：章标 = chapterLabels 真实章标（材料 index 1）——非 index 算术。
+    expect(anchor0.textContent).toContain('第 2 章遇袭');
+    expect(anchor0.textContent).toContain('3,5'); // 段落区间插值。
     expect(query('[data-decon-anchor="1"]').textContent).toContain('刀光落在她肩上的一瞬');
   });
 
-  it('canon tab：六域分组浏览', async () => {
+  it('canon tab：U2/F17 人读卡片（按域字段 + null 折叠 + anchors/provenance 摘要）+「AI 视图」开关回 JSON', async () => {
+    const span = { chapterIndex: 1, charStart: 0, charEnd: 120, paraStart: 3, paraEnd: 5 };
+    const provenance = { source: 'decon' as const, materialId: 'mat-aaaaaaaaaaaa', bookTitle: '小说一' };
     await openJob(
       detailFixture({
         canon: [
           {
             jobId: 'decon-aaaaaaaaaaaa',
-            domain: 'world',
-            name: '灵气复苏',
-            payload: { evidence: 'inferred', summary: '背景设定' },
-            anchors: [],
-            provenance: { source: 'decon', bookTitle: '小说一' },
+            domain: 'character',
+            name: '林拾',
+            payload: {
+              evidence: 'inferred',
+              portrait: {
+                identity: '高中生侦探',
+                speechPattern: '说话简短',
+                abilities: null,
+                neverDo: '不杀人',
+                traits: [
+                  { name: '重情', mutability: 'immutable', note: '为友涉险' },
+                  { name: '成长', mutability: 'evolvable' },
+                ],
+              },
+              aliases: ['小林'],
+              mentions: { chapters: [0, 3], total: 12, entries: [] },
+            },
+            anchors: [span],
+            provenance,
             updatedAt: '2026-09-05T00:00:00.000Z',
-          },
-        ],
+          } as never,
+          {
+            jobId: 'decon-aaaaaaaaaaaa',
+            domain: 'rule',
+            name: '灵气复苏',
+            payload: { evidence: 'exact', statement: '三十年前灵气复苏' },
+            anchors: [span],
+            provenance,
+            updatedAt: '2026-09-05T00:00:00.000Z',
+          } as never,
+        ] as never,
       }),
     );
     fireEvent.click(query('[data-decon-tab="canon"]'));
     await waitFor(() => {
-      expect(query('[data-decon-canon-entry="灵气复苏"]')).toBeTruthy();
+      expect(query('[data-decon-canon-entry="林拾"]')).toBeTruthy();
     });
+    const entry = query('[data-decon-canon-entry="林拾"]');
+    // 按域字段卡片：画像字段 + 特质行（可变性 chip + note）+ 别名 + 出场章数。
+    expect(entry.textContent).toContain('高中生侦探');
+    expect(entry.textContent).toContain('重情');
+    expect(entry.textContent).toContain('decon.canonCard.traitImmutable');
+    expect(entry.textContent).toContain('为友涉险');
+    expect(entry.textContent).toContain('小林');
+    expect(entry.textContent).toContain('decon.canonCard.mentions');
+    // 证据档 chip + anchors/provenance 摘要行。
+    expect(query('[data-decon-canon-evidence="inferred"]').textContent).toContain('decon.canonCard.evidenceInferred');
+    expect(entry.textContent).toContain('decon.canonCard.anchorsCount:1');
+    expect(entry.textContent).toContain('小说一');
+    // null 字段折叠（abilities 不渲染）+ rule 域 statement 字段卡。
+    expect(entry.querySelector('[data-decon-canon-field="abilities"]')).toBeNull();
+    expect(query('[data-decon-canon-entry="灵气复苏"]').textContent).toContain('三十年前灵气复苏');
+    // 「AI 视图」开关：开 → JSON 直出（同人消费面）。
+    fireEvent.click(query('[data-decon-canon-view="human"]'));
+    expect(query('[data-decon-canon-view]').getAttribute('data-decon-canon-view')).toBe('ai');
+    expect(query('[data-decon-canon-entry="林拾"]').querySelector('.decon-canonentry-payload')).not.toBeNull();
+    expect(query('[data-decon-canon-entry="林拾"]').querySelector('[data-decon-canon-field="identity"]')).toBeNull();
+  });
+
+  it('F18：粗拆档风格 tab 无 style_report → 回落 p3b stats 行 styleStats 三数字摘要 + 细拆解锁说明', async () => {
+    productsSpy.mockResolvedValue({
+      fresh: true,
+      products: [
+        {
+          jobId: 'decon-aaaaaaaaaaaa',
+          pass: 'p3b',
+          unit: 'stats',
+          payload: {
+            book: { chapterCount: 98 },
+            arcs: [],
+            styleStats: {
+              sentenceChars: { count: 42000, min: 2, avg: 18.4, max: 96, sigma: 9.1 },
+              paragraphChars: { count: 5600, min: 10, avg: 132.7, max: 890, sigma: 80.2 },
+              dialogueLineRatio: 0.42,
+            },
+          },
+          updatedAt: '2026-09-05T00:00:00.000Z',
+        },
+      ],
+    });
+    reportsSpy.mockResolvedValue({ fresh: true, list: [], report: null });
+    await openJob(detailFixture({ job: jobFixture({ status: 'done', tier: 'coarse', dimensions: [] }) }));
+    fireEvent.click(query('[data-decon-tab="style"]'));
+    await waitFor(() => {
+      expect(productsSpy).toHaveBeenCalledWith({ jobId: 'decon-aaaaaaaaaaaa', pass: 'p3b' });
+    });
+    await waitFor(() => {
+      expect(query('[data-decon-style-stats]')).toBeTruthy();
+    });
+    const stats = query('[data-decon-style-stats]');
+    expect(stats.textContent).toContain('decon.output.styleSentenceLabel');
+    expect(query('[data-decon-style-stat="sentence"]').textContent).toContain('decon.output.styleDistribution:42000,18,96');
+    expect(query('[data-decon-style-stat="dialogue"]').textContent).toContain('decon.output.styleDialogueRatio:42');
+    expect(query('[data-decon-style-needs-fine]').textContent).toContain('decon.output.styleNeedsFine');
   });
 
   it('风格导出禁用态：无当前项目 → disabled + 提示', async () => {
@@ -570,6 +658,259 @@ describe('capped 挂起 + 调预算续跑', () => {
         jobId: 'decon-aaaaaaaaaaaa',
         budget: { totalTokens: 500000 },
       });
+    });
+  });
+});
+
+describe('failed 续跑动线（C7/F11/CR-8——后端 decon:start 对 failed→retry，UI 露出主按钮）', () => {
+  it('failed 态失败点在 p1b（存在非 done 章号行）→「从{章标}继续」（章标 = chapterLabels 真实章标——CR-1）→ decon:start；删除降次按钮样式', async () => {
+    await openJob(
+      detailFixture({
+        job: jobFixture({ status: 'failed', error: '第 3 章提取输出因 token 上限截断——已挂起' }),
+        passStates: [
+          ...['0', '1', '2'].map((u) => ({
+            jobId: 'decon-aaaaaaaaaaaa',
+            pass: 'p1b',
+            unit: u,
+            status: 'done' as const,
+            outputRef: null,
+            outputHash: null,
+            updatedAt: '2026-09-05T00:00:00.000Z',
+          })),
+          {
+            jobId: 'decon-aaaaaaaaaaaa',
+            pass: 'p1b',
+            unit: '3',
+            status: 'failed' as const,
+            outputRef: null,
+            outputHash: null,
+            updatedAt: '2026-09-05T00:00:00.000Z',
+          },
+        ],
+        // CR-1 拍板 B：落点章 3 的真实章标（无简介伪章书里 index 3 = 书内第 3 章）。
+        chapterLabels: { 0: '简介（卷首）', 3: '第 3 章 古碑微光' },
+      }),
+    );
+    const btn = query('[data-decon-action="resume"]') as HTMLButtonElement;
+    // 落点 = 最大 done(2) + 1 = 3——章标用 chapterLabels 真实章标（非「材料第 3 章」）。
+    expect(btn.textContent).toContain('decon.action.resumeFromChapter');
+    expect(btn.textContent).toContain('第 3 章 古碑微光');
+    expect(btn.disabled).toBe(false);
+    fireEvent.click(btn);
+    await waitFor(() => {
+      expect(startSpy).toHaveBeenCalledWith({ jobId: 'decon-aaaaaaaaaaaa' });
+    });
+    // U35：删除降次按钮（破坏性兜底非主 CTA）。
+    expect(query('[data-decon-action="delete"]').className).toContain('decon-action--secondary');
+  });
+
+  it('CR-8：失败点在后续 pass（p1b 章号行全 done）→ 中性「继续拆解」不假造章号；缺章标表回落「材料第 N 章」', async () => {
+    await openJob(
+      detailFixture({
+        job: jobFixture({ status: 'failed', error: 'p2 域归纳截断' }),
+        passStates: [
+          ...['0', '1'].map((u) => ({
+            jobId: 'decon-aaaaaaaaaaaa',
+            pass: 'p1b',
+            unit: u,
+            status: 'done' as const,
+            outputRef: null,
+            outputHash: null,
+            updatedAt: '2026-09-05T00:00:00.000Z',
+          })),
+          {
+            jobId: 'decon-aaaaaaaaaaaa',
+            pass: 'p2',
+            unit: 'world',
+            status: 'failed' as const,
+            outputRef: null,
+            outputHash: null,
+            updatedAt: '2026-09-05T00:00:00.000Z',
+          },
+        ],
+      }),
+    );
+    const btn = query('[data-decon-action="resume"]') as HTMLButtonElement;
+    expect(btn.textContent).toContain('decon.action.resumeDecon');
+    expect(btn.textContent).not.toContain('decon.action.resumeFromChapter');
+  });
+
+  it('CR-8/CR-1 回落：失败点在 p1b 首章（零 done）且无章标表 →「从材料第 0 章继续」（首章即重入点，不假造 null）', async () => {
+    await openJob(
+      detailFixture({
+        job: jobFixture({ status: 'failed', error: '第 1 章提取失败' }),
+        passStates: [
+          {
+            jobId: 'decon-aaaaaaaaaaaa',
+            pass: 'p1b',
+            unit: '0',
+            status: 'failed' as const,
+            outputRef: null,
+            outputHash: null,
+            updatedAt: '2026-09-05T00:00:00.000Z',
+          },
+        ],
+      }),
+    );
+    const btn = query('[data-decon-action="resume"]') as HTMLButtonElement;
+    expect(btn.textContent).toContain('decon.action.resumeFromChapter');
+    expect(btn.textContent).toContain('decon.unit.materialChapter:0');
+  });
+
+  it('U17/U7：列表行 failed error 截断行 + createdAt 时间戳（非 failed 态无 error 行）', async () => {
+    seedState({
+      deconJobs: [
+        jobFixture({ status: 'failed', error: '第 3 章提取输出因 token 上限截断（finishReason=length）——已挂起，不落半程产物' }),
+        jobFixture({ jobId: 'decon-bbbbbbbbbbbb', status: 'running' }),
+      ],
+      deconJobsLoaded: true,
+    });
+    await act(async () => {
+      render(<DeconPage />);
+    });
+    const errorRow = query('[data-decon-job-error]');
+    expect(errorRow.textContent).toContain('第 3 章提取输出因 token 上限截断');
+    // 时间戳两行都在（数据面纯渲染——decon:list 行的 createdAt）。
+    expect(query('[data-decon-job-created="2026-09-05T00:00:00.000Z"]').textContent).not.toBe('');
+    // 非 failed 态无 error 行。
+    expect(document.querySelector('[data-decon-job="decon-bbbbbbbbbbbb"] [data-decon-job-error]')).toBeNull();
+  });
+});
+
+describe('U4 总进度条（当前 pass done/total + 第 N/M 章 + 诚实 ETA）', () => {
+  it('running 事件 pass 命中 passStates 聚合 → 主条 done/total + ETA（≥3 done 线性外推）+ 当前相位 第 N（共 M）', async () => {
+    const base = Date.parse('2026-09-05T08:00:00.000Z');
+    await openJob(
+      detailFixture({
+        job: jobFixture({ status: 'running' }),
+        passStates: [
+          ...[0, 1, 2, 3].map((i) => ({
+            jobId: 'decon-aaaaaaaaaaaa',
+            pass: 'p1b',
+            unit: String(i),
+            status: 'done' as const,
+            outputRef: null,
+            outputHash: null,
+            updatedAt: new Date(base + i * 60_000).toISOString(),
+          })),
+          ...['4', '5'].map((u) => ({
+            jobId: 'decon-aaaaaaaaaaaa',
+            pass: 'p1b',
+            unit: u,
+            status: 'pending' as const,
+            outputRef: null,
+            outputHash: null,
+            updatedAt: new Date(base).toISOString(),
+          })),
+        ],
+      }),
+    );
+    await act(async () => {
+      useAppStore.setState({
+        deconProgress: {
+          'decon-aaaaaaaaaaaa': { jobId: 'decon-aaaaaaaaaaaa', status: 'running', pass: 'p1b', unit: '4', elapsedMs: 30_000 },
+        },
+      } as any);
+    });
+    const bar = query('[data-decon-progress-total="p1b"]');
+    // 主条 4/6 + ETA（4 done × 60s 间隔 × 剩余 2 = 2m）。
+    expect(bar.textContent).toContain('decon.progress.total:4,6');
+    expect(bar.textContent).toContain('decon.progress.eta:2m00s');
+    // CR-19：pass 覆盖辅行（p1b 4/6 未完 → 已完成 0/1）。
+    expect(query('[data-decon-progress-passes="0/1"]').textContent).toContain('decon.progress.passCoverage');
+    // 当前相位行「材料第 4 章（共 6）」。
+    const current = query('[data-decon-progress-current="p1b"]');
+    expect(current.textContent).toContain('decon.progress.unitOfTotal:decon.unit.materialChapter:4,6');
+  });
+
+  it('ETA 样本不足（done < 3）省略；非 running 无总条', async () => {
+    await openJob(
+      detailFixture({
+        job: jobFixture({ status: 'running' }),
+        passStates: ['0', '1'].map((u) => ({
+          jobId: 'decon-aaaaaaaaaaaa',
+          pass: 'p1b',
+          unit: u,
+          status: 'done' as const,
+          outputRef: null,
+          outputHash: null,
+          updatedAt: '2026-09-05T08:00:00.000Z',
+        })),
+      }),
+    );
+    await act(async () => {
+      useAppStore.setState({
+        deconProgress: {
+          'decon-aaaaaaaaaaaa': { jobId: 'decon-aaaaaaaaaaaa', status: 'running', pass: 'p1b', unit: '2', elapsedMs: 5_000 },
+        },
+      } as any);
+    });
+    expect(query('[data-decon-progress-total="p1b"]').textContent).not.toContain('decon.progress.eta');
+    // 非 running（无 live running 事件）不渲染总条。
+    await act(async () => {
+      useAppStore.setState({ deconProgress: {} } as any);
+    });
+    expect(document.querySelector('[data-decon-progress-total]')).toBeNull();
+  });
+});
+
+describe('F15/U3/U34：done 后自动开首报告 + 完成横幅「打开读法」', () => {
+  it('done + meta 装载 → 自动开首份读法（latch 防切 tab 重置劫持）；横幅按钮强制开', async () => {
+    reportsSpy.mockResolvedValue({
+      fresh: true,
+      list: [
+        { kind: 'book_reading', unit: 'all', dimension: null, updatedAt: '2026-09-05T00:00:00.000Z' },
+        { kind: 'chapter_review', unit: 'ch:1', dimension: null, updatedAt: '2026-09-05T00:00:00.000Z' },
+      ],
+      report: {
+        jobId: 'decon-aaaaaaaaaaaa',
+        kind: 'book_reading',
+        unit: 'all',
+        contentMd: '# 书级读法\n全书骨架…',
+        anchors: [],
+        dimension: null,
+        updatedAt: '2026-09-05T00:00:00.000Z',
+      },
+    });
+    await openJob(detailFixture({ job: jobFixture({ status: 'done' }) }));
+    // CR-19：pass 覆盖辅行——默认 fixture p2 1/1 已完 + p1b 2/3 未完 → 已完成 1/2。
+    expect(query('[data-decon-progress-passes="1/2"]').textContent).toContain('decon.progress.passCoverage');
+    // 自动开首报告（reading 默认 tab——正文落场）。
+    await waitFor(() => {
+      expect(reportsSpy).toHaveBeenCalledWith({ jobId: 'decon-aaaaaaaaaaaa', kind: 'book_reading', unit: 'all' });
+    });
+    await waitFor(() => {
+      expect(query('[data-decon-report-md]').textContent).toContain('书级读法');
+    });
+    // U34：完成横幅「打开读法」按钮在位。
+    expect(query('[data-decon-action="open-reading"]')).toBeTruthy();
+    // latch：切章评 tab（自动开章评首篇）再切回 reading——book_reading 不重置重取。
+    const readingFetches = () =>
+      reportsSpy.mock.calls.filter((c) => (c[0] as { kind?: string }).kind === 'book_reading').length;
+    const beforeSwitch = readingFetches();
+    fireEvent.click(query('[data-decon-tab="chapters"]'));
+    await waitFor(() => {
+      expect(reportsSpy.mock.calls.some((c) => (c[0] as { kind?: string }).kind === 'chapter_review')).toBe(true);
+    });
+    fireEvent.click(query('[data-decon-tab="reading"]'));
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 60));
+    });
+    expect(readingFetches()).toBe(beforeSwitch);
+    // 横幅按钮（用户显式动作）不受 latch 约束——强制开首份读法。
+    fireEvent.click(query('[data-decon-action="open-reading"]'));
+    await waitFor(() => {
+      expect(readingFetches()).toBe(beforeSwitch + 1);
+    });
+  });
+
+  it('U5：reading 正文空态 hint（belt）+ 粗拆档 chapters/scenes 空态注明档位解锁', async () => {
+    reportsSpy.mockResolvedValue({ fresh: true, list: [], report: null });
+    await openJob(detailFixture({ job: jobFixture({ status: 'done', tier: 'coarse', dimensions: [] }) }));
+    // reading 有 metas 空（readingEmpty 空态）——hint 在正文区（无 metas → 空态文案不显 hint）。
+    fireEvent.click(query('[data-decon-tab="chapters"]'));
+    await waitFor(() => {
+      expect(query('[data-decon-coarse-locked]').textContent).toContain('decon.output.coarseLockedHint');
     });
   });
 });

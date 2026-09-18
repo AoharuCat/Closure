@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import type { ChainStreamEvent, ChildStreamEvent, SessionMessage, SkillExecutorRef, StreamDeltaData, ToolCall, ToolContext, ToolDefinition } from '../types';
+import type { ChainStreamEvent, ChildStreamEvent, ContextUsageEventData, SessionMessage, SkillExecutorRef, StreamDeltaData, ToolCall, ToolContext, ToolDefinition } from '../types';
+import { CONTEXT_SUMMARY_TASK_TYPE } from '../types';
 import type { GenerationDelta, GenerateTextUsage } from '../provider/ipc-provider';
 import type { CacheConfig, ContextState } from '../context/contextManager';
 import type { SummarizationGenerateFn } from '../context/summarizer';
@@ -8,7 +9,7 @@ import type { AgentBehaviorMode, ThinkingKind } from '@orison/shared-contracts';
 import { THINKING_PROFILES } from '@orison/shared-contracts';
 import { prepareContext, createDefaultContextState } from '../context/contextManager';
 import { hardCutForOverflow, isContextOverflowSeamError } from '../context/overflow';
-import { estimateTokens, estimateMessagesTokens, updateCalibrationRatio } from '../context/tokenEstimator';
+import { clampRedlinePercent, estimateTokens, estimateMessagesTokens, updateCalibrationRatio } from '../context/tokenEstimator';
 import { logger } from '../logger';
 import { AUTO_APPLY_SELF_REVIEW_MESSAGE, assertToolAllowed, enforceAutoApplyTier, filterToolsForPolicy, shouldGateAutoApply, type SessionPermissionMode } from '../runtime/toolPolicy';
 import { appendToolDescriptions } from '../prompt/render';
@@ -40,6 +41,14 @@ interface LoopGenerateResult {
    * 协议层双路径）自此自动激活。
    */
   usage?: GenerateTextUsage;
+  /**
+   * 09-12 子2 fallback chains（design §7.2）：实际服务模型（网关环成功注记）。只在档位
+   * 配了链时携带——runLoop 据此盖终帧 assistantMsg.generatedBy（UI 终态徽标「实际模型
+   * B · 回退自 A」的数据源）。additive：无链路径 undefined 零行为变化。
+   */
+  modelRef?: { keyId: string; modelId: string };
+  /** 仅发生过回退时携带（≥1 条逐家失败记录，落 generatedBy.fallbackFrom）。 */
+  fallbackTrace?: Array<{ keyId: string; modelId: string; reason: string }>;
 }
 
 export interface LoopOptions {
@@ -62,6 +71,14 @@ export interface LoopOptions {
     abort: AbortSignal,
     cacheConfig?: CacheConfig,
     onDelta?: (d: GenerationDelta) => void,
+    /**
+     * 09-12 子5 CR-1：调用面标签透传——runLoop 车道内压缩摘要调用（summarizationGenerate）
+     * 恒携 { taskType: 'context-summary' }（与链段 gate 摘要同族——流程标签非档位词，
+     * mirror agent-loop gateSummarizationGenerate）。装配闭包（workflow leader 车道）以
+     * `callOpts?.taskType ?? '<车道档>'` 转发进 generateImpl opts；不声明本参的既有闭包
+     * （child/skill 等少参形态）天然忽略（additive，零回归）。缺省 undefined = 主调用形态。
+     */
+    callOpts?: { taskType?: string },
   ) => Promise<LoopGenerateResult>;
   onMessage?: (msg: SessionMessage) => void;
   abort: AbortSignal;
@@ -111,6 +128,15 @@ export interface LoopOptions {
   thinkingKind?: ThinkingKind;
   onContextStateUpdate?: (state: ContextState) => void;
   onCompaction?: (compactedCount: number) => void;
+  /**
+   * 09-12 子5 R6（design §11）：leader 上下文占用快照发射钩子——每步 prepareContext 落定
+   * （含压缩对齐）后回调一次。usedTokens = loadTokens × 校准比（口径与压缩触发同源）；
+   * windowTokens 携带注入原值（contextWindowTokens 未注入 → null——不用 1M 缺省充数）；
+   * redlinePercent = clamp 后生效红线。agent 侧不判等（UI dispatcher 值等跳写）；每步一发，
+   **不**在循环里每 delta 发。缺省不开发射（child/链节点/非流式车道零回归）。载荷单源
+   * ContextUsageEventData——与 UI 侧 AgentStreamEvent 占位变体逐字段同型。
+   */
+  onContextUsage?: (data: ContextUsageEventData) => void;
 }
 
 export async function runLoop(opts: LoopOptions): Promise<SessionMessage[]> {
@@ -144,7 +170,9 @@ export async function runLoop(opts: LoopOptions): Promise<SessionMessage[]> {
 
   // Build a summarization generate function that reuses the same model (no tools)
   const summarizationGenerate: SummarizationGenerateFn = async (msgs, system, abortSignal) => {
-    const res = await generate(msgs, system, [], abortSignal);
+    // 09-12 子5 CR-1：压缩摘要恒标流程标签 'context-summary'（不随车道档位词归组——
+    // 与链段摘要同族），经 seam 第 7 参透传、装配闭包转发；不转发的主调用闭包不受影响。
+    const res = await generate(msgs, system, [], abortSignal, undefined, undefined, { taskType: CONTEXT_SUMMARY_TASK_TYPE });
     return { content: res.content };
   };
 
@@ -195,6 +223,26 @@ export async function runLoop(opts: LoopOptions): Promise<SessionMessage[]> {
       opts.onCompaction?.(prepared.compactedCount);
       logger.info({ compactedCount: prepared.compactedCount }, 'in-loop compaction applied');
     }
+
+    // 09-12 子5 R6（design §11）：上下文占用快照发射——prepared context 出来就发（压缩分支
+    // 已在上方对齐，loadTokens 为压缩后回落值）。值等跳写在 UI dispatcher（agent 侧不判等）；
+    // 每步 prepareContext 一发，非每 delta。windowTokens 携带注入原值（未注入 → null）；
+    // redlinePercent 与红线压缩触发同 clamp 生效值。
+    // CR-5（09-12 子5 CR 批）：校准比读点守卫——复活会话 meta 缺字段（undefined）/NaN 时
+    // 回退 1（Number.isFinite 全拦），防 usedTokens NaN% 毒 UI；下方校准环 EMA 输入同守卫
+    // （EMA 对 NaN 无自愈，守卫后的有限输出经 onContextStateUpdate 回写即自愈缺字段会话）。
+    // CR-10（09-12 子5 CR 批）：读外层 contextState 安全——prepareContext 全返回点不改
+    // tokenCalibrationRatio（压缩分支 finalState 透传原值、早退路径原样返回 contextState），
+    // 且本发射点在 generate 后的校准环更新之前，两值不可能分叉；若未来 prepareContext
+    // 改 ratio，须换读 prepared.contextState 终态。
+    const calibrationRatio = Number.isFinite(contextState.tokenCalibrationRatio)
+      ? contextState.tokenCalibrationRatio
+      : 1;
+    opts.onContextUsage?.({
+      usedTokens: Math.ceil(prepared.loadTokens * calibrationRatio),
+      windowTokens: opts.contextWindowTokens ?? null,
+      redlinePercent: clampRedlinePercent(opts.redlinePercent),
+    });
 
     // CR-002（08-25 BMad CR）：let——溢出重试路径从更新后的 contextState 重建（见 catch 内）。
     let cacheConfig = prepared.cacheConfig;
@@ -300,7 +348,6 @@ export async function runLoop(opts: LoopOptions): Promise<SessionMessage[]> {
         // 摘要已进 contextState.compactedSummary，沿用旧 cacheConfig 会让重试载荷带过期摘要
         //（切掉的中段静默丢失）；下方校准估算口径同步消费重建值。
         cacheConfig = {
-          enablePromptCache: true,
           pinnedContent: cacheConfig.pinnedContent,
           compactedSummary: contextState.compactedSummary,
         };
@@ -345,8 +392,13 @@ export async function runLoop(opts: LoopOptions): Promise<SessionMessage[]> {
         + (cacheConfig.pinnedContent ? estimateTokens(cacheConfig.pinnedContent) : 0)
         + (cacheConfig.compactedSummary ? estimateTokens(cacheConfig.compactedSummary) : 0)
         + estimateMessagesTokens(allMessages);
+      // CR-5（09-12 子5 CR 批）：EMA 输入守卫（同发射点）——缺字段/NaN 回退 1（EMA 对
+      // NaN 无自愈：NaN×0.8+observed×0.2 恒 NaN），有限输出回写即自愈缺字段会话。
+      const currentRatio = Number.isFinite(contextState.tokenCalibrationRatio)
+        ? contextState.tokenCalibrationRatio
+        : 1;
       const nextRatio = updateCalibrationRatio(
-        contextState.tokenCalibrationRatio,
+        currentRatio,
         response.usage.promptTokens,
         estimatedPromptTokens,
       );
@@ -405,6 +457,20 @@ export async function runLoop(opts: LoopOptions): Promise<SessionMessage[]> {
       // S4b（design §5.1/§5.2）：Anthropic thinking 块签名同位落消息——多轮回传时
       // messagesToPayload 原样复用（厂商校验签名，不得伪造）。
       reasoningSignature: response.reasoningSignature,
+      // 09-12 子2 fallback chains（design §7.2）：终态标注实际模型——只在回退机械运行过
+      //（档位配链，generate 回传 modelRef）时盖章；generatedBy additive optional，旧消息
+      // 零迁移。fallbackFrom 仅发生过回退时携带（二态）。
+      ...(response.modelRef
+        ? {
+            generatedBy: {
+              keyId: response.modelRef.keyId,
+              modelId: response.modelRef.modelId,
+              ...(response.fallbackTrace?.length
+                ? { fallbackFrom: response.fallbackTrace.map((t) => ({ keyId: t.keyId, modelId: t.modelId, reason: t.reason })) }
+                : {}),
+            },
+          }
+        : {}),
     };
     result.push(assistantMsg);
     onMessage?.(assistantMsg);

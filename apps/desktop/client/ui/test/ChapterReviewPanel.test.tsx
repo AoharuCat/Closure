@@ -25,7 +25,7 @@
 import { cleanup, screen, render, fireEvent } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ChapterReviewPanel } from '../src/features/agent-panel/ChapterReviewPanel';
+import { ChapterReviewPanel } from '../src/features/writing/ChapterReviewPanel';
 import { useAppStore } from '../src/shared/store/appStore';
 import { runProjectResets } from '../src/shared/store/resetRegistry';
 import type { ChapterReviewMetadata, RevisionIntent } from '@orison/shared-contracts';
@@ -56,6 +56,18 @@ const verdictMeta: ChapterReviewMetadata = {
   type: 'chapter_review',
   stage: 'verdict',
   resumeOptions: ['continue', 'redo', 'abort'],
+};
+
+// 链流程重排 W2 + CR-18 interim：终稿 checkpoint 载荷（write-chapter.ts:3234 产
+// resumeOptions=['accept','redo','abort']；draftContent 正文全文 + reviewSummary/lintReport 终态）。
+const finalMeta: ChapterReviewMetadata = {
+  type: 'chapter_review',
+  stage: 'final',
+  chapterId: 'ch_001',
+  draftContent: '终稿正文。AI 自审收敛后的版本。',
+  resumeOptions: ['accept', 'redo', 'abort'],
+  reviewSummary: { verdict: 'pass', reasons: ['去味干净'], loopCount: 1, capExhausted: false },
+  lintReport: '去味终态：0 命中（干净）。',
 };
 
 // dogfood R2 #83/#84（2026-08-28）：写前挂起 pause（出发核查矛盾/偏离，无草稿）——resumeOptions=
@@ -148,15 +160,16 @@ describe('ChapterReviewPanel', () => {
     useAppStore.setState({
       resolvedLocale: 'en-US',
       pausedReviewBySession: {},
-      reviewResuming: false,
+      // 09-13 子3 W4：五本地态 BySession 键控（键缺席 = 缺省态）。
+      reviewResumingBySession: {},
       reviewContinue,
       reviewRedo,
       reviewAbort,
       // Story 7.1 B1 slice state defaults.
-      reviewSelection: null,
-      compiledIntent: null,
-      intentCompiling: false,
-      intentCompileError: null,
+      reviewSelectionBySession: {},
+      compiledIntentBySession: {},
+      intentCompilingBySession: {},
+      intentCompileErrorBySession: {},
       setReviewSelection,
       compileIntent,
       confirmRedoWithIntent,
@@ -210,7 +223,8 @@ describe('ChapterReviewPanel', () => {
     await userEvent.type(textarea, '把开头改紧张');
     await userEvent.click(screen.getByRole('button', { name: 'Redo draft' }));
 
-    expect(reviewRedo).toHaveBeenCalledWith('把开头改紧张');
+    // W4：动作尾参携目标会话（props 缺席 → 视图会话 sid）。
+    expect(reviewRedo).toHaveBeenCalledWith('把开头改紧张', 'sess-cr');
   });
 
   it('forwards Redo draft with undefined when feedback empty (no-instruction rerun合法)', async () => {
@@ -219,7 +233,7 @@ describe('ChapterReviewPanel', () => {
     render(<ChapterReviewPanel />);
     await userEvent.click(screen.getByRole('button', { name: 'Redo draft' }));
 
-    expect(reviewRedo).toHaveBeenCalledWith(undefined);
+    expect(reviewRedo).toHaveBeenCalledWith(undefined, 'sess-cr');
   });
 
   it('forwards Abort to reviewAbort', async () => {
@@ -232,7 +246,7 @@ describe('ChapterReviewPanel', () => {
   });
 
   it('disables all action buttons + textarea while reviewResuming', () => {
-    useAppStore.setState({ agentSessionId: 'sess-cr', pausedReviewBySession: { 'sess-cr': draftMeta }, reviewResuming: true } as any);
+    useAppStore.setState({ agentSessionId: 'sess-cr', pausedReviewBySession: { 'sess-cr': draftMeta }, reviewResumingBySession: { 'sess-cr': true } } as any);
 
     render(<ChapterReviewPanel />);
 
@@ -291,13 +305,34 @@ describe('ChapterReviewPanel', () => {
     expect(screen.getByRole('button', { name: 'Abort' })).toBeTruthy();
   });
 
-  it('#83/#84：挂起卡 redo → reviewRedo 转发（维持原案重跑——approvedDeviations 使同偏离不再挂起）', async () => {
+  it('#83/#84 + W5 D-c：挂起卡 redo 意见必填——空意见禁用；填意见 → reviewRedo(feedback, sid)', async () => {
     useAppStore.setState({ agentSessionId: 'sess-cr', pausedReviewBySession: { 'sess-cr': suspensionMeta } } as any);
 
     render(<ChapterReviewPanel />);
-    await userEvent.click(screen.getByRole('button', { name: 'Redo draft' }));
+    // D-c（design §4.2）：挂起重跑 = 携意见（文字必填）——空意见禁用提交（防 AI 瞎猜恢复方向）。
+    const redo = screen.getByRole('button', { name: 'Redo draft' });
+    expect(redo).toBeDisabled();
+    expect(screen.getByText(/Empty notes cannot/)).toBeTruthy();
 
-    expect(reviewRedo).toHaveBeenCalledWith(undefined);
+    await userEvent.type(screen.getByPlaceholderText(/how the contradiction/), '以正文为准：开场改雨渐停');
+    expect(redo).toBeEnabled();
+    await userEvent.click(redo);
+
+    expect(reviewRedo).toHaveBeenCalledWith('以正文为准：开场改雨渐停', 'sess-cr');
+  });
+
+  it('W5 D-c：brief 打回规划环意见必填 + 键名 agent.briefRedo（redo 走 brief-compiler 重编）', async () => {
+    useAppStore.setState({ agentSessionId: 'sess-cr', pausedReviewBySession: { 'sess-cr': briefMeta } } as any);
+
+    render(<ChapterReviewPanel />);
+    const redo = screen.getByRole('button', { name: 'Send plan loop back' });
+    expect(redo).toBeDisabled();
+
+    await userEvent.type(screen.getByPlaceholderText(/Hook swap/), '钩子换掉');
+    expect(redo).toBeEnabled();
+    await userEvent.click(redo);
+
+    expect(reviewRedo).toHaveBeenCalledWith('钩子换掉', 'sess-cr');
   });
 
   it('#83/#84：真 draft checkpoint（resumeOptions 三钮）按钮照旧（零回归）', () => {
@@ -412,7 +447,7 @@ describe('ChapterReviewPanel', () => {
 
   it('intent confirm card aligns to insight-* language: source badge in title row, authority badges, shared button classes', () => {
     useAppStore.setState({ agentSessionId: 'sess-cr',
- pausedReviewBySession: { 'sess-cr': draftMeta }, compiledIntent: SAMPLE_INTENT } as any);
+ pausedReviewBySession: { 'sess-cr': draftMeta }, compiledIntentBySession: { 'sess-cr': SAMPLE_INTENT } } as any);
 
     const { container } = render(<ChapterReviewPanel />);
 
@@ -436,7 +471,7 @@ describe('ChapterReviewPanel', () => {
 
   it('hides selection box when reviewSelection is null', () => {
     useAppStore.setState({ agentSessionId: 'sess-cr',
- pausedReviewBySession: { 'sess-cr': draftMeta }, reviewSelection: null } as any);
+ pausedReviewBySession: { 'sess-cr': draftMeta }, reviewSelectionBySession: {} } as any);
 
     render(<ChapterReviewPanel />);
 
@@ -448,7 +483,7 @@ describe('ChapterReviewPanel', () => {
     useAppStore.setState({
       agentSessionId: 'sess-cr',
       pausedReviewBySession: { 'sess-cr': draftMeta },
-      reviewSelection: { text: '战斗开始了。', from: 5, to: 11 },
+      reviewSelectionBySession: { 'sess-cr': { text: '战斗开始了。', from: 5, to: 11 } },
     } as any);
 
     render(<ChapterReviewPanel />);
@@ -465,7 +500,7 @@ describe('ChapterReviewPanel', () => {
     useAppStore.setState({
       agentSessionId: 'sess-cr',
       pausedReviewBySession: { 'sess-cr': draftMeta },
-      reviewSelection: { text: '战斗开始了。', from: 5, to: 11 },
+      reviewSelectionBySession: { 'sess-cr': { text: '战斗开始了。', from: 5, to: 11 } },
     } as any);
 
     render(<ChapterReviewPanel />);
@@ -482,7 +517,7 @@ describe('ChapterReviewPanel', () => {
     useAppStore.setState({
       agentSessionId: 'sess-cr',
       pausedReviewBySession: { 'sess-cr': { ...draftMeta, briefContent: { goal: ' Establish stakes' } } },
-      reviewSelection: { text: '战斗开始了。', from: 5, to: 11 },
+      reviewSelectionBySession: { 'sess-cr': { text: '战斗开始了。', from: 5, to: 11 } },
     } as any);
 
     render(<ChapterReviewPanel />);
@@ -490,7 +525,8 @@ describe('ChapterReviewPanel', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Compile revision intent' }));
 
     expect(compileIntent).toHaveBeenCalledTimes(1);
-    // BMad CR F2：6 args = (selectedPassage, userInstruction, selectionFrom, selectionTo, draftText, chapterContext)。
+    // BMad CR F2：args = (selectedPassage, userInstruction, selectionFrom, selectionTo, draftText,
+    // chapterContext, sessionId?)——W4 尾参携目标会话。
     // from/to 来自 reviewSelection（ProseMirror 位置），draftText 来自 pausedReview.draftContent，
     // chapterContext = stringified brief。IPC 层纯代码构 scope.anchor（非 LLM 产）。
     expect(compileIntent).toHaveBeenCalledWith(
@@ -500,6 +536,7 @@ describe('ChapterReviewPanel', () => {
       11, // selectionTo
       expect.any(String), // draftText (pausedReview.draftContent)
       expect.any(String), // chapterContext (stringified brief)
+      'sess-cr', // sessionId (W4 尾参)
     );
   });
 
@@ -507,20 +544,20 @@ describe('ChapterReviewPanel', () => {
     useAppStore.setState({
       agentSessionId: 'sess-cr',
       pausedReviewBySession: { 'sess-cr': draftMeta },
-      reviewSelection: { text: '战斗开始了。', from: 5, to: 11 },
+      reviewSelectionBySession: { 'sess-cr': { text: '战斗开始了。', from: 5, to: 11 } },
     } as any);
 
     render(<ChapterReviewPanel />);
     await userEvent.click(screen.getByRole('button', { name: 'Clear selection' }));
 
-    expect(setReviewSelection).toHaveBeenCalledWith(null);
+    expect(setReviewSelection).toHaveBeenCalledWith('sess-cr', null);
   });
 
   it('renders intentCompileError hint when set (graceful, not silent)', () => {
     useAppStore.setState({
       agentSessionId: 'sess-cr',
       pausedReviewBySession: { 'sess-cr': draftMeta },
-      intentCompileError: 'optimizer timeout',
+      intentCompileErrorBySession: { 'sess-cr': 'optimizer timeout' },
     } as any);
 
     render(<ChapterReviewPanel />);
@@ -532,8 +569,8 @@ describe('ChapterReviewPanel', () => {
     useAppStore.setState({
       agentSessionId: 'sess-cr',
       pausedReviewBySession: { 'sess-cr': draftMeta },
-      reviewSelection: { text: '战斗开始了。', from: 5, to: 11 },
-      intentCompiling: true,
+      reviewSelectionBySession: { 'sess-cr': { text: '战斗开始了。', from: 5, to: 11 } },
+      intentCompilingBySession: { 'sess-cr': true },
     } as any);
 
     render(<ChapterReviewPanel />);
@@ -548,7 +585,7 @@ describe('ChapterReviewPanel', () => {
     useAppStore.setState({
       agentSessionId: 'sess-cr',
       pausedReviewBySession: { 'sess-cr': draftMeta },
-      compiledIntent: SAMPLE_INTENT,
+      compiledIntentBySession: { 'sess-cr': SAMPLE_INTENT },
     } as any);
 
     render(<ChapterReviewPanel />);
@@ -570,7 +607,7 @@ describe('ChapterReviewPanel', () => {
     useAppStore.setState({
       agentSessionId: 'sess-cr',
       pausedReviewBySession: { 'sess-cr': draftMeta },
-      compiledIntent: SAMPLE_INTENT,
+      compiledIntentBySession: { 'sess-cr': SAMPLE_INTENT },
     } as any);
 
     render(<ChapterReviewPanel />);
@@ -589,7 +626,7 @@ describe('ChapterReviewPanel', () => {
     useAppStore.setState({
       agentSessionId: 'sess-cr',
       pausedReviewBySession: { 'sess-cr': draftMeta },
-      compiledIntent: SAMPLE_INTENT,
+      compiledIntentBySession: { 'sess-cr': SAMPLE_INTENT },
     } as any);
 
     render(<ChapterReviewPanel />);
@@ -602,7 +639,7 @@ describe('ChapterReviewPanel', () => {
     useAppStore.setState({
       agentSessionId: 'sess-cr',
       pausedReviewBySession: { 'sess-cr': draftMeta },
-      compiledIntent: SAMPLE_INTENT,
+      compiledIntentBySession: { 'sess-cr': SAMPLE_INTENT },
     } as any);
 
     render(<ChapterReviewPanel />);
@@ -626,7 +663,7 @@ describe('ChapterReviewPanel', () => {
     useAppStore.setState({
       agentSessionId: 'sess-cr',
       pausedReviewBySession: { 'sess-cr': draftMeta },
-      compiledIntent: SAMPLE_INTENT,
+      compiledIntentBySession: { 'sess-cr': SAMPLE_INTENT },
     } as any);
 
     render(<ChapterReviewPanel />);
@@ -650,7 +687,7 @@ describe('ChapterReviewPanel', () => {
     useAppStore.setState({
       agentSessionId: 'sess-cr',
       pausedReviewBySession: { 'sess-cr': draftMeta },
-      compiledIntent: SAMPLE_INTENT,
+      compiledIntentBySession: { 'sess-cr': SAMPLE_INTENT },
     } as any);
 
     render(<ChapterReviewPanel />);
@@ -671,7 +708,7 @@ describe('ChapterReviewPanel', () => {
     useAppStore.setState({
       agentSessionId: 'sess-cr',
       pausedReviewBySession: { 'sess-cr': draftMeta },
-      compiledIntent: SAMPLE_INTENT,
+      compiledIntentBySession: { 'sess-cr': SAMPLE_INTENT },
     } as any);
 
     render(<ChapterReviewPanel />);
@@ -693,9 +730,9 @@ describe('ChapterReviewPanel', () => {
     useAppStore.setState({
       agentSessionId: 'sess-cr',
       pausedReviewBySession: { 'sess-cr': draftMeta },
-      reviewSelection: { text: '战斗开始了。', from: 5, to: 11 },
-      compiledIntent: SAMPLE_INTENT,
-      reviewResuming: true,
+      reviewSelectionBySession: { 'sess-cr': { text: '战斗开始了。', from: 5, to: 11 } },
+      compiledIntentBySession: { 'sess-cr': SAMPLE_INTENT },
+      reviewResumingBySession: { 'sess-cr': true },
     } as any);
 
     render(<ChapterReviewPanel />);
@@ -705,5 +742,44 @@ describe('ChapterReviewPanel', () => {
     expect((screen.getByRole('button', { name: 'Revise intent' }) as HTMLButtonElement).disabled).toBe(true);
     expect((screen.getByRole('button', { name: 'Cancel' }) as HTMLButtonElement).disabled).toBe(true);
     expect((screen.getByRole('button', { name: 'Continue' }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  // ── 链流程重排 W2 + CR-18 interim → 09-13 子3 W5：final 分支迁 FinalReviewCard ──
+
+  it('W5：final stage 载荷 → 渲染空（终稿卡归 FinalReviewCard，ReviewPhaseView 路由分派）', () => {
+    useAppStore.setState({ currentProject: { path: '/proj' } } as any);
+    useAppStore.setState({
+      agentSessionId: 'sess-cr',
+      pausedReviewBySession: { 'sess-cr': finalMeta },
+    } as any);
+
+    const { container } = render(<ChapterReviewPanel />);
+    expect(container.querySelector('.chapter-review')).toBeNull();
+  });
+
+  // ── 09-13 子3 W4：props sessionId 化（写作页挂载形态——后台会话直审不切走） ──
+
+  it('W4：props sessionId → 读目标会话的 pausedReview 键 + 动作转发携该 sid（非视图会话）', async () => {
+    useAppStore.setState({
+      agentSessionId: 'sess-view',
+      pausedReviewBySession: { 'sess-bg': draftMeta },
+    } as any);
+
+    render(<ChapterReviewPanel sessionId="sess-bg" />);
+
+    // 读目标会话（后台链会话）的键——视图会话（sess-view）无键不渲染干扰。
+    expect(screen.getByText('Chapter review')).toBeTruthy();
+    expect(screen.getByTestId('mock-tiptap').textContent).toBe('第一章草稿正文。这是测试内容。');
+    await userEvent.click(screen.getByRole('button', { name: 'Continue' }));
+    expect(reviewContinue).toHaveBeenCalledWith('sess-bg');
+  });
+
+  it('W4：props sessionId 缺席 → 兜底视图会话（既有挂载形态零回归）', async () => {
+    useAppStore.setState({ agentSessionId: 'sess-cr', pausedReviewBySession: { 'sess-cr': draftMeta } } as any);
+
+    render(<ChapterReviewPanel />);
+    await userEvent.click(screen.getByRole('button', { name: 'Continue' }));
+
+    expect(reviewContinue).toHaveBeenCalledWith('sess-cr');
   });
 });

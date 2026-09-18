@@ -7,7 +7,8 @@ import { AgentInput } from './AgentInput';
 import { AgentHistory } from './AgentHistory';
 import { AgentSettings } from './AgentSettings';
 import { PatchReviewPanel } from './PatchReviewPanel';
-import { ChapterReviewPanel } from './ChapterReviewPanel';
+// 09-13 子3 W4（design §5 / D2+D-g）：全尺寸审阅卡迁写作页——对话栏瘦身，挂载位换轻量提示。
+import { ReviewPendingNotice } from './ReviewPendingNotice';
 import { AuthorProfilePatchCard, pendingAuthorProfilePatchResults } from './AuthorProfilePatchCard';
 import { SettingMdPatchCard, pendingSettingMdPatchResults } from './SettingMdPatchCard';
 import { batchProgressFrom, findActiveBatch } from './batchMeta';
@@ -15,12 +16,16 @@ import { roleLabel } from './toolMeta';
 import { GEAR_OPTIONS, gearLabelKey } from './gearMeta';
 import { deriveChildActivity } from './messageGrouping';
 import type { ParticipationGear } from '@orison/shared-contracts';
-import { deriveSessionBadge, type SessionBadgeState } from '../../shared/store/agentEvents';
+import { deriveSessionBadge, getSessionProject, type SessionBadgeState } from '../../shared/store/agentEvents';
+// 09-13 子3 CR-7（09-18 CR 批 B）：后台链待审卡的项目归属过滤（同 spec 路径比较单源纪律）。
+import { sameProjectPath } from '../../shared/store/projectRunBusy';
 import { compactAgentSession } from '../../shared/api/agent';
 import { INBOX_UPLOAD_EXTENSIONS } from '../../shared/api/inboxAttachments';
 // 09-01 B4（dogfood #45）：drop 图片分支接管——白名单与 canvas 预检压缩同源（单源常量）。
 // CR-003a：识图转述进度订阅收口在 api 层（boundary rule——组件不直碰 window.orisonDesktop）。
 import { CHAT_IMAGE_EXT_RE, subscribeImageRelayProgress } from '../../shared/api/chatImages';
+// 09-12 子5 CR-13：余量条 title 原始 token 数千分位格式化（单源 numberFormat——与用量页同源）。
+import { formatTokenCount } from '../../shared/utils/numberFormat';
 import { useToastStore } from '../../shared/store/toastStore';
 import { useEffect, useMemo, useRef, useState } from 'react';
 
@@ -49,14 +54,21 @@ export function AgentPanel() {
     agentMessages, activeSessionRunning, agentError,
     newAgentSession, loadAgentSessions, loadAgentSkills,
     agentSessionId,
-    hasPendingPatch, resolvedLocale,
+    hasNonChainPatch, hasChapterCandidatePatch, resolvedLocale,
     agentExpanded, toggleAgentExpanded,
     hasPausedReview,
     agentParticipationGear, setAgentParticipationGear,
     agentSessions,
     resolvedAuthorProfilePatches, resolvedSettingMdPatches,
     uploadInboxFiles, uploadChatImages,
-  } = useAppStore(useShallow((s) => ({
+    contextUsageBySession,
+  } = useAppStore(useShallow((s) => {
+    // dogfood T1 Stage 3（r8 键控）：挂载门只看当前视图会话的键（后台挂起卡不顶前台面板）。
+    // 09-13 子3 W4（D-g 切分）：patch 挂载门按「是否含链产物 chapter_candidate」拆两判定——
+    // 含非链 patch（outline/世界/信息释放/情绪/决策——对话指挥产物）→ 渲染过滤后的 PatchReviewPanel；
+    // 含 chapter_candidate（链产物）→ ReviewPendingNotice 轻量提示跳写作页（混合批两者并存）。
+    const viewPending = s.agentSessionId ? s.pendingPatchBySession[s.agentSessionId]?.patch : undefined;
+    return {
     agentMessages: s.agentMessages,
     activeSessionRunning: s.activeSessionRunning,
     agentError: s.agentError,
@@ -64,8 +76,8 @@ export function AgentPanel() {
     loadAgentSessions: s.loadAgentSessions,
     loadAgentSkills: s.loadAgentSkills,
     agentSessionId: s.agentSessionId,
-    // dogfood T1 Stage 3（r8 键控）：挂载门只看当前视图会话的键（后台挂起卡不顶前台面板）。
-    hasPendingPatch: s.agentSessionId ? s.pendingPatchBySession[s.agentSessionId] !== undefined : false,
+    hasNonChainPatch: viewPending !== undefined && viewPending.patches.some((p) => (p.field as string) !== 'chapter_candidate'),
+    hasChapterCandidatePatch: viewPending !== undefined && viewPending.patches.some((p) => (p.field as string) === 'chapter_candidate'),
     resolvedLocale: s.resolvedLocale,
     hasPausedReview: s.agentSessionId ? s.pausedReviewBySession[s.agentSessionId] !== undefined : false,
     agentExpanded: s.agentExpanded,
@@ -78,7 +90,10 @@ export function AgentPanel() {
     resolvedSettingMdPatches: s.resolvedSettingMdPatches,
     uploadInboxFiles: s.uploadInboxFiles,
     uploadChatImages: s.uploadChatImages,
-  })));
+    // 09-12 子5 R6：leader 上下文占用 last 值（context-usage 事件源；本会话条数据源）。
+    contextUsageBySession: s.contextUsageBySession,
+    };
+  }));
 
   const { t } = useI18n(resolvedLocale);
   const showToast = useToastStore((s) => s.showToast);
@@ -147,6 +162,25 @@ export function AgentPanel() {
     return counts;
   }));
 
+  // ── 09-13 子3 CR-7（09-18 CR 批 B）：后台链待审卡 ──
+  // 本项目内**非视图会话**的 paused 链（chainRunBySession × 项目归属过滤 × sid !== agentSessionId）
+  // → ReviewPendingNotice 轻量卡（跳写作页 + 选链 + 进审阅——W5 接口已在）。design §1.3「暂停的
+  // 是后台链：不抢——chip badge「待审」+ 对话栏提示卡」的后半承诺在此补全（此前只有写作页
+  // chip 徽标，对话栏零提示）。与既有视图会话卡的去重 = sid 排除（视图会话的挂起卡走
+  // hasPausedReview 位，同链不在本列表二次渲染）；链车道 stub sid ≠ 视图会话 id，天然按此分线。
+  const backgroundPausedChainSids = useAppStore(useShallow((s) => {
+    const path = s.currentProject?.path;
+    if (path === undefined) return [];
+    const sids: string[] = [];
+    for (const [sid, run] of Object.entries(s.chainRunBySession)) {
+      if (sid === s.agentSessionId) continue;
+      if (run?.status !== 'paused') continue;
+      if (!sameProjectPath(getSessionProject(sid), path)) continue;
+      sids.push(sid);
+    }
+    return sids;
+  }));
+
   // dogfood T1 Stage 5（design §6.4/§7.4，D5）：当前会话活跃 child 组聚合徽标——
   // progress_activity 图标 + 角色 chip 组 + 「第 N 步」摘要（最活跃组）。空闲不占位。
   // dogfood T1 CR-T1-036：活跃判定升级为整次派发级（deriveChildActivity 透传
@@ -167,6 +201,27 @@ export function AgentPanel() {
     () => pendingSettingMdPatchResults(agentMessages, resolvedSettingMdPatches),
     [agentMessages, resolvedSettingMdPatches],
   );
+
+  // ── 09-12 子5 R6（design §11）：leader 上下文余量条 ──
+  // 当前会话的 context-usage last 值 → 占用百分比条。三态：无快照（会话重载后事件未到）
+  // 或 windowTokens null（注入原值无窗口信息——不显示假数）→ 条隐藏；percent ≥
+  // redlinePercent → 变色（把「到红线自动压缩」语义前置可视化）。估算口径与压缩触发同源
+  // （prepareContext loadTokens × 校准比——agent 侧同一次计算），UI 只渲染不重算。
+  const contextUsage = agentSessionId ? contextUsageBySession[agentSessionId] : undefined;
+  const contextUsageView = useMemo(() => {
+    if (!contextUsage || contextUsage.windowTokens === null || contextUsage.windowTokens <= 0) {
+      return null;
+    }
+    const percent = Math.max(
+      0,
+      Math.min(100, Math.round((contextUsage.usedTokens / contextUsage.windowTokens) * 100)),
+    );
+    return {
+      percent,
+      atRedline: percent >= contextUsage.redlinePercent,
+      title: `${formatTokenCount(contextUsage.usedTokens)} / ${formatTokenCount(contextUsage.windowTokens)} tokens`,
+    };
+  }, [contextUsage]);
 
   const expandLabel = agentExpanded
     ? t('workspace.collapseWorkbench')
@@ -377,6 +432,28 @@ export function AgentPanel() {
         </div>
       </div>
 
+      {/* 09-12 子5 R6（design §11）：leader 上下文余量条（header 与 body 之间的细条）。
+          隐藏三态：无快照 / windowTokens null（无窗口信息不显示假数）/ 无会话；
+          ≥红线变色（is-redline）——压缩红线语义前置可视化；「估算」小标 + title 原始
+          token 数。仅 leader 会话（child/链事件不含本变体，天然不在作用面）。 */}
+      {contextUsageView && (
+        <div
+          className={`agent-context-usage${contextUsageView.atRedline ? ' is-redline' : ''}`}
+          role="status"
+          title={contextUsageView.title}
+        >
+          <span className="agent-context-usage-label">{t('usagePanel.contextBarLabel')}</span>
+          <div className="agent-context-usage-track" aria-hidden="true">
+            <div
+              className="agent-context-usage-fill"
+              style={{ width: `${contextUsageView.percent}%` }}
+            />
+          </div>
+          <span className="agent-context-usage-percent">{contextUsageView.percent}%</span>
+          <span className="agent-context-usage-est">{t('usagePanel.contextBarEstimated')}</span>
+        </div>
+      )}
+
       <div className="agent-panel-body">
         {view === 'history' ? (
           <AgentHistory onClose={() => setView('chat')} />
@@ -421,7 +498,10 @@ export function AgentPanel() {
               </div>
             )}
             <AgentMessages messages={agentMessages} loading={activeSessionRunning} error={agentError} />
-            {hasPendingPatch && <PatchReviewPanel />}
+            {/* 09-13 子3 W4（D-g 切分）：chapter_candidate（链产物）不在对话栏渲染全尺寸卡——
+                轻量提示跳写作页产物区审阅落盘；非链 patch（对话指挥产物）照常全尺寸渲染（过滤后）。 */}
+            {hasChapterCandidatePatch && <ReviewPendingNotice kind="chapter-patch" sessionId={agentSessionId} />}
+            {hasNonChainPatch && <PatchReviewPanel excludeChapterCandidate />}
             {/* R2 #25：suggest 档审阅卡未决钉底（mirror PatchReviewPanel 位——滚动区外
                 恒可见）；resolved 后自动回消息流内联原位。 */}
             {pendingSettingMdCards.map((r, i) => (
@@ -430,7 +510,15 @@ export function AgentPanel() {
             {pendingAuthorProfileCards.map((r, i) => (
               <AuthorProfilePatchCard key={`pinned-author-profile-${i}`} result={r} />
             ))}
-            {hasPausedReview && <ChapterReviewPanel />}
+            {/* 09-13 子3 W4/W5（design §5.3）：ChapterReviewPanel 迁写作页（features/writing）——
+                对话栏挂载位换 ReviewPendingNotice 轻量提示（跳转 = 切写作页 + 选中该链 + 进审阅相位
+                ——sessionId = 视图会话，与挂载判定同键）。 */}
+            {hasPausedReview && <ReviewPendingNotice kind="chapter-review" sessionId={agentSessionId} />}
+            {/* 09-13 子3 CR-7（09-18 CR 批 B）：后台链待审卡（本项目非视图会话 paused 链——
+                每链一张；跳转带各自 sessionId 写显式选择）。 */}
+            {backgroundPausedChainSids.map((sid) => (
+              <ReviewPendingNotice key={`bg-chain-${sid}`} kind="chapter-review" sessionId={sid} />
+            ))}
             <AgentInput />
           </div>
         )}

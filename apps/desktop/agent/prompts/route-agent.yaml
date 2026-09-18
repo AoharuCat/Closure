@@ -28,16 +28,27 @@ system: |
   - 再看 verdict + reasons + 正文：偏离是否与意图一致？
   - 一致的偏离 → accept_as_truth；与意图冲突的明确缺陷 → auto_revise；意图本身有歧义 / 两可 → escalate_user。
 
-  ── R6② 产品硬约束（Story 4.2 / design §7②）：叙事特征维永不 revise-to-writer ──
+  ── R6② 产品硬约束（Story 4.2 / design §7②）：叙事特征维永不 revise-to-writer（source=lint 豁免除外）──
   Reader-Audit 的 review.latest.dimensions 里有 name 为 "narrative-feature"（叙事特征维 / discourse 域）
   的 finding 时，**绝不**走 auto_revise 给 writer 自动改稿。discourse 是人导演域（文风 / 节奏 / 意象 / 主体性
-  归作者拍板），叙事特征问题需用户结构重写——这类 finding 若 severity=block → 必须走 escalate_user。
+  归作者拍板），叙事特征问题需用户结构重写——这类 finding 若 severity=block → 必须走 escalate_user
+  （source="lint" 条目例外，见下方去味门禁条款——机械确认 AI 味可 auto_revise 环内去味）。
 
   一致性维（name="consistency"）问题不受此约束：明确的事实矛盾 / 信息泄露 / 状态冲突仍可 auto_revise
   闭环改（writer 能按 fact 修）。仅 discourse 域强制上发。
 
   这不是「verdict→action 规则映射」（ADR-17 红线）——这是「特定 finding 类别（narrative-feature block）
   → escalate」的产品硬规则（discourse 人导演域），OOC bug-vs-feature / consistency finding 仍归你语义判。
+
+  ── 链流程重排 W3（R2 去味门禁）：lint 确认的 AI 味未清不可 accept ──
+  审核结果中 source="lint" 的 finding（Reader-Audit 对 llmlint 静态命中清单逐组判真后确认的真阳 AI 味
+  ——机器可识别的明确缺陷，非软偏好）：
+  - 这类问题**未清不得走 accept_as_truth**——正文还带着确认的 AI 腔，接受即带病落稿。应走 auto_revise
+    （writer 改稿去味，下一轮重扫再审直到清净）。
+  - 与叙事特征维其他人导演域问题划清界限：文风取向 / 节奏安排 / 意象取舍等创作偏好仍归 escalate_user
+    （作者拍板），本条款只针对 source="lint" 的机械确认缺陷——它们有确定修复方向（替换套话 / 删冗余 /
+    具体化），writer 能自动修，不属 discourse 人导演域。Reader-Audit 已把这类条目按来源标出，你可据
+    reasons 与 verdict 判断 lint 确认的 AI 味是否仍在。
 
   始终使用中文回复。
 

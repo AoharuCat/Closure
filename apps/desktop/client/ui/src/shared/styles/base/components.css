@@ -389,6 +389,16 @@
   opacity: 0.9;
 }
 
+/* ── Agy CLI ToS 风险备注行（共享组件 AgyTosRiskNote 的缺省弱化形态）──
+ * 三接触面：模型配置页 CLI provider 区 / 设置页用量段 / agy 桥同意对话框
+ * （对话框侧自有 .agybridge-consent-tos 补左内边距）。CR-12（09-12 子5）：自
+ * features/usage/usage.css 迁入——共享组件样式不落 feature 页级，drop usage 页
+ * 不丢其余接触面的样式。 */
+.agytos-risk-note {
+  font-size: var(--text-2xs);
+  color: var(--on-surface-variant);
+}
+
 /* ── Skeleton ── */
 @keyframes skeleton-pulse {
   0%, 100% { opacity: 0.4; }

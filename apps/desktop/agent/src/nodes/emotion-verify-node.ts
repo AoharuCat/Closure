@@ -27,7 +27,7 @@ type EpisodeOutline = z.infer<(typeof episodeOutlinesSchema)>[number];
 // promise-emergence（读 world-state patches 登记 Promise）。emotion-verify 在 emergence 前确保 payoff 联动读到
 // 的 promise_registry 是当前章截止态（emergence 本章登记的 payoff 同章不反向影响 setpoint，避循环，design §3）。
 //
-// 🔑 范式判据（ADR-3 / .trellis/spec/core/creative-vs-mechanical.md §5.3 段）：本节点 = 纯代码机械组装——
+// 🔑 范式判据（ADR-3 / .trellis/spec/core/creative-vs-mechanical.md「EmotionArc」条）：本节点 = 纯代码机械组装——
 // 取 4 数据源（emotion_curve / emotional patches / promise_registry / asset_cards）+ 调 runEmotionVerify 纯函数
 // aggregator（setpoint 衰减 / topology / DTW / payoff 联动 / refId dedupe 全确定性数学，emotion-verify.ts）。
 // **不裁判语义**：偏离后「重规划成什么」归 Director（7.3/8.1）；turning point 识别 / VAD 缺失语义距离归 LLM

@@ -1,0 +1,429 @@
+/* ── 设置页「用量」（09-12 子5，design §5）──
+ * 页面骨架复用 layout/settings.css 的 settings-page / settings-page-header 类；
+ * 本文件只承载用量页自有块（瓦片 / 表格 / 外链 / 治理区）。经 global.css @import
+ * 挂载（agent-panel.css 同款 co-located 先例）。
+ * 视觉语汇对齐既有形态，零新样式体系：瓦片 mirror .kb-index-tile（surface-container
+ * 底 + 大数字 + 小标签）；chip 配色对复用 success/diff-add-bg 与 error/error-bg；
+ * 破坏性钮 / 重试钮 / 外链 = settings 既有描边按钮路数；全部 theme token，无裸色值。 */
+
+.usage-settings-page {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-lg);
+}
+
+/* ── 聚合瓦片行 ── */
+
+.usage-tiles {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-sm);
+}
+
+.usage-tile {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3xs);
+  padding: var(--space-md) var(--space-lg);
+  border-radius: var(--radius-md);
+  background: var(--surface-container);
+}
+
+.usage-tile-window {
+  font-size: var(--text-2xs);
+  font-weight: 500;
+  color: var(--on-surface-variant);
+}
+
+/* 窗口口径备注（「（保留窗内累计…）」）——标签行内弱化后缀。 */
+.usage-tile-note {
+  margin-left: var(--space-3xs);
+  font-weight: 400;
+  color: var(--outline);
+}
+
+/* 大数字 + 小单位（基线对齐：数字是瓦片视觉锚点，单位降权）。 */
+.usage-tile-value-row {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2xs);
+}
+
+.usage-tile-value {
+  font-size: var(--text-xl);
+  font-weight: 600;
+  line-height: 1.15;
+  color: var(--on-surface);
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-tile-unit {
+  font-size: var(--text-2xs);
+  color: var(--outline);
+}
+
+.usage-tile-calls {
+  font-size: var(--text-2xs);
+  color: var(--on-surface-variant);
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-tile-breakdown {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3xs) var(--space-sm);
+  font-size: var(--text-2xs);
+  color: var(--on-surface-variant);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 估算金额小字（有价才渲染；恒带「仅供参考」标注）——虚线分隔 + 后置，
+ * 与上方计量小字分层（估算属派生信息，视觉再退一档）。 */
+.usage-tile-cost {
+  margin-top: var(--space-2xs);
+  padding-top: var(--space-2xs);
+  border-top: 1px dashed var(--border-subtle);
+  font-size: var(--text-2xs);
+  color: var(--on-surface-variant);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 「仅供参考」chip（mirror .agent-child-group-count 的 chip-bg pill 形态）。 */
+.usage-cost-tag {
+  display: inline-block;
+  margin-left: var(--space-2xs);
+  padding: 0 var(--space-2xs);
+  border-radius: var(--radius-pill);
+  background: var(--chip-bg);
+  color: var(--chip-text);
+  font-size: var(--text-3xs);
+  white-space: nowrap;
+}
+
+/* ── 分解表（per-model / per-task）与最近调用列表 ── */
+
+.usage-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--text-xs);
+}
+
+/* 表头降权：小一号 + 半粗 + 字距，与数据行拉开层级。 */
+.usage-table th {
+  padding: var(--space-2xs) var(--space-sm);
+  border-bottom: 1px solid var(--outline-variant);
+  color: var(--on-surface-variant);
+  font-size: var(--text-2xs);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.usage-table td {
+  padding: var(--space-2xs) var(--space-sm);
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--on-surface);
+  font-variant-numeric: tabular-nums;
+  vertical-align: top;
+  white-space: nowrap;
+}
+
+/* 行悬停浅底（数据行扫读辅助，20 行最近调用表受益最大）。 */
+.usage-table tbody tr:hover td {
+  background: var(--hover-overlay);
+}
+
+.usage-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+/* 数字列右对齐（token/金额/耗时——位对位可比）。 */
+.usage-table-num {
+  text-align: right;
+  white-space: nowrap;
+}
+
+/* 时间列弱化（最近调用表：时间是最次要的定位信息）。 */
+.usage-table-time {
+  color: var(--on-surface-variant);
+}
+
+/* NULL cell（CR-18：未上报 ≠ 0——「—」弱化呈现 + title 说明）。 */
+.usage-cell-null {
+  color: var(--outline);
+}
+
+/* 模型/键双行 cell：主行 modelId（截断悬停有 title），次行键 · 形态 · 失败数弱化。 */
+.usage-model-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.usage-model-id {
+  display: block;
+  max-width: 18rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+  color: var(--on-surface);
+}
+
+.usage-model-sub {
+  max-width: 22rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--text-2xs);
+  color: var(--on-surface-variant);
+}
+
+/* 成败徽标（填充 chip——配色对复用既有语汇：成功 = success/diff-add-bg
+ * （.outline-diff-chip 同对），失败 = error/error-bg（.insight-card-badge--hard 同对））。 */
+.usage-status-chip {
+  display: inline-block;
+  padding: 0.05rem var(--space-2xs);
+  border-radius: var(--radius-pill);
+  font-size: var(--text-2xs);
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+.usage-status-chip.is-ok {
+  color: var(--success);
+  background: var(--diff-add-bg);
+}
+
+.usage-status-chip.is-fail {
+  color: var(--error);
+  background: var(--error-bg);
+  font-weight: 500;
+}
+
+/* ── 治理区 ── */
+
+.usage-governance-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-md);
+  flex-wrap: wrap;
+}
+
+.usage-governance-info {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3xs);
+  min-width: 0;
+}
+
+/* 保留天数输入行（label + number 输入 + 单位「天」）。输入框形态 mirror
+ * .form-field-input（settings.css 既有输入语汇：outline-variant 描边 + 最低面底 +
+ * accent 聚焦），窄幅右对齐（数字朝单位收拢、tabular-nums 位对位）；token 全走
+ * 既有体系。 */
+.usage-retention-field {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2xs);
+}
+
+.usage-retention-label {
+  font-size: var(--text-sm);
+  font-weight: 500;
+  color: var(--on-surface);
+}
+
+.usage-retention-input {
+  width: 4.5rem;
+  min-height: 28px;
+  padding: 0.2rem 0.4rem;
+  border: 1px solid var(--outline-variant);
+  border-radius: var(--radius-2xs);
+  background: var(--surface-container-lowest);
+  color: var(--on-surface);
+  font: inherit;
+  font-size: var(--text-sm);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-retention-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.usage-retention-input:disabled {
+  opacity: 0.55;
+}
+
+.usage-retention-unit {
+  font-size: var(--text-sm);
+  color: var(--on-surface-variant);
+}
+
+/* 带内即时反馈（打字期越界/空值；blur 归位或落盘后消失）——错误色小字，
+ * 与下方 hint 的常规弱化分层。 */
+.usage-retention-warn {
+  font-size: var(--text-2xs);
+  color: var(--error);
+}
+
+/* 破坏性操作（清空全部记录，confirm 后不可撤销）——错误色描边形态：
+ * transparent 底 + error 字色，悬停 error-bg 填充（token 三件套，
+ * mirror .model-editor-banner.is-error 的错误色路线；确认流复用 ConfirmDialog
+ * danger 变体，不另造对话框）。 */
+.usage-clear-button {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2xs);
+  flex-shrink: 0;
+  padding: 0.35rem 0.8rem;
+  border: 1px solid color-mix(in srgb, var(--error) 45%, transparent);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--error);
+  font: inherit;
+  font-size: var(--text-sm);
+  font-weight: 500;
+  cursor: pointer;
+  transition: background var(--duration-fast) ease;
+}
+
+.usage-clear-button:hover {
+  background: var(--error-bg);
+}
+
+.usage-clear-button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.usage-clear-button:disabled:hover {
+  background: transparent;
+}
+
+.usage-clear-button .material-symbols-outlined {
+  font-size: 1rem;
+}
+
+/* ── 外链区 ── */
+
+.usage-links {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+}
+
+.usage-link-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.usage-link-button {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2xs);
+  align-self: flex-start;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  font-size: var(--text-sm);
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.usage-link-button:hover {
+  text-decoration: underline;
+}
+
+.usage-link-button .material-symbols-outlined {
+  font-size: 0.95rem;
+  color: var(--on-surface-variant);
+}
+
+/* 标注行与按钮文字对齐（icon 宽 + 间隙），层级弱于链接本体。 */
+.usage-link-note {
+  padding-left: 1.2rem;
+  font-size: var(--text-2xs);
+  color: var(--on-surface-variant);
+  line-height: 1.45;
+}
+
+/* ── 三态（加载 / 错误 / 空）── */
+
+/* 居中弱化块（mirror .agent-messages-empty 的空态语汇），flex:1 在早退页占满。 */
+.usage-state-block {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-sm);
+  padding: var(--space-2xl) var(--space-lg);
+  text-align: center;
+}
+
+.usage-state-block .material-symbols-outlined {
+  font-size: 1.75rem;
+  color: var(--outline);
+  opacity: 0.7;
+}
+
+/* 空态（数据页有瓦片在上方，弱化块不占满：图标 + 引导文案居中，单元素承载——
+ * 文本与图标同节点，避免「包一层容器」让文本匹配翻倍；图标 DOM 后置 +
+ * order:-1 视觉前置，保证元素 textContent 仍以引导文案起头）。 */
+.usage-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-sm);
+  margin: 0;
+  padding: var(--space-xl) var(--space-lg);
+  font-size: var(--text-xs);
+  color: var(--on-surface-variant);
+  line-height: 1.45;
+  text-align: center;
+}
+
+.usage-empty .material-symbols-outlined {
+  order: -1;
+  font-size: 1.75rem;
+  color: var(--outline);
+  opacity: 0.6;
+}
+
+/* 错误态重试入口（次级描边钮——mirror .agent-message-error-retry 形态；
+ * 复用 usagePanel.refresh 既有键，不立第二文案）。 */
+.usage-retry-button {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2xs);
+  padding: 0.3rem 0.8rem;
+  border: 1px solid var(--outline-variant);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--on-surface);
+  font: inherit;
+  font-size: var(--text-sm);
+  cursor: pointer;
+  transition: background var(--duration-fast) ease;
+}
+
+.usage-retry-button:hover {
+  background: var(--hover-overlay);
+}
+
+/* 弱化小字备注行（口径说明 / 提示复用）。ToS 备注样式已迁 shared/styles/base/
+ * components.css（CR-12——共享组件 AgyTosRiskNote 的样式不落 feature 页级，
+ * drop usage 页不丢 ProfileEditor/同意对话框的样式）。 */
+.usage-hint {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--on-surface-variant);
+  line-height: 1.45;
+}

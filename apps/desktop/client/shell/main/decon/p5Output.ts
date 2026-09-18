@@ -20,6 +20,14 @@ import {
 } from '@orison/shared-contracts';
 import { getDb } from '../db/index';
 import {
+  CHAPTER_HEADING_NUM_RE,
+  CHAPTER_HEADING_NUMERALS,
+  buildChapterHeadings,
+  chapterRangeLabel,
+  parseChapterHeadingNumber,
+  type ChapterHeadingInfo,
+} from '../db/chapterHeadings';
+import {
   getDeconJob,
   getDeconPassState,
   getDeconProduct,
@@ -28,26 +36,22 @@ import {
   listDeconProducts,
   upsertDeconReport,
 } from '../db/closure-decon';
-import { getMaterialRow } from '../db/materialIndexer';
 import { getLogger } from '../logger';
 import { splitParagraphBlocks, type MaterialParagraphBlock } from '../ipc/toolHandlers/materialIngest';
 import {
   DECON_STALE_NOTE,
   capDeconUnit,
   checkDeconRunBoundary,
-  deconErrMsg,
-  estimateDeconCallTokens,
   failDeconUnit,
+  loadExtractableMaterial,
   loadRunningDeconJob,
   readDeconDerivedTextFor,
-  resolveDeconActualTokens,
+  runDeconLlmCall,
   sha256DeconContent,
-  writeDeconCost,
   writeDeconPassState,
   type DeconBoundaryStop,
 } from './deconRun';
 import { getDeconLlmCore, type DeconGenerateText } from './deconLlmCore';
-import { accumulateDeconCost, wouldExceedDeconBudget } from './deconBudget';
 import { decideDeconPassReentry, extractMaterialId, transitionDeconJob } from './deconJob';
 import { hashDeconProductOutput } from './p3Label';
 import { chapterCharCounts } from './p3Metrics';
@@ -90,8 +94,13 @@ import { DECON_P4_STANCE_PROMPT, buildDeconP4BookQuestionnaire, type DeconP4Book
 
 // ── 常量（token 预算独立核算——E10.2a CR-2 配套纪律；权重为推测值注记，dogfood 首本标定）──
 
-/** 书级读法输出 token 预算（长 markdown 报告 ~3000-6000 字 ≈ 2000-4000 tokens，8192 含余量）。 */
-export const DECON_P5_BOOK_READING_MAX_TOKENS = 8_192;
+/** 书级读法输出 token 预算（长 markdown 报告 ~3000-6000 字 ≈ 2000-4000 tokens，8192 含余量）。
+ *
+ * 8192 → 16384（dogfood R3 F15 实证）：98 章/49.5 万字实书的书级读法在 8192 帽下
+ * finishReason=length 截断（capped 挂起）——大书分组纪律下读法体量随章节数增长，
+ * 8192 只够中等书；对齐预算侧 DECON_P5_BOOK_READING_TOKENS(20_000) 口径内抬帽。
+ */
+export const DECON_P5_BOOK_READING_MAX_TOKENS = 16_384;
 
 /** 每章章评输出 token 预算（~800-2000 字 markdown，4096 含余量）。 */
 export const DECON_P5_CHAPTER_REVIEW_MAX_TOKENS = 4_096;
@@ -127,6 +136,11 @@ export const DECON_P5_SCENE_INTENSE_BEAT_WEIGHT = 1.5;
 /** 其余情绪拍权重（每拍计权——推测值）。 */
 export const DECON_P5_SCENE_BEAT_WEIGHT = 0.5;
 
+/**
+ * 截断升帽重试倍数常量已退役（CR-4）：callDeconP5Generate 收口 deconRun.runDeconLlmCall 共享
+ * 脚手架——帽倍率单源 DECON_LLM_RETRY_ESCALATE（deconRun.ts）。
+ */
+
 // ── report 产物 hash 单源（product 族 hashDeconProductOutput 的 report 版——键序自控防重入漂移）──
 
 /**
@@ -135,6 +149,179 @@ export const DECON_P5_SCENE_BEAT_WEIGHT = 0.5;
  */
 export function hashDeconReportOutput(contentMd: string, anchors: readonly DeconSpan[]): string {
   return hashDeconProductOutput({ contentMd, anchors });
+}
+
+// ── 章标真值与引用回查（R1/F19——dogfood R3 实证：chapters[0] 可能是简介伪章〔title null、
+//    index 0〕，真章「第N章」的 index ≈ N，index+1 渲染族整体偏移 1。章引用一律锚定**真实
+//    章标行原词**（章号从章标行解析），无章标章语义回落——零序号算术。范式判据：确定性装配面
+//    直接修；LLM 散文引用只核验标注不改写）──
+
+/** 散文「第N章」类引用提取（含区间形「第M-N章」与可选标题尾——书名号/引号/裸词三形态）。 */
+const DECON_CHAPTER_REF_NUM = `[0-9０-９]+|[${CHAPTER_HEADING_NUMERALS}]{1,8}`;
+const DECON_CHAPTER_REF_TAIL = "[^\\s，。；：、！？…—·（）()《》〈〉「」『』【】\\[\\]\"“”‘\\'#*|/\\\\-]{1,30}";
+/** 区间连接符（CR-10：补全角减号与「到」——「第3章到第5章」不再吞成伪标题尾致末号失验）。 */
+const DECON_CHAPTER_REF_RANGE_CONN = '[-–—~－至到]';
+/**
+ * 区间尾形态（CR-10，单捕获组两分支）：「第M-N章」族（连接符在两号之间）与「第M章到第N章」
+ * 族（首号自带章尾再接连接符——旧 regex 不认 → 「到第5章」被吞进首号的标题尾、末号失验）。
+ */
+const DECON_CHAPTER_REF_RANGE_TAIL = `\\s*(?:${DECON_CHAPTER_REF_RANGE_CONN}\\s*(?:第\\s*)?|章\\s*${DECON_CHAPTER_REF_RANGE_CONN}\\s*(?:第\\s*)?)`;
+const DECON_CHAPTER_REF_RE = new RegExp(
+  `[【\\[]?第\\s*(${DECON_CHAPTER_REF_NUM})(?:${DECON_CHAPTER_REF_RANGE_TAIL}(${DECON_CHAPTER_REF_NUM}))?\\s*章(?:\\s*[《「『“]([^《」『”]{1,50})[》」』”]|\\s*(${DECON_CHAPTER_REF_TAIL}))?`,
+  'g',
+);
+
+/** 章标真值类型（单源 db/chapterHeadings——prompt 对照表 / 渲染标签 / 引用回查三方共用）。 */
+export type DeconChapterHeadingInfo = ChapterHeadingInfo;
+
+/** 章节章标对照表块（全量/分组/汇总三 prompt 共用——LLM 章引用的唯一权威来源，R1/F19）。 */
+function renderDeconChapterHeadingTable(headings: ReadonlyMap<number, DeconChapterHeadingInfo>): string {
+  const lines = ['【章节章标对照表（提到任何一章时，引用必须照抄此表里的章标原词；禁止按内部序号自行推算章号）】'];
+  for (const info of headings.values()) lines.push(`- ${info.label}`);
+  return lines.join('\n');
+}
+
+export type DeconChapterRefMismatchKind = 'number-missing' | 'title-mismatch';
+
+/** 单条章引用错位（纯代码核验产物——只标注不改写）。 */
+export interface DeconChapterRefMismatch {
+  kind: DeconChapterRefMismatchKind;
+  /** 引用原文（含可选标题尾——match 截尾 trim）。 */
+  refText: string;
+  /** 引用章号（解析值）。 */
+  refNumber: number | null;
+  /** 引用携带的标题（书名号/引号/裸词捕获 trim；无 = null）。 */
+  refTitle: string | null;
+  /** 错位可定位的实际材料章（title-mismatch 必有；number-missing = null）。 */
+  actualChapterIndex: number | null;
+  /** 实际章标签签（label 形态）。 */
+  actualLabel: string | null;
+}
+
+export interface DeconChapterRefCheckResult {
+  /** 原文（无错位）或末尾附「章引用校验」注记后的文本。 */
+  contentMd: string;
+  /** 可定位错位章的材料 span（commit anchors 承载——纯标注）。 */
+  anchors: DeconSpan[];
+  mismatches: readonly DeconChapterRefMismatch[];
+}
+
+/**
+ * 章引用回查（纯函数——R1/F19 后半，范式判据：只标注不改写 LLM 散文）：从 contentMd 提取
+ * 「第N章」类引用（含区间形与可选标题尾）→ 对照真实章标行核验——(a) 引用标题命中他章
+ * （title-mismatch，可定位实际章）；(b) 章号在章标集中不存在（number-missing——含简介伪章
+ * 书的「第0章」与越界章号）。错位者进 anchors（可定位章的材料 span）+ contentMd 末尾附
+ * 「章引用校验」注记段；无错位零改动。材料无「第N章」族章标时核验面不成立，整体跳过。
+ */
+export function checkDeconChapterReferences(
+  contentMd: string,
+  chapters: ReadonlyArray<
+    Pick<Material['chapters'][number], 'index' | 'title' | 'charStart' | 'charEnd' | 'paraStart' | 'paraEnd'>
+  >,
+  headings: ReadonlyMap<number, DeconChapterHeadingInfo>,
+): DeconChapterRefCheckResult {
+  // 章号存在集（「第N章」是否在材料章标号域——纯存在性判定，无归因语义，天然免疫重复键）。
+  const chapterNumbers = new Set<number>();
+  // 标题 → 章映射（title-mismatch 定位用）：重复键即弃（CR-9）——同标题被多章持有时该标题
+  // 退出核验，不 last-write-wins 归错章（否则引用被误定位到末次持有章 → 误报 + 错锚）。
+  const indexByTitle = new Map<string, number>();
+  const ambiguousTitles = new Set<string>();
+  const setUniqueTitle = (title: string, chapterIndex: number): void => {
+    if (ambiguousTitles.has(title)) return;
+    const existing = indexByTitle.get(title);
+    if (existing === undefined) {
+      indexByTitle.set(title, chapterIndex);
+      return;
+    }
+    if (existing === chapterIndex) return; // 同章重复登记（title 与章标行尾同词）非冲突
+    indexByTitle.delete(title);
+    ambiguousTitles.add(title);
+  };
+  for (const chapter of chapters) {
+    const info = headings.get(chapter.index);
+    if (info !== undefined && info.number !== null) chapterNumbers.add(info.number);
+    if (chapter.title !== null && chapter.title.length > 0) setUniqueTitle(chapter.title, chapter.index);
+    if (info !== undefined && info.headingLine !== null) {
+      const numMatch = CHAPTER_HEADING_NUM_RE.exec(info.headingLine);
+      if (numMatch !== null) {
+        const tail = info.headingLine
+          .slice(numMatch[0].length)
+          .replace(/^[】\]]?[ \t\u3000:：，,、·．.\-—]+/, '')
+          .trim();
+        if (tail.length > 0) setUniqueTitle(tail, chapter.index);
+      }
+    }
+  }
+  if (chapterNumbers.size === 0) {
+    return { contentMd, anchors: [], mismatches: [] };
+  }
+  const raw: DeconChapterRefMismatch[] = [];
+  for (const match of contentMd.matchAll(DECON_CHAPTER_REF_RE)) {
+    const refNumber = parseChapterHeadingNumber(match[1]!);
+    if (refNumber === null) continue;
+    const rangeEndRaw = match[2];
+    const refTitleRaw = match[3] ?? match[4];
+    const refTitle = refTitleRaw === undefined ? null : refTitleRaw.trim();
+    const resolved = refTitle !== null && refTitle.length > 0 ? indexByTitle.get(refTitle) : undefined;
+    const actualInfo = resolved === undefined ? undefined : headings.get(resolved);
+    if (
+      resolved !== undefined &&
+      actualInfo !== undefined &&
+      actualInfo.number !== null &&
+      actualInfo.number !== refNumber
+    ) {
+      raw.push({
+        kind: 'title-mismatch',
+        refText: match[0].trim(),
+        refNumber,
+        refTitle,
+        actualChapterIndex: resolved,
+        actualLabel: actualInfo.label,
+      });
+      continue;
+    }
+    const rangeEnd = rangeEndRaw === undefined ? null : parseChapterHeadingNumber(rangeEndRaw);
+    const numbers = rangeEnd === null ? [refNumber] : [refNumber, rangeEnd];
+    for (const n of numbers) {
+      if (!chapterNumbers.has(n)) {
+        raw.push({ kind: 'number-missing', refText: match[0].trim(), refNumber: n, refTitle, actualChapterIndex: null, actualLabel: null });
+      }
+    }
+  }
+  const seen = new Set<string>();
+  const mismatches: DeconChapterRefMismatch[] = [];
+  for (const m of raw) {
+    const key = `${m.kind}|${m.refNumber}|${m.refTitle ?? ''}|${m.actualChapterIndex ?? ''}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    mismatches.push(m);
+  }
+  if (mismatches.length === 0) return { contentMd, anchors: [], mismatches };
+  const anchors: DeconSpan[] = [];
+  const anchorSeen = new Set<number>();
+  for (const m of mismatches) {
+    if (m.actualChapterIndex === null || anchorSeen.has(m.actualChapterIndex)) continue;
+    const chapter = chapters.find((c) => c.index === m.actualChapterIndex);
+    if (chapter === undefined) continue;
+    anchorSeen.add(chapter.index);
+    anchors.push({
+      chapterIndex: chapter.index,
+      charStart: chapter.charStart,
+      charEnd: chapter.charEnd,
+      paraStart: chapter.paraStart,
+      paraEnd: chapter.paraEnd,
+    });
+  }
+  const numbers = [...chapterNumbers].sort((a, b) => a - b);
+  const rangeNote =
+    numbers.length > 0 ? `（材料「第N章」族章号 ${numbers[0]}-${numbers[numbers.length - 1]}）` : '';
+  const lines = mismatches.map((m) =>
+    m.kind === 'title-mismatch' && m.actualChapterIndex !== null
+      ? `- 引用「${m.refText}」与材料章标不符：该标题的实际章标是「${m.actualLabel}」。`
+      : `- 引用「${m.refText}」在材料章标中不存在${rangeNote}。`,
+  );
+  const annotation = `\n\n---\n\n【章引用校验】（自动核对材料章标——只标注，不改写正文）\n${lines.join('\n')}`;
+  return { contentMd: contentMd + annotation, anchors, mismatches };
 }
 
 // ── scene 候选评分与选择（纯代码——确定性：同输入同选择）──
@@ -416,7 +603,10 @@ function fmtCounts(rec: Record<string, number>): string {
 }
 
 /** 书级统计摘要渲染（book_reading 输入——报告里的数字以此为准，LLM 不编数字）。 */
-function renderDeconStatsForPrompt(stats: DeconStatsPayload): string {
+function renderDeconStatsForPrompt(
+  stats: DeconStatsPayload,
+  chapterHeadings: ReadonlyMap<number, DeconChapterHeadingInfo>,
+): string {
   const b = stats.book;
   const lines: string[] = [
     '【全书计量统计（纯代码复算——报告里的数字以此为准）】',
@@ -433,9 +623,9 @@ function renderDeconStatsForPrompt(stats: DeconStatsPayload): string {
   if (stats.arcs.length > 0) {
     lines.push('弧级统计：');
     for (const a of stats.arcs) {
-      // CR-2 章号统一 1 基（fromChapter/toChapter 0 基索引 → 呈现 +1，与 P4 弧 prompt/UI 同面）。
+      // R1/F19：章区间标签锚定真实章标（章号从章标行解析，零序号算术）。
       lines.push(
-        `- 弧 ${a.index}（第 ${a.fromChapter + 1}-${a.toChapter + 1} 章）：钩子 ${a.hookCount}｜转折 ${a.transitionCount}｜爽点 ${a.highlightCount}｜情绪拍 ${a.emotionalBeatCount}｜信息差 ${a.infoGapCount}｜伏笔 ${a.foreshadowPlantedCount}｜相位 ${fmtCounts(a.plotPhaseCounts)}`,
+        `- 弧 ${a.index}（${chapterRangeLabel(chapterHeadings, a.fromChapter, a.toChapter)}）：钩子 ${a.hookCount}｜转折 ${a.transitionCount}｜爽点 ${a.highlightCount}｜情绪拍 ${a.emotionalBeatCount}｜信息差 ${a.infoGapCount}｜伏笔 ${a.foreshadowPlantedCount}｜相位 ${fmtCounts(a.plotPhaseCounts)}`,
       );
     }
   }
@@ -475,18 +665,23 @@ function bookMaterialInfoLines(input: { bookTitle: string; chapterCount: number;
 }
 
 /**
- * 单弧概要块渲染（全量/分组 prompt 共用；**章号 1 基呈现**——CR-2：chapterIndex 0 基索引
- * 一律 +1，与 P4 弧 prompt/UI 同面）。
+ * 单弧概要块渲染（全量/分组 prompt 共用；**章引用 = 真实章标原词**——R1/F19：chapters[0]
+ * 可能是简介伪章使 index+1 整体偏移 1，章号一律从章标行解析、无章标章语义回落，零序号算术）。
  */
-function renderDeconArcSynopsisBlock(arc: DeconArc, synopsesByChapter: ReadonlyMap<number, string>): string {
+function renderDeconArcSynopsisBlock(
+  arc: DeconArc,
+  synopsesByChapter: ReadonlyMap<number, string>,
+  chapterHeadings: ReadonlyMap<number, DeconChapterHeadingInfo>,
+): string {
+  const range = chapterRangeLabel(chapterHeadings, arc.fromChapter, arc.toChapter);
   const lines: string[] = [
     arc.title === null
-      ? `【弧 ${arc.index}｜第 ${arc.fromChapter + 1}-${arc.toChapter + 1} 章｜${arc.chapterCount} 章】`
-      : `【弧 ${arc.index}｜第 ${arc.fromChapter + 1}-${arc.toChapter + 1} 章｜${arc.chapterCount} 章｜${arc.title}】`,
+      ? `【弧 ${arc.index}｜${range}｜${arc.chapterCount} 章】`
+      : `【弧 ${arc.index}｜${range}｜${arc.chapterCount} 章｜${arc.title}】`,
   ];
   for (let ci = arc.fromChapter; ci <= arc.toChapter; ci++) {
     const syn = synopsesByChapter.get(ci);
-    if (syn !== undefined) lines.push(`- 第 ${ci + 1} 章：${syn}`);
+    if (syn !== undefined) lines.push(`- ${chapterHeadings.get(ci)?.label ?? `材料章 ${ci}`}：${syn}`);
   }
   return lines.join('\n');
 }
@@ -498,8 +693,9 @@ function renderDeconArcSynopsisBlock(arc: DeconArc, synopsesByChapter: ReadonlyM
 export function deconBookArcContributions(
   arcs: readonly DeconArc[],
   synopsesByChapter: ReadonlyMap<number, string>,
+  chapterHeadings: ReadonlyMap<number, DeconChapterHeadingInfo>,
 ): number[] {
-  return arcs.map((arc) => renderDeconArcSynopsisBlock(arc, synopsesByChapter).length);
+  return arcs.map((arc) => renderDeconArcSynopsisBlock(arc, synopsesByChapter, chapterHeadings).length);
 }
 
 export interface DeconP5BookPromptInput {
@@ -509,20 +705,23 @@ export interface DeconP5BookPromptInput {
   arcs: readonly DeconArc[];
   synopsesByChapter: ReadonlyMap<number, string>;
   stats: DeconStatsPayload | null;
+  /** 章标对照（R1/F19——对照表注入 + 章区间/概要行真实章标渲染）。 */
+  chapterHeadings: ReadonlyMap<number, DeconChapterHeadingInfo>;
 }
 
-/** 书级读法 user prompt（材料信息 + 弧级概要聚合 + 统计摘要 + 维 1/3/5 书级问题单末置）。 */
+/** 书级读法 user prompt（材料信息 + 章标对照表 + 弧级概要聚合 + 统计摘要 + 维 1/3/5 书级问题单末置）。 */
 export function buildDeconBookReadingUserPrompt(input: DeconP5BookPromptInput): string {
   const parts: string[] = [];
   parts.push(bookMaterialInfoLines(input).join('\n'));
+  parts.push(renderDeconChapterHeadingTable(input.chapterHeadings));
   if (input.arcs.length > 0) {
     parts.push(
-      ['【弧级概要（两级摘要——各章概要按剧情段分组）】', ...input.arcs.map((a) => renderDeconArcSynopsisBlock(a, input.synopsesByChapter))].join(
+      ['【弧级概要（两级摘要——各章概要按剧情段分组）】', ...input.arcs.map((a) => renderDeconArcSynopsisBlock(a, input.synopsesByChapter, input.chapterHeadings))].join(
         '\n',
       ),
     );
   }
-  if (input.stats !== null) parts.push(renderDeconStatsForPrompt(input.stats));
+  if (input.stats !== null) parts.push(renderDeconStatsForPrompt(input.stats, input.chapterHeadings));
   parts.push(
     [
       '【书级问题单（读法的问题面——作答融进报告对应小节）】',
@@ -545,9 +744,11 @@ export interface DeconP5BookGroupPromptInput {
   groupTotal: number;
   synopsesByChapter: ReadonlyMap<number, string>;
   stats: DeconStatsPayload | null;
+  /** 章标对照（R1/F19）。 */
+  chapterHeadings: ReadonlyMap<number, DeconChapterHeadingInfo>;
 }
 
-/** 大书分组草稿 user prompt（材料信息 + 本组弧级概要 + 统计——书级问题单住汇总调用）。 */
+/** 大书分组草稿 user prompt（材料信息 + 章标对照表 + 本组弧级概要 + 统计——书级问题单住汇总调用）。 */
 export function buildDeconBookGroupUserPrompt(input: DeconP5BookGroupPromptInput): string {
   const parts: string[] = [];
   parts.push(
@@ -556,12 +757,13 @@ export function buildDeconBookGroupUserPrompt(input: DeconP5BookGroupPromptInput
       `分组说明：全书篇幅过大，已按剧情段分 ${input.groupTotal} 组分析——本组为第 ${input.groupIndex} 组，只覆盖输入给出的以下剧情段；跨组结论如有出入，保留分歧如实写。`,
     ].join('\n'),
   );
+  parts.push(renderDeconChapterHeadingTable(input.chapterHeadings));
   parts.push(
-    ['【本组弧级概要（两级摘要——各章概要按剧情段分组）】', ...input.arcs.map((a) => renderDeconArcSynopsisBlock(a, input.synopsesByChapter))].join(
+    ['【本组弧级概要（两级摘要——各章概要按剧情段分组）】', ...input.arcs.map((a) => renderDeconArcSynopsisBlock(a, input.synopsesByChapter, input.chapterHeadings))].join(
       '\n',
     ),
   );
-  if (input.stats !== null) parts.push(renderDeconStatsForPrompt(input.stats));
+  if (input.stats !== null) parts.push(renderDeconStatsForPrompt(input.stats, input.chapterHeadings));
   return parts.join('\n\n');
 }
 
@@ -572,16 +774,19 @@ export interface DeconP5BookSynthesisPromptInput {
   stats: DeconStatsPayload | null;
   /** 各组草稿（组序升序）。 */
   groupDrafts: readonly string[];
+  /** 章标对照（R1/F19——汇总合成保留真实章标原词的真值源）。 */
+  chapterHeadings: ReadonlyMap<number, DeconChapterHeadingInfo>;
 }
 
-/** 大书汇总合成 user prompt（材料信息 + 统计 + 各组草稿 + 维 1/3/5 书级问题单末置）。 */
+/** 大书汇总合成 user prompt（材料信息 + 章标对照表 + 统计 + 各组草稿 + 维 1/3/5 书级问题单末置）。 */
 export function buildDeconBookSynthesisUserPrompt(input: DeconP5BookSynthesisPromptInput): string {
   const parts: string[] = [];
   parts.push(bookMaterialInfoLines(input).join('\n'));
-  if (input.stats !== null) parts.push(renderDeconStatsForPrompt(input.stats));
+  parts.push(renderDeconChapterHeadingTable(input.chapterHeadings));
+  if (input.stats !== null) parts.push(renderDeconStatsForPrompt(input.stats, input.chapterHeadings));
   parts.push(
     [
-      '【分组草稿（大书按剧情段分组分析的各组产出——跨组结论如有出入保留分歧如实写，数字以上方统计为准）】',
+      '【分组草稿（大书按剧情段分组分析的各组产出——跨组结论如有出入保留分歧如实写，数字以上方统计为准；引用章节时保留草稿与章标对照表里的真实章标原词，不要按序号推算章号）】',
       ...input.groupDrafts.map((d, i) => `### 第 ${i + 1} 组草稿\n${d}`),
     ].join('\n'),
   );
@@ -597,7 +802,8 @@ export function buildDeconBookSynthesisUserPrompt(input: DeconP5BookSynthesisPro
 export interface DeconP5ChapterPromptInput {
   bookTitle: string;
   chapterIndex: number;
-  chapterTitle: string | null;
+  /** 本章章标签签（章标行原词或语义回落——R1/F19，替代 chapterTitle + 序号算术）。 */
+  chapterLabel: string;
   facts: DeconFacts | null;
   labels: DeconChapterLabels | null;
   /** 该章各维章级 findings（pass='p4:<dim>'、unit='ch:N' 读回——聚合面）。 */
@@ -611,8 +817,8 @@ export function buildDeconChapterReviewUserPrompt(input: DeconP5ChapterPromptInp
     [
       '【材料信息】',
       `书名：${input.bookTitle}`,
-      // CR-2 章号统一 1 基（chapterIndex 0 基索引 → 呈现 +1）。
-      `本章：第 ${input.chapterIndex + 1} 章${input.chapterTitle === null ? '' : `《${input.chapterTitle}》`}`,
+      // R1/F19：本章定位用真实章标原词（章号从章标行解析，零序号算术）。
+      `本章：${input.chapterLabel}`,
     ].join('\n'),
   );
   parts.push(['【本章概要与事实提取】', input.facts === null ? '（本章无事实提取记录。）' : renderDeconFactsForPrompt(input.facts)].join('\n'));
@@ -627,7 +833,8 @@ export interface DeconP5ScenePromptInput {
   sceneRank: number;
   sceneTotal: number;
   chapterIndex: number;
-  chapterTitle: string | null;
+  /** 本章章标签签（章标行原词或语义回落——R1/F19，替代 chapterTitle + 序号算术）。 */
+  chapterLabel: string;
   derived: string;
   blocks: readonly MaterialParagraphBlock[];
   window: DeconSceneWindow;
@@ -645,8 +852,8 @@ export function buildDeconSceneAnnotationUserPrompt(input: DeconP5ScenePromptInp
     [
       '【材料信息】',
       `书名：${input.bookTitle}`,
-      // CR-2 章号统一 1 基（chapterIndex 0 基索引 → 呈现 +1；sceneRank 选定序另行 +1）。
-      `本场：第 ${input.chapterIndex + 1} 章${input.chapterTitle === null ? '' : `《${input.chapterTitle}》`} · 选定名场面第 ${input.sceneRank + 1} 场（共 ${input.sceneTotal} 场）`,
+      // R1/F19：章定位用真实章标原词（零序号算术）；选定序 sceneRank 是候选自枚举（0 起 → 呈现 +1）。
+      `本场：${input.chapterLabel} · 选定名场面第 ${input.sceneRank + 1} 场（共 ${input.sceneTotal} 场）`,
     ].join('\n'),
     [
       '【本场正文（【P段落号】标记每段开始；段落号是全文档全局编号）】',
@@ -672,7 +879,7 @@ const DECON_P5_BOOK_KIND_PROMPT = [
   '## 主题 —— 这本书最终讲什么、跟开篇承诺怎么呼应。',
   '写作要求：',
   '- 数字（章数/字数/间隔）以输入的计量统计为准，不要自己编数字；',
-  '- 提到具体章节时给出章号；',
+  '- 提到具体章节时，引用必须照抄输入「章节章标对照表」里的章标原词（含章号与标题）；禁止按材料内部序号自行推算章号；',
   '- 直接输出 markdown 正文，不要代码块包裹、不要任何前后缀解释。',
 ].join('\n');
 
@@ -713,7 +920,7 @@ const DECON_P5_BOOK_GROUP_KIND_PROMPT = [
   '按下面的骨架写本组草稿：',
   '## 本组各段概览 —— 逐段一小段话：这段在全书里承担什么、段内节奏怎么走、段末把读者带向哪里；',
   '## 本组结构与节奏观察 —— 本组内反复出现的调度安排、标准循环、换地图事件；跨段的铺垫与回收怎么衔接；',
-  '## 本组值得学的手艺点 —— 作者在这几段里做对了什么（提到具体章节给章号，从输入概要与统计里能确认的才写）。',
+  '## 本组值得学的手艺点 —— 作者在这几段里做对了什么（提到具体章节时照抄输入章标对照表里的章标原词，从输入概要与统计里能确认的才写）。',
   '写作要求：',
   '- 数字（章数/字数/间隔）以输入的计量统计为准，不要自己编数字；',
   '- 只依据输入材料，不编造概要里没有的情节；',
@@ -759,6 +966,8 @@ export interface DeconP5Deps {
   readDerivedText?: (material: Material) => string | null;
   /** 逐 unit running 进度事件注入（CR-8——runDeconPassSequence 传 stamped notify；直调测试缺省不发）。 */
   notify?: (event: DeconProgressEvent) => void;
+  /** 材料读点重试 sleep 注入（C4/F12——测试绕过真实等待）。 */
+  sleep?: (ms: number) => Promise<void>;
   now?: () => Date;
 }
 
@@ -857,8 +1066,11 @@ type DeconP5CallOutcome =
 /**
  * 单次报告生成调用（writer-draft 温 0.3）：预算门前置（超限 capped **不烧 token**）→ 调用 →
  * 实际记账（CR-13 usage 真值优先）并经 writeDeconCost 单源落 job 行 → finishReason='length'
- * 权威挂起（capped——报告重生成廉价不落半程）→ 空回复 failed。capped/failed 的 pass_state
- * 落库归调用方（capDeconUnit/failDeconUnit 需要 unit 串）。
+ * 权威截断判定 → 升帽自动重试一次（重试 est 照样过预算门、actual 各记各的、每 attempt notify
+ * note——相位可见）→ 仍截断按 P5 capped 语义诚实挂起（报告重生成廉价不落半程报告）→ 空回复
+ * failed。**CR-4**：手写重试环退役，语义收口 deconRun.runDeconLlmCall 共享脚手架（帽倍率
+ * DECON_LLM_RETRY_ESCALATE 单源）；本包装只剩 P5 语义映射（length→capped、error/empty→failed）。
+ * capped/failed 的 pass_state 落库归调用方（capDeconUnit/failDeconUnit 需要 unit 串）。
  */
 async function callDeconP5Generate(args: {
   generate: DeconGenerateText;
@@ -866,52 +1078,38 @@ async function callDeconP5Generate(args: {
   job: DeconJob;
   costRef: { cost: DeconCost };
   pass: string;
+  unit: string;
   system: string;
   user: string;
   maxTokens: number;
   unitLabel: string;
   nowIso: () => string;
+  /** 逐 attempt note 事件注入（升帽重试相位可见——R2；缺省不发）。 */
+  notify?: (event: DeconProgressEvent) => void;
 }): Promise<DeconP5CallOutcome> {
-  const est = estimateDeconCallTokens(args.system, args.user, args.maxTokens);
-  if (wouldExceedDeconBudget(args.job.budget, args.costRef.cost, args.pass, est)) {
-    return {
-      ok: false,
-      kind: 'capped',
-      message: `${args.unitLabel}预算超限（本次预估 ${est} tokens，已累计 ${args.costRef.cost.totalTokens}）——已诚实挂起（不烧 token），调整预算后续跑`,
-    };
+  const call = await runDeconLlmCall({
+    jobId: args.jobId,
+    pass: args.pass,
+    unit: args.unit,
+    slot: 'writer-draft',
+    system: args.system,
+    user: args.user,
+    maxTokens: args.maxTokens,
+    budget: args.job.budget,
+    cost: args.costRef.cost,
+    job: args.job,
+    generate: args.generate,
+    ...(args.notify !== undefined ? { notify: args.notify } : {}),
+    nowIso: args.nowIso,
+    label: args.unitLabel,
+  });
+  args.costRef.cost = call.cost;
+  if (call.ok) return { ok: true, text: call.text };
+  if (call.kind === 'budget-capped') return { ok: false, kind: 'capped', message: call.note };
+  if (call.kind === 'length') {
+    return { ok: false, kind: 'capped', message: `${call.note}——已挂起（不落半程报告），调整预算后续跑` };
   }
-  let text = '';
-  let finishReason: string | undefined;
-  let usage: { promptTokens?: number; completionTokens?: number; totalTokens?: number } | undefined;
-  try {
-    const response = await args.generate({
-      slot: 'writer-draft',
-      system: args.system,
-      user: args.user,
-      maxTokens: args.maxTokens,
-    });
-    text = (response?.text ?? '').trim();
-    finishReason = response?.finishReason;
-    usage = response?.usage;
-  } catch (err) {
-    return { ok: false, kind: 'failed', message: `${args.unitLabel}调用失败：${deconErrMsg(err)}` };
-  }
-  // 实际记账（CR-13）+ cost 回写单源（await 窗口翻态不被旧快照复活；行已删抛 DeconJobGoneError
-  // 由编排层静默退出）。
-  const actual = resolveDeconActualTokens(args.system, args.user, text, usage);
-  args.costRef.cost = accumulateDeconCost(args.costRef.cost, args.pass, actual.tokens, 1, actual.estimated);
-  writeDeconCost(args.jobId, args.job, args.costRef.cost, args.nowIso());
-  if (finishReason === 'length') {
-    return {
-      ok: false,
-      kind: 'capped',
-      message: `${args.unitLabel}输出因 token 上限截断（finishReason=length）——已挂起（不落半程报告），调整预算后续跑`,
-    };
-  }
-  if (text.length === 0) {
-    return { ok: false, kind: 'failed', message: `${args.unitLabel}返回空回复——已挂起` };
-  }
-  return { ok: true, text };
+  return { ok: false, kind: 'failed', message: call.note }; // error / empty
 }
 
 /**
@@ -975,12 +1173,20 @@ type DeconP5Prepare =
   | { ok: true; job: DeconJob; material: Material; derived: string; blocks: MaterialParagraphBlock[] }
   | { ok: false; result: DeconP5Result };
 
-function prepareDeconP5(
-  jobId: string,
-  deps: DeconP5Deps,
-  pass: string,
-  kindLabel: string,
-): DeconP5Prepare {
+/**
+ * 材料读点（C4/F12 读侧）：**CR-4 收口 deconRun.loadExtractableMaterial 共享 helper**（本文件
+ * ~30 行平行实现退役）——行缺/零章中间态（pending/failed——reingest/watcher upsert 与本读点的
+ * 竞态窗口）→ 有限重试窗口（~1s×10，常量单源 DECON_MATERIAL_LOAD_*）等收敛；真零章稳定态
+ * （ready/low-confidence——章界判定已落）立即诚实失败；durable failed 快败（CR-5）同helper。
+ * 测试经 deps.sleep 注入绕过真实等待（映射 helper 的 waitMs）。
+ */
+async function loadDeconP5Material(materialId: string, deps: DeconP5Deps): Promise<
+  { ok: true; material: Material } | { ok: false; message: string }
+> {
+  return loadExtractableMaterial(materialId, deps.sleep !== undefined ? { waitMs: deps.sleep } : {});
+}
+
+async function prepareDeconP5(jobId: string, deps: DeconP5Deps, pass: string): Promise<DeconP5Prepare> {
   const nowIso = (): string => (deps.now ?? (() => new Date()))().toISOString();
   const gate = loadRunningDeconJob(jobId);
   if (!gate.ok) {
@@ -992,17 +1198,22 @@ function prepareDeconP5(
     return { ok: false, result: { status: 'failed', message: gate.message, stats: emptyStats(0) } };
   }
   const job = gate.job;
-  const material = getMaterialRow(extractMaterialId(job.materialRef));
-  if (material === null || material.chapters.length === 0) {
-    const message = `材料 ${job.materialRef} 不存在或零章——${kindLabel} 无可产出章`;
-    failDeconUnit(jobId, pass, 'all', message, nowIso());
-    return { ok: false, result: { status: 'failed', message, stats: emptyStats(0) } };
+  // C4-F16 写侧：材料级前置失败只 transitionDeconJob（job 行 error 承载错误面）——'all' 仅是
+  // p5:book_reading 的合法 unit（单 unit pass），chapter_review（ch:N）/scene_annotation（scene:N）
+  // 写 (pass,'all',failed) 是化石形态（清理谓词同判定，不新产）。
+  const failPrepare = (message: string, chapters: number): DeconP5Prepare => {
+    if (pass === 'p5:book_reading') failDeconUnit(jobId, pass, 'all', message, nowIso());
+    else transitionDeconJob(jobId, 'fail', message);
+    return { ok: false, result: { status: 'failed', message, stats: emptyStats(chapters) } };
+  };
+  const materialLoad = await loadDeconP5Material(extractMaterialId(job.materialRef), deps);
+  if (!materialLoad.ok) {
+    return failPrepare(materialLoad.message, 0);
   }
+  const material = materialLoad.material;
   const derived = (deps.readDerivedText ?? readDeconDerivedTextFor)(material);
   if (derived === null) {
-    const message = '派生 .md 读取失败（缺失或车道不可解析）——无法装配输出基面';
-    failDeconUnit(jobId, pass, 'all', message, nowIso());
-    return { ok: false, result: { status: 'failed', message, stats: emptyStats(material.chapters.length) } };
+    return failPrepare('派生 .md 读取失败（缺失或车道不可解析）——无法装配输出基面', material.chapters.length);
   }
   if (sha256DeconContent(derived) !== job.derivedHash) {
     transitionDeconJob(jobId, 'stale', DECON_STALE_NOTE);
@@ -1010,9 +1221,7 @@ function prepareDeconP5(
   }
   const blocks = splitParagraphBlocks(derived);
   if (blocks.length === 0) {
-    const message = '材料无有效段落（派生 .md 全空白）——无可产出面';
-    failDeconUnit(jobId, pass, 'all', message, nowIso());
-    return { ok: false, result: { status: 'failed', message, stats: emptyStats(material.chapters.length) } };
+    return failPrepare('材料无有效段落（派生 .md 全空白）——无可产出面', material.chapters.length);
   }
   return { ok: true, job, material, derived, blocks };
 }
@@ -1045,16 +1254,18 @@ function decideDeconReportReentry(
 /**
  * 跑书级读法（pass='p5:book_reading'，unit='all'）。输入 = 弧级 synopsis 聚合 + p3b 统计 +
  * 维 1/3/5 书级问题单；断点重入（done+hash 一致 skip 零重付）；产物落 report 表
- * （kind='book_reading'，anchors 空——叙事聚合面无直接 span 锚，契约注释同源）。
- * **CR-7 大书分组**：输入超限时不再硬失败——对齐 P4 弧级 sansheng 分组纪律，按弧贡献量拆
- * 3-5 组组内串行多次 writer-draft 产**分组草稿**，再一次汇总调用（标准读法骨架 + 问题单）合成
- * 终稿；断点粒度维持 unit='all'（组内串行非独立断点——中断后重入整 unit 重跑）。
+ * （kind='book_reading'；anchors 承载 R1/F19 章引用回查的可定位错位章 span——LLM 散文只核验
+ * 标注不改写）。**CR-7 大书分组**：输入超限时不再硬失败——对齐 P4 弧级 sansheng 分组纪律，按弧
+ * 贡献量拆 3-5 组组内串行多次 writer-draft 产**分组草稿**，再一次汇总调用（标准读法骨架 +
+ * 问题单）合成终稿；断点粒度维持 unit='all'（组内串行非独立断点——中断后重入整 unit 重跑）。
  */
 export async function runDeconP5BookReading(jobId: string, deps: DeconP5Deps = {}): Promise<DeconP5Result> {
   const nowIso = (): string => (deps.now ?? (() => new Date()))().toISOString();
-  const prep = prepareDeconP5(jobId, deps, 'p5:book_reading', '书级读法');
+  const prep = await prepareDeconP5(jobId, deps, 'p5:book_reading');
   if (!prep.ok) return prep.result;
   const { job, material } = prep;
+  // 章标真值（R1/F19——prompt 对照表 / 弧概要渲染 / 引用回查三方共用的单源映射）。
+  const chapterHeadings = buildChapterHeadings(prep.derived, material.chapters);
 
   const stats = emptyStats(material.chapters.length);
   const stop = checkDeconRunBoundary(jobId);
@@ -1082,6 +1293,7 @@ export async function runDeconP5BookReading(jobId: string, deps: DeconP5Deps = {
     arcs,
     synopsesByChapter,
     stats: statsPayload,
+    chapterHeadings,
   });
 
   const generate = deps.generateText ?? getDeconLlmCore()?.generateText;
@@ -1110,17 +1322,19 @@ export async function runDeconP5BookReading(jobId: string, deps: DeconP5Deps = {
       job,
       costRef,
       pass: 'p5:book_reading',
+      unit,
       system: DECON_P5_BOOK_SYSTEM_PROMPT,
       user,
       maxTokens: DECON_P5_BOOK_READING_MAX_TOKENS,
       unitLabel: '书级读法',
       nowIso,
+      notify: deps.notify,
     });
     if (!call.ok) return cappedOrFail(call);
     finalText = call.text;
   } else {
     // CR-7：按弧分组（贡献量 = 渲染块实长）拆 3-5 组——组内串行产分组草稿，再汇总合成。
-    const contributions = deconBookArcContributions(arcs, synopsesByChapter);
+    const contributions = deconBookArcContributions(arcs, synopsesByChapter, chapterHeadings);
     const groups = splitDeconArcGroups(contributions, DECON_P5_BOOK_INPUT_CHAR_LIMIT);
     if (groups.length === 0) {
       const message = `书级读法输入装配超限（${user.length} 字符 > 上限 ${DECON_P5_BOOK_INPUT_CHAR_LIMIT}）且无弧级概要可分组（零 facts/零弧）——已诚实挂起（不静默截断）`;
@@ -1138,6 +1352,7 @@ export async function runDeconP5BookReading(jobId: string, deps: DeconP5Deps = {
         groupTotal: groups.length,
         synopsesByChapter,
         stats: statsPayload,
+        chapterHeadings,
       });
       const call = await callDeconP5Generate({
         generate,
@@ -1145,11 +1360,13 @@ export async function runDeconP5BookReading(jobId: string, deps: DeconP5Deps = {
         job,
         costRef,
         pass: 'p5:book_reading',
+        unit,
         system: DECON_P5_BOOK_GROUP_SYSTEM_PROMPT,
         user: groupUser,
         maxTokens: DECON_P5_BOOK_READING_MAX_TOKENS,
         unitLabel: `书级读法分组草稿（第 ${gi + 1}/${groups.length} 组）`,
         nowIso,
+        notify: deps.notify,
       });
       if (!call.ok) return cappedOrFail(call);
       drafts.push(call.text);
@@ -1160,6 +1377,7 @@ export async function runDeconP5BookReading(jobId: string, deps: DeconP5Deps = {
       charCount: material.quality.charCount,
       stats: statsPayload,
       groupDrafts: drafts,
+      chapterHeadings,
     });
     const call = await callDeconP5Generate({
       generate,
@@ -1167,22 +1385,28 @@ export async function runDeconP5BookReading(jobId: string, deps: DeconP5Deps = {
       job,
       costRef,
       pass: 'p5:book_reading',
+      unit,
       system: DECON_P5_BOOK_SYSTEM_PROMPT,
       user: synthUser,
       maxTokens: DECON_P5_BOOK_READING_MAX_TOKENS,
       unitLabel: '书级读法汇总合成',
       nowIso,
+      notify: deps.notify,
     });
     if (!call.ok) return cappedOrFail(call);
     finalText = call.text;
   }
+  // R1/F19 章引用回查（单缝——全量/分组/汇总三路 finalText 唯一出口，commit 之前）：
+  // 「第N章」类引用对照真实章标核验，错位只标注不改写——(a) 可定位错位章进 anchors；
+  // (b) contentMd 末尾附「章引用校验」注记段；无错位零改动。
+  const refCheck = checkDeconChapterReferences(finalText, material.chapters, chapterHeadings);
   const commit = commitDeconP5Report({
     jobId,
     pass: 'p5:book_reading',
     kind: 'book_reading',
     unit,
-    contentMd: finalText,
-    anchors: [],
+    contentMd: refCheck.contentMd,
+    anchors: refCheck.anchors,
     dimension: null,
     stats,
     unitLabel: '书级读法',
@@ -1203,9 +1427,10 @@ export async function runDeconP5ChapterReview(jobId: string, deps: DeconP5Deps =
   const tierGate = requireDeconP5Tier(jobId, 'p5:chapter_review', new Set(['fine', 'deep']));
   if (tierGate !== null) return tierGate;
   const nowIso = (): string => (deps.now ?? (() => new Date()))().toISOString();
-  const prep = prepareDeconP5(jobId, deps, 'p5:chapter_review', '章评');
+  const prep = await prepareDeconP5(jobId, deps, 'p5:chapter_review');
   if (!prep.ok) return prep.result;
   const { job, material } = prep;
+  const chapterHeadings = buildChapterHeadings(prep.derived, material.chapters);
 
   const stats = emptyStats(material.chapters.length);
   const factsByChapter = loadDeconFactsByChapter(job.materialRef, job.derivedHash);
@@ -1247,11 +1472,13 @@ export async function runDeconP5ChapterReview(jobId: string, deps: DeconP5Deps =
       }
     }
 
+    // R1/F19：章定位标签 = 真实章标行原词（章号从章标行解析，零序号算术）。
+    const chapterLabel = chapterHeadings.get(chapter.index)?.label ?? `材料章 ${chapter.index}`;
     writeDeconPassState(jobId, 'p5:chapter_review', unit, 'running', null, nowIso());
     const user = buildDeconChapterReviewUserPrompt({
       bookTitle: material.name,
       chapterIndex: chapter.index,
-      chapterTitle: chapter.title,
+      chapterLabel,
       facts,
       labels,
       findings,
@@ -1262,12 +1489,13 @@ export async function runDeconP5ChapterReview(jobId: string, deps: DeconP5Deps =
       job,
       costRef,
       pass: 'p5:chapter_review',
+      unit,
       system: DECON_P5_CHAPTER_SYSTEM_PROMPT,
       user,
       maxTokens: DECON_P5_CHAPTER_REVIEW_MAX_TOKENS,
-      // CR-2 章号统一 1 基（chapterIndex 0 基索引 → 呈现 +1）。
-      unitLabel: `第 ${chapter.index + 1} 章章评`,
+      unitLabel: `章评（${chapterLabel}）`,
       nowIso,
+      notify: deps.notify,
     });
     if (!call.ok) {
       if (call.kind === 'capped') {
@@ -1286,7 +1514,7 @@ export async function runDeconP5ChapterReview(jobId: string, deps: DeconP5Deps =
       anchors: [],
       dimension: null,
       stats,
-      unitLabel: `第 ${chapter.index + 1} 章章评`,
+      unitLabel: `章评（${chapterLabel}）`,
       nowIso,
     });
     if (!commit.ok) return commit.result;
@@ -1305,9 +1533,10 @@ export async function runDeconP5SceneAnnotation(jobId: string, deps: DeconP5Deps
   const tierGate = requireDeconP5Tier(jobId, 'p5:scene_annotation', new Set(['deep']));
   if (tierGate !== null) return tierGate;
   const nowIso = (): string => (deps.now ?? (() => new Date()))().toISOString();
-  const prep = prepareDeconP5(jobId, deps, 'p5:scene_annotation', '细批');
+  const prep = await prepareDeconP5(jobId, deps, 'p5:scene_annotation');
   if (!prep.ok) return prep.result;
   const { job, material, derived, blocks } = prep;
+  const chapterHeadings = buildChapterHeadings(derived, material.chapters);
 
   const stats = emptyStats(material.chapters.length);
   const factsByChapter = loadDeconFactsByChapter(job.materialRef, job.derivedHash);
@@ -1354,6 +1583,8 @@ export async function runDeconP5SceneAnnotation(jobId: string, deps: DeconP5Deps
       }
     }
 
+    // R1/F19：章定位 = 真实章标行原词（零序号算术）；rank 是候选选定序自枚举（0 起 → 呈现 +1）。
+    const chapterLabel = chapterHeadings.get(chapterIndex)?.label ?? `材料章 ${chapterIndex}`;
     writeDeconPassState(jobId, 'p5:scene_annotation', unit, 'running', null, nowIso());
     const labels = labelsByChapter.get(chapterIndex);
     const user = buildDeconSceneAnnotationUserPrompt({
@@ -1361,7 +1592,7 @@ export async function runDeconP5SceneAnnotation(jobId: string, deps: DeconP5Deps
       sceneRank: rank,
       sceneTotal: candidates.length,
       chapterIndex,
-      chapterTitle: chapter.title,
+      chapterLabel,
       derived,
       blocks,
       window,
@@ -1373,12 +1604,13 @@ export async function runDeconP5SceneAnnotation(jobId: string, deps: DeconP5Deps
       job,
       costRef,
       pass: 'p5:scene_annotation',
+      unit,
       system: DECON_P5_SCENE_SYSTEM_PROMPT,
       user,
       maxTokens: DECON_P5_SCENE_ANNOTATION_MAX_TOKENS,
-      // CR-2 章号统一 1 基（chapterIndex 0 基索引 → 呈现 +1；rank 选定序另行 +1）。
-      unitLabel: `第 ${rank + 1} 场细批（第 ${chapterIndex + 1} 章）`,
+      unitLabel: `细批第 ${rank + 1} 场（${chapterLabel}）`,
       nowIso,
+      notify: deps.notify,
     });
     if (!call.ok) {
       if (call.kind === 'capped') {
@@ -1397,7 +1629,7 @@ export async function runDeconP5SceneAnnotation(jobId: string, deps: DeconP5Deps
       anchors: [window.span],
       dimension: null,
       stats,
-      unitLabel: `第 ${rank + 1} 场细批（第 ${chapterIndex + 1} 章）`,
+      unitLabel: `细批第 ${rank + 1} 场（${chapterLabel}）`,
       nowIso,
     });
     if (!commit.ok) return commit.result;

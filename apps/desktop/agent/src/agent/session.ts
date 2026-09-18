@@ -149,6 +149,9 @@ export function loadSession(id: string, projectPath: string): SessionState | und
     // 防每 turn TypeError 或 trust 翻成不安全向；空 `[]` 第三态亦拒（mirror zod .min(1)）。
     balancedAskCategories: normalizeBalancedAskCategories(meta?.balancedAskCategories),
     trustAdjudication: normalizeTrustAdjudication(meta?.trustAdjudication),
+    // 链流程重排 W2：hardEscalatePolicy 归一（'auto' 才原样保留——垃圾值 → undefined → 消费端回退
+    // 'ask' 安全默认，mirror normalizeTrustAdjudication 的安全向归一哲学）。
+    hardEscalatePolicy: meta?.hardEscalatePolicy === 'auto' ? 'auto' : undefined,
     messages,
     parentId: meta?.parentId,
     children: meta?.children ?? [],

@@ -1,6 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import type { SceneGraph, SceneNode } from '@orison/shared-contracts';
-import type { GenerateFn } from '../src/nodes/llm-node';
 import type { RunSnapshot } from '../src/contracts/run';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -13,8 +12,6 @@ import type { RunSnapshot } from '../src/contracts/run';
 // registry mock 用 vi.doMock + fresh import（mirror chapter-summary-node.test——registry 是模块级
 // 单例，doMock 后重 import 节点模块才拿到 mock registry）。
 // ─────────────────────────────────────────────────────────────────────────────
-
-const noopGenerate = vi.fn<GenerateFn>(async () => ({ content: '{}', finishReason: 'stop' }));
 
 function makeRun(artifacts: Record<string, unknown>): RunSnapshot {
   return {
@@ -338,140 +335,6 @@ describe('mention-ledger-node (Story 8.7 design §2.2)', () => {
     const artifact = result.artifact as { ok: boolean; reason: string };
     expect(artifact.ok).toBe(false);
     expect(artifact.reason).toBe('handler_rejected');
-  });
-});
-
-// ════════════════════════════════════════════════════════════════════════════
-// 修订降档包装（design §2.3：targeted-revision 落盘后降档）
-// ════════════════════════════════════════════════════════════════════════════
-
-/** 造 fake degrade_episode_mentions registry（捕获入参）。 */
-function mockDegradeTool() {
-  const calls: Array<{ params: Record<string, unknown>; projectPath: string }> = [];
-  vi.doMock('../src/tool/registry', () => ({
-    registry: {
-      get: (id: string) => {
-        if (id !== 'degrade_episode_mentions') return undefined;
-        return {
-          id,
-          description: '',
-          parameters: {},
-          execute: async (params: Record<string, unknown>, ctx: { projectPath: string }) => {
-            calls.push({ params, projectPath: ctx.projectPath });
-            return { title: 'degrade_episode_mentions', output: '', metadata: { ok: true } };
-          },
-        };
-      },
-    },
-  }));
-  return calls;
-}
-
-async function freshWrapper() {
-  const { createTargetedRevisionWithMentionDegrade } = await import('../src/nodes/mention-ledger-node');
-  return createTargetedRevisionWithMentionDegrade({ generate: noopGenerate });
-}
-
-describe('createTargetedRevisionWithMentionDegrade (Story 8.7 design §2.3)', () => {
-  beforeEach(() => {
-    vi.resetModules();
-    noopGenerate.mockClear();
-  });
-
-  it('首跑无 review.latest（shouldSkip 直通）→ 不降档（修订未发生）', async () => {
-    const calls = mockDegradeTool();
-    const wrapper = await freshWrapper();
-    const initialDraft = { title: '初稿', text: '原稿', wordCount: 100 };
-    const result = await wrapper.run({
-      run: makeRun({
-        chapter_brief_input: { episodeId: 'ep-1' },
-        'draft.initial': initialDraft,
-        // 无 review.latest（链首跑态）
-      }),
-      requirement: '',
-    });
-    expect(noopGenerate).not.toHaveBeenCalled(); // inner shouldSkip 直通
-    expect(result.stateKey).toBe('draft.initial');
-    expect(result.artifact).toBe(initialDraft);
-    expect(calls).toHaveLength(0); // 未修订不降档
-  });
-
-  it('闭环重跑（有 review.latest）+ 修订成功落盘 → 降档工具收 {episodeId}（declared 清位语义归 handler）', async () => {
-    const calls = mockDegradeTool();
-    const revised = { title: '修订', text: '修订正文', wordCount: 200, revisionNotes: ['补动机'] };
-    noopGenerate.mockResolvedValueOnce({ content: JSON.stringify(revised), finishReason: 'stop' });
-    const wrapper = await freshWrapper();
-    const result = await wrapper.run({
-      run: makeRun({
-        chapter_brief_input: { episodeId: 'ep-1' },
-        'draft.initial': { title: '初稿', text: '原稿', wordCount: 100 },
-        'review.latest': { verdict: 'revise', reasons: ['动机不足'] },
-      }),
-      requirement: '',
-    });
-    expect(noopGenerate).toHaveBeenCalledTimes(1);
-    expect(result.stateKey).toBe('draft.initial');
-    expect(result.artifact).toEqual(revised); // 产物透传（overwrite 语义零变）
-    expect(calls).toHaveLength(1);
-    expect(calls[0].params).toEqual({ episodeId: 'ep-1' });
-    expect(calls[0].projectPath).toBe('/test-project');
-  });
-
-  it('闭环重跑 + LLM 失败（error artifact）→ 修订未落盘，不降档', async () => {
-    const calls = mockDegradeTool();
-    noopGenerate.mockResolvedValue({ content: 'not-json', finishReason: 'stop' }); // parse 持续失败 → error artifact
-    const wrapper = await freshWrapper();
-    const result = await wrapper.run({
-      run: makeRun({
-        chapter_brief_input: { episodeId: 'ep-1' },
-        'draft.initial': { title: '初稿', text: '原稿', wordCount: 100 },
-        'review.latest': { verdict: 'revise', reasons: ['动机不足'] },
-      }),
-      requirement: '',
-    });
-    const artifact = result.artifact as { error?: boolean };
-    expect(artifact.error).toBe(true); // createLlmNode 兜底 error artifact
-    expect(calls).toHaveLength(0); // 修订未落盘不降档
-  });
-
-  it('episodeId 缺（chapter_brief_input 无）→ 修订照常，降档跳过（无章可降）', async () => {
-    const calls = mockDegradeTool();
-    const revised = { title: '修订', text: 'x', wordCount: 1 };
-    noopGenerate.mockResolvedValueOnce({ content: JSON.stringify(revised), finishReason: 'stop' });
-    const wrapper = await freshWrapper();
-    await wrapper.run({
-      run: makeRun({
-        'draft.initial': { title: '初稿', text: '原稿', wordCount: 100 },
-        'review.latest': { verdict: 'revise', reasons: ['r'] },
-      }),
-      requirement: '',
-    });
-    expect(calls).toHaveLength(0);
-  });
-
-  it('降档工具未注册（测试环境 registry 空）→ warn 跳过，修订产物照常返回（链不破）', async () => {
-    // 不 doMock registry——真实单例为空（degrade 工具未注册）。
-    const revised = { title: '修订', text: 'x', wordCount: 1, revisionNotes: [] as string[] };
-    noopGenerate.mockResolvedValueOnce({ content: JSON.stringify(revised), finishReason: 'stop' });
-    const { createTargetedRevisionWithMentionDegrade } = await import('../src/nodes/mention-ledger-node');
-    const wrapper = createTargetedRevisionWithMentionDegrade({ generate: noopGenerate });
-    const result = await wrapper.run({
-      run: makeRun({
-        chapter_brief_input: { episodeId: 'ep-1' },
-        'draft.initial': { title: '初稿', text: '原稿', wordCount: 100 },
-        'review.latest': { verdict: 'revise', reasons: ['r'] },
-      }),
-      requirement: '',
-    });
-    expect(result.stateKey).toBe('draft.initial');
-    expect(result.artifact).toEqual(revised);
-  });
-
-  it('contract 透传 inner（chapter-chain 装配读契约形态零变）', async () => {
-    const wrapper = await freshWrapper();
-    expect(wrapper.contract?.nodeId).toBe('targeted-revision-agent');
-    expect(wrapper.contract?.requiredArtifactKeys).toEqual(['draft.initial']);
-    expect(wrapper.contract?.producedArtifactKeys).toEqual(['draft.initial']);
   });
 });
 

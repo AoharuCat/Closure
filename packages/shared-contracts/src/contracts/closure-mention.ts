@@ -132,9 +132,10 @@ export const recordEpisodeMentionsRequestSchema = z.object({
 export type RecordEpisodeMentionsRequest = z.infer<typeof recordEpisodeMentionsRequestSchema>;
 
 /**
- * `degrade_episode_mentions` handler/tool 入参（链内 targeted-revision 落盘后降档，design §2.3）。
+ * `degrade_episode_mentions` handler/tool 入参（mention 账保守化降档）。
  * handler 侧做两件事：mention 行 source 降 conservative（declared 清位）+ 章摘要 synopsis 标 stale
- * （degradedNote 追记）——均幂等。
+ * （degradedNote 追记）——均幂等。链内 targeted-revision 落盘触发面已随链流程重排退役
+ * （09-13 W1d），现消费方 = W4 re-extract-chapter / 手改后保守化通道。
  */
 export const degradeEpisodeMentionsRequestSchema = z.object({
   episodeId: z.string().min(1),

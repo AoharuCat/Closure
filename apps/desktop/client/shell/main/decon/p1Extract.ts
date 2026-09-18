@@ -19,26 +19,23 @@ import {
   upsertDeconChapterFacts,
   upsertDeconPassState,
 } from '../db/closure-decon';
-import { getMaterialRow } from '../db/materialIndexer';
 import { getLogger } from '../logger';
 import { splitParagraphBlocks, type MaterialParagraphBlock } from '../ipc/toolHandlers/materialIngest';
 import {
   DECON_STALE_NOTE,
   capDeconUnit,
   checkDeconRunBoundary,
-  deconErrMsg,
-  estimateDeconCallTokens,
   failDeconUnit,
+  loadExtractableMaterial,
   loadRunningDeconJob,
   readDeconDerivedTextFor,
-  resolveDeconActualTokens,
+  runDeconLlmCall,
   sha256DeconContent,
-  writeDeconCost,
   writeDeconPassState,
   type DeconBoundaryStop,
 } from './deconRun';
+import { buildChapterHeadings as buildDeconChapterHeadings, chapterShortLabel as deconChapterShortLabel } from '../db/chapterHeadings';
 import { getDeconLlmCore, type DeconGenerateText } from './deconLlmCore';
-import { accumulateDeconCost, wouldExceedDeconBudget } from './deconBudget';
 import { decideDeconPassReentry, extractMaterialId, hashDeconFactsOutput, transitionDeconJob } from './deconJob';
 
 // ── E10.3a（task 09-05）W4：P1b 逐章提取（parent design §2.1 P1b / child A design §P1b 契约）──
@@ -407,6 +404,8 @@ export interface DeconP1bDeps {
   readDerivedText?: (material: Material) => string | null;
   /** 逐章 running 进度事件注入（CR-8——runDeconPassSequence 传 stamped notify；直调测试缺省不发）。 */
   notify?: (event: DeconProgressEvent) => void;
+  /** 材料读重试等待注入（C4-F12——测试零延迟；缺省 ~1s×10 实时钟）。 */
+  waitMs?: (ms: number) => Promise<void>;
   now?: () => Date;
 }
 
@@ -451,16 +450,19 @@ export async function runDeconP1b(jobId: string, deps: DeconP1bDeps = {}): Promi
   }
   const job: DeconJob = gate.job;
 
-  const material = getMaterialRow(extractMaterialId(job.materialRef));
-  if (material === null || material.chapters.length === 0) {
-    const message = `材料 ${job.materialRef} 不存在或零章——P1b 无可提取章`;
-    failDeconUnit(jobId, 'p1b', 'all', message, nowIso());
-    return { status: 'failed', message, stats: emptyStats(0) };
+  // C4-F12：材料读点有限重试（中间态零章等重索引收敛；真删除/终局零章诚实失败）。
+  // C4-F16 写侧：材料级前置失败只 transitionDeconJob——job 行 error 已承载错误面，
+  // 不写 ('p1b','all',failed) pass_state 化石行（'all' 非 p1b 合法 unit）。
+  const loaded = await loadExtractableMaterial(extractMaterialId(job.materialRef), { waitMs: deps.waitMs });
+  if (!loaded.ok) {
+    transitionDeconJob(jobId, 'fail', loaded.message);
+    return { status: 'failed', message: loaded.message, stats: emptyStats(0) };
   }
+  const material = loaded.material;
   const derived = (deps.readDerivedText ?? readDeconDerivedTextFor)(material);
   if (derived === null) {
     const message = '派生 .md 读取失败（缺失或车道不可解析）——无法锚定 facts 基面';
-    failDeconUnit(jobId, 'p1b', 'all', message, nowIso());
+    transitionDeconJob(jobId, 'fail', message);
     return { status: 'failed', message, stats: emptyStats(material.chapters.length) };
   }
   if (sha256DeconContent(derived) !== job.derivedHash) {
@@ -471,9 +473,13 @@ export async function runDeconP1b(jobId: string, deps: DeconP1bDeps = {}): Promi
   const blocks = splitParagraphBlocks(derived);
   if (blocks.length === 0) {
     const message = '材料无有效段落（派生 .md 全空白）——不可提取';
-    failDeconUnit(jobId, 'p1b', 'all', message, nowIso());
+    transitionDeconJob(jobId, 'fail', message);
     return { status: 'failed', message, stats: emptyStats(material.chapters.length) };
   }
+
+  // C5：chapterIndex → 真实章标行映射（失败 note 的章号展示不再 index 算术——F19）。
+  const headings = buildDeconChapterHeadings(derived, material.chapters);
+  const chLabel = (chapterIndex: number): string => deconChapterShortLabel(headings.get(chapterIndex), chapterIndex);
 
   // synopsis 滑窗底座：既有 facts（继承/前次完成章）供窗；本章完成后回填。
   const synopses = new Map<number, string>();
@@ -563,52 +569,49 @@ export async function runDeconP1b(jobId: string, deps: DeconP1bDeps = {}): Promi
     for (const segment of segments) {
       const user = buildDeconFactsUserPrompt({
         dictionaryEntries: dictionary.entries,
-        prevSynopses: windowSynopses(synopses, chapter.index),
+        prevSynopses: windowSynopses(synopses, chapter.index, chLabel),
         derived,
         blocks,
         segment,
       });
-      const est = estimateDeconCallTokens(DECON_P1B_SYSTEM_PROMPT, user, DECON_P1B_FACTS_MAX_TOKENS);
-      if (wouldExceedDeconBudget(job.budget, cost, 'p1b', est)) {
-        const note = `p1b 第 ${chapter.index} 章预算超限（本次预估 ${est} tokens，已累计 ${cost.totalTokens}）——已诚实挂起（不烧 token），调整预算后续跑`;
-        capDeconUnit(jobId, 'p1b', unit, note, nowIso());
-        return { status: 'capped', message: note, stats };
+      // C3：预算门→调用→记账→length 判定→升帽重试一次（脚手架单源）；截断仍挂 = failed
+      // （facts 含 synopsis 语义面——半程产物不可续，mirror 旧语义）。
+      const call = await runDeconLlmCall({
+        jobId,
+        pass: 'p1b',
+        unit,
+        slot: 'extraction',
+        system: DECON_P1B_SYSTEM_PROMPT,
+        user,
+        maxTokens: DECON_P1B_FACTS_MAX_TOKENS,
+        budget: job.budget,
+        cost,
+        job,
+        generate,
+        notify: deps.notify,
+        nowIso,
+        label: `p1b ${chLabel(chapter.index)}提取`,
+      });
+      if (!call.ok) {
+        if (call.kind === 'budget-capped') {
+          capDeconUnit(jobId, 'p1b', unit, call.note, nowIso());
+          return { status: 'capped', message: call.note, stats };
+        }
+        if (call.kind === 'length') {
+          return failUnit(`${call.note}——已挂起，不落半程产物`);
+        }
+        return failUnit(call.note); // error / empty（脚手架已记账已判空）
       }
-      let text = '';
-      let finishReason: string | undefined;
-      let usage: { promptTokens?: number; completionTokens?: number; totalTokens?: number } | undefined;
-      try {
-        const response = await generate({
-          slot: 'extraction',
-          system: DECON_P1B_SYSTEM_PROMPT,
-          user,
-          maxTokens: DECON_P1B_FACTS_MAX_TOKENS,
-        });
-        text = (response?.text ?? '').trim();
-        finishReason = response?.finishReason;
-        usage = response?.usage;
-      } catch (err) {
-        return failUnit(`第 ${chapter.index} 章提取调用失败：${deconErrMsg(err)}`);
-      }
-      // 实际记账（调用已发生——provider usage 真值优先 CR-13）并落 job 行——writeDeconCost 单源
-      // 重读现值行（await 窗口翻态不被旧快照复活；行已删抛 DeconJobGoneError 静默中止）。
-      const actual = resolveDeconActualTokens(DECON_P1B_SYSTEM_PROMPT, user, text, usage);
-      cost = accumulateDeconCost(cost, 'p1b', actual.tokens, 1, actual.estimated);
-      writeDeconCost(jobId, job, cost, nowIso());
-      if (finishReason === 'length') {
-        return failUnit(`第 ${chapter.index} 章提取输出因 token 上限截断（finishReason=length）——已挂起，不落半程产物`);
-      }
-      if (!text) {
-        return failUnit(`第 ${chapter.index} 章提取返回空回复——已挂起`);
-      }
+      const text = call.text;
+      cost = call.cost;
       const parsed = parseDeconFactsSegmentResponse(text);
       if (parsed === null) {
-        return failUnit(`第 ${chapter.index} 章提取输出不可解析为 JSON 对象——整体拒收（不硬给 facts）`);
+        return failUnit(`${chLabel(chapter.index)}提取输出不可解析为 JSON 对象——整体拒收（不硬给 facts）`);
       }
       stats.droppedMalformed += parsed.droppedMalformed;
       if (parsed.itemCount > DECON_P1B_MAX_ITEMS_PER_SEGMENT) {
         return failUnit(
-          `第 ${chapter.index} 章提取条目数 ${parsed.itemCount} 超过上限 ${DECON_P1B_MAX_ITEMS_PER_SEGMENT}——为避免静默截断已挂起（材料可能异常，请人工检查）`,
+          `${chLabel(chapter.index)}提取条目数 ${parsed.itemCount} 超过上限 ${DECON_P1B_MAX_ITEMS_PER_SEGMENT}——为避免静默截断已挂起（材料可能异常，请人工检查）`,
         );
       }
 
@@ -670,7 +673,7 @@ export async function runDeconP1b(jobId: string, deps: DeconP1bDeps = {}): Promi
     };
     const validated = deconFactsSchema.safeParse(candidateFacts);
     if (!validated.success) {
-      return failUnit(`第 ${chapter.index} 章合并 facts 未过契约校验（内部错误——锚定映射与契约漂移，请报告）`);
+      return failUnit(`${chLabel(chapter.index)}合并 facts 未过契约校验（内部错误——锚定映射与契约漂移，请报告）`);
     }
     const facts = validated.data;
 
@@ -706,12 +709,19 @@ export async function runDeconP1b(jobId: string, deps: DeconP1bDeps = {}): Promi
   return { status: 'done', stats };
 }
 
-/** 前章 synopsis 滑窗（最近 N 章——按章号顺序取 < 当前章的已有 synopsis）。 */
-function windowSynopses(synopses: ReadonlyMap<number, string>, chapterIndex: number): string[] {
+/**
+ * 前章 synopsis 滑窗（最近 N 章——按章号顺序取 < 当前章的已有 synopsis）。行标签 = 真实章标
+ * 短标签（C5/F19——滑窗行直接进 P1b prompt，零序号算术：无章标章语义回落标签）。
+ */
+function windowSynopses(
+  synopses: ReadonlyMap<number, string>,
+  chapterIndex: number,
+  chapterLabel: (chapterIndex: number) => string,
+): string[] {
   const out: string[] = [];
   for (let i = Math.max(0, chapterIndex - DECON_P1B_PREV_SYNOPSIS_WINDOW); i < chapterIndex; i++) {
     const s = synopses.get(i);
-    if (s !== undefined) out.push(`第 ${i} 章：${s}`);
+    if (s !== undefined) out.push(`${chapterLabel(i)}：${s}`);
   }
   return out;
 }

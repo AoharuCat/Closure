@@ -19,6 +19,21 @@ vi.mock('electron', () => ({
   app: { getPath: () => `${process.cwd()}/test-tmp-user-data` },
 }));
 
+// CR-25 测试缝：configIpc 的盘上键层尚未持久化 customHeaders/verifySsl（子3 在途，
+// 该文件归批B）——本文件只测 resolveListModelsRequest 的**合并契约**（凡
+// readModelConfigFromDisk 返回的键带 customHeaders/verifySsl，keyId 路径必须并车），
+// 故 partial-mock 该导出为可注入；真实现挂 hoisted holder（vi.mock 工厂提升早于
+// 顶层 let 初始化——直接模块级 let 会 TDZ），缺省透传（既有 keyId 存取测试走真盘）。
+const configIpcMocks = vi.hoisted(() => ({
+  readModelConfigFromDisk: vi.fn(),
+  realReadModelConfigFromDisk: undefined as undefined | (() => import('@orison/shared-contracts').ModelConfig),
+}));
+vi.mock('../main/ipc/configIpc', async (importOriginal) => {
+  const original = await importOriginal<typeof import('../main/ipc/configIpc')>();
+  configIpcMocks.realReadModelConfigFromDisk = original.readModelConfigFromDisk;
+  return { ...original, readModelConfigFromDisk: configIpcMocks.readModelConfigFromDisk };
+});
+
 import { _setModelConfigDirForTest, registerConfigIpc } from '../main/ipc/configIpc';
 import { registerModelProviderIpc } from '../main/ipc/modelProviderIpc';
 
@@ -54,6 +69,13 @@ describe('model provider IPC', () => {
     handle.mockReset();
     _setModelConfigDirForTest(TEST_MODEL_DIR);
     rmBestEffort(TEST_MODEL_DIR);
+    // 缺省透传真实现（partial-mock 只在 CR-25 注入用例里改写返回值）。
+    configIpcMocks.readModelConfigFromDisk.mockReset();
+    configIpcMocks.readModelConfigFromDisk.mockImplementation(() => {
+      const real = configIpcMocks.realReadModelConfigFromDisk;
+      if (!real) throw new Error('real readModelConfigFromDisk not captured by mock factory');
+      return real();
+    });
   });
 
   afterEach(() => {
@@ -161,5 +183,74 @@ describe('model provider IPC', () => {
         headers: expect.objectContaining({ authorization: 'Bearer sk-from-disk' }),
       }),
     );
+    // 无 verifySsl 的键：init 不携带 dispatcher 字段（零透传——默认校验路径字节不变）。
+    const init = fetchMock.mock.calls[0]![1] as RequestInit & { dispatcher?: unknown };
+    expect('dispatcher' in init).toBe(false);
+  });
+
+  // ── CR-25（09-12 子3 §3⑦）：listModels 键发现请求并入 customHeaders/verifySsl ──
+
+  it('CR-25: keyId 路径读盘合并键 customHeaders/verifySsl（网关鉴权键的模型发现不再恒 401/431）', async () => {
+    // 注入带传输面的键（盘层 round-trip 归子3 在途波次——此处钉合并契约本身）。
+    configIpcMocks.readModelConfigFromDisk.mockReturnValue({
+      ...SAMPLE_CONFIG,
+      keys: [{
+        ...SAMPLE_CONFIG.keys[0]!,
+        customHeaders: { 'X-Gateway-Auth': 'gw-token', 'X-Route': 'pool-a' },
+        verifySsl: true,
+      }],
+    });
+
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(mockJsonResponse({
+      data: [{ id: 'gpt-4o-mini' }],
+    }));
+
+    registerModelProviderIpc();
+    const [, handler] = handle.mock.calls[0]!;
+
+    await expect(handler({}, { keyId: 'key_001' })).resolves.toHaveLength(1);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://relay.example.com/v1/models',
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          authorization: 'Bearer sk-from-disk',
+          'X-Gateway-Auth': 'gw-token',
+          'X-Route': 'pool-a',
+        }),
+      }),
+    );
+    // verifySsl=true → 不安全 undici dispatcher 进 fetch init（per-request，不装全局）。
+    const init = fetchMock.mock.calls[0]![1] as RequestInit & { dispatcher?: unknown };
+    expect(init.dispatcher).toBeTruthy();
+  });
+
+  it('CR-25: ad-hoc 路径（首键设置）请求自带 customHeaders/verifySsl 同样上车', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(mockJsonResponse({
+      data: [{ id: 'gpt-4o-mini' }],
+    }));
+
+    registerModelProviderIpc();
+    const [, handler] = handle.mock.calls[0]!;
+
+    await expect(handler({}, {
+      protocol: 'openai-compatible',
+      apiKey: 'sk-adhoc',
+      baseUrl: 'https://gw.example.com',
+      customHeaders: { 'X-Gateway-Auth': 'adhoc-token' },
+      verifySsl: true,
+    })).resolves.toHaveLength(1);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://gw.example.com/v1/models',
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          authorization: 'Bearer sk-adhoc',
+          'X-Gateway-Auth': 'adhoc-token',
+        }),
+      }),
+    );
+    const init = fetchMock.mock.calls[0]![1] as RequestInit & { dispatcher?: unknown };
+    expect(init.dispatcher).toBeTruthy();
   });
 });

@@ -138,7 +138,7 @@ export function toolLabel(toolId: string, t: (key: string) => string): string {
 /**
  * dogfood R2 #29：子代理角色名词表（agent_role id → i18n 键）——「Sub Agent」只是指代，
  * 用户要求按**当前代理的具体名称**显示并随 locale 翻译（story-planner-agent → 故事规划师 /
- * Story Planner）。全集 = apps/desktop/agent/prompts/ 的 28 个 agent yaml；词表外角色
+ * Story Planner）。全集 = apps/desktop/agent/prompts/ 的 agent yaml 集；词表外角色
  * （如 skill 标签 story:d1、测试简写 researcher）回落原文 id（mirror toolLabel 词表外
  * 显原文先例）。新角色三处同步：prompts 加 yaml + 此表 + 两 locale agent.role.* 键。
  */
@@ -151,7 +151,6 @@ const ROLE_LABELS: Record<string, string> = {
   'multi-review-agent': 'agent.role.multi-review-agent',
   'revision-guard-agent': 'agent.role.revision-guard-agent',
   'revision-optimizer-agent': 'agent.role.revision-optimizer-agent',
-  'targeted-revision-agent': 'agent.role.targeted-revision-agent',
   'adjudicator-agent': 'agent.role.adjudicator-agent',
   'arc-audit-agent': 'agent.role.arc-audit-agent',
   'arc-emergence-agent': 'agent.role.arc-emergence-agent',

@@ -36,6 +36,22 @@ decon:
     fubi: "伏笔形态学"
     duizhao: "对照与变奏"
     style: "风格维"
+  # ── 维度粒度说明（CR-14——granularity 契约原文是 zh 开发注记，键化供 en 侧对拍；zh 按
+  #     原文意译去掉内部术语）──
+  dimGranularity:
+    huoke: "开篇章级（前 12 章，章数不足则全书）——结论汇入书级读法"
+    qidaigan: "章级 + 弧级双面"
+    jiegou: "弧级——结论汇入书级读法"
+    renshe: "弧级（出场退场表自动预注）"
+    shijieguan: "弧级——结论汇入读法；层级与字数证据来自统计"
+    qingxu: "章级 + 弧级双面"
+    wenbi: "章级抽查（深度档另有名场面细批）"
+    zaogeng: "章级 + 弧级双面"
+    xinxicha: "章级 + 弧级读者知识曲线"
+    shijian: "章级 + 弧级（频率面）"
+    fubi: "弧级（埋-收配对，回收点锚点必带）"
+    duizhao: "弧级（同类场景聚类后析变奏）"
+    style: "书级抽样（14 节风格卡 + 风格报告）"
   # ── job 状态（DECON_JOB_STATUSES 八态——pending = P0 落库未启动）──
   status:
     pending: "待启动"
@@ -57,6 +73,7 @@ decon:
     failed: "拆解失败：{message}"
     done: "拆解完成——产出见下方阅读区"
     cancelled: "已取消——重拆走「新建拆解」"
+    openReading: "打开读法"
   # ── pass 标签（p4/p5 带后缀由调用方拼维度/报告 kind）──
   pass:
     p1a: "实体词典"
@@ -68,15 +85,23 @@ decon:
     p4: "手艺层"
     p5: "输出装配"
     p6: "手艺落卡"
-  # ── unit 友好形 ──
+  # ── unit 友好形（C5/F19——章号零序号算术：数字/ch: unit 是材料端 index 0 基，UI 无章标
+  #    真值源，一律材料相对引用「材料第 N 章」（N = 原始 index），不再 index+1 冒充书内章号）──
   unit:
-    chapter: "第 {index} 章"
+    materialChapter: "材料第 {index} 章"
     arc: "第 {index} 弧"
     scene: "名场面 {index}"
     all: "全书"
     arcs: "弧切分"
     stats: "统计族"
     literal: "{unit}"
+  # ── U4 总进度条 ──
+  progress:
+    total: "{done}/{total}"
+    eta: "预计剩余 {eta}"
+    unitOfTotal: "{unit}（共 {total}）"
+    # CR-19：pass 覆盖辅行（已完成 pass 数/总 pass 数）。
+    passCoverage: "已完成 {done}/{total} 个阶段"
   # ── 新建向导 ──
   wizard:
     title: "新建拆解"
@@ -90,6 +115,9 @@ decon:
     dimFineCount: "已选 {count}/3 个手艺维（风格维可选，不计入）"
     dimCoarseHint: "粗拆档只有风格维可勾（不勾 = 纯骨架粗拆）"
     dimDeepHint: "深度档全 12 手艺维必选（已预填）——风格维可选"
+    dimCoarseMore: "还有 {count} 个手艺维在细拆档解锁"
+    dimPreviewShow: "展开预览"
+    dimPreviewHide: "收起预览"
     invalidDims: "维度选择不符合档位规则"
     reviewGates: "人审闸门（词典 / canon / 手艺层三道确认，到点暂停等你过目）"
     gatesOn: "开启（推荐——首本标定）"
@@ -103,6 +131,19 @@ decon:
     estimateTitle: "成本预估"
     estimateTotal: "合计约 {tokens} tokens"
     estimateInherited: "P1 已复用（零重付）——同指纹事实层产物直接继承"
+    # CR-17：每 pass 一句通俗说明（网文作者受众——讲清钱花在哪/什么在推高费用）。
+    estimateNote:
+      p1a: "把全书的候选实体列成清单，一次分类到位，费用固定"
+      p1b: "逐章过全书提取事实——章数 × 单章费用，是整场拆解最贵的一项"
+      p1c: "把前面积累的实体和别名聚类消歧，费用固定"
+      p2: "按六个域（世界/规则/角色/基调/时间线/关系）归纳设定，每个域各算一笔"
+      p3a: "逐章打标记（钩子/转折/情绪拍等），章数越多越贵"
+      p4: "按你勾的手艺维度逐维细问——维度和章数越多越贵"
+      p4style: "书级抽样看文风（不逐章），按弧数计费"
+      p5book: "通读全书骨架写一份读法，费用固定"
+      p5chapter: "逐章写评语，章数越多越贵"
+      p5scene: "挑名场面逐段细批，深度档才有"
+      p6: "把手艺发现整理成卡，按候选条数计费"
     start: "启动拆解"
     createFailed: "创建失败：{message}"
   # ── 人审闸门卡 ──
@@ -137,9 +178,18 @@ decon:
     chaptersEmpty: "还没有章评——完成细拆档（或以上）后生成"
     scenesEmpty: "还没有名场面细批——深度档生成"
     styleEmpty: "风格报告尚未产出——勾选风格维后生成"
+    styleStatsTitle: "风格统计（粗拆即产出）"
+    styleSentenceLabel: "句长"
+    styleParagraphLabel: "段落长度"
+    styleDialogueLabel: "对话行占比"
+    styleDistribution: "共 {count} 项·平均 {avg} 字·最长 {max} 字"
+    styleDialogueRatio: "{ratio}%"
+    styleNeedsFine: "完整风格报告需细拆档勾选风格维后生成"
     canonEmpty: "canon 六域为空"
+    selectReport: "从左侧选择读法条目查看全文"
     selectChapter: "选择左侧章评查看全文"
     selectScene: "选择左侧名场面查看全文"
+    coarseLockedHint: "本会话是粗拆档——章评与细批在细拆档及以上解锁"
     styleExport: "导出到当前项目风格卡"
     styleExportNoProject: "没有打开的项目——先选定目标项目再导出"
     styleExportConfirmTitle: "写入风格卡"
@@ -152,7 +202,7 @@ decon:
     craftZoneJump: "到手艺页人审"
     reportFailed: "取报告失败：{message}"
     anchorsTitle: "锚点（可追原文）"
-    anchorRow: "第 {chapter} 章·段落 {start}–{end}"
+    anchorRow: "{chapter}·段落 {start}–{end}"
   # ── 报告 kind（DECON_REPORT_KINDS 四 kind）──
   reportKind:
     book_reading: "书级读法"
@@ -174,11 +224,50 @@ decon:
     tone: "基调"
     timeline: "时间线"
     relationship: "关系"
+  # ── canon 产出卡片（U2/F17——按域字段卡 +「AI 视图」开关）──
+  canonCard:
+    aiView: "AI 视图（JSON 原文）"
+    evidenceExact: "原文确认"
+    evidenceInferred: "结构推断"
+    anchorsCount: "锚点 {count} 处"
+    provenance: "出处《{book}》"
+    summary: "概括"
+    statement: "规则表述"
+    baseline: "基调"
+    identity: "身份"
+    speechPattern: "语言风格"
+    traits: "特质"
+    traitImmutable: "核心不变"
+    traitEvolvable: "可演变"
+    abilities: "能力"
+    arc: "成长弧"
+    coreTrauma: "核心创伤"
+    pillars: "行为支柱"
+    voiceAnchors: "语言锚点"
+    antiVoice: "反锚点"
+    neverDo: "绝不做"
+    aliases: "别名"
+    mentions: "出场章数"
+    portraitDegraded: "画像降级（摘录不足）"
+    consistency: "时间线"
+    consistencyExact: "章序一致"
+    consistencyLoose: "有意错乱"
+    consistencyConflict: "真矛盾"
+    events: "事件（{count}）"
+    eventRow: "材料第 {chapter} 章·{label}"
+    eventUnannotated: "材料第 {chapter} 章·未标注"
+    conflictNote: "矛盾注记"
+    pair: "关系"
+    edgeCount: "证据"
+    edgeCountValue: "{count} 处证据边"
   # ── 动作 ──
   action:
     refresh: "刷新"
     pause: "暂停"
     resume: "继续"
+    # CR-8：failed 态中性续跑（失败点不在逐章提取时——不假造章号）。
+    resumeDecon: "继续拆解"
+    resumeFromChapter: "从{chapter}继续"
     resumeWithBudget: "调预算续跑"
     cancel: "取消"
     delete: "删除"

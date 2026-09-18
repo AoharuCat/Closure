@@ -322,6 +322,33 @@ describe('createResearchVerifier — 核实子循环', () => {
     expect(outcome.kind === 'gaps' && outcome.verdict.gaps[0].desc).toContain('王五');
   });
 
+  it('onDelta 注入（09-13 子2 W1）：reasoning 增量经 deps.onDelta 上行；text 滤除（verdict JSON 不开正文流）', async () => {
+    const seenOpts: Array<{ onDelta?: unknown }> = [];
+    const generate = vi.fn(async (
+      _msgs: unknown[],
+      _sys: string,
+      _tls: unknown,
+      _abort: AbortSignal,
+      opts?: { onDelta?: (d: { type: 'text' | 'reasoning'; delta: string }) => void },
+    ) => {
+      seenOpts.push(opts ?? {});
+      opts?.onDelta?.({ type: 'reasoning', delta: '核对中' });
+      opts?.onDelta?.({ type: 'text', delta: '{"checklist"' }); // 裸 JSON text——滤除
+      return textRound(`${JSON.stringify(passVerdict())}\n<VERIFICATION_VERDICT_READY>`);
+    });
+    const deltas: Array<{ messageId: string; channel: string; delta: string }> = [];
+    const verifier = createResearchVerifier({
+      ...makeVerifierDeps(generate as never as GenerateFn),
+      onDelta: (d) => deltas.push(d),
+    });
+    const outcome = await verifier(verifyInput());
+    // 判定不受开流影响（契约零变）。
+    expect(outcome).toEqual({ kind: 'pass', verdict: passVerdict() });
+    // makeAgentLoop 收到 onDelta（开流选中流式路径）；回调只收 reasoning。
+    expect(typeof seenOpts[0]?.onDelta).toBe('function');
+    expect(deltas).toEqual([{ messageId: expect.any(String), channel: 'reasoning', delta: '核对中' }]);
+  });
+
   it('verdict parse 失败 → 回纠错重发 → 合法 verdict 收束（不崩不静默）', async () => {
     const generate = vi
       .fn<GenerateFn>()

@@ -375,7 +375,7 @@ describe.skipIf(!sqliteUsable)('materialIndexer DB integration (Story 10.1 Wave 
       expect(derived.slice(r.char_start as number, r.char_end as number)).toBe(r.body_text);
     }
     const firstChapterRows = rows.filter((r) => r.chapter_index === 0);
-    expect(firstChapterRows[0]!.name).toBe('novel·第1章');
+    expect(firstChapterRows[0]!.name).toBe('novel·第 1 章');
     expect(firstChapterRows[0]!.entry_id).toBe(materialEntryId(PID!, materialId, 0, 0));
 
     // 批量 embed 单调用断言（整材料一次，非逐 chunk）。
@@ -448,7 +448,7 @@ describe.skipIf(!sqliteUsable)('materialIndexer DB integration (Story 10.1 Wave 
     const row = getMaterialRow(materialId)!;
     expect(row.chapters[0]!.title).toBe('人工改名之章'); // chapters_json 刷新（AC4）
     const rows = materialRowsRaw(materialId).filter((r) => r.chapter_index === 0);
-    expect(rows[0]!.name).toBe('novel·第1章'); // name 是材料名+章序（不含标题）——标题在 chapters_json
+    expect(rows[0]!.name).toBe('novel·第 1 章'); // name = 材料名+章标真值短标签（C5——章号从章标行解析非序号算术）；标题在 chapters_json
   });
 
   it('CR-001 生产装配：派生正文被人工编辑 + 原件未变 → 重摄取不覆写（getRegisteredContentHash 闭包激活）', async () => {
@@ -474,6 +474,77 @@ describe.skipIf(!sqliteUsable)('materialIndexer DB integration (Story 10.1 Wave 
     expect(after).toBe(edited); // 🔑 派生逐字保留（未被自动重分覆写）
     const row = getMaterialRow(materialId)!;
     expect(row.quality.parseNotes.some((n) => n.includes('人工编辑'))).toBe(true); // 诚实 note
+  });
+
+  it('C2 防清 belt：markers=0 重摄取（CR-001 生产装配）→ 0 章中间行不存在 + 相 B autoResplit 收敛真实值', async () => {
+    writeProjectSource('novel.txt', chapteredNovel());
+    const { deps } = embedCountingDeps();
+    const first = await registerMaterial({ scope: 'project', projectDir: PROJECT_DIR }, 'novel.txt', deps);
+    const materialId = first.materialId!;
+    expect(getMaterialRow(materialId)!.chapters).toHaveLength(4);
+
+    // R10 剥离形态：标记全失 + 一处人工正文改动（内容变更 → CR-001；markers=0 → 标记重建零章）。
+    const derivedAbs = path.join(PROJECT_DIR, 'materials', '.derived', 'novel.md');
+    const stripped = `${stripChapterMarkerLines(readFileSync(derivedAbs, 'utf-8'))}\n\n人工补记：伏笔在第三章回收。`;
+    writeFileSync(derivedAbs, stripped, 'utf-8');
+
+    // 拦截相 B embed 窗口观察中间行态（最终 UPDATE 前）——belt 应已保留 4 章（旧形态此处行是
+    // 0 章 ready 假态，UI 显「0 章|章界待校对」1-3 分钟直至相 B 事务回填）。
+    let midWindowRow: Material | null = null;
+    const beltDeps = {
+      resolveModel: () => stubModel(),
+      embedBatch: async (_m: ResolvedModel, texts: string[]) => {
+        midWindowRow = getMaterialRow(materialId);
+        return texts.map((_, i) => vec1024(i));
+      },
+    };
+    const res = await registerMaterial({ scope: 'project', projectDir: PROJECT_DIR }, 'novel.txt', beltDeps);
+    expect(res.outcome).toBe('registered'); // reingest-skipped-manual → registered
+    expect(midWindowRow).not.toBeNull();
+    expect(midWindowRow!.chapters).toHaveLength(4); // 🔑 belt 生效：embed 窗口行仍 4 章（0 章中间行不存在）
+    expect(readFileSync(derivedAbs, 'utf-8')).toBe(stripped); // 派生人工内容不覆写
+
+    // 相 B 收敛（belt 不拦）：autoResplit 读磁盘派生 .md 重切——最终行 span 基面 = 当前裸文本
+    // （与 belt 保留的旧标记基面 span 必不同）+ regex 真实值 + 诚实 note 存续。
+    const row = getMaterialRow(materialId)!;
+    expect(row.chapters).toHaveLength(4);
+    expect(row.chapters.every((c) => c.method === 'regex')).toBe(true);
+    expect(row.status).toBe('ready');
+    expect(row.quality.parseNotes.some((n) => n.includes('章标记缺失'))).toBe(true);
+    expect(JSON.stringify(row.chapters)).not.toBe(JSON.stringify(midWindowRow!.chapters)); // 覆写证明
+    const strippedText = readDerivedForTest(derivedAbs);
+    for (const c of row.chapters) {
+      expect(strippedText.slice(c.charStart, c.charEnd).trim().length).toBeGreaterThan(0); // span 落裸文本基面
+    }
+  });
+
+  it('C5：chunk 展示名 = 章标真值（简介伪章书不再 +1 错位；简介语义回落；伪章「全文」不变）', async () => {
+    // 简介伪章形态：首章标前的卷首简介自成 index 0（title null）——旧 `第${index+1}章` 序号
+    // 算术把真「第一章」（index 1）渲染成「第2章」整体错位（F19）。
+    const introBook = [
+      '卷首简介：一个闭环的故事。',
+      '第一章 风起', `${'墨'.repeat(160)}。`,
+      '第二章 云涌', `${'雨'.repeat(160)}。`,
+      '第三章 潮生', `${'潮'.repeat(160)}。`,
+    ].join('\n\n');
+    writeProjectSource('intro-book.txt', introBook);
+    const { deps } = embedCountingDeps();
+    const res = await registerMaterial({ scope: 'project', projectDir: PROJECT_DIR }, 'intro-book.txt', deps);
+    const materialId = res.materialId!;
+    const row = getMaterialRow(materialId)!;
+    expect(row.chapters).toHaveLength(4); // 简介伪章 + 三真章
+    expect(row.chapters[0]!.title).toBeNull();
+
+    const rows = materialRowsRaw(materialId);
+    const nameOf = (chapterIndex: number): string => {
+      const hit = rows.find((r) => r.chapter_index === chapterIndex);
+      expect(hit).toBeDefined();
+      return String(hit!.name);
+    };
+    expect(nameOf(0)).toBe('intro-book·简介（卷首）'); // 简介伪章语义回落（非「第1章」谎言）
+    expect(nameOf(1)).toBe('intro-book·第 1 章'); // 🔑 真「第一章」标 1（旧 = 「第2章」错位）
+    expect(nameOf(2)).toBe('intro-book·第 2 章');
+    expect(nameOf(3)).toBe('intro-book·第 3 章');
   });
 
   it('F-09：≥2 万字低置信挂起（无 LLM 内核）→ 零章 + 全文单伪章照索引 + status 保留 low-confidence', async () => {
@@ -619,7 +690,7 @@ describe.skipIf(!sqliteUsable)('materialIndexer DB integration (Story 10.1 Wave 
       expect(r.source).toBe('craft-lecture'); // source = 材料名
       expect(r.model).toBe('text-embedding-3-test');
       expect(String(r.craft_id).startsWith(`mat:${materialId}.ch`)).toBe(true);
-      expect(String(r.name)).toMatch(/^craft-lecture·第\d+章·c\d+$/);
+      expect(String(r.name)).toMatch(/^craft-lecture·第 \d+ 章·c\d+$/);
     }
     if (isSqliteVecAvailable()) {
       const vecs = craftVecRows(`mat:${materialId}`);

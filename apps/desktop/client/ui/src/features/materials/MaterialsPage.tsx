@@ -31,6 +31,7 @@ import {
   revealInFolder,
 } from '../../shared/api/materials';
 import { MaterialRow } from './MaterialRow';
+import { ImportSourcePicker } from './ImportSourcePicker';
 import { ProvenanceForm } from './ProvenanceForm';
 import { materialDistillBadge } from '../craft/craftView';
 import type { CraftDistillSkipReason } from '@orison/shared-contracts';
@@ -316,7 +317,8 @@ export function MaterialsPage() {
         />
       </div>
 
-      {/* 导入进度 + 三档拒收回报（反馈区呈现最近一次成功导入）。 */}
+      {/* 导入进度 + 三档拒收回报（反馈区呈现最近一次成功导入）+ 来源引导（C9——导入刚
+          完成就地选来源可跳过，落库走 update-provenance；ImportSourcePicker 内自判空）。 */}
       {(materialsImporting || materialsImportFeedback !== null) && (
         <div className="materials-importfeedback" data-materials-import-feedback="true">
           {materialsImporting && materialsImportProgress !== null && (
@@ -363,6 +365,9 @@ export function MaterialsPage() {
                 </ul>
               )}
             </div>
+          )}
+          {materialsImportFeedback !== null && (
+            <ImportSourcePicker items={materialsImportFeedback.imported} />
           )}
         </div>
       )}

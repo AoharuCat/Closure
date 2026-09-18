@@ -15,6 +15,7 @@ import {
 import { getMaterialRow } from '../db/materialIndexer';
 import { getLogger } from '../logger';
 import {
+  DECON_LLM_RETRY_ESCALATE,
   DECON_STALE_NOTE,
   capDeconUnit,
   deconErrMsg,
@@ -90,9 +91,13 @@ export const DECON_P1C_APPOSITION_MIN_CHAPTERS = 2;
 
 /**
  * 裁决输出 token 预算（**每批独立核算**——CR-12：裁决对 O(n²) 无上界 vs 4096；每批 ≤30 对
- * × 每条 {"pairId","sameEntity"} ≈ 10 tokens ≈ 300，2048 含余量）。
+ * × 每条 {"pairId","sameEntity"} ≈ 10 tokens ≈ 300）。
+ *
+ * 2048 → 8192（dogfood R3 F13 实证）：2048 帽下 deepseek-v4-flash（thinking off）别名裁决
+ * 连续两次 finishReason=length 确定性截断——flash 系输出带 ~2-4K 固定对话性包袱，帽须按
+ * 「模型最低输出开销 + JSON 体」核算而非纯 JSON 体；对齐 seam 缺省 belt 8192。
  */
-export const DECON_P1C_ADJUDICATE_MAX_TOKENS = 2048;
+export const DECON_P1C_ADJUDICATE_MAX_TOKENS = 8192;
 
 /** 裁决分批大小（CR-12——批间独立预算门/纠偏重试/记账）。 */
 export const DECON_P1C_ADJUDICATE_BATCH_SIZE = 30;
@@ -493,7 +498,9 @@ export async function runDeconP1c(jobId: string, deps: DeconP1cDeps = {}): Promi
       let batchVerdicts: Map<string, boolean> | null = null;
       for (let attempt = 0; attempt < 2; attempt++) {
         const user = buildDeconAdjudicationUserPrompt(batch, observations, attempt > 0);
-        const est = estimateDeconCallTokens(DECON_P1C_ADJUDICATE_SYSTEM_PROMPT, user, DECON_P1C_ADJUDICATE_MAX_TOKENS);
+        // C3：attempt>0 升帽 ×2（JSON 纠偏环语义保留——升帽给截断重试留输出余量；est 按当次帽过门）。
+        const cap = attempt > 0 ? DECON_P1C_ADJUDICATE_MAX_TOKENS * DECON_LLM_RETRY_ESCALATE : DECON_P1C_ADJUDICATE_MAX_TOKENS;
+        const est = estimateDeconCallTokens(DECON_P1C_ADJUDICATE_SYSTEM_PROMPT, user, cap);
         if (wouldExceedDeconBudget(job.budget, cost, 'p1c', est)) {
           const note = `p1c 别名裁决预算超限（本次预估 ${est} tokens，已累计 ${cost.totalTokens}）——已诚实挂起（不烧 token），调整预算后续跑`;
           capDeconUnit(jobId, 'p1c', DECON_PASS_UNIT_ALL, note, nowIso());
@@ -508,7 +515,7 @@ export async function runDeconP1c(jobId: string, deps: DeconP1cDeps = {}): Promi
             slot: 'review-judge',
             system: DECON_P1C_ADJUDICATE_SYSTEM_PROMPT,
             user,
-            maxTokens: DECON_P1C_ADJUDICATE_MAX_TOKENS,
+            maxTokens: cap,
           });
           text = (response?.text ?? '').trim();
           finishReason = response?.finishReason;

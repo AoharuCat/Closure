@@ -1,5 +1,6 @@
 import { marked } from 'marked';
 import TurndownService from 'turndown';
+import DOMPurify from 'dompurify';
 import { stripFrontmatter } from './frontmatter';
 
 marked.setOptions({
@@ -20,9 +21,95 @@ turndown.addRule('strikethrough', {
   replacement: (content) => `~~${content}~~`,
 });
 
+// ── Serializer escape policy (dogfood R3 / R10) ───────────────────────────
+// turndown's default text-node escape rewrites EVERY underscore
+// (`book_id` → `book\_id`) and every text-node-start `=` run (`= 正文` →
+// `\= 正文`). On the editor's save path that is pure byte drift — the R3
+// dogfood derived .md accumulated this escape pollution on every in-app
+// save. The defaults are load-bearing in general (escaped output must
+// re-parse to the same literals), so only the two offending rules are
+// replaced with boundary-aware versions; every other default escape stays:
+//  - `_`: an underscore run flanked by letters/digits on BOTH sides can
+//    never open or close emphasis (CommonMark intraword rule), so it stays
+//    unescaped — `book_id=…` round-trips byte-exact. Word-boundary runs (a
+//    space/punctuation/line edge on a side) are still escaped so a literal
+//    `_x_` never turns into emphasis on re-parse.
+//  - `=`: only an `=` run at a text-node start that forms a whole line can
+//    act as a setext underline on re-parse; `= 正文` (content after the
+//    run) cannot, and stays unescaped.
+// `escape` is a public TurndownService method consulted for every non-code
+// text node, so shadowing it on the shared instance retargets every
+// serialization through htmlToMarkdown.
+const EDITOR_ESCAPES: ReadonlyArray<readonly [RegExp, string]> = [
+  [/\\/g, '\\\\'],
+  [/\*/g, '\\*'],
+  [/^-/g, '\\-'],
+  [/^\+ /g, '\\+ '],
+  [/^(#{1,6}) /g, '\\$1 '],
+  [/`/g, '\\`'],
+  [/^~~~/g, '\\~~~'],
+  [/\[/g, '\\['],
+  [/\]/g, '\\]'],
+  [/^>/g, '\\>'],
+  [/^(\d+)\. /g, '$1\\. '],
+];
+
+const SETEXT_UNDERLINE_AT_START_RE = /^(=+)(?=[ \t]*(?:\n|$))/;
+const LETTER_OR_DIGIT = /[\p{L}\p{N}]/u;
+
+function escapeUnderscoreRuns(text: string): string {
+  if (!text.includes('_')) return text;
+  let out = '';
+  let runStart = -1;
+  for (let i = 0; i <= text.length; i++) {
+    if (i < text.length && text.charAt(i) === '_') {
+      if (runStart === -1) runStart = i;
+      continue;
+    }
+    if (runStart !== -1) {
+      const run = text.slice(runStart, i);
+      const before = runStart > 0 ? text.charAt(runStart - 1) : '';
+      const after = i < text.length ? text.charAt(i) : '';
+      const intraword =
+        before !== '' && after !== '' && LETTER_OR_DIGIT.test(before) && LETTER_OR_DIGIT.test(after);
+      out += intraword ? run : run.replace(/_/g, '\\_');
+      runStart = -1;
+    }
+    if (i < text.length) out += text.charAt(i);
+  }
+  return out;
+}
+
+/** Boundary-aware replacement for turndown's default text-node escape. */
+function escapeEditorText(text: string): string {
+  let out = text;
+  for (const [re, replacement] of EDITOR_ESCAPES) out = out.replace(re, replacement);
+  // `=` rule after the pipeline so its inserted backslash is not doubled by
+  // the `\\` rule above.
+  out = out.replace(SETEXT_UNDERLINE_AT_START_RE, '\\$1');
+  return escapeUnderscoreRuns(out);
+}
+
+turndown.escape = escapeEditorText;
+
 export function markdownToHtml(markdown: string): string {
   if (!markdown) return '';
   return (marked.parse(markdown, { async: false }) as string).trimEnd();
+}
+
+// ── Model-output rendering (dogfood R3 U1: promoted from features/agent-panel) ──
+
+/**
+ * Model-authored markdown → sanitized HTML (marked + DOMPurify). Single source
+ * for every surface that renders model output as rich text: agent replies
+ * (AgentMessageItem), subagent draft cards, and decon reports (DeconJobPanel).
+ * The renderer holds fs/git write-tool IPC access, so raw model output must
+ * never run as HTML un-sanitized. Not for editor save paths — those go through
+ * htmlToMarkdown round-trips above.
+ */
+export function renderMarkdown(content: string): string {
+  const html = marked.parse(content, { async: false }) as string;
+  return DOMPurify.sanitize(html);
 }
 
 export function htmlToMarkdown(html: string): string {

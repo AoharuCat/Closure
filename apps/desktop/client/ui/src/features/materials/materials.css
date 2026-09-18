@@ -175,6 +175,56 @@
   margin: var(--space-3xs) 0;
 }
 
+/* ── 导入来源引导（C9/F3/U22——每份成功导入一行 medium/tier 下拉，可跳过零强制）── */
+.materials-sourcepick {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3xs);
+  padding: var(--space-2xs) 0;
+}
+
+.materials-sourcepick-title {
+  font-size: var(--text-xs);
+  color: var(--on-surface-variant);
+}
+
+.materials-sourcerow {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  font-size: var(--text-xs);
+  color: var(--on-surface-variant);
+}
+
+.materials-sourcerow-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.materials-sourceselect {
+  border: 1px solid var(--border-default);
+  background: var(--input-bg, var(--surface-container-lowest));
+  color: var(--on-surface);
+  border-radius: var(--radius-2xs);
+  padding: var(--space-3xs) var(--space-2xs);
+  font-size: var(--text-xs);
+}
+
+.materials-sourceselect:focus-visible {
+  border-color: var(--accent);
+}
+
+.materials-sourceselect:disabled {
+  opacity: 0.55;
+}
+
+.materials-sourcerow-saved {
+  color: var(--success);
+}
+
 /* ── 列表滚动面 ── */
 .materials-listwrap {
   flex: 1;

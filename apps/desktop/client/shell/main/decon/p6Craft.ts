@@ -62,18 +62,15 @@ import {
   capDeconUnit,
   checkDeconRunBoundary,
   deconErrMsg,
-  estimateDeconCallTokens,
   failDeconUnit,
   loadRunningDeconJob,
   readDeconDerivedTextFor,
-  resolveDeconActualTokens,
+  runDeconLlmCall,
   sha256DeconContent,
-  writeDeconCost,
   writeDeconPassState,
   type DeconBoundaryStop,
 } from './deconRun';
 import { getDeconLlmCore, type DeconGenerateText } from './deconLlmCore';
-import { accumulateDeconCost, wouldExceedDeconBudget } from './deconBudget';
 import { decideDeconPassReentry, extractMaterialId, transitionDeconJob } from './deconJob';
 import { isQuoteInSpan, type DeconParaRange } from './p1Extract';
 import { hashDeconProductOutput } from './p3Label';
@@ -854,6 +851,8 @@ export async function runDeconP6(jobId: string, deps: DeconP6Deps = {}): Promise
       writeDeconPassState(jobId, 'p6', 'all', 'running', null, nowIso());
 
       // 约束式归类+浓缩（两次尝试——越界/坏输出重试矫正，仍坏 per-claim 丢弃不炸 pass）。
+      // C3：LLM 调用面走脚手架单源（预算门→调用→记账→length 升帽重试一次）；截断仍挂 =
+      // failed（condensed 语义面——半程主张不可续）。空回复/解析坏仍是候选级丢弃非 pass 失败。
       let outcome: DeconP6CondenseOutcome | null = null;
       let dropReason = '归类+浓缩输出不可用（重试耗尽）';
       for (let attempt = 0; attempt < 2 && outcome === null; attempt++) {
@@ -863,53 +862,40 @@ export async function runDeconP6(jobId: string, deps: DeconP6Deps = {}): Promise
           activeTerms,
           corrective: attempt > 0,
         });
-        const est = estimateDeconCallTokens(
-          DECON_P6_SYSTEM_PROMPT,
+        const call = await runDeconLlmCall({
+          jobId,
+          pass: 'p6',
+          unit: 'all',
+          slot: 'extraction',
+          system: DECON_P6_SYSTEM_PROMPT,
           user,
-          DECON_P6_CONDENSE_MAX_TOKENS,
-        );
-        if (wouldExceedDeconBudget(job.budget, cost, 'p6', est)) {
-          const note = `p6 落卡整理预算超限（本次预估 ${est} tokens，已累计 ${cost.totalTokens}）——已诚实挂起（不烧 token），调整预算后续跑`;
-          capDeconUnit(jobId, 'p6', 'all', note, nowIso());
-          return { status: 'capped', message: note, stats };
+          maxTokens: DECON_P6_CONDENSE_MAX_TOKENS,
+          budget: job.budget,
+          cost,
+          job,
+          generate,
+          notify: deps.notify,
+          nowIso,
+          label: 'p6 落卡整理',
+        });
+        // CR-16：记账先累计再分支——empty 纠偏重试的 attempt-1 花费已落 job 行（helper 内
+        // writeDeconCost 单源），本地 cost 不跟进会在 attempt-2 以旧值覆写（replace 语义丢笔）。
+        cost = call.cost;
+        if (!call.ok) {
+          if (call.kind === 'budget-capped') {
+            capDeconUnit(jobId, 'p6', 'all', call.note, nowIso());
+            return { status: 'capped', message: call.note, stats };
+          }
+          if (call.kind === 'length') {
+            return failUnit(`${call.note}——已挂起（不落半程主张）`);
+          }
+          if (call.kind === 'empty') {
+            dropReason = '空回复';
+            continue;
+          }
+          return failUnit(call.note); // error
         }
-        let text = '';
-        let finishReason: string | undefined;
-        let usage:
-          | {
-              promptTokens?: number;
-              completionTokens?: number;
-              totalTokens?: number;
-            }
-          | undefined;
-        try {
-          const response = await generate({
-            slot: 'extraction',
-            system: DECON_P6_SYSTEM_PROMPT,
-            user,
-            maxTokens: DECON_P6_CONDENSE_MAX_TOKENS,
-          });
-          text = (response?.text ?? '').trim();
-          finishReason = response?.finishReason;
-          usage = response?.usage;
-        } catch (err) {
-          return failUnit(`p6 落卡整理调用失败：${deconErrMsg(err)}`);
-        }
-        // 实际记账（CR-13）+ cost 回写单源（行已删抛 DeconJobGoneError 由编排层静默退出）。
-        const actual = resolveDeconActualTokens(DECON_P6_SYSTEM_PROMPT, user, text, usage);
-        cost = accumulateDeconCost(cost, 'p6', actual.tokens, 1, actual.estimated);
-        writeDeconCost(jobId, job, cost, nowIso());
-        if (finishReason === 'length') {
-          // condensed 是语义面（mirror p1b/p4 findings）：半程主张不可续——failed 诚实挂起。
-          return failUnit(
-            'p6 落卡整理输出因 token 上限截断（finishReason=length）——已挂起（不落半程主张）',
-          );
-        }
-        if (!text) {
-          dropReason = '空回复';
-          continue;
-        }
-        const parsed = parseDeconP6Response(text, activeTerms);
+        const parsed = parseDeconP6Response(call.text, activeTerms);
         if (!parsed.ok) {
           dropReason = '输出不可解析/越界';
           continue;

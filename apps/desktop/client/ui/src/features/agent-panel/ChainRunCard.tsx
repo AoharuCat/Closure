@@ -3,6 +3,8 @@ import { useShallow } from 'zustand/react/shallow';
 import { useAppStore } from '../../shared/store/appStore';
 import { useI18n } from '../../shared/i18n/useI18n';
 import { CHAIN_NODE_ORDER, chainNodeLabel, type ChainRunState } from '../../shared/store/chainStreamBuffer';
+// 09-12 子2：模型切换行的显示名单源（与通知条/终态徽标同一查表）。
+import { modelDisplayName } from '../../shared/model/modelDisplay';
 // dogfood T1 CR-T1-047（decision 1A）：draft-writer 阶段二产物是 JSON 信封
 //（{"title":"…","text":"…正文…"} + 尾部 wordCount/<DRAFT_READY>）——渲染层纯函数解出
 // text 增量，用户全程看可读章稿而非裸 JSON 转义字面。畸形 fallback 原样（不比现状差）。
@@ -45,7 +47,11 @@ function renderMarkdown(content: string): string {
 }
 
 export function ChainRunCard({ run, onRetry, onResume }: Props) {
-  const { resolvedLocale } = useAppStore(useShallow((s) => ({ resolvedLocale: s.resolvedLocale })));
+  const { resolvedLocale, modelConfigForCard } = useAppStore(useShallow((s) => ({
+    resolvedLocale: s.resolvedLocale,
+    // 09-12 子2：模型切换行的显示名查表源。
+    modelConfigForCard: s.modelConfig as import('@orison/shared-contracts').ModelConfig | undefined,
+  })));
   const { t } = useI18n(resolvedLocale);
 
   const compact = run.status === 'paused';
@@ -146,6 +152,21 @@ export function ChainRunCard({ run, onRetry, onResume }: Props) {
           );
         })}
       </div>
+      {/* 09-12 子2（design §8⑤）：链内模型切换行——writer 循环/核实子循环回退时
+          （model-fallback 事件带 nodeId）呈现「{节点}：{from} 失败 → 已切换 {to}」；
+          未发生回退不渲染（主指派模型在跑，配置面已可见）。 */}
+      {run.modelSwitch ? (
+        <div className="chain-run-card-model-switch" role="status">
+          <span className="material-symbols-outlined" aria-hidden="true">swap_horiz</span>
+          <span>
+            {t('agent.chainModelSwitch', {
+              node: run.modelSwitch.nodeLabel,
+              from: modelDisplayName(modelConfigForCard, run.modelSwitch.from),
+              to: modelDisplayName(modelConfigForCard, run.modelSwitch.to),
+            })}
+          </span>
+        </div>
+      ) : null}
       {!compact && (
         <div className="chain-run-card-body">
           {/* dogfood T1 CR-T1-050：正文区只在「流仍在途」或「中断/失败保留态」显已流出的文本

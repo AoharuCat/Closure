@@ -10,6 +10,7 @@ import {
 import { getMaterialRow } from '../db/materialIndexer';
 import { getLogger } from '../logger';
 import {
+  DECON_LLM_RETRY_ESCALATE,
   DECON_STALE_NOTE,
   capDeconUnit,
   deconErrMsg,
@@ -451,7 +452,9 @@ export async function runDeconP1a(jobId: string, deps: DeconP1aDeps = {}): Promi
     let batchEntries: DeconDictionaryEntry[] | null = null;
     for (let attempt = 0; attempt < 2; attempt++) {
       const user = buildDeconDictionaryUserPrompt(batch, attempt > 0);
-      const est = estimateDeconCallTokens(DECON_P1A_SYSTEM_PROMPT, user, DECON_P1A_CLASSIFY_MAX_TOKENS);
+      // C3：attempt>0 升帽 ×2（JSON 纠偏环语义保留——升帽给截断重试留输出余量；est 按当次帽过门）。
+      const cap = attempt > 0 ? DECON_P1A_CLASSIFY_MAX_TOKENS * DECON_LLM_RETRY_ESCALATE : DECON_P1A_CLASSIFY_MAX_TOKENS;
+      const est = estimateDeconCallTokens(DECON_P1A_SYSTEM_PROMPT, user, cap);
       if (wouldExceedDeconBudget(job.budget, cost, 'p1a', est)) {
         const note = `p1a 词典分类预算超限（本次预估 ${est} tokens，已累计 ${cost.totalTokens}）——已诚实挂起（不烧 token），调整预算后续跑`;
         capDeconUnit(jobId, 'p1a', DECON_PASS_UNIT_ALL, note, nowIso());
@@ -466,7 +469,7 @@ export async function runDeconP1a(jobId: string, deps: DeconP1aDeps = {}): Promi
           slot: 'extraction',
           system: DECON_P1A_SYSTEM_PROMPT,
           user,
-          maxTokens: DECON_P1A_CLASSIFY_MAX_TOKENS,
+          maxTokens: cap,
         });
         text = (response?.text ?? '').trim();
         finishReason = response?.finishReason;

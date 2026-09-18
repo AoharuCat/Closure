@@ -60,6 +60,13 @@ describe('runLoop autoApply self-review gate (CR-001)', () => {
     // params 非对象（null/字符串）→ 安全不拦（非 autoApply 语义无从谈起）。
     expect(shouldGateAutoApply('growth_curve_update', null)).toBe(false);
     expect(shouldGateAutoApply('growth_curve_update', 'oops')).toBe(false);
+    // 09-12 子4 W6 遗留②：桥 Tier 2 两写工具归 diff 家族——此前缺省 'read' 让闸门
+    // 不覆盖（autoApply:true 绕自审直落）+ readonly 档可直调。重发自审同放行。
+    expect(shouldGateAutoApply('info_release_map_update', { autoApply: true })).toBe(true);
+    expect(shouldGateAutoApply('promise_ledger_update', { autoApply: true })).toBe(true);
+    expect(
+      shouldGateAutoApply('info_release_map_update', { autoApply: true, selfReviewConfirmed: true }),
+    ).toBe(false);
   });
 
   it('首次 autoApply:true 调用被拦：不执行工具（无 IPC），返闸门消息；重发 selfReviewConfirmed:true 才真执行', async () => {

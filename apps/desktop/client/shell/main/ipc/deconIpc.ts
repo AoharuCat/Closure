@@ -25,6 +25,7 @@ import {
   DECON_REVIEW_CHECKPOINTS,
   DECON_TIERS,
   deconBudgetSchema,
+  parseDeconMaterialRef,
   deconReportKindSchema,
   deconReviewCheckpointSchema,
   deconStylePayloadSchema,
@@ -36,6 +37,7 @@ import type {
   DeconStartResult,
 } from '@orison/shared-contracts';
 import { atomicWriteFileSync } from '@orison/shared-contracts/fs/atomicWrite';
+import { assignmentThinkingControl } from '@orison/desktop-agent';
 import {
   deleteDeconJobCascade,
   getDeconDictionary,
@@ -53,6 +55,7 @@ import {
   upsertDeconReview,
 } from '../db/closure-decon';
 import { listDeconCanonEntries } from '../db/closure-canon';
+import { buildChapterHeadings, chapterShortLabel } from '../db/chapterHeadings';
 import { getMaterialRow } from '../db/materialIndexer';
 import { getProjectById } from '../db/projectRepository';
 import { getLogger } from '../logger';
@@ -65,11 +68,16 @@ import {
   type DeconFingerprintPair,
   type DeconJobDeps,
 } from '../decon/deconJob';
-import { estimateDeconCost } from '../decon/deconBudget';
+import {
+  DECON_THINKING_TOKEN_FACTOR,
+  estimateDeconCost,
+  type DeconEstimateThinkingSlot,
+} from '../decon/deconBudget';
 import {
   cancelInflightDeconPipeline,
   DeconJobGoneError,
   deconErrMsg,
+  readDeconDerivedTextFor,
   registerInflightDeconPipeline,
   type DeconPipelineHandle,
 } from '../decon/deconRun';
@@ -87,6 +95,7 @@ import { runDeconP6 } from '../decon/p6Craft';
 import { mergeDeconStyleCard } from '../decon/styleExport';
 import { withProjectLock } from '../fs/projectWriteLock';
 import { sendDeconProgress } from './deconNotify';
+import { readTaskModelSlots } from './configIpc';
 import { assertSafePath } from './pathGuard';
 
 // ── E10.3a（task 09-05）W6：拆解管线 IPC——invoke 通道族 + 后台管线编排 ──
@@ -207,6 +216,29 @@ function coerceCreateInput(
 export const DECON_GET_MENTIONS_HEAD = 8;
 export const DECON_GET_MENTIONS_TAIL = 8;
 
+/**
+ * CR-1（拍板 B）章引用标签单制：章 index → 真实章标短标签（chapterHeadings 单源——
+ * chapterShortLabel：章号可解析「第 N 章」/章标行原词/语义回落，零序号算术）。材料缺/
+ * 派生读失败 → 空表（UI 回落「材料第 N 章」）；stale 态仍构建（章序展示面不受产物门约束）。
+ */
+function buildDeconChapterLabels(
+  materialRef: string,
+  readDerived: (material: Material) => string | null,
+): Record<number, string> {
+  const parsed = parseDeconMaterialRef(materialRef);
+  if (parsed === null) return {};
+  const material = getMaterialRow(parsed.materialId);
+  if (material === null || material.chapters.length === 0) return {};
+  const derived = readDerived(material);
+  if (derived === null) return {};
+  const headings = buildChapterHeadings(derived, material.chapters);
+  const labels: Record<number, string> = {};
+  for (const chapter of material.chapters) {
+    labels[chapter.index] = chapterShortLabel(headings.get(chapter.index), chapter.index);
+  }
+  return labels;
+}
+
 function projectDeconEntityForIpc(entity: DeconEntityRow): DeconEntityIpc {
   const mentionsTotal = entity.mentions.length;
   if (mentionsTotal <= DECON_GET_MENTIONS_HEAD + DECON_GET_MENTIONS_TAIL) {
@@ -254,11 +286,14 @@ export type DeconPhaseStep =
   | { kind: 'pass'; pass: string; runner: DeconPhaseRunner }
   | { kind: 'gate'; checkpoint: DeconReviewCheckpoint };
 
-/** 闸门暂停注记（进度事件 **note 面**——CR-10 软提示通道：「待人工确认」的可辨识文案；error 只留给真失败）。 */
+/**
+ * 闸门暂停注记（进度事件 **note 面**——CR-10 软提示通道：「待人工确认」的可辨识文案；error 只留给真失败）。
+ * F14：不泄漏内部 IPC 通道名（decon:approve-review）——用户面只说「确认后自动继续拆解」。
+ */
 const DECON_GATE_NOTES: Readonly<Record<DeconReviewCheckpoint, string>> = {
-  dictionary: '待人工确认：词典与实体（P1c 产物）——确认后经 decon:approve-review 续跑',
-  canon: '待人工确认：正典六域（P2 产物）——确认后经 decon:approve-review 续跑',
-  craft: '待人工确认：手艺层发现（P4 各维 findings）——确认后经 decon:approve-review 续跑',
+  dictionary: '待人工确认：词典与实体（P1c 产物）——在下方闸门卡确认后自动继续拆解',
+  canon: '待人工确认：正典六域（P2 产物）——在下方闸门卡确认后自动继续拆解',
+  craft: '待人工确认：手艺层发现（P4 各维 findings）——在下方闸门卡确认后自动继续拆解',
 };
 
 /**
@@ -436,6 +471,32 @@ export async function runDeconPassSequence(
   }
 }
 
+/**
+ * C6：拆解三缝档（extraction/review-judge/writer-draft）的 thinking 开启解析 → 预估系数表。
+ * 开启判据 = assignmentThinkingControl 归一后 level 非 'off'（thinkingCustom 有值 / thinking
+ * 非 auto 档）；readTaskModelSlots 读 task-models sidecar（mtime 缓存零热点）。读失败 /
+ * 缺档 → 空表（零思考假设即旧行为——诚实降级不阻创建）。
+ */
+function resolveDeconThinkingFactors(): Partial<Record<DeconEstimateThinkingSlot, number>> {
+  const factors: Partial<Record<DeconEstimateThinkingSlot, number>> = {};
+  try {
+    const slots = readTaskModelSlots() ?? {};
+    for (const slot of ['extraction', 'review-judge', 'writer-draft'] as const) {
+      const control = assignmentThinkingControl(slots[slot]);
+      if (control !== undefined && control.level !== 'off') factors[slot] = DECON_THINKING_TOKEN_FACTOR;
+    }
+  } catch (err) {
+    // CR-15：静默吞错会让 F9③ 的思考口径悄然失效（预估回零思考假设且无人知晓）——warn 落
+    // 日志再诚实降级（零思考假设即旧行为，不阻创建）。
+    getLogger().warn(
+      { err: errMsg(err) },
+      'decon:create thinking factor resolution failed (estimate falls back to zero-thinking basis)',
+    );
+    return {};
+  }
+  return factors;
+}
+
 // ── IPC 工厂（deps 注入，零网络可测——mirror createMaterialIpcHandlers / createCraftIpcHandlers）──
 
 export interface DeconIpcHandlers {
@@ -459,6 +520,8 @@ export interface DeconIpcDeps {
   now?: () => Date;
   /** 双指纹读取注入（缺省生产 readDeconCurrentFingerprints；测试零 fs/db-material 依赖）。 */
   readCurrentFingerprints?: (materialId: string) => DeconFingerprintPair | null;
+  /** 章 label 装配的派生文本读取（缺省生产 readDeconDerivedTextFor；测试零 fs 依赖——CR-1）。 */
+  readMaterialDerivedText?: (material: Material) => string | null;
   /** 进度广播注入（缺省 sendDeconProgress；测试 spy）。 */
   notify?: (event: DeconProgressEvent) => void;
 }
@@ -466,6 +529,7 @@ export interface DeconIpcDeps {
 export function createDeconIpcHandlers(deps: DeconIpcDeps = {}): DeconIpcHandlers {
   const now = deps.now ?? (() => new Date());
   const notify = deps.notify ?? sendDeconProgress;
+  const readMaterialDerivedText = deps.readMaterialDerivedText ?? readDeconDerivedTextFor;
   const jobDeps: DeconJobDeps = {
     ...(deps.readCurrentFingerprints !== undefined ? { readCurrentFingerprints: deps.readCurrentFingerprints } : {}),
     now,
@@ -534,6 +598,7 @@ export function createDeconIpcHandlers(deps: DeconIpcDeps = {}): DeconIpcHandler
         dimensions: created.job.dimensions,
         stats,
         p1Reusable: created.inheritedP1,
+        thinkingBySlot: resolveDeconThinkingFactors(),
       });
       const estimateIpc: DeconEstimateIpc = { totalTokens: estimate.totalTokens, byPass: estimate.byPass };
       return { ok: true, job: created.job, inheritedP1: created.inheritedP1, estimate: estimateIpc };
@@ -619,11 +684,12 @@ export function createDeconIpcHandlers(deps: DeconIpcDeps = {}): DeconIpcHandler
 
     /**
      * `decon:get`——会话详情（人审取数面）：断点行 + canon 六域 + 词典 + 实体 + **闸门行 +
-     * 报告计数**（E10.3b additive——W1 契约预留字段在此落值）。读侧 freshness 校验（F-02——
+     * 报告计数 + 章标标签表**（E10.3b additive + CR-1 拍板 B）。读侧 freshness 校验（F-02——
      * 双指纹失配 → job 翻 stale + fresh=false + freshReason；cancelled 终态产物面同为空——
      * CR-9 对齐契约注释）。**entities mentions 截断投影**（CR-9：首 N + 末 N 章 + 总数——千章级
      * mentions 不整面灌 renderer）。闸门行 stale/cancelled 态仍回（off 是用户常设配置、UI 区分
-     * 「等审暂停」与「用户暂停」靠 review 行——pending = 等审）；reportCounts 产物面随 fresh。
+     * 「等审暂停」与「用户暂停」靠 review 行——pending = 等审）；reportCounts 产物面随 fresh；
+     * chapterLabels 恒回（材料现值构建，章序展示面）。
      */
     async getDecon(rawInput: unknown): Promise<DeconJobDetail | null> {
       const jobId = coerceJobId(rawInput);
@@ -631,12 +697,14 @@ export function createDeconIpcHandlers(deps: DeconIpcDeps = {}): DeconIpcHandler
       const job = getDeconJob(jobId);
       if (job === null) return null;
       const reviews = listDeconReviews(jobId);
+      const chapterLabels = buildDeconChapterLabels(job.materialRef, readMaterialDerivedText);
       const freshness = checkDeconJobFreshness(job, jobDeps);
       const liveJob = getDeconJob(jobId) ?? job; // freshness 翻 stale 后重读现值行
       if (!freshness.fresh) {
         return {
           job: liveJob,
           passStates: listDeconPassStates(jobId),
+          chapterLabels,
           fresh: false,
           freshReason: freshness.reason,
           canon: [],
@@ -654,6 +722,7 @@ export function createDeconIpcHandlers(deps: DeconIpcDeps = {}): DeconIpcHandler
       return {
         job: liveJob,
         passStates: listDeconPassStates(jobId),
+        chapterLabels,
         fresh: true,
         canon: listDeconCanonEntries(jobId),
         dictionary: getDeconDictionary(job.materialRef, job.derivedHash),

@@ -6,7 +6,13 @@ export type ExecuteToolFn = (toolId: string, params: unknown, ctx: { projectDir:
 
 let _executeTool: ExecuteToolFn | undefined;
 
-export function setExecuteToolFn(fn: ExecuteToolFn) {
+/**
+ * Inject (or clear, with `undefined`) the ExecuteToolFn seam. Accepting
+ * `undefined` lets tests restore the pre-injection state in afterEach
+ *（CR-24 测试卫生：beforeEach 注入 / afterEach 还原配对——残留 stub 会跨 describe
+ * 泄漏成假执行环境）。
+ */
+export function setExecuteToolFn(fn: ExecuteToolFn | undefined) {
   _executeTool = fn;
 }
 

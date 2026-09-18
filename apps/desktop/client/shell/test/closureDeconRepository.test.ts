@@ -50,6 +50,7 @@ import {
   getDeconProduct,
   getDeconReport,
   getDeconReview,
+  deleteDeconIllegalAllFailedPassStates,
   listDeconChapterFacts,
   listDeconEntities,
   listDeconJobs,
@@ -411,6 +412,68 @@ maybe('closure_decon_job / pass_state 往返', () => {
     expect(findInflightDeconJobByMaterial(MAT_ID)?.jobId).toBe(created.job.jobId);
     expect(transitionDeconJob(created.job.jobId, 'finish', undefined, deps).ok).toBe(true);
     expect(findInflightDeconJobByMaterial(MAT_ID)).toBeNull();
+    deleteDeconProductsByMaterial(MAT_ID);
+  });
+
+  it('F16 清理侧：deleteDeconIllegalAllFailedPassStates 只删多 unit pass 的 (all,failed) 化石——合法 all 行不误删；startDeconJob retry 顺带清理', () => {
+    insertMaterialRow();
+    const created = createDeconJob({ materialId: MAT_ID, tier: 'coarse' }, deps);
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    const jobId = created.job.jobId;
+    expect(transitionDeconJob(jobId, 'start', undefined, deps).ok).toBe(true);
+    expect(transitionDeconJob(jobId, 'fail', '前置失败', deps).ok).toBe(true);
+
+    const at = (pass: string, unit: string, status: 'failed' | 'done' = 'failed') =>
+      upsertDeconPassState({
+        jobId,
+        pass,
+        unit,
+        status,
+        outputRef: null,
+        outputHash: null,
+        updatedAt: NOW.toISOString(),
+      });
+    // 化石（非法形态——多 unit pass 的 'all' failed 行；R3 遗留 ('p1b','all','failed') 同族；
+    // CR-6 单源 = 契约 DECON_ILLEGAL_ALL_UNIT_PASSES——含 p3b/p5:scene_annotation 增补面）：
+    at('p1b', 'all');
+    at('p3a', 'all');
+    at('p2', 'all');
+    at('p3b', 'all');
+    at('p4:qingxu', 'all');
+    at('p5:chapter_review', 'all');
+    at('p5:scene_annotation', 'all');
+    // 合法行（绝不误删）——单行哨兵 'all' pass 的失败行 / done 行 / 非 all unit 行：
+    at('p1a', 'all');
+    at('p1c', 'all');
+    at('p6', 'all');
+    at('p4:style', 'all');
+    at('p5:book_reading', 'all', 'done');
+    at('p1b', '3');
+
+    expect(deleteDeconIllegalAllFailedPassStates(jobId)).toBe(7);
+    for (const fossil of [
+      ['p1b', 'all'],
+      ['p3a', 'all'],
+      ['p2', 'all'],
+      ['p3b', 'all'],
+      ['p4:qingxu', 'all'],
+      ['p5:chapter_review', 'all'],
+      ['p5:scene_annotation', 'all'],
+    ] as const) {
+      expect(getDeconPassState(jobId, fossil[0], fossil[1])).toBeNull();
+    }
+    expect(getDeconPassState(jobId, 'p1a', 'all')?.status).toBe('failed');
+    expect(getDeconPassState(jobId, 'p1c', 'all')?.status).toBe('failed');
+    expect(getDeconPassState(jobId, 'p6', 'all')?.status).toBe('failed');
+    expect(getDeconPassState(jobId, 'p4:style', 'all')?.status).toBe('failed');
+    expect(getDeconPassState(jobId, 'p5:book_reading', 'all')?.status).toBe('done');
+    expect(getDeconPassState(jobId, 'p1b', '3')?.status).toBe('failed');
+
+    // startDeconJob retry 挂钩：failed 态 job 再 start（= retry）顺带清理新化石。
+    at('p1b', 'all');
+    expect(startDeconJob(jobId, deps).ok).toBe(true);
+    expect(getDeconPassState(jobId, 'p1b', 'all')).toBeNull();
     deleteDeconProductsByMaterial(MAT_ID);
   });
 });

@@ -44,6 +44,11 @@ import { upsertMaterialRow } from '../main/db/materialIndexer';
 import { createDeconJob, startDeconJob } from '../main/decon/deconJob';
 import type { DeconGenerateText } from '../main/decon/deconLlmCore';
 import {
+  buildChapterHeadings as buildDeconChapterHeadings,
+  chapterFullLabel as deconChapterFullLabel,
+  chapterShortLabel as deconChapterShortLabel,
+} from '../main/db/chapterHeadings';
+import {
   DECON_HUOKE_CHAPTER_WINDOW,
   DECON_P4_ARC_GROUP_MAX,
   DECON_P4_ARC_GROUP_MIN,
@@ -456,8 +461,11 @@ describe('buildDeconP4ChapterUserPrompt / buildDeconP4ArcUserPrompt（注入装�
   });
 
   it('弧级：概要+统计+出场退场+引文窗口+聚类；「@P段号」窗口随行', () => {
+    // C5：章号展示走真实章标行映射（fixture title 即「第N章」形态——title 充当章标行）。
+    const headings = buildDeconChapterHeadings(DERIVED, FIXTURE.chapters);
+    const chShort = (ci: number): string => deconChapterShortLabel(headings.get(ci), ci);
     const chapterBlocks = [0, 1, 2].map((ci) =>
-      buildDeconP4ArcChapterBlock({ index: ci, title: `第${ci + 1}章`, facts: factsFor(ci) }, DERIVED),
+      buildDeconP4ArcChapterBlock({ index: ci, title: `第${ci + 1}章`, facts: factsFor(ci) }, DERIVED, chShort),
     );
     const built = buildDeconP4ArcUserPrompt({
       derived: DERIVED,
@@ -468,9 +476,11 @@ describe('buildDeconP4ChapterUserPrompt / buildDeconP4ArcUserPrompt（注入装�
       appearances: buildDeconP4Appearances(
         ARC,
         new Map<number, DeconFacts>([0, 1, 2].map((ci) => [ci, factsFor(ci)])),
+        chShort,
       ),
       clusters: [{ chapters: [0, 1], sharedEntities: ['李逍遥', '赵灵儿'] }],
       sampleBlocks: [],
+      chapterLabel: chShort,
     });
     expect(built.prompt).toContain('弧计量统计');
     expect(built.prompt).toContain('钩子 1 次');
@@ -480,6 +490,66 @@ describe('buildDeconP4ChapterUserPrompt / buildDeconP4ArcUserPrompt（注入装�
     expect(built.prompt).toContain('同类场景聚类');
     // 引文窗口 = 各章事件/伏笔 span 窗口（章 1 伏笔 span = 块 4）。
     expect(built.windows).toContainEqual({ blockStart: 4, blockEnd: 5, chapterIndex: 1 });
+  });
+
+  it('C5 真实章标对拍：简介伪章形态（index 0 无章标 + 真章 index=N）——章号一律真实章标行，index+1 错位根治', () => {
+    // 真实摄取形态：简介伪章（首标题前正文）+ 章文首行即章标行（无法告白形态——真·第N章 index=N）。
+    const parts = ['书名：无法告白\n\n开篇前的简介正文，自成一章。', '第1章 预付两百万\n\n他预付了两百万日元。', '第2章 手稿\n\n正文内容。', '第3章 古碑\n\n正文内容。'];
+    const derived = parts.join('');
+    const chapters: Material['chapters'] = [];
+    let off = 0;
+    parts.forEach((p, i) => {
+      chapters.push({
+        index: i,
+        title: i === 0 ? null : parts[i]!.split(' ')[1] ?? null,
+        charStart: off,
+        charEnd: off + p.length,
+        paraStart: 0,
+        paraEnd: 0,
+        confidence: 'high',
+        method: 'regex',
+      });
+      off += p.length;
+    });
+    const headings = buildDeconChapterHeadings(derived, chapters);
+    const chShort = (ci: number): string => deconChapterShortLabel(headings.get(ci), ci);
+    const chFull = (ci: number): string => deconChapterFullLabel(headings.get(ci), ci);
+
+    const facts = (ci: number): DeconFacts => ({
+      synopsis: `章${ci}概要`,
+      entities: [{ name: '主角', type: 'person', span: { chapterIndex: ci, charStart: 0, charEnd: 5, paraStart: 0, paraEnd: 1 } }],
+      events: [],
+      relationshipEdges: [],
+      foreshadowPlanted: [],
+      infoGap: [],
+    });
+    const arc: DeconArc = { index: 0, title: null, origin: 'single', chapterCount: 3, charCount: 100, fromChapter: 1, toChapter: 3 };
+
+    // 出场退场：真章号（旧 index+1 会错位成 2、3、4 / 首现 2）。
+    const appearances = buildDeconP4Appearances(arc, new Map([1, 2, 3].map((ci) => [ci, facts(ci)])), chShort);
+    expect(appearances.lines[0]).toContain('弧内出现第 1、2、3 章');
+    expect(appearances.lines[0]).toContain('全书首现 第 1 章、末现 第 3 章');
+
+    // 弧内各章概要块：章标行原词。
+    const chapterBlocks = [1, 2, 3].map((ci) =>
+      buildDeconP4ArcChapterBlock({ index: ci, title: chapters[ci]!.title, facts: facts(ci) }, derived, chFull),
+    );
+    expect(chapterBlocks[0]?.text).toContain('第1章 预付两百万概要');
+
+    // 弧信息头 + 聚类组：真实章号区间（旧代码「第 2 至 4 章」错位）。
+    const built = buildDeconP4ArcUserPrompt({
+      derived,
+      blocks: [],
+      arc,
+      arcStat: null,
+      chapterBlocks,
+      appearances,
+      clusters: [{ chapters: [1, 2], sharedEntities: ['主角'] }],
+      sampleBlocks: [],
+      chapterLabel: chShort,
+    });
+    expect(built.prompt).toContain('第 1 章 至 第 3 章');
+    expect(built.prompt).toContain('组：第 1、2 章');
   });
 });
 

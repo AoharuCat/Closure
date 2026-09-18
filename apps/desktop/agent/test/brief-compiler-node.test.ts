@@ -1865,3 +1865,71 @@ describe('brief-compiler-node — characterProgressions 编译（8.5 R3，纯代
     expect((result.artifact as { characterProgressions?: unknown }).characterProgressions).toBeUndefined();
   });
 });
+
+// ════════════════════════════════════════════════════════════════════════════
+// 链流程重排 W2（遗留①）：规划环 revise 回环的重编意图注入（plan_review hard findings →
+// chapter_brief.recompileHints，纯机械投影）——环有实质输入而非同输入确定性重编 + 空 LLM 复判。
+// ════════════════════════════════════════════════════════════════════════════
+
+describe('brief-compiler-node — W2 遗留① recompileHints 注入（规划环 revise 回环）', () => {
+  const PLAN_REVIEW_REVISE = {
+    verdict: 'revise',
+    summary: '红线不一致',
+    findings: [
+      { dimension: 'red-line', severity: 'hard', grounding: 'chapterBrief.mustHide', note: 'mustHide 与第 2 章已揭露事实矛盾——重编改为 hintOnly' },
+      { dimension: 'pacing', severity: 'soft', grounding: 'chapterBrief.pacing', note: '节奏偏慢（软维度——不触发回环）' },
+    ],
+  };
+
+  it('plan_review verdict=revise → hard findings 机械注入 recompileHints（soft 不注入）', async () => {
+    const node = createBriefCompilerNode();
+    const result = await node.run({
+      run: makeRun({
+        chapter_brief_input: { episodeId: TARGET_EPISODE, brief: {} },
+        scene_graph: buildSceneGraph(),
+        episode_outlines: EPISODES,
+        plan_review: PLAN_REVIEW_REVISE,
+      }),
+      requirement: '',
+    });
+    const brief = result.artifact as { recompileHints?: Array<{ dimension: string; note: string }> };
+    expect(brief.recompileHints).toEqual([
+      { dimension: 'red-line', grounding: 'chapterBrief.mustHide', note: 'mustHide 与第 2 章已揭露事实矛盾——重编改为 hintOnly' },
+    ]);
+  });
+
+  it('首圈无 plan_review → 零注入（recompileHints 缺省，零回归）', async () => {
+    const node = createBriefCompilerNode();
+    const result = await node.run({
+      run: makeRun({
+        chapter_brief_input: { episodeId: TARGET_EPISODE, brief: {} },
+        scene_graph: buildSceneGraph(),
+        episode_outlines: EPISODES,
+      }),
+      requirement: '',
+    });
+    const brief = result.artifact as { recompileHints?: unknown };
+    expect(brief.recompileHints).toBeUndefined();
+  });
+
+  it('plan_review verdict=pass / 坏形态 → 零注入（仅 revise 回环语义注入）', async () => {
+    const node = createBriefCompilerNode();
+    for (const bad of [
+      { verdict: 'pass', summary: 'ok', findings: PLAN_REVIEW_REVISE.findings },
+      { verdict: 'escalate', summary: '灰区', findings: PLAN_REVIEW_REVISE.findings },
+      'not-an-object',
+    ]) {
+      const result = await node.run({
+        run: makeRun({
+          chapter_brief_input: { episodeId: TARGET_EPISODE, brief: {} },
+          scene_graph: buildSceneGraph(),
+          episode_outlines: EPISODES,
+          plan_review: bad,
+        }),
+        requirement: '',
+      });
+      const brief = result.artifact as { recompileHints?: unknown };
+      expect(brief.recompileHints).toBeUndefined();
+    }
+  });
+});

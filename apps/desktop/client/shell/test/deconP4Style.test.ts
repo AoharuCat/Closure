@@ -49,6 +49,10 @@ import { replaceDeconCanonEntries } from '../main/db/closure-canon';
 import { upsertMaterialRow } from '../main/db/materialIndexer';
 import { createDeconJob, startDeconJob } from '../main/decon/deconJob';
 import type { DeconGenerateText } from '../main/decon/deconLlmCore';
+import {
+  buildChapterHeadings as buildDeconChapterHeadings,
+  chapterShortLabel as deconChapterShortLabel,
+} from '../main/db/chapterHeadings';
 import { composeDerivedText, splitParagraphBlocks } from '../main/ipc/toolHandlers/materialIngest';
 import {
   DECON_P4_STYLE_EXCERPT_MAX_CHARS,
@@ -332,8 +336,12 @@ describe('selectDeconStyleExcerpt（⑬ 节选——纯代码选段）', () => {
 });
 
 describe('collectDeconStyleSamples（抽样段——每弧首/中/尾 + 高潮对照）', () => {
+  // C5：章号标签走真实章标行映射（fixture title 即「第N章」形态——title 充当章标行）。
+  const HEADINGS = buildDeconChapterHeadings(DERIVED, FIXTURE.chapters);
+  const chShort = (ci: number): string => deconChapterShortLabel(HEADINGS.get(ci), ci);
+
   it('单弧 → 首/中/尾章样本 + 高潮对照段；总上限裁剪计数', () => {
-    const { samples, droppedForCap } = collectDeconStyleSamples(DERIVED, BLOCKS, FIXTURE.chapters, ARCS, LABELS_BY_CHAPTER);
+    const { samples, droppedForCap } = collectDeconStyleSamples(DERIVED, BLOCKS, FIXTURE.chapters, ARCS, LABELS_BY_CHAPTER, chShort);
     expect(samples.map((s) => s.label)).toEqual(
       expect.arrayContaining(['弧 0-2 章 · 第 1 章（弧首）', '弧 0-2 章 · 第 2 章（弧中）', '弧 0-2 章 · 第 3 章（弧尾）', '高潮对照 · 第 1 章（爽点段峰值章）']),
     );
@@ -364,7 +372,8 @@ describe('collectDeconStyleSamples（抽样段——每弧首/中/尾 + 高潮�
       charCount: longDerived.length,
       origin: 'single',
     }));
-    const { samples, droppedForCap } = collectDeconStyleSamples(longDerived, longBlocks, chapters, manyArcs, LABELS_BY_CHAPTER);
+    // 合成章无 title/章标行——标签函数本测试不断言，给确定性占位即可。
+    const { samples, droppedForCap } = collectDeconStyleSamples(longDerived, longBlocks, chapters, manyArcs, LABELS_BY_CHAPTER, (ci) => `第 ${ci + 1} 章`);
     const total = samples.reduce((s, x) => s + x.text.length, 0);
     expect(total).toBeLessThanOrEqual(DECON_P4_STYLE_SAMPLES_TOTAL_CAP);
     expect(samples.length).toBeGreaterThan(0);
@@ -373,13 +382,46 @@ describe('collectDeconStyleSamples（抽样段——每弧首/中/尾 + 高潮�
 
   it('全书零爽点段打标（合法 P3a 输入）→ 高潮对照诚实跳过不崩（W7 集成验收发现的空 reduce 修复）', () => {
     const emptyLabels = new Map<number, DeconChapterLabels>(FIXTURE.chapters.map((c) => [c.index, EMPTY_LABELS]));
-    const { samples, droppedForCap } = collectDeconStyleSamples(DERIVED, BLOCKS, FIXTURE.chapters, ARCS, emptyLabels);
+    const { samples, droppedForCap } = collectDeconStyleSamples(DERIVED, BLOCKS, FIXTURE.chapters, ARCS, emptyLabels, chShort);
     // 弧首/中/尾样本照出；高潮对照段无峰值可取——跳过（无「高潮对照」标签），不 throw。
     expect(samples.map((s) => s.label)).toEqual(
       expect.arrayContaining(['弧 0-2 章 · 第 1 章（弧首）', '弧 0-2 章 · 第 3 章（弧尾）']),
     );
     expect(samples.some((s) => s.label.includes('高潮对照'))).toBe(false);
     expect(droppedForCap).toBe(0);
+  });
+
+  it('C5 真实章标对拍：简介伪章形态的样本标签用真章号（index+1 错位根治）', () => {
+    // 真实摄取形态：简介伪章 index 0 + 真·第N章 index=N（旧 index+1 会把第2章标成「第 3 章」）。
+    const parts = [
+      '书名：无法告白\n\n开篇前的简介正文，自成一章。',
+      '第1章 预付两百万\n\n他预付了两百万日元，转身走进了雨夜。',
+      '第2章 手稿\n\n正文内容持续了相当长的一段时间。',
+      '第3章 古碑\n\n两人在观中客房住下，约好明日一早去后山深处。',
+    ];
+    const derived = parts.join('');
+    const blocks = splitParagraphBlocks(derived);
+    const chapters: Array<{ index: number; title: string | null; charStart: number; charEnd: number }> = [];
+    let off = 0;
+    parts.forEach((p, i) => {
+      chapters.push({ index: i, title: i === 0 ? null : parts[i]!.split(' ')[1] ?? null, charStart: off, charEnd: off + p.length });
+      off += p.length;
+    });
+    const headings = buildDeconChapterHeadings(derived, chapters);
+    const chShortReal = (ci: number): string => deconChapterShortLabel(headings.get(ci), ci);
+    const arcs: DeconArc[] = [{ index: 0, title: null, fromChapter: 1, toChapter: 3, chapterCount: 3, charCount: derived.length, origin: 'single' }];
+    // 爽点峰值在 index 3（真·第3章）——高潮对照标签必须用真章号。
+    const labels = new Map<number, DeconChapterLabels>([
+      [1, EMPTY_LABELS],
+      [2, EMPTY_LABELS],
+      [3, { ...EMPTY_LABELS, highlightSpans: [{ chapterIndex: 3, charStart: chapters[3]!.charStart + 5, charEnd: chapters[3]!.charStart + 25, paraStart: 0, paraEnd: 1 }] }],
+    ]);
+    const { samples } = collectDeconStyleSamples(derived, blocks, chapters, arcs, labels, chShortReal);
+    expect(samples.map((s) => s.label)).toEqual(
+      expect.arrayContaining(['弧 1-3 章 · 第 1 章（弧首）', '弧 1-3 章 · 第 2 章（弧中）', '弧 1-3 章 · 第 3 章（弧尾）', '高潮对照 · 第 3 章（爽点段峰值章）']),
+    );
+    // 错位章号（index+1 旧算术的产物——弧首会错成「第 2 章」）绝不出现在标签里。
+    expect(samples.some((s) => s.label.includes('第 4 章'))).toBe(false);
   });
 });
 

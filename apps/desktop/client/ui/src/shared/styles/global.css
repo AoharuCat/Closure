@@ -39,6 +39,10 @@
 @import "../../features/materials/materials.css";
 @import "../../features/craft/craft.css";
 @import "../../features/decon/decon.css";
+@import "../../features/writing/writing.css";
+@import "../../features/usage/usage.css";
+@import "../../features/agent-panel/agy-bridge-consent.css";
+@import "../../features/model-settings/agy-bridge.css";
 
 /* ── Reset ── */
 #root {

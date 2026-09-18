@@ -2,6 +2,12 @@ import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import type {
   AssetRecord,
   AssetUpsertInput,
+  // 子4 agy MCP 工具桥（W4）：同意/状态/关闭回收三通道契约类型（type-only，sandbox 纪律
+  // 见下方 WORLD_CHANGED_CHANNEL 注释）。
+  AgyBridgeConsentResult,
+  AgyBridgeConsentValue,
+  AgyBridgeRevokeResult,
+  AgyBridgeStatusView,
   CraftRebuildResult,
   GenerateEmbeddingPayload,
   GenerateImagePayload,
@@ -13,6 +19,8 @@ import type {
   EmbeddingResponse,
   IndexStatus,
   ListRemoteModelsRequest,
+  ListCliModelsRequest,
+  CliModelDiscoveryResult,
   DocParserProbeResult,
   ModelConfig,
   ModelRef,
@@ -50,6 +58,10 @@ import type {
   ResumeChapterChainInput,
   RunChapterChainInput,
   RunChapterChainSummary,
+  // 链流程重排 W4（R6 / 09-13 子3 W6）：derivation-status 查询 + 链外重提取的结果契约
+  //（type-only 零 runtime 内联——sandbox 纪律见下方 WORLD_CHANGED_CHANNEL 注释）。
+  ChapterDerivationStatusResult,
+  ReExtractChapterResult,
   RunStorySyncPayload,
   RunStorySyncResult,
   SaveBase64ImageInput,
@@ -60,6 +72,8 @@ import type {
   UpdateCheckResult,
   UpdateEvent,
   UserPreferencesConfig,
+  UsageClearResult,
+  UsageOverview,
   WorldChangedEvent,
   WorldOverview,
   WorldOverviewRequest,
@@ -235,6 +249,10 @@ export const exposedDesktopApi = {
     ipcRenderer.invoke('research:canary-vision', ref) as Promise<VisionCanaryResult>,
   listRemoteModels: (request: ListRemoteModelsRequest) =>
     ipcRenderer.invoke('model:list-remote-models', request) as Promise<RemoteModel[]>,
+  // 09-12 agy provider W4: CLI-form provider model discovery (`agy models` TSV).
+  // Typed result — `not-logged-in` drives the settings-page login guidance.
+  listCliModels: (request: ListCliModelsRequest) =>
+    ipcRenderer.invoke('model:list-cli-models', request) as Promise<CliModelDiscoveryResult>,
   // 模型生成（desktop main 直连 provider）
   generateText: (payload: GenerateTextPayload) =>
     ipcRenderer.invoke('model:generate-text', payload) as Promise<TextGenerationResponse>,
@@ -245,6 +263,18 @@ export const exposedDesktopApi = {
   // Story 2.1: cross-encoder rerank（检索阶段 rerank，mirror embedding 通道）
   rerank: (payload: RerankPayload) =>
     ipcRenderer.invoke('model:rerank', payload) as Promise<RerankResponse>,
+  // ── 09-12 usage-panel（子5 W3）：应用内用量面两通道（纯读聚合 + 手动清空；无推送事件面）。──
+  usageOverview: () =>
+    ipcRenderer.invoke('usage:overview') as Promise<UsageOverview>,
+  usageClear: () =>
+    ipcRenderer.invoke('usage:clear') as Promise<UsageClearResult>,
+  // ── 子4 agy MCP 工具桥（W4）：同意/状态/关闭回收三通道（machine 级读写，无推送面）。──
+  agyBridgeStatus: () =>
+    ipcRenderer.invoke('agy-bridge:status') as Promise<AgyBridgeStatusView>,
+  agyBridgeSetConsent: (input: { consent: AgyBridgeConsentValue }) =>
+    ipcRenderer.invoke('agy-bridge:consent', input) as Promise<AgyBridgeConsentResult>,
+  agyBridgeRevoke: () =>
+    ipcRenderer.invoke('agy-bridge:revoke') as Promise<AgyBridgeRevokeResult>,
   // Story 2.1 CR-craft-kb-011: manual full rebuild of the global craft KB index.
   // No 2.1 UI calls it (agent-facing story); the IPC surface is the deliverable
   // for Epic 3's settings/command-bar "Rebuild craft KB" action.
@@ -265,6 +295,12 @@ export const exposedDesktopApi = {
   // (mirror 4.6 PatchReview accept/reject — UI calls directly, not via leader LLM).
   resumeChapterChain: (input: ResumeChapterChainInput) =>
     ipcRenderer.invoke('closure:resume-chapter-chain', input) as Promise<RunChapterChainSummary>,
+  // 链流程重排 W4（R6 / 09-13 子3 W6 preload 暴露）：shell handler 在位，此处补渲染层通道——
+  // 章卡衍生状态查询（stale 徽标 / 重提取按钮态）+ 链外重提取（盘上正文 standalone E 段）。
+  chapterDerivationStatus: (input: { projectPath: string; chapterId?: string }) =>
+    ipcRenderer.invoke('closure:chapter-derivation-status', input) as Promise<ChapterDerivationStatusResult>,
+  reExtractChapter: (input: { projectPath: string; chapterId: string; autonomy?: 'readonly' | 'suggest' | 'auto' }) =>
+    ipcRenderer.invoke('closure:re-extract-chapter', input) as Promise<ReExtractChapterResult>,
   // Story 7.1 Route 1: compile revision intent from selection + instruction
   // (B trigger 选区指挥精修 — UI calls at draft checkpoint pause after user selects a passage).
   compileRevisionIntent: (input: CompileRevisionIntentInput) =>

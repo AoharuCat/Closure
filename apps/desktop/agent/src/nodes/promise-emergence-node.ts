@@ -14,6 +14,7 @@ import {
   type SceneGraph,
   type WorldPatch,
 } from '@orison/shared-contracts';
+import { CHAIN_ARTIFACT_ITEMS_CAP } from './chain-node-artifact';
 import type { AgentNode, NodeResult, NodeRunInput, RunSnapshot } from '../contracts/run';
 import { createLlmNode, type LlmNodeDeps } from './llm-node';
 import { extractJson } from './extract-json';
@@ -280,6 +281,14 @@ export interface PromiseEmergenceArtifact {
   gapsDetected: number;
   /** LLM 段产出的合法 PromiseAction 数（safeParse 后）。 */
   actionsProduced: number;
+  /**
+   * 09-13 子2 W3（design §2 items kind）：本圈登记的 PromiseAction 原始清单——产出快照投影
+   *（chain-node-artifact items）的数据源。节点 artifact 形态不敷投影的**唯一节点侧补字段**
+   *（design §2「个别节点 artifact 形态不敷投影时才节点侧补字段」条款）；additive optional
+   *（无 actions / graceful 跳过缺省）。CR 批 CR-4：封顶 CHAIN_ARTIFACT_ITEMS_CAP（50）——
+   * 全量计数看 actionsProduced（落盘不受 cap 影响 builtin 已携全量）。
+   */
+  actions?: PromiseAction[];
   /** 登记跳过原因（无 gap / 无 patches / LLM 失败 / 无 action 时填，CR-E3 graceful）。 */
   skipped?: string;
   /** A1：actions 是否已自动落盘到 promise_registry creative field（autoApply 模式，mirror 6.6 world-state 自动写）。 */
@@ -482,6 +491,14 @@ export function createPromiseEmergenceNode(deps: LlmNodeDeps): AgentNode {
         gapsDetected: gaps.length,
         actionsProduced: actions.length,
       };
+      // 09-13 子2 W3：原始 actions 随 artifact 携带（产出快照 items 投影源；additive）。
+      // CR 批 CR-4：artifact 侧封顶 CHAIN_ARTIFACT_ITEMS_CAP（与产出快照投影 cap 同常数）——
+      // LLM 超额产出无界进 run.artifacts 会膨胀 persist 的 chainSnapshot。**落盘不受影响**
+      //（上方 writePromiseActions 已携全量写 promise_registry）；全量计数经 actionsProduced
+      // 注明（投影 total 读它——截断可观测「N/total」）。
+      if (actions.length > 0) {
+        artifact.actions = actions.slice(0, CHAIN_ARTIFACT_ITEMS_CAP);
+      }
       // A1：autoApply 模式 handler 直接落盘 → record applied outcome（mirror 6.6 world-state 自动写）。
       if (writeResult?.applied === true) artifact.applied = true;
       if (writeResult?.fieldPatch !== undefined) artifact.fieldPatch = writeResult.fieldPatch;

@@ -5,7 +5,7 @@ import { getAllAgentContracts, getAgentContract } from '../src/engine/agentContr
 describe('agentContracts 注册表', () => {
   const contracts = getAllAgentContracts();
 
-  it('注册表包含所有预期 agent', () => {
+  it('注册表包含所有预期 agent（targeted-revision 已随链流程重排退役删除）', () => {
     const ids = contracts.map((c) => c.id);
     expect(ids).toContain('intake-agent');
     expect(ids).toContain('asset-loader-agent');
@@ -14,7 +14,8 @@ describe('agentContracts 注册表', () => {
     expect(ids).toContain('draft-writer-agent');
     expect(ids).toContain('continuity-memory-agent');
     expect(ids).toContain('multi-review-agent');
-    expect(ids).toContain('targeted-revision-agent');
+    // CR-25（W-CR 批清理）：dormant 条目已删——守门防回潮。
+    expect(ids).not.toContain('targeted-revision-agent');
   });
 
   it('每个 contract 都能通过 agentContractSchema 校验', () => {

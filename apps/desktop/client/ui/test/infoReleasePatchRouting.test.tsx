@@ -66,7 +66,7 @@ describe('Story 6.3 CR-6a - write_chapter infoReleasePatch metadata 路由', () 
       pendingPatchBySession: {},
                   fieldMetadata: {},
       pausedReviewBySession: {},
-      reviewResuming: false,
+      reviewResumingBySession: {},
       resolvedLocale: 'zh-CN',
     } as any);
   });

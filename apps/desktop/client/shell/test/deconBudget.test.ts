@@ -104,6 +104,34 @@ describe('estimateDeconCost（三档预估）', () => {
     expect(Object.keys(est.byPass).filter((k) => k.startsWith('p4:') && k !== 'p4:style')).toEqual([]);
   });
 
+  it('C6 thinkingBySlot：开启档系数只放大对应 slot 的 pass——未开启 slot 面与 base 零变化', () => {
+    const input = { tier: 'fine' as const, dimensions: ['qingxu', 'style'], stats: STATS, p1Reusable: P1_NONE };
+    const base = estimateDeconCost(input);
+    // extraction（p1a/p1b/p3a/p6）+ review-judge（p1c/p2/p4:<手艺维>）开启：
+    const withExRev = estimateDeconCost({ ...input, thinkingBySlot: { extraction: 1.5, 'review-judge': 1.5 } });
+    expect(withExRev.byPass.p1a).toBe(Math.round(base.byPass.p1a! * 1.5));
+    expect(withExRev.byPass.p1b).toBe(Math.round(base.byPass.p1b! * 1.5));
+    expect(withExRev.byPass.p3a).toBe(Math.round(base.byPass.p3a! * 1.5));
+    expect(withExRev.byPass.p6).toBe(Math.round(base.byPass.p6! * 1.5));
+    expect(withExRev.byPass.p1c).toBe(Math.round(base.byPass.p1c! * 1.5));
+    expect(withExRev.byPass.p2).toBe(Math.round(base.byPass.p2! * 1.5));
+    expect(withExRev.byPass['p4:qingxu']).toBe(Math.round(base.byPass['p4:qingxu']! * 1.5));
+    // writer-draft（p5:book_reading / p5:chapter_review / p4:style）未开启 → 原值：
+    expect(withExRev.byPass['p5:book_reading']).toBe(base.byPass['p5:book_reading']);
+    expect(withExRev.byPass['p5:chapter_review']).toBe(base.byPass['p5:chapter_review']);
+    expect(withExRev.byPass['p4:style']).toBe(base.byPass['p4:style']);
+    expect(withExRev.totalTokens).toBe(Object.values(withExRev.byPass).reduce((a, b) => a + b, 0));
+    expect(withExRev.totalTokens).toBeGreaterThan(base.totalTokens);
+    // writer-draft 开启 → p5/p4:style 面放大、extraction 面不变：
+    const withWriter = estimateDeconCost({ ...input, thinkingBySlot: { 'writer-draft': 1.5 } });
+    expect(withWriter.byPass['p5:book_reading']).toBe(Math.round(base.byPass['p5:book_reading']! * 1.5));
+    expect(withWriter.byPass['p4:style']).toBe(Math.round(base.byPass['p4:style']! * 1.5));
+    expect(withWriter.byPass.p1b).toBe(base.byPass.p1b);
+    // 空表 / 系数 1 = 旧行为（零思考假设逐字节不变）：
+    expect(estimateDeconCost({ ...input, thinkingBySlot: {} })).toEqual(base);
+    expect(estimateDeconCost({ ...input, thinkingBySlot: { extraction: 1 } })).toEqual(base);
+  });
+
   it('E10.3b 三态 gate②③：fine 手艺维原式 + style 特化式并存；p6 只计手艺维（排除 style——风格维不落 craft 卡）', () => {
     const withStyle = estimateDeconCost({
       tier: 'fine',

@@ -61,10 +61,11 @@ describe('dogfood R2 #93 — notifyLeaderChainCompleted（链完成事件回注 
     expect(eventMsg!.content).toContain('待作者在审核卡确认');
     expect(messages.some((m) => m.role === 'assistant' && m.content.includes('向你汇报'))).toBe(true);
 
-    // 触发一轮：generate 收到的最后一条 user 消息即事件正文（该轮 user 侧输入）。
+    // 触发一轮：generate 收到的最后一条 user 侧输入即事件正文（system 稳定化后 turn 尾
+    // 还有状态注记——同为 user role，按 kind 排除后取真正的作者侧输入）。
     expect(generate).toHaveBeenCalledTimes(1);
-    const llmMessages = generate.mock.calls[0][0] as Array<{ role: string; content: string }>;
-    const lastUser = [...llmMessages].reverse().find((m) => m.role === 'user');
+    const llmMessages = generate.mock.calls[0][0] as Array<{ role: string; kind?: string; content: string }>;
+    const lastUser = [...llmMessages].reverse().find((m) => m.role === 'user' && m.kind !== 'session_state_note');
     expect(lastUser!.content).toContain('[链完成事件 · 系统回注]');
 
     // jsonl 落盘带 kind（可审计——非伪造用户消息）。
@@ -182,5 +183,27 @@ describe('dogfood R2 #93 — notifyLeaderChainCompleted（链完成事件回注 
     expect(minimal).toContain('[链完成事件 · 系统回注]');
     expect(minimal).not.toContain('字数：');
     expect(minimal).not.toContain('路由判定：');
+  });
+
+  it('W2 完成事实扩展：arcBeatCount 提取统计 / derivationStale 重提取指路 / loopUnconverged 环未收敛上报', async () => {
+    const { renderChainCompletedEventMessage } = await import('../src/runtime/workflow');
+
+    const text = renderChainCompletedEventMessage({
+      runId: 'r3',
+      arcBeatCount: 2,
+      derivationStale: true,
+      loopUnconverged: true,
+    });
+    expect(text).toContain('弧节拍：本章声明 2 条');
+    expect(text).toContain('衍生状态待重提取');
+    expect(text).toContain('re-extract');
+    expect(text).toContain('环未收敛');
+
+    // 缺省不添行（零噪音）。终弃（chapterAbandoned）不设 payload 字段——终弃链非 completed
+    // 终态（清快照），leader 侧经 write_chapter 工具结果行同步上报，完成事件车道结构性不可达。
+    const clean = renderChainCompletedEventMessage({ runId: 'r4' });
+    expect(clean).not.toContain('弧节拍');
+    expect(clean).not.toContain('衍生状态');
+    expect(clean).not.toContain('环未收敛');
   });
 });

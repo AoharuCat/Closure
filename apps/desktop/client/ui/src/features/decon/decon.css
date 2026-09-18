@@ -68,6 +68,29 @@
   max-width: 100%;
 }
 
+/* U7：行内创建时间戳（本地化）。 */
+.decon-jobrow-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2xs);
+}
+
+.decon-jobrow-time {
+  font-size: var(--text-xs);
+  color: var(--on-surface-variant);
+  font-variant-numeric: tabular-nums;
+}
+
+/* U17：failed 态 error 一行截断摘要（全文在详情横幅 + title 悬浮）。 */
+.decon-jobrow-error {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--text-xs);
+  color: var(--error);
+}
+
 /* 新建向导模态（App 级 overlay——与 ConfirmDialog 同层）。 */
 .decon-modal {
   position: fixed;
@@ -140,11 +163,11 @@
   border-radius: var(--radius-sm);
 }
 
+/* CR-17：行改列容器（主行 + 通俗说明副行）。 */
 .decon-estimate-row {
   display: flex;
-  align-items: center;
-  gap: var(--space-sm);
-  font-size: var(--text-xs);
+  flex-direction: column;
+  gap: 2px;
 }
 
 .decon-estimate-row--total {
@@ -153,12 +176,25 @@
   padding-top: var(--space-2xs);
 }
 
+.decon-estimate-line {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  font-size: var(--text-xs);
+}
+
 .decon-estimate-pass {
   flex: 1;
 }
 
 .decon-estimate-tokens {
   font-variant-numeric: tabular-nums;
+}
+
+/* CR-17：每 pass 一句通俗说明（muted 小字——钱花在哪/什么在推高费用）。 */
+.decon-estimate-note {
+  font-size: var(--text-2xs);
+  color: var(--on-surface-variant);
 }
 
 /* 状态横幅（色档按 banner kind——capped/stale 警示、failed 危险、闸门主强调）。 */
@@ -215,7 +251,7 @@
   background: var(--surface-container-low);
 }
 
-/* pass 进度面板（聚合行 + 当前相位行）。 */
+/* pass 进度面板（U4 总进度条 + 聚合行 + 当前相位行）。 */
 .decon-progress {
   display: flex;
   flex-direction: column;
@@ -225,12 +261,47 @@
   border-radius: var(--radius-sm);
 }
 
+/* U4 总进度条（mirror materials-importprogress 形态：bar 底 + 半透明进度层 + 居中文本）。 */
+.decon-progress-total {
+  position: relative;
+  height: 22px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-container);
+  overflow: hidden;
+}
+
+.decon-progress-total-bar {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: var(--accent);
+  opacity: 0.35;
+  transition: width 0.2s ease;
+}
+
+.decon-progress-total-text {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  color: var(--on-surface);
+}
+
 .decon-progress-current {
   display: flex;
   align-items: center;
   gap: var(--space-2xs);
   font-weight: 600;
   color: var(--accent);
+}
+
+/* CR-19：U4 pass 覆盖辅行（已完成 pass 数/总 pass 数）。 */
+.decon-progress-coverage {
+  font-size: var(--text-xs);
+  color: var(--on-surface-variant);
+  font-variant-numeric: tabular-nums;
 }
 
 .decon-progress-row {
@@ -384,22 +455,26 @@
   opacity: 0.85;
 }
 
+/* U1：报告正文 markdown 容器（渲染经 renderMarkdown + DOMPurify；排版走 .agent-msg-md
+ * 类族——衬线正文/标题层级/列表/引用，本类只补报告面容器样式；pre-wrap 等宽裸出退役）。 */
 .decon-reportmd {
   margin: 0;
   padding: var(--space-sm);
   border: 1px solid var(--border-default);
   border-radius: var(--radius-sm);
   background: var(--surface-container-low);
-  font-size: var(--text-sm);
-  white-space: pre-wrap;
-  word-break: break-word;
 }
 
-/* canon 浏览（六域分组条目）。 */
+/* canon 浏览（六域分组条目——U2/F17 按域字段卡片 +「AI 视图」开关）。 */
 .decon-canonbrowse {
   display: flex;
   flex-direction: column;
   gap: var(--space-2xs);
+}
+
+.decon-canonviewtoggle {
+  display: flex;
+  justify-content: flex-end;
 }
 
 .decon-canonentry {
@@ -411,6 +486,13 @@
   border-radius: var(--radius-2xs);
 }
 
+.decon-canonentry-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2xs);
+  flex-wrap: wrap;
+}
+
 .decon-canonentry-name {
   font-weight: 600;
   font-size: var(--text-sm);
@@ -420,6 +502,147 @@
   font-size: var(--text-xs);
   color: var(--on-surface-variant);
   overflow-wrap: anywhere;
+}
+
+/* canon 字段行（label + value）。 */
+.decon-canonfield {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3xs);
+}
+
+.decon-canonfield-label {
+  font-size: var(--text-xs);
+  color: var(--on-surface-variant);
+}
+
+.decon-canonfield-value {
+  font-size: var(--text-sm);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.decon-canonfield-value--muted {
+  color: var(--on-surface-variant);
+}
+
+/* character 特质行（name + 可变性 chip + note）。 */
+.decon-canontraits {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3xs);
+}
+
+.decon-canontrait {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2xs);
+  flex-wrap: wrap;
+}
+
+.decon-canontrait-name {
+  font-size: var(--text-sm);
+}
+
+.decon-canontrait-note {
+  font-size: var(--text-xs);
+  color: var(--on-surface-variant);
+}
+
+/* timeline 事件列举行。 */
+.decon-canonlist {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3xs);
+}
+
+.decon-canonlist-row {
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  color: var(--on-surface);
+}
+
+/* 条目尾行：锚点计数 + 出处（U2——每条目 anchors/provenance 摘要）。 */
+.decon-canonmeta {
+  font-size: var(--text-xs);
+  color: var(--on-surface-variant);
+}
+
+/* F18：粗拆档风格 tab 回落统计摘要卡。 */
+.decon-stylestats {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2xs);
+  padding: var(--space-sm);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+}
+
+/* 完成横幅「打开读法」内嵌按钮（U34——ghost 形态：透明底 + accent 描边）。 */
+.decon-banner-open {
+  margin-left: var(--space-sm);
+  padding: var(--space-3xs) var(--space-2xs);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-2xs);
+  background: transparent;
+  color: var(--accent);
+  font-family: inherit;
+  font-size: var(--text-xs);
+  cursor: pointer;
+}
+
+.decon-banner-open:hover {
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+/* 删除降次按钮（U35——破坏性兜底非主 CTA：muted 描边幽灵形态）。 */
+.decon-action--secondary {
+  border-color: var(--border-default);
+  color: var(--on-surface-variant);
+}
+
+.decon-action--secondary:hover {
+  border-color: var(--error);
+  color: var(--error);
+}
+
+/* U8：粗拆档「12 手艺维预览」区（提示 + 展开 + granularity 列表）。 */
+.decon-dimpreview {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2xs);
+}
+
+.decon-dimpreview-hint {
+  font-size: var(--text-xs);
+  color: var(--on-surface-variant);
+}
+
+.decon-dimpreview-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3xs);
+  padding: var(--space-2xs) var(--space-sm);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-2xs);
+}
+
+.decon-dimpreview-row {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-sm);
+  flex-wrap: wrap;
+}
+
+.decon-dimpreview-name {
+  font-size: var(--text-xs);
+  font-weight: 600;
+}
+
+.decon-dimpreview-gran {
+  font-size: var(--text-xs);
+  color: var(--on-surface-variant);
 }
 
 /* 风格导出 / 手艺卡跳转区（产出区尾部动作行）。 */

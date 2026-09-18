@@ -17,10 +17,12 @@ vi.mock('../src/skill/discovery', () => ({
 // （start_batch / batch_status / end_batch / set_participation_gear / write_chapter / present_result
 // 均为 builtin 注册的真工具）→ write_chapter 内部走真 runChapterChain（dispatchSubagent +
 // createChapterChainNodes 全链 + 真 chainRunner）。mock 仅两层（注入 seam，testing spec）：
-// 1. `generate`（LLM）——scripted 按 system 标记区分 leader / 链节点 / 子 agent（retrieval /
-//    director / adjudicator）。leader 脚本「像真 leader」：按系统提示词里的批量协议段行动
-//    （判轻重问/直写、escalate 必停、锚点收尾）——同时把收到的 system prompt 记录下来断言
-//    协议段真的注入（协议到达 + 行为遵守双验证）。
+// 1. `generate`（LLM）——scripted 区分 leader / 链节点 / 子 agent：leader 按消息流里
+//    kind='session_state_note' 注记识别（system 稳定化 + CR-D1 拆分后注记 = 纯动态状态快照，
+//    静态能力段已回 system 恒定区；注记仍只在 leader 会话追加——leader-only 判据不变），
+//    链节点 / 子 agent（retrieval / director / adjudicator）按 system 标记。leader 脚本「像真
+//    leader」：按注记里的批量协议段行动（判轻重问/直写、escalate 必停、锚点收尾）——同时把
+//    收到的注记 content 记录下来断言协议段真的注入（协议到达 + 行为遵守双验证）。
 // 2. `setExecuteToolFn` bridge——remoteToolProxy 工具（query_world_slice / write_world_events /
 //    feedback_ledger_write / git_* 等）的最小 shell 侧替身（agent 包无 db/IPC）。
 //
@@ -177,9 +179,29 @@ function adjudicatorResponse(kind: ScenarioConfig['adjudication']) {
 }
 
 /**
- * 场景 scripted generate。区分（system 标记，leader 判定必须最先——leader system 的工具描述
- * 段含「审核」等词，勿被链节点 matcher 误吞）：
- * - leader：'Interaction Mode (Closure 工作台)'（buildInteractionModeSegment 头，leader-only）。
+ * leader 判据：消息流含 kind='session_state_note' 注记（system 稳定化〔09-12〕+ CR-D1 拆分
+ * 〔09-13 拍板 B〕后注记 = 纯动态状态快照——「Interaction Mode (Closure 工作台)」静态能力段头
+ * 已回 system，注记头为「Session State (Closure 工作台)」）。注记只在 leader 会话追加（child/
+ * 链节点会话零继承父历史，见 sessionTree createChildSession）→ 在场 = leader-only 判据。
+ */
+function hasSessionStateNote(messages: unknown): boolean {
+  return (
+    Array.isArray(messages)
+    && messages.some((m) => (m as { kind?: string } | null)?.kind === 'session_state_note')
+  );
+}
+
+/** 最新一条 session_state_note 注记 content（同快照 hash 门不新增——多轮取最新须 filter 取尾）。 */
+function latestSessionStateNoteContent(messages: unknown): string {
+  if (!Array.isArray(messages)) return '';
+  const notes = messages.filter((m) => (m as { kind?: string } | null)?.kind === 'session_state_note');
+  return notes.length > 0 ? (notes.at(-1) as { content: string }).content : '';
+}
+
+/**
+ * 场景 scripted generate。区分（leader 判定必须最先——leader system 的工具描述段含「审核」
+ * 等词，勿被链节点 matcher 误吞）：
+ * - leader：消息流含 session_state_note 注记（见上方 hasSessionStateNote——leader-only）。
  * - 链节点 / 子 agent：yaml system 标记（mirror chain-e2e：路由判决 / Reader-Audit / 状态提取 /
  *   完整性审核 / 修订编辑；子 agent：资料员 retrieval / 你是导演 director / 灰区创作裁决器）。
  */
@@ -188,16 +210,16 @@ function makeScenarioGenerate(cfg: ScenarioConfig) {
   let routeIdx = 0;
   let reviewIdx = 0;
   let callSeq = 0;
-  const leaderSystems: string[] = [];
+  const leaderNotes: string[] = [];
   const generate = async (
-    _messages: unknown,
+    messages: unknown,
     sys: string | undefined,
   ): Promise<{ content: string; toolCalls?: ToolCall[]; finishReason: string }> => {
     const s = sys ?? '';
     callSeq++;
     // ── leader（runLoop 主循环；咨询点 = 返回无 toolCalls → turn break）──
-    if (s.includes('Interaction Mode (Closure 工作台)')) {
-      leaderSystems.push(s);
+    if (hasSessionStateNote(messages)) {
+      leaderNotes.push(latestSessionStateNoteContent(messages));
       const step = cfg.leader[leaderIdx];
       if (!step) {
         throw new Error(`batch-integration: leader script exhausted at generate call #${callSeq} (leader #${leaderIdx + 1})`);
@@ -220,6 +242,11 @@ function makeScenarioGenerate(cfg: ScenarioConfig) {
     // 🔑 顺序敏感：专属标记在前，generic「Reader-Audit/审核」matcher 必须**最后**——adjudicator /
     // director 的 yaml system 本身含「Reader-Audit」字样（grep prompts/*.yaml 核实），generic 先判
     // 会把它们误吞成 multi-review fixture（灰区采信/裁决行为错乱）。
+    if (s.includes('规划审核')) {
+      // W1d：brief-reviewer（A2 规划审核）——pass 直通（须在 generic「审核」matcher 前——
+      // brief-reviewer system 含「审核」子串，否则吞掉 reviewSeverities 序列错位）。
+      return { content: JSON.stringify({ verdict: 'pass', summary: '卡可写', findings: [] }), finishReason: 'stop' };
+    }
     if (s.includes('路由判决')) {
       const decision = cfg.routeDecisions[Math.min(routeIdx, cfg.routeDecisions.length - 1)];
       routeIdx++;
@@ -265,7 +292,7 @@ function makeScenarioGenerate(cfg: ScenarioConfig) {
     // ── 默认：draft-writer ──
     return { content: JSON.stringify(INITIAL_DRAFT), finishReason: 'stop' };
   };
-  return { generate, leaderSystems };
+  return { generate, leaderNotes };
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -343,7 +370,7 @@ describe('Story 3.5 — 批量编排集成（真 runLoop + 真 runChapterChain�
   // ──────────────────────────────────────────────────────────────────────────
   it('smart：通报走向单不阻塞 → 重点场 turn break 问 → 答后续跑两章 → 锚点 end_batch + present_result + L0 + report 盖章', async () => {
     writeBatchProject(projectPath);
-    const { generate, leaderSystems } = makeScenarioGenerate({
+    const { generate, leaderNotes } = makeScenarioGenerate({
       leader: [
         // turn 0（warmup，无批量）：旧消息无 batchId 不破（AC7）。
         { content: '你好，我是写作搭档。' },
@@ -371,8 +398,8 @@ describe('Story 3.5 — 批量编排集成（真 runLoop + 真 runChapterChain�
     const warmupAssistant = warmup.find((m) => m.role === 'assistant')!;
     expect(warmupAssistant.batchId).toBeUndefined();
     expect(warmupAssistant.batchKind).toBeUndefined();
-    const warmupSystem = leaderSystems[0];
-    expect(warmupSystem).not.toContain('批量写作协议');
+    const warmupNote = leaderNotes[0] ?? '';
+    expect(warmupNote).not.toContain('批量写作协议');
 
     // turn 1：批量指令 → start_batch 被调 + 通报/问询产出 + turn break。
     const turn1 = await runTurn(runtime, session.id, '把主线这四场全权写到锚点，你判断哪些要问我');
@@ -418,16 +445,17 @@ describe('Story 3.5 — 批量编排集成（真 runLoop + 真 runChapterChain�
 
     // turn 2：答后续跑（对账 → 写两章 → 锚点收尾）。
     const turn2 = await runTurn(runtime, session.id, 'sc2 按正面突破写，继续');
-    // turn 2 系统 prompt：批量协议段 + smart 档 + 穿透纪律 + stale 引导（AC6）+ 进度/下一场。
-    const turn2System = leaderSystems[leaderSystems.length - 1];
-    expect(turn2System).toContain('批量写作协议');
-    expect(turn2System).toContain('参与档位=smart');
-    expect(turn2System).toContain('通报走向单');
-    expect(turn2System).toContain('硬性打断穿透');
-    expect(turn2System).toContain('不豁免 BLOCK');
-    expect(turn2System).toContain('diagnose_impacts');
-    expect(turn2System).toContain('0/4 场已完成');
-    expect(turn2System).toContain('下一场=sc1');
+    // turn 2 注记（turn 开始追加的 session_state_note）：批量协议段 + smart 档 + 穿透纪律 +
+    // stale 引导（AC6）+ 进度/下一场。
+    const turn2Note = leaderNotes[leaderNotes.length - 1] ?? '';
+    expect(turn2Note).toContain('批量写作协议');
+    expect(turn2Note).toContain('参与档位=smart');
+    expect(turn2Note).toContain('通报走向单');
+    expect(turn2Note).toContain('硬性打断穿透');
+    expect(turn2Note).toContain('不豁免 BLOCK');
+    expect(turn2Note).toContain('diagnose_impacts');
+    expect(turn2Note).toContain('0/4 场已完成');
+    expect(turn2Note).toContain('下一场=sc1');
     // batch_status 真对账（0 落盘 → 0/4 + 剩余场信号刷新）。
     const statusOutput = toolOutputs(turn2, 'batch_status')[0];
     expect(statusOutput).toContain(`batchId=${batchId}`);
@@ -477,7 +505,7 @@ describe('Story 3.5 — 批量编排集成（真 runLoop + 真 runChapterChain�
   // ──────────────────────────────────────────────────────────────────────────
   it('hands_off+trust：单 turn 零问跑完两章；灰区（warn）经裁决器 accept 自动采信续跑（不 turn break）', async () => {
     writeBatchProject(projectPath);
-    const { generate, leaderSystems } = makeScenarioGenerate({
+    const { generate, leaderNotes } = makeScenarioGenerate({
       leader: [
         // chat 入口调档（AC3 三入口之一）：放手 + 信灰区裁决。
         { content: '切档。', toolCalls: [{ name: 'set_participation_gear', args: { gear: 'hands_off', trustAdjudication: true } }] },
@@ -496,8 +524,9 @@ describe('Story 3.5 — 批量编排集成（真 runLoop + 真 runChapterChain�
 
     // 整个批量在单一 turn 内完成（hands_off 零问 = 无中途 turn break）。
     const turn1 = await runTurn(runtime, session.id, '放手把主线写完，灰区你采信初审就行');
-    // 零中途咨询：全程只有一个 user 消息（本 turn 的指令）。
-    expect(turn1.filter((m) => m.role === 'user')).toHaveLength(1);
+    // 零中途咨询：全程只有一个真作者 user 消息（本 turn 的指令；session_state_note 是系统注入
+    // 的 user-role 注记，非作者发言，不计入咨询点）。
+    expect(turn1.filter((m) => m.role === 'user' && m.kind !== 'session_state_note')).toHaveLength(1);
     // chat 调档工具真生效 + 持久。
     const gearOutput = toolOutputs(turn1, 'set_participation_gear')[0];
     expect(gearOutput).toContain('参与档位已设置为 hands_off');
@@ -522,9 +551,9 @@ describe('Story 3.5 — 批量编排集成（真 runLoop + 真 runChapterChain�
     const lastAssistant = turn1.filter((m) => m.role === 'assistant').at(-1)!;
     expect(lastAssistant.content).toContain('验收清单');
     expect(lastAssistant.batchKind).toBe('report');
-    // leader 本 turn 系统 prompt 尚无批量段（turn 开始时无活跃批量）——协议经 start_batch
-    // 工具 output 指引（含「批量写作协议」指针）。
-    expect(leaderSystems[0]).not.toContain('批量写作协议');
+    // leader 本 turn 注记尚无批量段（turn 开始时无活跃批量）——协议经 start_batch 工具 output
+    // 指引（含「批量写作协议」指针）。
+    expect(leaderNotes[0] ?? '').not.toContain('批量写作协议');
     expect(toolOutputs(turn1, 'start_batch')[0]).toContain('批量写作协议');
   });
 
@@ -533,7 +562,7 @@ describe('Story 3.5 — 批量编排集成（真 runLoop + 真 runChapterChain�
   // ──────────────────────────────────────────────────────────────────────────
   it('hands_off+trust BLOCK：write_chapter 返 block findings → 批量停下呈现（不写下一章），batch 保持 running', async () => {
     writeBatchProject(projectPath);
-    const { generate, leaderSystems } = makeScenarioGenerate({
+    const { generate, leaderNotes } = makeScenarioGenerate({
       leader: [
         { content: '切档。', toolCalls: [{ name: 'set_participation_gear', args: { gear: 'hands_off', trustAdjudication: true } }] },
         { content: '启动批量。', toolCalls: [{ name: 'start_batch', args: { lineTag: 'main' } }] },
@@ -572,13 +601,13 @@ describe('Story 3.5 — 批量编排集成（真 runLoop + 真 runChapterChain�
     // turn 2：批量活跃 + live 档位 hands_off + trust → 协议段注入（穿透纪律文本到位）。
     const turn2 = await runTurn(runtime, session.id, '收到，我先看看这个 findings');
     expect(assistantToolCalls(turn2)).toHaveLength(0); // 停下等用户，不动批量
-    const turn2System = leaderSystems[leaderSystems.length - 1];
-    expect(turn2System).toContain('批量写作协议');
-    expect(turn2System).toContain('参与档位=hands_off');
-    expect(turn2System).toContain('trustAdjudication=true');
-    expect(turn2System).toContain('全程不问');
-    expect(turn2System).toContain('不豁免 BLOCK');
-    expect(turn2System).toContain('0/4 场已完成'); // 章正文未落盘（accept 走工作台）→ 对账前进度 0
+    const turn2Note = leaderNotes[leaderNotes.length - 1] ?? '';
+    expect(turn2Note).toContain('批量写作协议');
+    expect(turn2Note).toContain('参与档位=hands_off');
+    expect(turn2Note).toContain('trustAdjudication=true');
+    expect(turn2Note).toContain('全程不问');
+    expect(turn2Note).toContain('不豁免 BLOCK');
+    expect(turn2Note).toContain('0/4 场已完成'); // 章正文未落盘（accept 走工作台）→ 对账前进度 0
   });
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -586,7 +615,7 @@ describe('Story 3.5 — 批量编排集成（真 runLoop + 真 runChapterChain�
   // ──────────────────────────────────────────────────────────────────────────
   it('steer：每场（章）写前都 turn break 问；确认后才 write_chapter', async () => {
     writeBatchProject(projectPath);
-    const { generate, leaderSystems } = makeScenarioGenerate({
+    const { generate, leaderNotes } = makeScenarioGenerate({
       leader: [
         // turn 1：启动 + 逐场预告 → 写前问（turn break，零 write_chapter）。
         { content: '启动批量（掌舵）。', toolCalls: [{ name: 'start_batch', args: { lineTag: 'main' } }] },
@@ -617,11 +646,11 @@ describe('Story 3.5 — 批量编排集成（真 runLoop + 真 runChapterChain�
     const turn2Calls = assistantToolCalls(turn2).filter((c) => c.name === 'write_chapter');
     expect(turn2Calls).toHaveLength(1);
     expect(turn2.filter((m) => m.role === 'assistant').at(-1)!.content).toContain('确认开写');
-    // 批量活跃 turn 的系统 prompt：steer 协议注入。
-    const turn2System = leaderSystems[leaderSystems.length - 1];
-    expect(turn2System).toContain('参与档位=steer');
-    expect(turn2System).toContain('每场写前都问');
-    expect(turn2System).toContain('逐场预告');
+    // 批量活跃 turn 的注记：steer 协议注入。
+    const turn2Note = leaderNotes[leaderNotes.length - 1] ?? '';
+    expect(turn2Note).toContain('参与档位=steer');
+    expect(turn2Note).toContain('每场写前都问');
+    expect(turn2Note).toContain('逐场预告');
 
     // turn 3：写第3章 + 收尾完成。
     const turn3 = await runTurn(runtime, session.id, '确认，写完收尾');
@@ -635,7 +664,7 @@ describe('Story 3.5 — 批量编排集成（真 runLoop + 真 runChapterChain�
   // ──────────────────────────────────────────────────────────────────────────
   it('balanced：走向单等作者确认才开写（确认前零 write_chapter）；圈类别协议注入', async () => {
     writeBatchProject(projectPath);
-    const { generate, leaderSystems } = makeScenarioGenerate({
+    const { generate, leaderNotes } = makeScenarioGenerate({
       leader: [
         // turn 1：走向单 → 等确认（turn break，零 write）。
         { content: '启动批量。', toolCalls: [{ name: 'start_batch', args: { lineTag: 'main' } }] },
@@ -664,13 +693,13 @@ describe('Story 3.5 — 批量编排集成（真 runLoop + 真 runChapterChain�
     expect(assistantToolCalls(turn2).filter((c) => c.name === 'write_chapter')).toHaveLength(2);
     expect(toolOutputs(turn2, 'end_batch')[0]).toContain('收口（done）');
     expect(loadBatchRuns(projectPath)![0].status).toBe('done');
-    // 批量活跃 turn 的系统 prompt：balanced 协议（等确认 + 默认三项圈类别）。
-    const turn2System = leaderSystems[leaderSystems.length - 1];
-    expect(turn2System).toContain('参与档位=balanced');
-    expect(turn2System).toContain('走向单必须等作者确认');
-    expect(turn2System).toContain('主角生死安危');
-    expect(turn2System).toContain('信息差关键抉择');
-    expect(turn2System).toContain('方向转弯');
+    // 批量活跃 turn 的注记：balanced 协议（等确认 + 默认三项圈类别）。
+    const turn2Note = leaderNotes[leaderNotes.length - 1] ?? '';
+    expect(turn2Note).toContain('参与档位=balanced');
+    expect(turn2Note).toContain('走向单必须等作者确认');
+    expect(turn2Note).toContain('主角生死安危');
+    expect(turn2Note).toContain('信息差关键抉择');
+    expect(turn2Note).toContain('方向转弯');
   });
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -679,7 +708,7 @@ describe('Story 3.5 — 批量编排集成（真 runLoop + 真 runChapterChain�
   it('崩溃恢复：running 残留批量 + ch-0 正文已落盘 → batch_status 对账 2/4 → 只续写剩余章 → 收口 + 盖章从磁盘重导', async () => {
     // fixture：ch-0 正文已落盘（模拟崩溃前 accept 持久化已发生）。
     writeBatchProject(projectPath, { landedCh0Prose: true });
-    const { generate, leaderSystems } = makeScenarioGenerate({
+    const { generate, leaderNotes } = makeScenarioGenerate({
       leader: [
         { content: '恢复：先对账批量进度。', toolCalls: [{ name: 'batch_status', args: {} }] },
         { content: '续写剩余的第3章。', toolCalls: [writeChapterCall('ep1', 'ch-1', '锚点收束')] },
@@ -741,10 +770,10 @@ describe('Story 3.5 — 批量编排集成（真 runLoop + 真 runChapterChain�
       expect(msg.batchId).toBe('batch-crash-e2e');
     }
     expect(turn1.filter((m) => m.role === 'assistant').at(-1)!.batchKind).toBe('report');
-    // 恢复 turn 的系统 prompt：批量协议 + 对账后进度 + 下一场。
-    const turn1System = leaderSystems[leaderSystems.length - 1];
-    expect(turn1System).toContain('批量写作协议');
-    expect(turn1System).toContain('0/4 场已完成'); // turn 开始时 doneSceneIds 尚空（对账在工具内发生）
+    // 恢复 turn 的注记：批量协议 + turn 开始时进度 + 下一场。
+    const turn1Note = leaderNotes[leaderNotes.length - 1] ?? '';
+    expect(turn1Note).toContain('批量写作协议');
+    expect(turn1Note).toContain('0/4 场已完成'); // turn 开始时 doneSceneIds 尚空（对账在工具内发生）
   });
 
   // ──────────────────────────────────────────────────────────────────────────

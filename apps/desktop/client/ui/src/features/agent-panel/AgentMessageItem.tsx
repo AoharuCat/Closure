@@ -8,6 +8,8 @@ import { WRITE_TOOLS } from '../../shared/store/agentDiffSlice';
 import type { Attachment, SelectionAttachment } from '../../shared/types/attachment';
 // 09-01 B4（R2.6）：气泡 image 缩略图的盘读路径拼接 + 绝对路径归一（ProjectTree.tsx:230 同款）。
 import { chatImageAbsolutePath } from '../../shared/api/chatImages';
+// 09-12 子2（design §8③）：终态徽标的模型显示名单源（与通知条/chip 同一查表）。
+import { modelDisplayName } from '../../shared/model/modelDisplay';
 import { AgentToolCard } from './AgentToolCard';
 import { DiffCard } from './DiffCard';
 // dogfood R2 #12：三派发工具的成功产出（大纲/分集草案、调研报告）专用产出卡——
@@ -25,6 +27,8 @@ import { SettingMdPatchCard, extractSettingMdPatch, isSettingMdPatchResolved } f
 import { AuthorProfilePatchCard, extractAuthorProfilePatch, isAuthorProfilePatchResolved } from './AuthorProfilePatchCard';
 import { Collapsible } from '../../shared/components/Collapsible';
 import { toolPresentation, toolLabel, roleLabel, parseChildTag } from './toolMeta';
+// 子4 W6：「桥」徽标——本会话对话车道经桥运行（childTag 消费侧排除——桥只接 leader）。
+import { useAgyBridgeLaneActive } from './useAgyBridgeLane';
 import { useTypewriter } from './useTypewriter';
 // dogfood R2 #11（findings #11④）：MD 渲染单源（R2 #12 提出供 DispatchDraftCard 复用）。
 import { renderMarkdown } from './markdown';
@@ -271,15 +275,19 @@ function ReasoningFold({ reasoning, streaming, revealed, t }: { reasoning: strin
 }
 
 function AgentMessageItemImpl({ message, isLatest, canTruncateFrom, onTruncateFrom, resolvedToolCallIds }: Props) {
-  const { resolvedLocale, resolvedAuthorProfilePatches, resolvedSettingMdPatches } = useAppStore(useShallow((s) => ({
+  const { resolvedLocale, resolvedAuthorProfilePatches, resolvedSettingMdPatches, modelConfigForBadge } = useAppStore(useShallow((s) => ({
     resolvedLocale: s.resolvedLocale,
     // dogfood R2 #25：suggest 档审阅卡未决时不内联（run 继续会被后续消息顶出视野）——
     // 钉底渲染在 AgentPanel（mirror PatchReviewPanel 位）；resolved 后回内联原位存档。
     resolvedAuthorProfilePatches: s.resolvedAuthorProfilePatches,
     resolvedSettingMdPatches: s.resolvedSettingMdPatches,
+    // 09-12 子2（design §8③）：终态徽标「实际模型 B · 回退自 A」的显示名查表源。
+    modelConfigForBadge: s.modelConfig as import('@orison/shared-contracts').ModelConfig | undefined,
   })));
   const { t } = useI18n(resolvedLocale);
   const mountedAtRef = useRef(Date.now());
+  // 子4 W6：桥车道派生（徽标用；childTag 消息在下方各消费点排除）。
+  const bridgeLaneActive = useAgyBridgeLaneActive();
 
   // Strip a child-execution tag (e.g. `[skill:story:d1] ...`) off assistant
   // content so it renders as an indented, labelled step instead of leaking the
@@ -500,6 +508,8 @@ function AgentMessageItemImpl({ message, isLatest, canTruncateFrom, onTruncateFr
       else stepResults.push(r);
     }
     const childTagOnTool = parseChildTag(message.content ?? '');
+    // 子4 W6：桥徽标 = 本会话 leader 车道经桥运行（子代理工具卡不标——桥只接 dialogue）。
+    const bridgeOnTool = bridgeLaneActive && !childTagOnTool;
 
     return (
       <div className="agent-msg agent-msg-tool">
@@ -548,11 +558,11 @@ function AgentMessageItemImpl({ message, isLatest, canTruncateFrom, onTruncateFr
                 </>
               }
             >
-              {stepResults.map((r, i) => <AgentToolCard key={`step-${i}`} result={r} />)}
+              {stepResults.map((r, i) => <AgentToolCard key={`step-${i}`} result={r} bridge={bridgeOnTool} />)}
             </Collapsible>
           ) : (
             <div className="agent-work-steps">
-              {stepResults.map((r, i) => <AgentToolCard key={`step-${i}`} result={r} />)}
+              {stepResults.map((r, i) => <AgentToolCard key={`step-${i}`} result={r} bridge={bridgeOnTool} />)}
             </div>
           )
         )}
@@ -580,6 +590,26 @@ function AgentMessageItemImpl({ message, isLatest, canTruncateFrom, onTruncateFr
           t('agent.leader')
         )}
       </div>
+      {/* 09-12 子2（design §8③）：终态标注实际模型（成本/质量预期不错位）。只在
+          generatedBy 在场（档位配了链 + fetch 对账/历史装载路径）时渲染——旧消息零变化；
+          回退发生时追加「回退自 A、B」（CR-24：逐家失败全列，不只 [0]——链上每家都
+          烧过一次 attempt，漏显会让用户误判失败面）。 */}
+      {message.role === 'assistant' && message.generatedBy ? (
+        <span className="agent-msg-generated-by">
+          <span className="material-symbols-outlined" aria-hidden="true">neurology</span>
+          {t('agent.messageGeneratedBy', { model: modelDisplayName(modelConfigForBadge, message.generatedBy) })}
+          {message.generatedBy.fallbackFrom?.length ? (
+            <span className="agent-msg-generated-by-from">
+              {' · '}
+              {t('agent.messageGeneratedByFallback', {
+                from: message.generatedBy.fallbackFrom
+                  .map((failed) => modelDisplayName(modelConfigForBadge, failed))
+                  .join(resolvedLocale === 'zh-CN' ? '、' : ', '),
+              })}
+            </span>
+          ) : null}
+        </span>
+      ) : null}
       {canTruncateFrom && onTruncateFrom && <TruncateFromHereButton onClick={() => onTruncateFrom(message.id)} t={t} />}
       {message.reasoning ? (
         <ReasoningFold reasoning={message.reasoning} streaming={isStreaming} revealed={revealRef.current} t={t} />
@@ -642,6 +672,11 @@ function AgentMessageItemImpl({ message, isLatest, canTruncateFrom, onTruncateFr
             progress_activity
           </span>
           {t('agent.toolCalling', { name: toolLabel(message.streamingToolName, t) })}
+          {bridgeLaneActive && !childTag ? (
+            <span className="agent-tool-call-bridge-chip" title={t('agent.bridgeToolBadgeTitle')}>
+              {t('agent.bridgeToolBadge')}
+            </span>
+          ) : null}
         </div>
       )}
       {/* R2 #9：结果卡已落地的调用徽标隐去（徽标 = 执行中指示，卡片 = 完成态）。 */}

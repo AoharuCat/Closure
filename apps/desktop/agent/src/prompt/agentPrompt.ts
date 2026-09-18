@@ -27,7 +27,9 @@ import { logger } from '../logger';
 // expected_downstream_consumers:
 // - Story 4.0 Step 2：createLlmNode.run() = loadAgentPrompt(role) → renderTemplate(userTemplate, vars)
 //   → generate([user], system, [], abort, {modelRef})。
-// - Story 4.0 Step 3：draft-writer / multi-review / route / targeted-revision 节点实例化。
+// - Story 4.0 Step 3：draft-writer / multi-review / route（+ 当时的 targeted-revision，09-13 W1d 退役）
+//   节点实例化；链流程重排后另经 brief-reviewer-node / revision-optimizer-node 工厂消费（loadAgentPrompt
+//   'brief-reviewer-agent' / 'revision-optimizer-agent'）。
 
 const BOM_CHAR_CODE = 0xfeff;
 

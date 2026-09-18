@@ -1,3 +1,4 @@
+import { Agent } from 'undici';
 import { ProtocolHttpError } from './errors';
 
 export type JsonRequestOptions = {
@@ -6,7 +7,35 @@ export type JsonRequestOptions = {
   headers?: Record<string, string>;
   body?: unknown;
   signal?: AbortSignal;
+  /**
+   * undici dispatcher for this request (09-12 子3 verifySsl): `dispatcher` is a
+   * NON-STANDARD fetch init field (absent from lib.dom's RequestInit — callers
+   * pass the undici Agent from getInsecureDispatcher, local cast at the fetch
+   * call). ABSENT = default verification, and the init object is left
+   * byte-identical to the pre-子3 shape (zero passthrough when unused).
+   */
+  dispatcher?: unknown;
 };
+
+/**
+ * Lazy process-singleton undici Agent with certificate verification OFF
+ * (09-12 子3, design §3 ⑧). NEVER installed globally (setGlobalDispatcher would
+ * affect every key and every fetch face of the process) — it reaches the wire
+ * only as the per-request `dispatcher` init field of keys that explicitly set
+ * verifySsl / requests that pass insecure. Pure JS (no native rebuild face).
+ */
+let insecureAgent: Agent | undefined;
+
+export function getInsecureDispatcher(): Agent {
+  insecureAgent ??= new Agent({ connect: { rejectUnauthorized: false } });
+  return insecureAgent;
+}
+
+/** Attach the non-standard `dispatcher` field onto a fetch init (mutates; no-op for undefined). */
+function applyDispatcher(init: RequestInit, dispatcher: unknown): void {
+  if (dispatcher === undefined) return;
+  (init as { dispatcher?: unknown }).dispatcher = dispatcher;
+}
 
 function trimTrailingSlash(value: string): string {
   return value.replace(/\/+$/, '');
@@ -28,13 +57,16 @@ export async function postJson<T>({
   headers = {},
   body,
   signal,
+  dispatcher,
 }: JsonRequestOptions): Promise<T> {
-  const response = await fetch(url, {
+  const init: RequestInit = {
     method,
     headers: { 'content-type': 'application/json', ...headers },
     body: body === undefined ? undefined : JSON.stringify(body),
     signal,
-  });
+  };
+  applyDispatcher(init, dispatcher);
+  const response = await fetch(url, init);
 
   const text = await response.text();
   const parsed = text ? safeParseJson(text) : null;
@@ -50,8 +82,11 @@ export async function getJson<T>({
   url,
   headers = {},
   signal,
-}: { url: string; headers?: Record<string, string>; signal?: AbortSignal }): Promise<T> {
-  const response = await fetch(url, { method: 'GET', headers, signal });
+  dispatcher,
+}: { url: string; headers?: Record<string, string>; signal?: AbortSignal; dispatcher?: unknown }): Promise<T> {
+  const init: RequestInit = { method: 'GET', headers, signal };
+  applyDispatcher(init, dispatcher);
+  const response = await fetch(url, init);
   const text = await response.text();
   const parsed = text ? safeParseJson(text) : null;
 
@@ -98,18 +133,22 @@ export async function postMultipart<T>({
   headers = {},
   formData,
   signal,
+  dispatcher,
 }: {
   url: string;
   headers?: Record<string, string>;
   formData: FormData;
   signal?: AbortSignal;
+  dispatcher?: unknown;
 }): Promise<T> {
-  const response = await fetch(url, {
+  const init: RequestInit = {
     method: 'POST',
     headers,
     body: formData,
     signal,
-  });
+  };
+  applyDispatcher(init, dispatcher);
+  const response = await fetch(url, init);
 
   const text = await response.text();
   const parsed = text ? safeParseJson(text) : null;
@@ -154,6 +193,8 @@ export type SseRequestOptions = {
   headers?: Record<string, string>;
   body?: unknown;
   signal?: AbortSignal;
+  /** undici dispatcher passthrough (09-12 子3 verifySsl) — see JsonRequestOptions.dispatcher. */
+  dispatcher?: unknown;
   /**
    * Called for every complete frame. Return `'stop'` to gracefully end the
    * read loop early (CR-T1-003): terminal frames like Anthropic's
@@ -176,14 +217,17 @@ export async function postSse({
   headers = {},
   body,
   signal,
+  dispatcher,
   onEvent,
 }: SseRequestOptions): Promise<void> {
-  const response = await fetch(url, {
+  const init: RequestInit = {
     method: 'POST',
     headers: { 'content-type': 'application/json', accept: 'text/event-stream', ...headers },
     body: body === undefined ? undefined : JSON.stringify(body),
     signal,
-  });
+  };
+  applyDispatcher(init, dispatcher);
+  const response = await fetch(url, init);
 
   if (!response.ok) {
     const text = await response.text();

@@ -1,8 +1,6 @@
-import { assignmentThinkingControl, resolveTaskModel } from '@orison/desktop-agent';
+import { assignmentFallbackChain, assignmentThinkingControl, resolveTaskModel } from '@orison/desktop-agent';
 import type { GenerationFinishReason, ThinkingControl } from '@orison/shared-contracts';
-import { generateText } from '@orison/model-protocols';
-import { readModelConfigFromDisk } from '../ipc/configIpc';
-import { resolveModel } from '../ipc/modelGatewayIpc';
+import { handleGenerateText } from '../ipc/modelGatewayIpc';
 
 // ── E10.3a（task 09-05）W2：拆解管线 LLM 缝（parent design §4——shell 直调 provider，
 //    不进 agent runLoop，10.2 同款）──
@@ -105,17 +103,29 @@ const generateDecon: DeconGenerateText = async (input) => {
   const ref = assignment
     ? { keyId: assignment.keyId, modelId: assignment.modelId }
     : { keyId: 'default', modelId: 'default' };
-  const resolved = resolveModel(ref, readModelConfigFromDisk());
   const thinking: ThinkingControl | undefined = assignmentThinkingControl(assignment);
-  const response = await generateText(resolved, {
-    model: resolved.modelId,
-    messages: [
-      ...(input.system ? [{ role: 'system' as const, content: input.system }] : []),
-      { role: 'user' as const, content: input.user },
-    ],
-    temperature: TEMPERATURE_BY_SLOT[input.slot],
-    maxTokens: input.maxTokens ?? DECON_DEFAULT_MAX_TOKENS,
-    ...(thinking ? { thinking } : {}),
+  // CR-14（09-12 子2 CR 批）：链投影单次求值再 spread（spread 条件+取值双写 = TOCTOU
+  // + 复制粘贴面；materialLLMCore / craftDistillLlmCore 同改）。
+  const fallbacks = assignmentFallbackChain(assignment);
+  // 09-12 子2（复核 H1 重接）：直调面改经网关环入口（in-process handleGenerateText）——
+  // 无链快径字节级现行为；档位配链时生效（resolveModel 上移进环 per-attempt 解析）。
+  // 防环注记同文件头：modelGatewayIpc 静态引用既有，db/ 层禁 import 本文件的约束不变。
+  const response = await handleGenerateText({
+    ref,
+    request: {
+      model: ref.modelId,
+      messages: [
+        ...(input.system ? [{ role: 'system' as const, content: input.system }] : []),
+        { role: 'user' as const, content: input.user },
+      ],
+      temperature: TEMPERATURE_BY_SLOT[input.slot],
+      maxTokens: input.maxTokens ?? DECON_DEFAULT_MAX_TOKENS,
+      // 09-12 usage-panel：taskType = 拆解档位名（extraction / review-judge / writer-draft
+      // ——与路由同 slot 单源，ledger byTask 分解词面）。
+      taskType: input.slot,
+      ...(thinking ? { thinking } : {}),
+    },
+    ...(fallbacks?.length ? { fallbacks } : {}),
   });
   // CR-2：透传 provider 停因（TextGenerationResponse.finishReason——GenerationFinishReason，
   // OpenAI/Anthropic 双协议路径均产出；undefined = 端点未回报）。截断判定权威信号。

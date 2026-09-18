@@ -1,0 +1,202 @@
+/* ── agy MCP 工具桥知情同意对话框（09-12 子4 W6，design §4.3/§8）──
+ * 结构 mirror .style-input-*（overlay 取消 + dialog stopPropagation）；披露清单用
+ * 定义列表形态（label + 正文成对，四件披露一眼可核）。全部 theme token，零裸色值。 */
+
+.agybridge-consent-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-image-overlay);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-xl);
+  background: var(--overlay-heavy);
+}
+
+.agybridge-consent-dialog {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+  width: min(640px, calc(100vw - 2rem));
+  max-height: calc(100vh - 3rem);
+  padding: var(--space-xl);
+  border-radius: var(--radius-lg);
+  background: var(--surface-container-lowest);
+  box-shadow: var(--shadow-soft);
+}
+
+.agybridge-consent-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-md);
+}
+
+.agybridge-consent-header h2 {
+  margin: 0;
+  font-size: var(--text-lg);
+  font-weight: 600;
+  color: var(--on-surface);
+}
+
+.agybridge-consent-close {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 0.3rem;
+  background: transparent;
+  color: var(--on-surface-variant);
+  cursor: pointer;
+}
+
+.agybridge-consent-close:hover {
+  background: var(--hover-overlay);
+  color: var(--on-surface);
+}
+
+.agybridge-consent-close .material-symbols-outlined {
+  font-size: 18px;
+}
+
+.agybridge-consent-intro {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: 1.55;
+  color: var(--on-surface-variant);
+}
+
+.agybridge-consent-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+  min-height: 0;
+  overflow-y: auto;
+}
+
+/* 披露清单（四件 + 副本位置）：label 小半粗弱化，正文正文色；逐条可核。 */
+.agybridge-disclosure {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2xs);
+  padding: var(--space-sm) var(--space-md);
+  border: 1px solid var(--outline-variant);
+  border-radius: var(--radius-sm);
+  background: var(--surface-container-low);
+}
+
+.agybridge-disclosure dt {
+  font-size: var(--text-2xs);
+  font-weight: 600;
+  color: var(--on-surface-variant);
+}
+
+.agybridge-disclosure dd {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: 1.55;
+  color: var(--on-surface);
+}
+
+/* 副本根路径（机器路径原样展示，code 形态 + 换行兜底）。 */
+.agybridge-disclosure-path {
+  font-family: var(--font-mono, monospace);
+  font-size: var(--text-xs);
+  overflow-wrap: anywhere;
+  color: var(--on-surface-variant);
+}
+
+/* ToS 备注（共享组件 agytos-risk-note）：对话框内提一档强调——它承载账号风险告知，
+ * 弱化到与设置页同级即可（组件自带弱化形态，此处只补左内边距对齐清单）。 */
+.agybridge-consent-tos {
+  padding-left: var(--space-2xs);
+}
+
+/* 冲突指引块（阻断态）：错误色描边 + 规则原文 code 列表。 */
+.agybridge-consent-conflict {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2xs);
+  padding: var(--space-sm) var(--space-md);
+  border: 1px solid color-mix(in srgb, var(--error) 45%, transparent);
+  border-radius: var(--radius-sm);
+  background: var(--surface-container-low);
+  font-size: var(--text-sm);
+  line-height: 1.55;
+  color: var(--on-surface);
+}
+
+.agybridge-consent-conflict-title {
+  font-weight: 600;
+  color: var(--error);
+}
+
+.agybridge-conflict-rules {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.agybridge-conflict-rules code {
+  font-family: var(--font-mono, monospace);
+  font-size: var(--text-xs);
+  overflow-wrap: anywhere;
+  color: var(--on-surface-variant);
+}
+
+.agybridge-consent-hint {
+  margin: 0;
+  font-size: var(--text-2xs);
+  line-height: 1.5;
+  color: var(--on-surface-variant);
+}
+
+.agybridge-consent-footer {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  padding-top: var(--space-2xs);
+  border-top: 1px solid var(--outline-variant);
+}
+
+.agybridge-consent-footer button {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.45rem 0.9rem;
+  border: 1px solid var(--outline-variant);
+  border-radius: 0.4rem;
+  background: var(--surface-container-lowest);
+  color: var(--on-surface);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.8rem;
+  font-weight: 500;
+  transition: border-color 0.12s, background 0.12s;
+}
+
+.agybridge-consent-footer button:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: var(--hover-overlay);
+}
+
+.agybridge-consent-footer button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.agybridge-consent-footer button.primary {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--surface-container-lowest);
+}
+
+.agybridge-consent-footer button.primary:hover:not(:disabled) {
+  background: var(--accent-strong);
+  border-color: var(--accent-strong);
+}

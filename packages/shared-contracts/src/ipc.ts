@@ -7,6 +7,7 @@ export { CRAFT_DISTILL_PROGRESS_CHANNEL, DECON_PROGRESS_CHANNEL, MATERIAL_CHANGE
 import type {
   EmbeddingRequest,
   EmbeddingResponse,
+  GenerateFallbackEntry,
   ImageGenerationRequest,
   ImageGenerationResponse,
   TextGenerationRequest,
@@ -25,6 +26,9 @@ import type { CraftRebuildResult, RerankPayload, RerankResponse } from './contra
 import type { IndexStatus, StoryRebuildResult } from './contracts/closure-index';
 import type { ChapterBrief } from './contracts/chapter-brief';
 import type { ChapterAcceptArtifact, EscalateFinding } from './contracts/chapter-integration';
+// 链流程重排 W4（R6 / 09-13 子3 W6）：derivation-status 查询 + 链外重提取的结果契约
+//（输入镜像 Zod 单源 schema，见 chapter-chain-artifacts.ts「W4」段）。
+import type { ChapterDerivationStatusResult, ReExtractChapterResult } from './contracts/chapter-chain-artifacts';
 import type { ArcBeat } from './contracts/arc-registry';
 import type { ArchiveIssue, CompileReport, ResearchSuspension } from './contracts/research-brief';
 import type { StoryTimeDriftWarning } from './contracts/storytime-drift';
@@ -34,6 +38,9 @@ import type { BalancedAskCategory, ParticipationGear } from './contracts/batch-r
 import type { AcceptSettingMdInput, AcceptSettingMdResult } from './contracts/setting-md-edit';
 import type { ApplyAuthorProfileNoteInput, ApplyAuthorProfileNoteResult } from './contracts/author-profile';
 import type { LintClassifyResult, LintFixPatch, LintFullReport } from './contracts/lint';
+// 09-12 usage-panel（子5）：usage:overview 载荷契约（type-only；类型体单源 contracts/usage.ts，
+// 下方「Usage panel」段 re-export 供外部消费）。
+import type { UsageOverview } from './contracts/usage';
 import type {
   WorldChangedEvent,
   WorldOverview,
@@ -137,10 +144,20 @@ export const desktopIpcSchema = z.object({
     'research:probe-doc-parser',
     'research:canary-vision',
     'model:list-remote-models',
+    'model:list-cli-models',
     'model:generate-text',
     'model:generate-image',
     'model:generate-embedding',
     'model:rerank',
+    // 09-12 usage-panel（子5 W3）：应用内用量面两通道（聚合读面 + 手动清空）。无推送事件
+    // ——设置页「用量」段是瞬态读面（mount 拉取 + 手动刷新 + 清空/保存后重拉），design §5。
+    'usage:overview',
+    'usage:clear',
+    // 子4 agy MCP 工具桥（09-12-agy-mcp-tool-bridge W4）：同意/状态/关闭回收三通道
+    //（machine 级读写，无窗口面无 pathGuard 面；revoke 语义 = 状态翻转关闭——design §4.4）。
+    'agy-bridge:status',
+    'agy-bridge:consent',
+    'agy-bridge:revoke',
     'closure:rebuild-craft-kb',
     'closure:index-status',
     'closure:rebuild-story-index',
@@ -297,14 +314,40 @@ export type ProjectLifecycleResult =
 
 export type { ModelCapability, ModelProtocol, DiscoveredModel, ApiKeyConfig, ApiKeyEntry, ModelConfig, ResolvedModel } from './contracts/model';
 
+/* ── Usage panel（09-12 usage-panel，design §3——usage:overview 载荷契约）── */
+export type {
+  UsageOverview,
+  UsageWindowTotals,
+  UsageModelKeyRow,
+  UsageModelBreakdown,
+  UsageTaskBreakdown,
+  UsageRecentCall,
+  UsageCostTokenInput,
+} from './contracts/usage';
+export { estimateUsageCost } from './contracts/usage';
+
 /**
- * Request to list models from a remote endpoint.
+ * usage:clear 模式 A 结果（09-12 usage-panel，design §3）：确认对话框语义归 UI 侧，
+ * handler 只做清空；db 错误内部 catch + warn 后返 'operation-failed'（不上抛 renderer）。
+ */
+export type UsageClearResult =
+  | { ok: true; deleted: number }
+  | { ok: false; error: 'operation-failed' };
+
+/**
+ * Request to list models from a remote endpoint. `customHeaders`/`verifySsl`
+ * (09-12 子3, design §2 #6) ride the ad-hoc path (first-key setup, no keyId
+ * yet): a gateway authenticating via custom headers would otherwise make the
+ * discovery request fail forever. The keyId path ignores them — the shell
+ * reads the persisted key's own fields.
  */
 export type ListRemoteModelsRequest = {
   keyId?: string;
   protocol?: ModelProtocol;
   apiKey?: string;
   baseUrl?: string;
+  customHeaders?: Record<string, string>;
+  verifySsl?: boolean;
 };
 
 /**
@@ -315,6 +358,76 @@ export type RemoteModel = {
   capability: ModelCapability;
   alias: string;
 };
+
+/* ── CLI-form provider model discovery（09-12 agy provider W4）── */
+
+/**
+ * Request to discover models from a CLI-form provider: spawns
+ * `<cliExecutable> models` and parses the two-column TSV output
+ * (`slug<TAB>显示名`, machine-verified shape). An empty/absent
+ * `cliExecutable` asks the shell to try its default install candidates
+ * (Windows: `%LOCALAPPDATA%\agy\bin\agy.exe`, then `agy.exe` on PATH).
+ */
+export type ListCliModelsRequest = {
+  cliExecutable?: string;
+};
+
+/**
+ * Typed failure codes for CLI model discovery (模式 A — each carries renderer
+ * guidance, not a raw throw): `not-logged-in` (agy cached credentials missing
+ * → run `agy` in a terminal first), `executable-not-found` (path/PATH miss),
+ * `discovery-failed` (everything else, `detail` carries the stderr excerpt).
+ */
+export type CliModelDiscoveryErrorCode = 'not-logged-in' | 'executable-not-found' | 'discovery-failed';
+
+/**
+ * Discovery result. On success `resolvedExecutable` echoes the executable that
+ * actually ran (the auto-detected default when the request left it empty) so
+ * the renderer can persist a concrete path — the key schema requires one.
+ */
+export type CliModelDiscoveryResult =
+  | { ok: true; resolvedExecutable: string; models: RemoteModel[] }
+  | { ok: false; error: CliModelDiscoveryErrorCode; detail?: string };
+
+/* ── agy MCP 工具桥（09-12-agy-mcp-tool-bridge 子4 W4）── */
+
+/** 同意值：allowed = 已同意（假宿副本可写预授权）；declined = 已拒绝（记住，降级纯文本）。 */
+export type AgyBridgeConsentValue = 'allowed' | 'declined';
+
+/** 运行前状态机四态（design §4.2/§5.1：declined > conflict > missing-consent > ok）。 */
+export type AgyBridgeConsentState = 'ok' | 'missing-consent' | 'conflict' | 'declined';
+
+/**
+ * 桥状态读面（agy-bridge:status / consent 写后回显）：状态机四态 + 冲突规则原文（用户
+ * deny/ask 压制——UI 列原文指引自行调整，不代删）+ 当前同意值 + 假宿根/同意文件路径
+ * （设置页展示用）。
+ */
+export type AgyBridgeStatusView = {
+  state: AgyBridgeConsentState;
+  conflicts: string[];
+  consent: AgyBridgeConsentValue | undefined;
+  homeRoot: string;
+  consentFilePath: string;
+};
+
+/**
+ * agy-bridge:consent 模式 A 结果：写失败 'operation-failed'（warn 记日志不上抛）；
+ * 成功附写后状态视图（consent=allowed 而用户 deny/ask 压制时 UI 即时见 conflict 态）。
+ */
+export type AgyBridgeConsentResult =
+  | { ok: true; view: AgyBridgeStatusView }
+  | { ok: false; error: 'operation-failed' };
+
+/**
+ * agy-bridge:revoke 结果（关闭回收 = 状态翻转回未配置；用户真实全局零写入——无条目
+ * 移除面）。活动桥会话存在 → 'active-sessions'（附会话 id——UI 提示先结束会话）；
+ * 存储错误 → 'operation-failed'（warn 记原文不上抛——与 consent 通道同语义，不伪装
+ * 成活动会话占用）。
+ */
+export type AgyBridgeRevokeResult =
+  | { ok: true }
+  | { ok: false; error: 'active-sessions'; activeSessions: string[] }
+  | { ok: false; error: 'operation-failed' };
 
 /* ── Generation IPC payloads ── */
 
@@ -330,6 +443,14 @@ export type ModelRef = {
 export type GenerateTextPayload = {
   ref: ModelRef;
   request: TextGenerationRequest;
+  /**
+   * Ordered fallback chain behind `ref` (09-12 子2 fallback chains): the
+   * hand-written mirror of generateTextPayloadSchema's additive `fallbacks` —
+   * ABSENT = zero-default single-model path; ≥1 entries = the gateway loop
+   * advances through them on fallback-eligible failures. Normalized wire form
+   * ({ref, thinking?} — never the raw slot fields).
+   */
+  fallbacks?: GenerateFallbackEntry[];
 };
 
 export type GenerateImagePayload = {
@@ -402,17 +523,22 @@ export type RunChapterChainInput = {
  * - guardOverride：Story 7.2 art-mode——soft-violation pause 后作者「强行放行」（revision_guard_override
  *   artifact → revision-guard force-accept splice）。**仅 action=redo 时透传**（soft-violation pause 时 guard 已
  *   在 completedNodes，continue 会跳过 → splice 不发生；IPC redoOpts 据 guardOverride 切 redo.nodeId）。
+ * - editedDraft：链流程重排 W2（R3 终稿手改通道）——人手改正文**全文**（终稿卡编辑面产出），仅
+ *   action=accept（终稿 checkpoint 专属动作）合法。shell resume 入口先 F1a 立即落正文再续跑 E 段
+ *   （editedDraft 覆写 draft.initial.text + wordCount 机械重算 + 申报类 stale 清理，applyEditedDraft 单源）。
  */
 export type ResumeChapterChainInput = {
   projectPath: string;
   sessionId: string;
   chapterId?: string;
-  action: 'continue' | 'redo' | 'abort';
+  action: 'continue' | 'accept' | 'redo' | 'abort';
   feedback?: string;
   /** Story 7.1 Route 1：B trigger 选区精修的 RevisionIntent（revision_intent artifact 注入）。 */
   revisionIntent?: RevisionIntent;
   /** Story 7.2 art-mode：soft-violation 强行放行（revision_guard_override artifact 注入）。 */
   guardOverride?: 'force-accept';
+  /** 链流程重排 W2：终稿手改全文（action=accept 可选载荷；F1a 立即落正文 + E 段对改后正文提取）。 */
+  editedDraft?: string;
 };
 
 /**
@@ -509,8 +635,35 @@ export type RunChapterChainSummary = {
    *
    * Story 7.2：加 'revision-guard'（段落级改稿保义门 soft-violation pause → art-mode 卡）。UI 据 pausedStage
    * = 'revision-guard' 展 guard 确认卡（findings + before/after + 强行放行/改/取消）。
+   *
+   * 链流程重排 W2：加 'final'（终稿人审——route accept 后、E 段前；正文可编辑 + accept 可携
+   * editedDraft）。旧 'draft'/'verdict' 已退出 deriveCheckpointPolicy 停点集（枚举值保留兼容旧载荷）。
    */
-  pausedStage?: 'brief' | 'draft' | 'verdict' | 'revision-guard';
+  pausedStage?: 'brief' | 'draft' | 'final' | 'verdict' | 'revision-guard';
+  /**
+   * 链流程重排 W2（plan-review M5）：终稿 checkpoint（pausedStage='final'）的审读摘要——终稿卡呈现
+   * 「AI 自审收敛了几轮、结论如何」。镜像 agent RunSnapshotSummary.reviewSummary（两处平行 type
+   * 同步，B01 纪律）。非 final pause 缺省。
+   */
+  reviewSummary?: { verdict: string; reasons: string[]; loopCount: number; capExhausted: boolean };
+  /**
+   * 链流程重排 W2（R2 去味门禁）：终稿 checkpoint 的 lint 终态报告 digest（命中计数 + 高优命中摘录）。
+   * 镜像 agent RunSnapshotSummary.lintReport。非 final pause 缺省。
+   */
+  lintReport?: string;
+  /**
+   * 链流程重排（W2 引入 / W3 接真判决）：去味门禁信号——终轮 review.latest 含 L2 确认的 lint 来源
+   * 条目（finding.source==='lint' 且 severity=block/warn——判真伪归 multi-review L2，判源不判义）。
+   * hardEscalate='auto' 的 cap 超限两支（终弃 vs 采信）消费。缺省 = 门禁过 / 无 lint 确认（保守采信）。
+   * 镜像 agent RunSnapshotSummary.lintUnresolved。
+   */
+  lintUnresolved?: true;
+  /**
+   * 链流程重排 W2（R4c 落盘拆两步 / AC2c）：E 段提取失败章标——route accept 已过（终稿已定）但
+   * E 段节点 error 中断。入口层据此走 post-hoc 落正文 + 章标 stale + 指引 re-extract 修复通道
+   * （W4 落地）。镜像 agent RunSnapshotSummary.derivationStale。
+   */
+  derivationStale?: true;
   /**
    * Story 4.3：draft checkpoint pause 时的正文（review payload，豁免 context isolation 同 CR-15a prose 是 deliverable）。
    * 源 `artifacts['draft.initial'].text`。非 paused 缺省。镜像 agent RunSnapshotSummary.draftContent。
@@ -667,6 +820,16 @@ export type UserPreferencesConfig = {
    * helper below.
    */
   interfaceScale?: number;
+
+  // ── In-app usage ledger retention（09-12 usage-panel，R5 数据治理）──
+  /**
+   * closure_llm_log 滚动保留窗天数（启动期 prune + 变更即 prune + 清空）。缺省 90；
+   * 手改合法带 [7, 730]——带外值在每个消费点经 clampUsageRetentionDays 归位（mirror
+   * interfaceScale 的 lenient-read 形态）。「累计」语义 = 保留窗内累计（prune 后历史
+   * 不可恢复，UI 文案如实标注）。配置读写搭既有 config:load/save-user-preferences
+   * 通道（shell 读侧默认合并归位，W3 接线）。
+   */
+  usageRetentionDays?: number;
 };
 
 /** Preset levels offered in Settings ▸ 外观; rendered as 85% / 100% / 115% / 130%. */
@@ -684,6 +847,28 @@ export const INTERFACE_SCALE_MAX = INTERFACE_SCALE_PRESETS[INTERFACE_SCALE_PRESE
  * the default lives here (BMad CR 组4：interfaceScale 契约单一化).
  */
 export const INTERFACE_SCALE_DEFAULT: number = INTERFACE_SCALE_PRESETS[1];
+
+// ── Usage ledger retention band（09-12 usage-panel，design §3 搭车 preferences）──
+// 先于 DEFAULT_USER_PREFERENCES 声明（mirror INTERFACE_SCALE_DEFAULT 位次——const
+// 无提升，DEFAULT 在模块求值期即引用）。
+export const USAGE_RETENTION_DAYS_DEFAULT: number = 90;
+/** 手改合法带下界（更短窗口抹掉「近 7 日」聚合意义）。 */
+export const USAGE_RETENTION_DAYS_MIN = 7;
+/** 手改合法带上界（两年——无界增长违 R5「过期行删除」本义）。 */
+export const USAGE_RETENTION_DAYS_MAX = 730;
+
+/**
+ * Clamp an arbitrary (possibly corrupt) usageRetentionDays into the legal band
+ * — NaN / non-number / missing → default 90；带外值钳到最近边界。shell prune 消费点
+ * 与 UI 保存路径共用（clamp-before-persist 保磁盘恒合法，mirror clampInterfaceScale）。
+ */
+export function clampUsageRetentionDays(value: unknown): number {
+  if (!Number.isFinite(value as number)) return USAGE_RETENTION_DAYS_DEFAULT;
+  return Math.min(
+    USAGE_RETENTION_DAYS_MAX,
+    Math.max(USAGE_RETENTION_DAYS_MIN, value as number),
+  );
+}
 
 /** Single source of truth for user-preference defaults, shared by main + renderer. */
 export const DEFAULT_USER_PREFERENCES: UserPreferencesConfig = {
@@ -703,6 +888,7 @@ export const DEFAULT_USER_PREFERENCES: UserPreferencesConfig = {
   wallpaperFrostBlur: 0,
   contextCompaction: { redlinePercent: 95 },
   interfaceScale: INTERFACE_SCALE_DEFAULT,
+  usageRetentionDays: USAGE_RETENTION_DAYS_DEFAULT,
 };
 
 /* ── Global interface scale（08-26 structure-rebuild R8）──
@@ -971,6 +1157,12 @@ export type OrisonDesktopApi = {
    */
   canaryProbeVision(ref: ModelRef): Promise<VisionCanaryResult>;
   listRemoteModels(request: ListRemoteModelsRequest): Promise<RemoteModel[]>;
+  /**
+   * 09-12 agy provider W4: discover models from a CLI-form provider
+   * (`<cliExecutable> models`, two-column TSV). Typed result (模式 A) —
+   * `not-logged-in` drives the inline login guidance on the settings page.
+   */
+  listCliModels(request: ListCliModelsRequest): Promise<CliModelDiscoveryResult>;
   generateText(payload: GenerateTextPayload): Promise<TextGenerationResponse>;
   generateImage(payload: GenerateImagePayload): Promise<ImageGenerationResponse>;
   generateEmbedding(payload: GenerateEmbeddingPayload): Promise<EmbeddingResponse>;
@@ -1013,6 +1205,21 @@ export type OrisonDesktopApi = {
    * snapshot). Returns the same RunChapterChainSummary shape as runChapterChain.
    */
   resumeChapterChain(input: ResumeChapterChainInput): Promise<RunChapterChainSummary>;
+  /**
+   * 链流程重排 W4（R6 / 09-13 子3 W6 preload 暴露）：查询注册章的衍生状态新鲜度（章卡
+   * stale 徽标 + 「重提取」按钮态数据源）。轻量 best-effort 查询——loadProject 失败 / 未注册
+   * db 返空 chapters（如实：从未提取），不 throw。镜像 `chapterDerivationStatusInputSchema`
+   * （chapter-chain-artifacts.ts，Zod 单源）。
+   */
+  chapterDerivationStatus(input: { projectPath: string; chapterId?: string }): Promise<ChapterDerivationStatusResult>;
+  /**
+   * 链流程重排 W4（R6 / 09-13 子3 W6 preload 暴露）：链外重提取——盘上正文 standalone 跑
+   * E 段（幂等写 world/promise/arc/summary/mention/story-sync），修复「落盘后手改正文 /
+   * E 段失败章标」的衍生状态漂移。同项目单 run 闸拒绝（reason 机器串，projectRunBusy 解析）；
+   * story-sync 反哺 patches 走档位分流（storySyncReview 人审 envelope / storySyncLanded 直落，
+   * mirror resume 终态消费）。镜像 `reExtractChapterInputSchema`（Zod 单源）。
+   */
+  reExtractChapter(input: { projectPath: string; chapterId: string; autonomy?: 'readonly' | 'suggest' | 'auto' }): Promise<ReExtractChapterResult>;
   /**
    * Story 7.1 Route 1：B trigger 选区指挥精修——编译改稿意图。UI 在 draft checkpoint pause 后，
    * 用户选段 + 写粗指令 → 调本 IPC → 派 revision-optimizer 子 agent → 返 RevisionIntent（用户确认关用）
@@ -1210,6 +1417,36 @@ export type OrisonDesktopApi = {
    * （材料级 P1 同新指纹产物命中则零重付）。material-not-found = 材料已删（只剩 delete 出路）。
    */
   deconConfirmRerun(input: DeconConfirmRerunInput): Promise<DeconConfirmRerunResult>;
+  // ── 09-12 usage-panel（子5 W3）：应用内用量面（设置页「用量」段）──
+  /**
+   * closure_llm_log 聚合读面（单载荷单 loading 态——mirror research aggregate-load 先例）：
+   * 今日 / 近 7 日 / 累计（=保留窗内）三窗合计 + byModel（近 7 日，per-(key,model,protocol)
+   * 行组）+ byTask（近 7 日，NULL 组 = 未标注）+ 最近 20 条 + retentionDays + oldestTs。
+   * 窗口边界 = 本地时区自然日（epoch ms 列 + 查询侧 JS 算日界——design §2 偏离注记①）。
+   * ¥ 估算（estimatedCost）：仅配了 per-model pricing 的行组有值，恒「仅供参考」是 UI 义务。
+   */
+  usageOverview(): Promise<UsageOverview>;
+  /**
+   * 手动清空全表（确认对话框归 UI 侧；本 handler 只做清空，清后无需 prune——全删语义）。
+   * 模式 A 类型化结果，失败 'operation-failed'。
+   */
+  usageClear(): Promise<UsageClearResult>;
+  // ── 子4 agy MCP 工具桥（09-12-agy-mcp-tool-bridge W4）：同意状态面三通道 ──
+  /**
+   * 桥状态读面（状态机四态 + 冲突规则原文 + 假宿根/同意文件路径）。每次现读（用户手改
+   * agy settings 即时反映——不信缓存，design §10）。
+   */
+  agyBridgeStatus(): Promise<AgyBridgeStatusView>;
+  /**
+   * 设置同意（allowed/declined——拒绝也记住，AC6；同意后本次运行不自动重试——用户重发，
+   * design §4.3）。成功附写后状态视图。
+   */
+  agyBridgeSetConsent(input: { consent: AgyBridgeConsentValue }): Promise<AgyBridgeConsentResult>;
+  /**
+   * 关闭回收（状态翻转回未配置 + 活动桥会话提示；用户真实全局零写入——无条目移除面，
+   * 假宿残留由启动清扫守卫覆盖）。
+   */
+  agyBridgeRevoke(): Promise<AgyBridgeRevokeResult>;
   /** 拆解进度订阅（mirror onCraftDistillProgress 形态，返回退订函数只移除本监听器）。 */
   onDeconProgress(callback: (event: DeconProgressEvent) => void): () => void;
   runStorySync(payload: RunStorySyncPayload): Promise<RunStorySyncResult>;
@@ -2143,6 +2380,14 @@ export type DeconDeleteResult =
 export interface DeconJobDetail {
   job: DeconJob;
   passStates: DeconPassState[];
+  /**
+   * 章 index → 真实章标短标签（CR-1 拍板 B——章引用标签单制）：壳侧 chapterHeadings 单源
+   * 构建（chapterShortLabel：章号可解析 →「第 N 章」/无数字章标 → 章标行原词/无章标 → 语义
+   * 回落《title》·简介（卷首）·正文（无章标）——零序号算术）。UI 一切章引用（unit 标签/
+   * 报告锚点/续跑落点/进度 N/M）消费本表，键缺失回落 `decon.unit.materialChapter`
+   * （材料第 {index} 章）。材料缺/派生读失败 → 空表（stale 态仍回——章序展示面）。
+   */
+  chapterLabels: Record<number, string>;
   fresh: boolean;
   /** fresh=false 的原因（fresh=true 时缺省）。 */
   freshReason?: 'stale' | 'cancelled';

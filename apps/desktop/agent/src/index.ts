@@ -15,7 +15,7 @@ export type {
   // runtime.notifyLeaderChainCompleted——类型经包出口单源，防 shell 侧平行声明漂移）。
   ChainCompletedEventPayload,
 } from './runtime/workflow';
-export type { RuntimeStreamEvent, SessionState, SessionMessage, PendingConfirmationState, ConfirmationResolution, ChainStreamEvent, ChainNodeDeltaData, ChainNodeDoneData } from './types';
+export type { RuntimeStreamEvent, SessionState, SessionMessage, PendingConfirmationState, ConfirmationResolution, ChainStreamEvent, ChainNodeDeltaData, ChainNodeDoneData, ChainNodeDonePauseKind, ChainNodeArtifactSummary, ChainNodeArtifactFindingRow, ChainNodeArtifactData, ChainToolEventData } from './types';
 // dogfood T1 Stage 6（链节点流式）：CHAIN_RUN_SENTINEL_NODE_ID = 链 run 级终态帧的哨兵 nodeId
 //（chain-node-done 的 data.nodeId === 本值时 status 为 run 终态）。UI / 测试消费同一单源。
 export { CHAIN_RUN_SENTINEL_NODE_ID } from './types';
@@ -25,6 +25,51 @@ export { updateStatus as updateSessionStatus } from './agent/session';
 export type { GenerateTextFn, GenerateTextRequest, GenerationDelta, GenerateTextCallbacks, GenerateTextUsage } from './provider/ipc-provider';
 export type { ExecuteToolFn } from './tool/remote';
 export { setGenerateTextFn } from './provider/ipc-provider';
+// 子4 W4（09-12 agy MCP 工具桥）：dialogue 桥车道——注入 seam（setBridgeTurnFn /
+// setAgyBridgeModeResolver，mirror setGenerateTextFn——shell agentIpc 装配，wiring 测试钉死
+// 漏装配）+ executor + 面策展常量 + 类型化征询错误。类型（BridgeTurnRequest/Outcome 等）
+// 一并导出——shell 侧实现按本包导出类型编译，seam 不漂移。
+export {
+  setBridgeTurnFn,
+  setAgyBridgeModeResolver,
+  __clearBridgeSeamsForTest,
+  __getAgyBridgeTurnFnForTest,
+  __getAgyBridgeModeResolverForTest,
+  runBridgeExecutor,
+  resolveAgyBridgeDialogueLane,
+  bridgeFaceToolIds,
+  buildBridgeFaceEntries,
+  sessionMessagesToWire,
+  BRIDGE_TOOL_FACE,
+  BRIDGE_TOOL_FACE_TIER1,
+  BRIDGE_TOOL_FACE_TIER2,
+  BRIDGE_TOOL_DESCRIPTION_OVERRIDES,
+  AgyBridgeConsentRequiredError,
+} from './agent/bridgeExecutor';
+export type {
+  AgyBridgeTurnFn,
+  BridgeTurnRequest,
+  BridgeTurnOutcome,
+  BridgeToolCallRecord,
+  BridgeFaceEntry,
+  BridgeTurnPhaseEvent,
+  AgyBridgeModeDecision,
+  AgyBridgeModeResolver,
+  AgyBridgeConsentAskState,
+  AgyBridgeConsentErrorState,
+  AgyBridgeLaneDecision,
+} from './agent/bridgeExecutor';
+// 子4 W4：toolPolicy 三道闸函数上根导出——shell agyBridge 基座（三道闸重建，design §5.2）
+// 由 W2 的深导入切换为根导入（语义零变化；vitest alias 同步移除）。类型一并导出。
+export {
+  assertToolAllowed,
+  enforceAutoApplyTier,
+  shouldGateAutoApply,
+  filterToolsForPolicy,
+  classifyTool,
+  AUTO_APPLY_SELF_REVIEW_MESSAGE,
+} from './runtime/toolPolicy';
+export type { SessionPermissionMode, ToolClass } from './runtime/toolPolicy';
 // dogfood T1 Stage 1（流式缝）：generate 与 setGenerateTextFn 同源导出——shell 缝测试
 // （agentIpcStreamDispatch）须从包外调用真实 generate 驱动已注入的 generateTextImpl，
 // 才能钉住「callbacks 有无分派流式/非流式」这行 wiring（mirror resolveTaskModel 的 CR-001 姿态）。
@@ -39,7 +84,7 @@ export { setPromptsBaseDir } from './prompt/agentPrompt';
 // the task-models sidecar per call so slot changes apply without a restart.
 // resolveTaskModel is exported alongside so the shell wiring test can pin the
 // injection end-to-end (CR-001: deleting the agentIpc wiring line must go red).
-export { setTaskSlotResolver, resolveTaskModel, assignmentThinkingControl, assignmentModelRef, assignmentContextWindowTokens, assignmentThinkingKind } from './runtime/taskModelRouting';
+export { setTaskSlotResolver, resolveTaskModel, assignmentThinkingControl, assignmentModelRef, assignmentFallbackChain, assignmentContextWindowTokens, assignmentThinkingKind } from './runtime/taskModelRouting';
 // S4b（task 08-25 design §4.1）：压缩红线策略注入缝——shell（agentIpc）注入
 // readUserPreferences 现读闭包（mirror setTaskSlotResolver 形态）；workflow leader 车道
 // 装配时现取注入 runLoop.redlinePercent。readContextPolicy 一并导出供 shell 接线测试钉注入。
@@ -56,6 +101,10 @@ export type { CheckpointPolicy, CheckpointStage } from './contracts/run';
 // （shell closureChainIpc 终态消费 mirror write_chapter applyStorySyncFeedback 档位判定），章节出处
 // label helper 同源（「第 ch_1 章」畸形文案防线，CR-08-16-010）。
 export { formatStorySyncChapterLabel, STORY_SYNC_REVIEW_CAP } from './tool/write-chapter';
+// 链流程重排 W2（R3 终稿手改通道）：editedDraft 覆写单源（workflow resume 读回 + shell resume IPC F1a
+// 候选组装两入口共用——applyEditedDraft 单源防两处 wordCount/stale 清理漂移）。姿态同
+// deriveCheckpointPolicy 先例（shell → agent 导出）。
+export { applyEditedDraft, recountDraftWordCount } from './nodes/chapter-nodes';
 // 风格卡片 MVP CR-026（08-28 BMad CR auditor#3）：style_context 消费单源导出——shell
 // closureChainIpc 写章入口直调（mirror write_chapter agent 路径同一对函数，「零逻辑复制」
 // 姿态同 lint/deriveCheckpointPolicy 先例）。readStyleCardBody = 读卡（无卡 ENOENT → undefined）；

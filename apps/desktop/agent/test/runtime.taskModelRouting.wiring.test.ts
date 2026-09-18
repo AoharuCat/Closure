@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   episodeOutlineSchema,
   type ResearchBrief,
+  type TaskModelSlot,
 } from '@orison/shared-contracts';
 import { runChain } from '../src/runtime/chainRunner';
 import {
@@ -14,11 +15,18 @@ import {
 } from '../src/nodes/chapter-chain';
 import { resolveTaskModel, setTaskSlotResolver } from '../src/runtime/taskModelRouting';
 import { registry } from '../src/tool/registry';
+// CR-24（09-12 agy provider CR 批）：setExecuteToolFn 的还原句柄——三个注入它的
+// describe（writer 双档 ×2 + sessionKey）afterEach 配对还原，stub 不跨 describe 残留。
+import { setExecuteToolFn } from '../src/tool/remote';
 // CR-002 factory spies（module mock 包装的透传工厂——见文件头 mock 段）。
 import {
+  createReaderAuditNode,
   createRevisionGuardNode,
+  createRouteNode,
 } from '../src/nodes/chapter-nodes';
-import { createTargetedRevisionWithMentionDegrade } from '../src/nodes/mention-ledger-node';
+import { createCompletenessVerifyNode } from '../src/nodes/completeness-verify-node';
+import { createBriefReviewerNode } from '../src/nodes/brief-reviewer-node';
+import { createRevisionOptimizerNode } from '../src/nodes/revision-optimizer-node';
 import { createPromiseEmergenceNode } from '../src/nodes/promise-emergence-node';
 import { createArcEmergenceNode } from '../src/nodes/arc-emergence-node';
 import type { GenerateFn } from '../src/nodes/llm-node';
@@ -36,7 +44,8 @@ import type { GenerateResult } from '../src/provider/ipc-provider';
 // - review-judge：multi-review / completeness-verify / route（链 e2e 三锚点）
 // - extraction：world-extractor ×5 + story-sync（链 e2e 六锚点）
 // - dispatch：workflow.ts yaml 派发单点按 agentName 查表（runtime 级，director→dispatch、
-//   adjudicator→review-judge、未知名→undefined 自动选择）
+//   adjudicator→route-judge〔09-13 R1b 迁档，细档未配回落 review-judge〕、未知名→undefined
+//   自动选择）
 // - dialogue：leader runLoop（runtime 级 sendMessage；turn 入口解析一次，CR-003）
 // 回归门：未配置任何档 → 全锚点收 undefined → provider default 哨兵 → shell 自动选择
 // （= 会话模型机制退役〔拍板 #5〕后「选择器为空」的现状路径）。
@@ -51,18 +60,31 @@ vi.mock('../src/skill/discovery', () => ({
   discoverSkills: vi.fn(async () => []),
 }));
 
-// CR-002：四节点装配行档位钉死——包装（透传 + 记录）四个工厂，直接断言 createChapterChainNodes
-// 传给各工厂的 deps.modelRef = design §2 档位（revision-guard=review-judge / targeted-revision=
-// writer-draft / promise-emergence=extraction / arc-emergence=extraction）。vi.fn(actual) 生产行为
-// 零变化（describe 1/2 的链装配照常），只新增调用记录——这四个装配行写错档位在链 e2e 里与
-// 「共用同一 llmDepsFor 表达式的正确档位」表象相同，只有工厂实收参数能抓。
+// CR-002 + 链流程重排 W1d：装配行档位钉死——包装（透传 + 记录）各 LLM 装配行工厂，直接断言
+// createChapterChainNodes 传给各工厂的 deps.modelRef = 档位表（R1b 细档：revision-guard /
+// multi-review / route-judge / plan-review；optimizer=review-judge 现状档；writer-draft / extraction）。
+// vi.fn(actual) 生产行为零变化（describe 1/2 的链装配照常），只新增调用记录——装配行写错档位在
+// 链 e2e 里与「共用同一 llmDepsFor 表达式的正确档位」表象相同，只有工厂实收参数能抓。
 vi.mock('../src/nodes/chapter-nodes', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/nodes/chapter-nodes')>();
-  return { ...actual, createRevisionGuardNode: vi.fn(actual.createRevisionGuardNode) };
+  return {
+    ...actual,
+    createRevisionGuardNode: vi.fn(actual.createRevisionGuardNode),
+    createReaderAuditNode: vi.fn(actual.createReaderAuditNode),
+    createRouteNode: vi.fn(actual.createRouteNode),
+  };
 });
-vi.mock('../src/nodes/mention-ledger-node', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../src/nodes/mention-ledger-node')>();
-  return { ...actual, createTargetedRevisionWithMentionDegrade: vi.fn(actual.createTargetedRevisionWithMentionDegrade) };
+vi.mock('../src/nodes/completeness-verify-node', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/nodes/completeness-verify-node')>();
+  return { ...actual, createCompletenessVerifyNode: vi.fn(actual.createCompletenessVerifyNode) };
+});
+vi.mock('../src/nodes/brief-reviewer-node', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/nodes/brief-reviewer-node')>();
+  return { ...actual, createBriefReviewerNode: vi.fn(actual.createBriefReviewerNode) };
+});
+vi.mock('../src/nodes/revision-optimizer-node', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/nodes/revision-optimizer-node')>();
+  return { ...actual, createRevisionOptimizerNode: vi.fn(actual.createRevisionOptimizerNode) };
 });
 vi.mock('../src/nodes/promise-emergence-node', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/nodes/promise-emergence-node')>();
@@ -105,11 +127,13 @@ describe('S4b 接线 — 思考策略随档（chapter-chain llmDepsFor.thinking�
   });
 
   it('各档配 thinking:high → 全部 generate 实收 {level:"high"}；配 thinkingCustom → {level:"custom",custom}', async () => {
-    // 档位差异化：extraction=custom（数值型预算字串）、review-judge=high、writer-draft=low。
+    // 档位差异化：extraction=custom（数值型预算字串）、审核族全档（粗 review-judge + R1b 细档
+    // plan-review/multi-review/route-judge/revision-guard）=high、writer-draft=low。
+    const REVIEW_LINEAGE: TaskModelSlot[] = ['review-judge', 'plan-review', 'multi-review', 'route-judge', 'revision-guard'];
     const resolver: ChainSlotResolver = (slot) => {
       const base = { keyId: 'wire', modelId: `slot-${slot}` };
       if (slot === 'extraction') return { ...base, thinkingCustom: '8192' };
-      if (slot === 'review-judge') return { ...base, thinking: 'high' as const };
+      if (REVIEW_LINEAGE.includes(slot)) return { ...base, thinking: 'high' as const };
       if (slot === 'writer-draft') return { ...base, thinking: 'low' as const };
       return base;
     };
@@ -126,8 +150,8 @@ describe('S4b 接线 — 思考策略随档（chapter-chain llmDepsFor.thinking�
       const slot = expectedSlotForSystem(sys);
       if (slot === 'extraction') {
         expect(thinkingAt(generate, i), `call#${i}（extraction 档）`).toEqual({ level: 'custom', custom: '8192' });
-      } else if (slot === 'review-judge') {
-        expect(thinkingAt(generate, i), `call#${i}（review-judge 档）`).toEqual({ level: 'high' });
+      } else if (REVIEW_LINEAGE.includes(slot as TaskModelSlot)) {
+        expect(thinkingAt(generate, i), `call#${i}（${slot} 档）`).toEqual({ level: 'high' });
       } else {
         expect(thinkingAt(generate, i), `call#${i}（writer-draft 档）`).toEqual({ level: 'low' });
       }
@@ -161,13 +185,13 @@ describe('S4b 接线 — writer 双档思考策略不杂交（selfcheck assignme
     registry.__clearForTest();
     const { registerBuiltinTools } = await import('../src/tool/builtin');
     registerBuiltinTools();
-    const { setExecuteToolFn } = await import('../src/tool/remote');
     setExecuteToolFn(async (toolId) => ({ title: toolId, output: `(${toolId} unset)` }));
   });
 
   afterEach(() => {
     rmBestEffort(dir);
     setTaskSlotResolver(undefined);
+    setExecuteToolFn(undefined);
   });
 
   it('selfcheck={low} / draft={high} → Phase1+核实器收 low、Phase2+2.5 收 high（不出现模型与策略错配）', async () => {
@@ -295,11 +319,22 @@ const REVIEW_RESULT = {
 function makeE2eGenerate() {
   return vi.fn<GenerateFn>(async (_msgs, sys): Promise<GenerateResult> => {
     const s = sys ?? '';
+    if (s.includes('规划审核')) {
+      return { content: JSON.stringify({ verdict: 'pass', summary: '卡可写', findings: [] }), finishReason: 'stop' };
+    }
     if (s.includes('路由判决')) {
       return { content: JSON.stringify({ decision: 'accept_as_truth', reason: '正文达标' }), finishReason: 'stop' };
     }
-    if (s.includes('修订编辑')) {
-      return { content: JSON.stringify(INITIAL_DRAFT), finishReason: 'stop' };
+    if (s.includes('改稿意图编译器')) {
+      return {
+        content: JSON.stringify({
+          change: { summary: '补动机' },
+          lockedItems: [],
+          rationale: { source: 'audit-finding', note: 'A-trigger' },
+          provenance: { rawUserInstruction: '据 findings 修订', compilerNote: 'C1' },
+        }),
+        finishReason: 'stop',
+      };
     }
     if (s.includes('完整性审核')) {
       return { content: JSON.stringify({ findings: [], summary: '无缺漏', degraded: false }), finishReason: 'stop' };
@@ -321,18 +356,19 @@ function makeE2eGenerate() {
 }
 
 /**
- * system 标记 → 期望档位（design §2 表逐节点核对）。e2e happy-path 的 10 调用分布：
- * draft-writer(legacy 降级直写,1) → writer-draft；world-extractor(5) + story-sync(1) → extraction；
- * multi-review(1) + completeness(1) + route(1) → review-judge。
- * （promise/arc-emergence 在本 fixture 无候选不触发 L2；targeted-revision 首跑 skip；revision-guard
- *  整章路径 pass-through——它们的档位由装配行与上述节点共用同一 llmDepsFor 表达式，档位归属另在
- *  writer 双档 describe + S2 表测试钉。）
+ * system 标记 → 期望档位（design §2 表 + R1b 细档，逐节点核对）。e2e happy-path 的 11 调用分布：
+ * brief-reviewer(1) → plan-review；draft-writer(legacy 降级直写,1) → writer-draft；
+ * world-extractor(5) + story-sync(1) → extraction；multi-review(1) + completeness(1) → multi-review
+ *（completeness 并 multi-review 档，同族不碎片化）；route(1) → route-judge。
+ * （promise/arc-emergence 在本 fixture 无候选不触发 L2；revision-optimizer 首圈 no-op 零调用；
+ *  revision-guard 整章路径 pass-through——它们的档位由 CR-002 describe 工厂捕获法钉死。）
  */
 function expectedSlotForSystem(sys: string): string {
-  if (sys.includes('路由判决')) return 'review-judge';
-  if (sys.includes('修订编辑')) return 'writer-draft';
-  if (sys.includes('完整性审核')) return 'review-judge';
-  if (sys.includes('Reader-Audit') || sys.includes('多维度') || sys.includes('审核')) return 'review-judge';
+  if (sys.includes('规划审核')) return 'plan-review';
+  if (sys.includes('改稿意图编译器')) return 'review-judge'; // optimizer 现状粗档（未细拆）
+  if (sys.includes('路由判决')) return 'route-judge';
+  if (sys.includes('完整性审核')) return 'multi-review';
+  if (sys.includes('Reader-Audit') || sys.includes('多维度') || sys.includes('审核')) return 'multi-review';
   if (sys.includes('状态提取')) return 'extraction';
   if (sys.includes('story-sync-agent')) return 'extraction';
   return 'writer-draft'; // draft-writer legacy 降级直写（默认分支）
@@ -346,7 +382,7 @@ describe('S4 接线 — 链装配 slot 映射（chapter-chain llmDepsFor，desig
     registry.__clearForTest();
   });
 
-  it('配齐六档 → 每个 generate 调用实收所属节点档位的 modelRef（锚点：writer-draft×1 / extraction×6 / review-judge×3）', async () => {
+  it('配齐档位 → 每个 generate 调用实收所属节点档位的 modelRef（锚点：plan-review×1 / writer-draft×1 / multi-review×2 / route-judge×1 / extraction×6）', async () => {
     const generate = makeE2eGenerate();
     const session = makeSession();
     const snapshot: RunSnapshot = await runChain(
@@ -358,9 +394,9 @@ describe('S4 接线 — 链装配 slot 映射（chapter-chain llmDepsFor，desig
       { generate, sessionContext: session, signal: new AbortController().signal },
     );
 
-    // 链跑通（route 首判 accept）——档位路由零行为影响。
+    // 链跑通（route 首判 accept → 提取段跑完）——档位路由零行为影响。
     expect(snapshot.status).toBe('completed');
-    expect(generate.mock.calls.length).toBe(10);
+    expect(generate.mock.calls.length).toBe(11);
 
     const slotCounts: Record<string, number> = {};
     for (let i = 0; i < generate.mock.calls.length; i += 1) {
@@ -373,7 +409,7 @@ describe('S4 接线 — 链装配 slot 映射（chapter-chain llmDepsFor，desig
       ).toEqual({ keyId: 'wire', modelId: `slot-${slot}` });
     }
     // 锚点覆盖计数（R4 红线：每档至少一个锚点在此钉死）。
-    expect(slotCounts).toEqual({ 'writer-draft': 1, extraction: 6, 'review-judge': 3 });
+    expect(slotCounts).toEqual({ 'plan-review': 1, 'writer-draft': 1, 'multi-review': 2, 'route-judge': 1, extraction: 6 });
   });
 
   it('未传 resolver（未配置任何档）→ 全部调用 modelRef=undefined（default 哨兵自动选择 = 现状回归门）', async () => {
@@ -389,7 +425,7 @@ describe('S4 接线 — 链装配 slot 映射（chapter-chain llmDepsFor，desig
     );
 
     expect(snapshot.status).toBe('completed');
-    expect(generate.mock.calls.length).toBe(10);
+    expect(generate.mock.calls.length).toBe(11);
     for (let i = 0; i < generate.mock.calls.length; i += 1) {
       expect(modelRefAt(generate, i), `call#${i}`).toBeUndefined();
     }
@@ -481,16 +517,16 @@ describe('S4 接线 — writer 双档分离（生产装配形态，writer-selfch
     // CR-010：先清空再重注册（beforeEach 重建）——两阶段路径（工具环境可用）不依赖执行序。
     registry.__clearForTest();
     // 生产装配的写手/核实器用默认 resolveTool（builtin registry）——注册 + stub 执行 seam
-    // （mirror writer-node.test.ts CR-001 beforeEach）。
+    // （mirror writer-node.test.ts CR-001 beforeEach；afterEach 配对还原见 CR-24）。
     const { registerBuiltinTools } = await import('../src/tool/builtin');
     registerBuiltinTools();
-    const { setExecuteToolFn } = await import('../src/tool/remote');
     setExecuteToolFn(async (toolId) => ({ title: toolId, output: `(${toolId} unset)` }));
   });
 
   afterEach(() => {
     rmBestEffort(dir);
     setTaskSlotResolver(undefined);
+    setExecuteToolFn(undefined);
   });
 
   /** 生产装配链的 draft-writer 节点（slot resolver 注入形态）。 */
@@ -569,23 +605,32 @@ describe('S4 接线 — writer 双档分离（生产装配形态，writer-selfch
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 2b. CR-002：四装配行档位钉死（工厂捕获法）——revision-guard（review-judge）/
-//     targeted-revision（writer-draft）/ promise-emergence（extraction）/ arc-emergence
-//     （extraction）四装配行在链 e2e fixture 里不触发 LLM（guard 整章路径 pass-through /
-//     targeted 首跑 skip / promise-arc 无候选不跑 L2），档位写错在 e2e 无表象。文件头 module
-//     mock 把四工厂包成透传 vi.fn——直接断言工厂**实收 deps.modelRef**（零 LLM fixture）。
+// 2b. CR-002 + W1d：装配行档位钉死（工厂捕获法）——revision-guard（revision-guard 细档）/
+//     brief-reviewer（plan-review）/ revision-optimizer（review-judge 现状档）/ multi-review
+//     （multi-review）/ completeness（multi-review 并档）/ route（route-judge）/ promise-emergence
+//     （extraction）/ arc-emergence（extraction）。部分装配行在链 e2e fixture 里不触发 LLM（guard
+//     整章路径 pass-through / optimizer 首圈 no-op / promise-arc 无候选不跑 L2），档位写错在 e2e
+//     无表象。文件头 module mock 把各工厂包成透传 vi.fn——直接断言工厂**实收 deps.modelRef**。
 // ═════════════════════════════════════════════════════════════════════════════
 
-describe('S4 接线 — CR-002 四装配行工厂实收档位（deps.modelRef 逐工厂钉死）', () => {
+describe('S4 接线 — CR-002/W1d 装配行工厂实收档位（deps.modelRef 逐工厂钉死）', () => {
   const guardSpy = vi.mocked(createRevisionGuardNode);
-  const targetedSpy = vi.mocked(createTargetedRevisionWithMentionDegrade);
+  const briefReviewerSpy = vi.mocked(createBriefReviewerNode);
+  const optimizerSpy = vi.mocked(createRevisionOptimizerNode);
+  const readerAuditSpy = vi.mocked(createReaderAuditNode);
+  const completenessSpy = vi.mocked(createCompletenessVerifyNode);
+  const routeSpy = vi.mocked(createRouteNode);
   const promiseSpy = vi.mocked(createPromiseEmergenceNode);
   const arcSpy = vi.mocked(createArcEmergenceNode);
 
   beforeEach(() => {
     registry.__clearForTest();
     guardSpy.mockClear();
-    targetedSpy.mockClear();
+    briefReviewerSpy.mockClear();
+    optimizerSpy.mockClear();
+    readerAuditSpy.mockClear();
+    completenessSpy.mockClear();
+    routeSpy.mockClear();
     promiseSpy.mockClear();
     arcSpy.mockClear();
   });
@@ -597,19 +642,35 @@ describe('S4 接线 — CR-002 四装配行工厂实收档位（deps.modelRef �
     };
   }
 
-  it('配齐档位 → 四工厂各自实收 design §2 档位的 modelRef（revision-guard 与 targeted-revision 勾反可抓）', () => {
+  it('配齐档位 → 各工厂各自实收所属档位的 modelRef（细档勾反可抓——echoResolver 直返 slot-<slot>）', () => {
     const generate = vi.fn<GenerateFn>(async () => ({ content: '{}', finishReason: 'stop' }));
     createChapterChainNodes(generate, echoResolver, makeFactorySession());
 
-    // 各工厂恰装配一次，实收 deps.modelRef = 所属档位 ref（echoResolver：modelId=slot-<slot>）。
+    // 各工厂恰装配一次，实收 deps.modelRef = 所属档位 ref（R1b 细档 + optimizer 现状粗档）。
     expect(guardSpy).toHaveBeenCalledTimes(1);
-    expect(guardSpy.mock.calls[0][0].modelRef).toEqual({ keyId: 'wire', modelId: 'slot-review-judge' });
-    // 勾反档位（review-judge vs writer-draft）是链 e2e 抓不到的静默面——互斥断言钉死两侧。
-    expect(guardSpy.mock.calls[0][0].modelRef).not.toEqual({ keyId: 'wire', modelId: 'slot-writer-draft' });
+    expect(guardSpy.mock.calls[0][0].modelRef).toEqual({ keyId: 'wire', modelId: 'slot-revision-guard' });
+    // 细档勾反（回落粗档 review-judge / 错挂 writer-draft）是链 e2e 抓不到的静默面——互斥断言钉死。
+    expect(guardSpy.mock.calls[0][0].modelRef).not.toEqual({ keyId: 'wire', modelId: 'slot-review-judge' });
 
-    expect(targetedSpy).toHaveBeenCalledTimes(1);
-    expect(targetedSpy.mock.calls[0][0].modelRef).toEqual({ keyId: 'wire', modelId: 'slot-writer-draft' });
-    expect(targetedSpy.mock.calls[0][0].modelRef).not.toEqual({ keyId: 'wire', modelId: 'slot-review-judge' });
+    expect(briefReviewerSpy).toHaveBeenCalledTimes(1);
+    expect(briefReviewerSpy.mock.calls[0][0].modelRef).toEqual({ keyId: 'wire', modelId: 'slot-plan-review' });
+    expect(briefReviewerSpy.mock.calls[0][0].modelRef).not.toEqual({ keyId: 'wire', modelId: 'slot-review-judge' });
+
+    expect(optimizerSpy).toHaveBeenCalledTimes(1);
+    // optimizer 维持现状粗档 review-judge（意图编译归审核族未细拆——回落 review-judge 语义）。
+    expect(optimizerSpy.mock.calls[0][0].modelRef).toEqual({ keyId: 'wire', modelId: 'slot-review-judge' });
+
+    expect(readerAuditSpy).toHaveBeenCalledTimes(1);
+    expect(readerAuditSpy.mock.calls[0][0].modelRef).toEqual({ keyId: 'wire', modelId: 'slot-multi-review' });
+    expect(readerAuditSpy.mock.calls[0][0].modelRef).not.toEqual({ keyId: 'wire', modelId: 'slot-review-judge' });
+
+    // completeness 并 multi-review 档（审核族同族不碎片化，design §1）。
+    expect(completenessSpy).toHaveBeenCalledTimes(1);
+    expect(completenessSpy.mock.calls[0][0].modelRef).toEqual({ keyId: 'wire', modelId: 'slot-multi-review' });
+
+    expect(routeSpy).toHaveBeenCalledTimes(1);
+    expect(routeSpy.mock.calls[0][0].modelRef).toEqual({ keyId: 'wire', modelId: 'slot-route-judge' });
+    expect(routeSpy.mock.calls[0][0].modelRef).not.toEqual({ keyId: 'wire', modelId: 'slot-review-judge' });
 
     expect(promiseSpy).toHaveBeenCalledTimes(1);
     expect(promiseSpy.mock.calls[0][0].modelRef).toEqual({ keyId: 'wire', modelId: 'slot-extraction' });
@@ -618,11 +679,11 @@ describe('S4 接线 — CR-002 四装配行工厂实收档位（deps.modelRef �
     expect(arcSpy.mock.calls[0][0].modelRef).toEqual({ keyId: 'wire', modelId: 'slot-extraction' });
   });
 
-  it('未传 resolver → 四工厂 deps.modelRef 全 undefined（自动选择回归门）', () => {
+  it('未传 resolver → 各工厂 deps.modelRef 全 undefined（自动选择回归门）', () => {
     const generate = vi.fn<GenerateFn>(async () => ({ content: '{}', finishReason: 'stop' }));
     createChapterChainNodes(generate, undefined, makeFactorySession());
 
-    for (const factory of [guardSpy, targetedSpy, promiseSpy, arcSpy]) {
+    for (const factory of [guardSpy, briefReviewerSpy, optimizerSpy, readerAuditSpy, completenessSpy, routeSpy, promiseSpy, arcSpy]) {
       expect(factory).toHaveBeenCalledTimes(1);
       expect(factory.mock.calls[0][0].modelRef).toBeUndefined();
     }
@@ -660,10 +721,10 @@ describe('S4 接线 — dispatch 档（workflow.ts:491 派发单点按 agentName
     vi.resetModules();
   });
 
-  it('director-agent（dispatch 族）→ generate 实收 dispatch 档 ref；adjudicator-agent → review-judge 档 ref', async () => {
+  it('director-agent（dispatch 族）→ generate 实收 dispatch 档 ref；adjudicator-agent → route-judge 档 ref（09-13 R1b 迁档）', async () => {
     const generate = vi.fn<GenerateFn>(async () => ({ content: '{"ok":true}', finishReason: 'stop' }));
     const { runtime, inject, session } = await makeRuntimeAndResolver(generate, projectPath);
-    inject((slot) => (slot === 'dispatch' || slot === 'review-judge'
+    inject((slot) => (slot === 'dispatch' || slot === 'route-judge'
       ? { keyId: 'wire', modelId: `slot-${slot}` }
       : undefined));
 
@@ -672,6 +733,18 @@ describe('S4 接线 — dispatch 档（workflow.ts:491 派发单点按 agentName
     expect(modelRefAt(generate, 0)).toEqual({ keyId: 'wire', modelId: 'slot-dispatch' });
 
     generate.mockClear();
+    await runtime.runAgentWithExplicitSystem(session.id, 'adjudicator-agent', {}, {});
+    expect(generate).toHaveBeenCalledTimes(1);
+    expect(modelRefAt(generate, 0)).toEqual({ keyId: 'wire', modelId: 'slot-route-judge' });
+  });
+
+  it('adjudicator-agent 细档未配 → 回落 review-judge 档 ref（fine ?? review-judge 接线面，09-13 R1b）', async () => {
+    // 只配 review-judge：adjudicator 映射 route-judge 细档未配 → 经 resolveTaskModel
+    // 回落链落到 review-judge 档 assignment（镜像生产闭包 `(slot)=>resolveTaskModel(slot)`）。
+    const generate = vi.fn<GenerateFn>(async () => ({ content: '{"ok":true}', finishReason: 'stop' }));
+    const { runtime, inject, session } = await makeRuntimeAndResolver(generate, projectPath);
+    inject((slot) => (slot === 'review-judge' ? { keyId: 'wire', modelId: 'slot-review-judge' } : undefined));
+
     await runtime.runAgentWithExplicitSystem(session.id, 'adjudicator-agent', {}, {});
     expect(generate).toHaveBeenCalledTimes(1);
     expect(modelRefAt(generate, 0)).toEqual({ keyId: 'wire', modelId: 'slot-review-judge' });
@@ -801,5 +874,145 @@ describe('S4 接线 — extraction 档（runBackfill 旧章 5 轴补提取）', 
         expect(modelRefAt(generate, i), `call#${i}`).toEqual({ keyId: 'wire', modelId: 'slot-extraction' });
       }
     }
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 09-12 agy provider：会话键接线（design §3.1 装配点②③——writer agent 循环 + 链 run）。
+// 断言钉 mock generate 实收的 opts.sessionKey（mirror modelRefAt/thinkingAt 红线形态：
+// 「接线漏了」与「没配会话」不可观测区分，唯一防线是行为级断言）：
+//   - 循环消费者按逻辑会话命名空间分键（CR-21）：writer 两阶段实收
+//     `chain:<childSessionId>:writer`、核实子循环实收 `chain:<id>:verify`——两循环不同键；
+//   - 单发 llm-node 族结构性忽略（LlmNodeDeps 无此字段——chain e2e 全部 undefined）；
+//   - makeAgentLoop 无 sessionKey → undefined（缺省零回归门）。
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe('agy provider 接线 — 链 run 会话键（chapter-chain sessionKey）', () => {
+  describe('writer 两阶段 + 核实循环（agent 循环消费者带键）', () => {
+    let dir = '';
+
+    beforeEach(async () => {
+      dir = mkdtempSync(path.join(os.tmpdir(), 'orison-wire-skey-'));
+      registry.__clearForTest();
+      const { registerBuiltinTools } = await import('../src/tool/builtin');
+      registerBuiltinTools();
+      setExecuteToolFn(async (toolId) => ({ title: toolId, output: `(${toolId} unset)` }));
+    });
+
+    afterEach(() => {
+      rmBestEffort(dir);
+      setTaskSlotResolver(undefined);
+      setExecuteToolFn(undefined);
+    });
+
+    it('4 轮 generate 分键（CR-21）：Phase1/Phase2/2.5 实收 chain:<id>:writer、核实器实收 chain:<id>:verify', async () => {
+      setTaskSlotResolver(() => undefined);
+      const generate = twoPhaseGenerate();
+      const { createChapterChainNodes } = await import('../src/nodes/chapter-chain');
+      const session: SessionState = {
+        id: 'sess-wire-skey', agentName: 'chapter-chain', projectPath: dir, status: 'idle',
+        messages: [], children: [], createdAt: Date.now(), updatedAt: Date.now(),
+      };
+      const node = createChapterChainNodes(generate, (s) => resolveTaskModel(s), session)
+        .find((c) => c.id === 'draft-writer-agent')!.node;
+
+      await node.run(writerRunInput(dir));
+
+      expect(generate).toHaveBeenCalledTimes(4);
+      // 调用序（twoPhaseGenerate fixture）：#0 Phase1 自查简报（writer 循环）、#1 核实
+      // verdict（verifier 循环）、#2 Phase2 写作、#3 阶段 2.5 出场申报（均 writer 循环）。
+      const expectedKeys = [
+        'chain:sess-wire-skey:writer',
+        'chain:sess-wire-skey:verify',
+        'chain:sess-wire-skey:writer',
+        'chain:sess-wire-skey:writer',
+      ];
+      for (let i = 0; i < 4; i += 1) {
+        expect(generate.mock.calls[i]?.[4]?.sessionKey, `call#${i}`).toBe(expectedKeys[i]);
+      }
+      // CR-21 红线：两循环不同键（同模型交替不再互踢冷重启）。
+      expect(new Set(expectedKeys).size).toBe(2);
+    });
+  });
+
+  describe('单发 llm-node 族（结构性忽略 = 单发冷路径）', () => {
+    beforeEach(() => {
+      registry.__clearForTest();
+    });
+
+    it('链 e2e（legacy 降级直写路径）：全部 generate 调用 sessionKey === undefined', async () => {
+      const generate = makeE2eGenerate();
+      const session = makeSession();
+      const snapshot = await runChain(
+        { chain: createChapterChainNodes(generate, echoResolver, session), initialArtifacts: makeInitialArtifacts(), requirement: '' },
+        { generate, sessionContext: session, signal: new AbortController().signal },
+      );
+      expect(snapshot.status).toBe('completed');
+      for (let i = 0; i < generate.mock.calls.length; i += 1) {
+        expect(generate.mock.calls[i]?.[4]?.sessionKey, `call#${i}`).toBeUndefined();
+      }
+    });
+  });
+
+  describe('makeAgentLoop（装配点②接收面）', () => {
+    it('deps.sessionKey → 每轮 generate opts 实收；缺省 → undefined（零回归门）', async () => {
+      const { makeAgentLoop } = await import('../src/nodes/agent-loop');
+      const generate = vi.fn<GenerateFn>(async () => ({
+        content: '好的<STOP>', finishReason: 'stop',
+      }));
+      const loop = makeAgentLoop(
+        { generate, sessionKey: 'chain:sess-x', projectPath: '/tmp/x' },
+        {
+          toolIds: [],
+          systemPrompt: 'SYS',
+          stablePrefix: [],
+          stopMarkers: ['<STOP>'],
+          maxRounds: 3,
+          projectPath: '/tmp/x',
+        },
+      );
+      const result = await loop({ userPrompt: '去' });
+      expect(result.status).toBe('stopped');
+      expect(generate).toHaveBeenCalled();
+      for (let i = 0; i < generate.mock.calls.length; i += 1) {
+        expect(generate.mock.calls[i]?.[4]?.sessionKey, `call#${i}`).toBe('chain:sess-x');
+      }
+
+      // 缺省：不带键（单发冷路径，零回归）。
+      generate.mockClear();
+      const loopNoKey = makeAgentLoop(
+        { generate, projectPath: '/tmp/x' },
+        {
+          toolIds: [],
+          systemPrompt: 'SYS',
+          stablePrefix: [],
+          stopMarkers: ['<STOP>'],
+          maxRounds: 3,
+          projectPath: '/tmp/x',
+        },
+      );
+      await loopNoKey({ userPrompt: '去' });
+      for (let i = 0; i < generate.mock.calls.length; i += 1) {
+        expect(generate.mock.calls[i]?.[4]?.sessionKey, `call#${i}`).toBeUndefined();
+      }
+
+      // CR-23（'' 与 undefined 语义一致化）：'' 视同缺席——不进 generate opts。
+      generate.mockClear();
+      const loopEmptyKey = makeAgentLoop(
+        { generate, sessionKey: '', projectPath: '/tmp/x' },
+        {
+          toolIds: [],
+          systemPrompt: 'SYS',
+          stablePrefix: [],
+          stopMarkers: ['<STOP>'],
+          maxRounds: 3,
+          projectPath: '/tmp/x',
+        },
+      );
+      await loopEmptyKey({ userPrompt: '去' });
+      for (let i = 0; i < generate.mock.calls.length; i += 1) {
+        expect(generate.mock.calls[i]?.[4]?.sessionKey, `call#${i}`).toBeUndefined();
+      }
+    });
   });
 });

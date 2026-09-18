@@ -318,6 +318,9 @@ importers:
       ai:
         specifier: ^6.0.180
         version: 6.0.180(zod@3.25.76)
+      undici:
+        specifier: ^8.10.2
+        version: 8.10.2
       zod:
         specifier: ^3.24.3
         version: 3.25.76
@@ -4403,6 +4406,10 @@ packages:
   undici@6.26.0:
     resolution: {integrity: sha512-4yqz8a3n5HmGTlsbADNtr/dJlhkh/55Rq798G6ibiULcXbDtaLpTl1pvdqcbFfeoj3iSi52lePFM7h9H21cw/A==, tarball: https://registry.npmmirror.com/undici/-/undici-6.26.0.tgz}
     engines: {node: '>=18.17'}
+
+  undici@8.10.2:
+    resolution: {integrity: sha512-/y4/bH9YNU5hi9NIrpOuvGXFcxrj3CMrV+/AYpowAYTpHn8gX/XPFjNy766FPoYY0miQhdW977JFWKGNhBdwyQ==, tarball: https://registry.npmmirror.com/undici/-/undici-8.10.2.tgz}
+    engines: {node: '>=22.19.0'}
 
   universalify@0.1.2:
     resolution: {integrity: sha512-rBJeI5CXAlmy1pV+617WB9J63U6XcazHHF2f2dbJix4XzpUF0RS3Zbj0FGIOCAva5P/d/GBOYaACQ1w+0azUkg==, tarball: https://registry.npmmirror.com/universalify/-/universalify-0.1.2.tgz}
@@ -9040,6 +9047,8 @@ snapshots:
   undici-types@7.16.0: {}
 
   undici@6.26.0: {}
+
+  undici@8.10.2: {}
 
   universalify@0.1.2: {}
 

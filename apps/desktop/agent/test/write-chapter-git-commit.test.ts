@@ -230,48 +230,11 @@ describe('write_chapter Story 7.4 Step 6 git 版本节点落地', () => {
   });
 
   // ════════════════════════════════════════════════════════════════════════════
-  // b. 环 A：auto mode + auto_revise redo 落定 → git_commit 被调，message 含 findings 摘要
+  // b. 环 A（auto_revise leader redo 落定 commit）已随 09-13 W1a 退役——链内回环取代 break 交
+  //    leader，autoReviseCount/CR-004 splice 落盘收尾不再存在；修订落定的版本节点收口随新链
+  //    落盘拆两步（F1a/F1b）归后续波次。环 B（atomic-edit 落盘 commit）/ 首写 / count=0 / 未注册
+  //    四路径保持覆盖。
   // ════════════════════════════════════════════════════════════════════════════
-
-  it('环 A：auto_revise redo 落定（autoReviseCount>0）→ git_commit 被调，message 含「段落级保义改稿」+ findings', async () => {
-    writeTwoEpisodeProject();
-    const FINDINGS = [{ severity: 'warn', quote: '主角突然决定进城', location: '句3', explanation: '前文未铺垫进城动机' }];
-    const MOCK_INTENT = JSON.stringify({
-      change: { summary: '补强动机' },
-      lockedItems: [],
-      rationale: { source: 'audit-finding', note: 'auto_revise' },
-      provenance: { rawUserInstruction: 'auto_revise', compilerNote: 'A-trigger' },
-    });
-    // role-aware：director 空 / revision-optimizer 返 intent。
-    runAgentWithExplicitSystem.mockImplementation((_sid, role) => {
-      if (role === 'revision-optimizer-agent') return Promise.resolve({ content: MOCK_INTENT });
-      return Promise.resolve({ content: '{}' });
-    });
-    // 第一次 auto_revise_pending（含 findings），redo 后 accept。
-    const autoReviseSummary: RunSnapshotSummary = {
-      status: 'auto_revise_pending',
-      routeDecision: { decision: 'auto_revise', reason: '明确缺陷需修订' },
-      draftText: '正文',
-      autoReviseFindings: FINDINGS,
-      errors: [],
-    };
-    runChapterChain
-      .mockResolvedValueOnce(autoReviseSummary)
-      .mockResolvedValueOnce(SUMMARY_ACCEPT);
-    const gitCommitExecute = await registerGitTools(2); // working tree 有变更
-
-    const { writeChapterTool } = await import('../src/tool/write-chapter');
-
-    await writeChapterTool.execute({ episodeId: 'ep2', chapterBrief: { goal: '抵达 B 城' } }, ctx);
-
-    // git_commit 被调（环 A 落地点：redo 循环退出后 autoReviseCount>0）。
-    expect(gitCommitExecute).toHaveBeenCalledTimes(1);
-    const message = (gitCommitExecute.mock.calls[0][0] as { message: string }).message;
-    expect(message).toContain('段落级保义改稿');
-    expect(message).toContain('auto_revise');
-    // FR-293 精神：message 含 findings 摘要（drift 可查回溯）。
-    expect(message).toContain('主角突然决定进城');
-  });
 
   // ════════════════════════════════════════════════════════════════════════════
   // c. 首写（无修订无 atomic-edit）→ git_commit 不调（零回归）

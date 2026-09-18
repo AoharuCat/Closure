@@ -11,12 +11,12 @@ import { logger } from '../logger';
 // toolExecution IPC → shell worldStateHandlers.materializeChapterSummaryHandler：db + project.yaml 组装 →
 // assembleChapterStateSummary 纯函数 → 单 WAL 事务 upsert closure_chapter_summary + 机会式 checkpoint）。
 //
-// **物化时机（design §2 链位理由）**：summary 六字段含「伏笔状态变更/未解决承诺/下章回收清单」——
-// 须在 promise-emergence（写 promise_registry）之后取数才新鲜；route 是 through 节点（through-break 后
-// post-through 节点不可达）→ 必须在 route 之前。leader redo 每轮重跑本节点（orchestration-pattern
-// 语义 2：redo 重跑到链尾全部）→ 幂等 upsert last-write-wins，终轮摘要即终态（mirror world 提取器
-// slice.id idempotent 哲学）；revision loop 切片 [targeted-revision..route] 不含本节点 → auto_revise
-// 闭环重跑不重复物化。
+// **物化时机（design §2 链位理由；链流程重排 W1d 后 = 提取段 E6）**：summary 六字段含「伏笔状态变更/
+// 未解决承诺/下章回收清单」——须在 promise-emergence（E4 写 promise_registry）之后取数才新鲜，故挂
+// E4 后、E7 storytime-drift 前（提取段内部相对序由取数新鲜度决定）。route 终态（accept）后自然前进
+// 进提取段 → 本节点对**最终稿**一次物化；redo 重跑（orchestration-pattern 语义 2：重跑到链尾全部）
+// → 幂等 upsert last-write-wins，终轮摘要即终态（mirror world 提取器 slice.id idempotent 哲学）；
+// 自审环 [revision-optimizer..route] 不含本节点 → auto_revise 环内回环不重复物化。
 //
 // 🔑 范式判据（ADR-3）：本节点 = 纯代码机械中转（读 episodeId → 调工具 → 记计数 artifact），无 LLM /
 // 无语义判断。六字段汇编全在 shell 侧纯函数（assembleChapterStateSummary）——「查询/汇编/确定性计算」

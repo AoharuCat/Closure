@@ -150,11 +150,14 @@ export function isSyntheticUserContent(content: string | undefined | null): bool
  * 重试钮载荷（CR-T1-041）：末条**真人** user 消息内容。length 续写注入的
  * 'Continue from where you left off...' 经对账入 store 后，末条 user 可能是内部
  * 指令——重试钮重发它 = 用户答非所问；扫尾时跳过合成消息取更早的真人消息。
+ * CR-P2（09-13 稳定化 CR 批）：kind='session_state_note' 同跳——状态注记是 user-role
+ * 系统广播且恒垫在 turn 尾（错误轮末条就是它），不跳 = 重试钮把整段快照当作者输入重发。
  */
 export function lastRetryableUserContent(messages: AgentMessage[]): string | null {
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
     if (m.role !== 'user') continue;
+    if (m.kind === 'session_state_note') continue;
     if (isSyntheticUserContent(m.content)) continue;
     return m.content;
   }

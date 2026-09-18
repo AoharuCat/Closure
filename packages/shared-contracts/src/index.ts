@@ -12,6 +12,7 @@ export * from './contracts/memory-tags';
 export * from './contracts/story-memory';
 export * from './contracts/novel-orchestration';
 export * from './contracts/generation';
+export * from './contracts/usage';
 export * from './contracts/model';
 export * from './contracts/closure-retrieval';
 export * from './contracts/chapter-chunking';

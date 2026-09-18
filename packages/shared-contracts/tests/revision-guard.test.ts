@@ -271,3 +271,22 @@ describe('BMad CR CR-001：resumeChapterChainInputSchema refinement（guardOverr
     expect(result.success).toBe(true);
   });
 });
+
+describe('CR-13（09-13 CR 修复批）：editedDraft 空白串拒收（trim 非空 refine）', () => {
+  it('accept + 有实质内容 editedDraft 合法', () => {
+    const result = resumeChapterChainInputSchema.safeParse({
+      projectPath: '/p', sessionId: 's', action: 'accept', editedDraft: '# 第一章\n\n正文',
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('accept + whitespace-only editedDraft → reject（防 F1a 以空白覆写正文）', () => {
+    const result = resumeChapterChainInputSchema.safeParse({
+      projectPath: '/p', sessionId: 's', action: 'accept', editedDraft: " \n\t ",
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((i) => i.path.includes('editedDraft'))).toBe(true);
+    }
+  });
+});

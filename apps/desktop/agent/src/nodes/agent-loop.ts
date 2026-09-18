@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { SessionMessage, ToolCall, ToolContext, ToolDefinition } from '../types';
-import type { ThinkingControl } from '@orison/shared-contracts';
+import type { GenerateFallbackEntry, ThinkingControl } from '@orison/shared-contracts';
 import { THINKING_PROFILES, resolveModelInfo } from '@orison/shared-contracts';
 import { registry } from '../tool/registry';
 import { logger } from '../logger';
@@ -110,13 +110,64 @@ export interface AgentLoopDeps {
   /** abort 信号（缺省新建永不 abort 的 signal，mirror LlmNodeDeps.signal）。 */
   signal?: AbortSignal;
   /**
-   * dogfood T1 Stage 6（design §4，r1 甄别）：可选流式回调——存在时每次 generate **预分配该轮
-   * assistantId**（delta 与该轮 assistant 消息同 id，mirror runLoop §3.1 消除 id 漂移）并把
-   * opts.onDelta 传入 generate（shell 缝按 callbacks 分派流式路径）。**caller 负责甄别**：只有
-   * draft-writer 阶段二（写作）注入——阶段一自查简报 / 阶段 2.5 申报是 JSON 产物，流裸 JSON
-   * 无意义且浪费事件带宽（r1 / design §3.2）。
+   * dogfood T1 Stage 6（design §4，r1 甄别）→ 09-13 子2 W1 全相位开流：可选流式回调——
+   * 存在时每次 generate **预分配该轮 assistantId**（delta 与该轮 assistant 消息同 id，
+   * mirror runLoop §3.1 消除 id 漂移）并把 opts.onDelta 传入 generate（shell 缝按
+   * callbacks 分派流式路径）。seam 本身双通道透传（text/reasoning，tool 在包装内滤除）；
+   * **通道政策在 caller**（链装配侧）：text 仅 draft-writer 阶段二（正文流语义不变——
+   * JSON 阶段裸 text 不上行，writer-node / research-verifier 按相位滤），reasoning
+   * 全相位全节点（09-13 子2 design §1）。
    */
   onDelta?: (d: { messageId: string; channel: 'text' | 'reasoning'; delta: string }) => void;
+  /**
+   * 09-12 agy provider（design §3.1 装配点②「writer agent 循环」）：逻辑会话键——链段装配方
+   * 注入（chapter-chain 按逻辑会话命名空间分键：写手循环 `chain:<childSessionId>:writer` /
+   * 核实子循环 `:verify`〔CR-21〕，runChain 级唯一 id 源）；进主循环 generate
+   * opts（每轮同键 → session-capable provider 复用温进程 + 增量发送）。'' 与 undefined
+   * 同义 = 缺席（单发冷路径，两态纪律）。**刻意不进** gateSummarizationGenerate——摘要
+   * 调用是另一逻辑会话（消息序列无关），同键会造成镜像分歧反复冷重启。
+   */
+  sessionKey?: string;
+  /**
+   * 09-12 子2 fallback chains（H2 透传面）：slot 回退链（wire 归一形态，chapter-chain
+   * 装配方经 assignmentFallbackChain 投影注入）——进主循环 generate opts。摘要调用
+   * （gateSummarizationGenerate）刻意不带——链侧压缩摘要回退政策 = **不回退**（CR-26
+   * 统一说明）：单发小调用回退价值低且会拖长压缩窗，摘要 LLM 失败已有
+   * compactWithSummarization 内部确定性兜底（segmented → 硬截断）非硬失败
+   *（mirror sessionKey 的「摘要另一逻辑会话」裁量）。dialogue 车道（workflow
+   * manualCompactSession 的 summarizationGenerate）是另一态 = 随档回退（用户在场，
+   * 摘要失败卡对话压缩）——两态互指，改任一侧先读对面（runtime/workflow.ts
+   * summarizationGenerate 装配处注释）。
+   */
+  fallbacks?: GenerateFallbackEntry[];
+  /**
+   * 09-12 usage-panel：任务档位/流程标签——进主循环 generate opts（writer 循环按 phase
+   * 由 writer-node buildLoop 注入 'writer-draft' / 'writer-selfcheck'）。闸门压缩摘要
+   * （gateSummarizationGenerate）恒标流程语义 'context-summary'（链段摘要，非档位车道的
+   * 主调用——与 sessionKey 的「摘要另一逻辑会话」同款裁量）。
+   */
+  taskType?: string;
+  /**
+   * 09-12 子2（design §7）：模型切换回调——链段装配方注入（chapter-chain 补 nodeId/role
+   * 转成 ChainStreamEvent 'model-fallback' 事件）。缺省不传（直构测试零事件）。
+   */
+  onFallback?: (event: { from: { keyId: string; modelId: string }; to: { keyId: string; modelId: string }; reason: string; attempt: number }) => void;
+  /**
+   * 09-13 子2 CR 批（CR-11）：链节点位元数据——onToolCall 发射时并入载荷（事件归属）。
+   * 循环宿主注入（writer-node 用自身节点位常量 / research-verifier 归属写手节点位）；
+   * 链外直构测试缺省不带（payload 无 nodeId 键，消费方兜底当前唯一节点位）。additive optional。
+   */
+  nodeId?: string;
+  /**
+   * 09-13 子2 W4（design §3，B 路线定案）：链内工具调用观测回调——每个工具执行终态后发射
+   * （executeCallSafely 循环体）。inputSummary = 归一后 call.arguments JSON 截断 200（与畸形
+   * 参数回显共用 TOOL_ARG_SUMMARY_CAP 单一常数）；status = 输出 `Error:` 前缀机械判；
+   * resultCount = **输出字符数恒档**（design §3 定谳：executeCallSafely seam 只返 output 字符串，
+   * 不强行改其返回结构透传 ToolResult metadata——结构化计数档机会主义不承诺）。链装配方
+   * （chapter-chain）注入并补 nodeId 转 ChainStreamEvent 'chain-tool' 事件；leader/child 车道
+   * 不发射（本事件链专用）。缺省不开（直构测试零事件，零回归）。
+   */
+  onToolCall?: (d: { nodeId?: string; toolName: string; inputSummary: string; resultCount: number; status: 'ok' | 'error' }) => void;
 }
 
 export interface AgentLoopConfig {
@@ -155,6 +206,12 @@ export interface AgentLoopInput {
 
 /** 连续全错误轮中断默认阈值（mirror runLoop MAX_CONSECUTIVE_TOOL_ERRORS = 3）。 */
 export const AGENT_LOOP_DEFAULT_MAX_CONSECUTIVE_ERROR_ROUNDS = 3;
+
+/**
+ * 工具参数摘要截断上限（09-13 子2 W4：单一常数两消费点——chain-tool 事件 inputSummary 与
+ * executeCallSafely 畸形参数回显〔既有先例〕同形 `slice(0, 200) + '…'`，免两套常数）。
+ */
+const TOOL_ARG_SUMMARY_CAP = 200;
 
 // ── 摘要对形态常量 + 构造/估算 helper（CR-018：targetTokens 扣摘要对开销的估算口径与
 // 注入口径必须同源——常量单点，估算与 buildSummaryPair 共用，防漂移）。──
@@ -284,8 +341,11 @@ export function makeAgentLoop(deps: AgentLoopDeps, config: AgentLoopConfig) {
           ? {
               ...(deps.modelRef ? { modelRef: deps.modelRef } : {}),
               ...(deps.thinking ? { thinking: deps.thinking } : {}),
+              // 09-12 usage-panel：链段压缩摘要恒标 'context-summary'（流程标签——不随
+              // 主循环档位词，摘要调用语义自成一族，见 AgentLoopDeps.taskType 注释）。
+              taskType: 'context-summary',
             }
-          : undefined,
+          : { taskType: 'context-summary' },
       );
       return { content: res.content };
     };
@@ -403,11 +463,17 @@ export function makeAgentLoop(deps: AgentLoopDeps, config: AgentLoopConfig) {
 
       // dogfood T1 Stage 6：onDelta 在时预分配该轮 assistantId（delta 事件与该轮 assistant 消息
       // 同 id——UI 侧可按 messageId 分轮拼接）；opts.onDelta 随 modelRef/thinking 一并注入 generate。
+      // 09-12 子2（H2）：fallbacks/onFallback 同 deps 透传进 generate opts（逐字段枚举会静默丢）。
+      // 09-12 usage-panel：taskType 同透传。
       const roundMessageId = randomUUID();
-      const generateOpts = deps.modelRef || deps.onDelta || deps.thinking
+      const generateOpts = deps.modelRef || deps.onDelta || deps.thinking || deps.sessionKey || deps.fallbacks?.length || deps.onFallback || deps.taskType
         ? {
             ...(deps.modelRef ? { modelRef: deps.modelRef } : {}),
             ...(deps.thinking ? { thinking: deps.thinking } : {}),
+            ...(deps.sessionKey ? { sessionKey: deps.sessionKey } : {}),
+            ...(deps.taskType ? { taskType: deps.taskType } : {}),
+            ...(deps.fallbacks?.length ? { fallbacks: deps.fallbacks } : {}),
+            ...(deps.onFallback ? { onFallback: deps.onFallback } : {}),
             ...(deps.onDelta
               ? {
                   onDelta: (d: GenerationDelta) => {
@@ -477,7 +543,33 @@ export function makeAgentLoop(deps: AgentLoopDeps, config: AgentLoopConfig) {
         let allErrors = true;
         for (const call of response.toolCalls) {
           const output = await executeCallSafely(call, toolsById, ctx);
-          if (!output.startsWith('Error:')) allErrors = false;
+          const failed = output.startsWith('Error:');
+          if (!failed) allErrors = false;
+          // 09-13 子2 W4（design §3，B 定案）：链内工具调用观测——executeCallSafely 后发射
+          //（call.arguments 已被归一回写——发射读到的是归一形态，反而更干净）。发射失败静默
+          //（可观测性绝不破循环，mirror withNodeArtifact safeEmit 姿态）。
+          // CR 批 CR-11：deps.nodeId 并入载荷（节点位透传——装配侧 wrapper 读透传值不硬编码）。
+          if (deps.onToolCall) {
+            try {
+              deps.onToolCall({
+                ...(deps.nodeId ? { nodeId: deps.nodeId } : {}),
+                toolName: call.name,
+                inputSummary:
+                  call.arguments.length > TOOL_ARG_SUMMARY_CAP
+                    ? `${call.arguments.slice(0, TOOL_ARG_SUMMARY_CAP)}…`
+                    : call.arguments,
+                resultCount: output.length,
+                status: failed ? 'error' : 'ok',
+              });
+            } catch (err) {
+              // 可观测性发射失败（IPC 已死等）静默丢弃；CR 批 CR-5：低噪留痕
+              //（系统性死通道与安静系统不可区分——debug 一句，带 nodeId/error）。
+              logger.debug(
+                { nodeId: deps.nodeId, err: err instanceof Error ? err.message : String(err) },
+                'makeAgentLoop: onToolCall emit failed (ignored)',
+              );
+            }
+          }
           const toolMsg: SessionMessage = {
             id: randomUUID(),
             role: 'tool',
@@ -562,7 +654,8 @@ async function executeCallSafely(
     }
   }
   if (typeof params !== 'object' || params === null || Array.isArray(params)) {
-    const raw = call.arguments.length > 200 ? `${call.arguments.slice(0, 200)}…` : call.arguments;
+    // 09-13 子2 W4：截断常数与 chain-tool inputSummary 共用 TOOL_ARG_SUMMARY_CAP（单一常数）。
+    const raw = call.arguments.length > TOOL_ARG_SUMMARY_CAP ? `${call.arguments.slice(0, TOOL_ARG_SUMMARY_CAP)}…` : call.arguments;
     return `Error: malformed arguments for tool "${call.name}"（无法解析为 JSON 对象，请修正后重发）：${raw}`;
   }
   // 修正回写防毒历史（mirror runLoop：畸形串留在消息历史会毒化后续 parse）。

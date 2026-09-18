@@ -40,7 +40,9 @@ import {
 } from '../main/db/closure-decon';
 import { upsertMaterialRow } from '../main/db/materialIndexer';
 import { createDeconJob, hashDeconDictionaryOutput, startDeconJob, transitionDeconJob } from '../main/decon/deconJob';
+import type { DeconGenerateText } from '../main/decon/deconLlmCore';
 import {
+  DECON_P1A_CLASSIFY_MAX_TOKENS,
   buildDeconNameCandidates,
   parseDeconDictionaryClassifyResponse,
   runDeconP1a,
@@ -280,6 +282,28 @@ maybe('runDeconP1a（db 编排）', () => {
     expect(inherited.status).toBe('done');
     if (inherited.status === 'done') expect(inherited.skipped).toBe(true);
     expect(gen3).toHaveBeenCalledTimes(0);
+  });
+
+  it('C3 截断升帽：attempt 0 截断 → attempt 1 帽 ×2 重试成功落库（JSON 纠偏环保留 + 升帽）', async () => {
+    const DERIVED_HASH = sha(P1A_TEXT);
+    const created = createDeconJob({ materialId: MAT_ID, tier: 'coarse' }, jobDeps(DERIVED_HASH));
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    const jobId = created.job.jobId;
+    expect(startDeconJob(jobId, jobDeps(DERIVED_HASH)).ok).toBe(true);
+
+    const entries = [{ name: '李逍遥', type: 'person', confidence: 0.9 }];
+    const caps: number[] = [];
+    const gen: DeconGenerateText = async (input) => {
+      caps.push(input.maxTokens ?? -1);
+      return caps.length === 1
+        ? { text: JSON.stringify(entries), finishReason: 'length' }
+        : { text: JSON.stringify(entries), finishReason: 'stop' };
+    };
+    const result = await runDeconP1a(jobId, { generateText: gen, readDerivedText: () => P1A_TEXT, now: () => NOW });
+    expect(result.status).toBe('done');
+    expect(caps).toEqual([DECON_P1A_CLASSIFY_MAX_TOKENS, DECON_P1A_CLASSIFY_MAX_TOKENS * 2]); // attempt>0 升帽 ×2
+    expect(getDeconJob(jobId)?.cost.byPass.p1a?.calls).toBe(2); // 两笔 actual 各记各的
   });
 
   it('capped 挂起不烧 token：预算门前置（generate 零调用）+ job/pass_state 双落 capped', async () => {

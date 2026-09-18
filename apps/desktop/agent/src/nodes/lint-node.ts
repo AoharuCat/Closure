@@ -16,13 +16,13 @@ import { logger } from '../logger';
 // regex 词法 + density 密度指纹 + handler 算法，零 LLM）扫描 → 产 `lint_report` artifact
 // （review=agent 桶 LintChapterReport，喂 multi-review L2 叙事特征维作 L1 同族软信号，design §3.2）。
 //
-// **链位理由（design §3.1）**：挂 revision-guard-agent 紧后、world-extractor-physical 前——
+// **链位理由（design §3.1；链流程重排 W1d 后 = 自审环 C4）**：挂 revision-guard-agent 紧后、
+// multi-review 前——
 // 1. draft.initial 在 revision-guard splice 后才落定（段落级模式），此前扫的是「改前整章+改后段」
 //    混合形态，非终版正文。
-// 2. world-extractor 前不影响五轴提取（lint 只读正文不写任何状态）。
-// 3. revision 闭环切片 [targeted-revision..route] 不含本节点 → auto_revise 闭环重跑不重复扫；
-//    redo 重跑（orchestration-pattern 语义 2：重跑到链尾全部）幂等——纯函数 over artifacts，
-//    lint_report 覆盖重写零副作用。
+// 2. **每圈跑**（提取段后移后本节点在自审环体 [revision-optimizer..route] 内）：auto_revise 每圈
+//    重扫改后稿（lint_report 覆盖重写零副作用——纯函数 over artifacts），终圈 report 即终稿去味
+//    终态（C7 route 出环门禁 / 终稿 checkpoint 载荷的数据源，W3 落判据）。
 //
 // **范式判据（ADR-3 / .trellis/spec/core/creative-vs-mechanical.md）**：本节点 = 纯代码确定性定位
 // （静态规则扫文字痕迹，不理解意义）；命中真假与修复方向 = 语义判断，归 multi-review L2 / 作者

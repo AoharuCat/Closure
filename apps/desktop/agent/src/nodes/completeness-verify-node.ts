@@ -18,6 +18,7 @@ import { loadAgentPrompt } from '../prompt/agentPrompt';
 import { renderTemplate } from '../prompt/template';
 import { logger } from '../logger';
 import type { SessionMessage } from '../types';
+import type { GenerationDelta } from '../provider/ipc-provider';
 import type { AgentNode, NodeResult, RunSnapshot } from '../contracts/run';
 
 // ── Story 4.4 R2：completeness-verify-node（design §1-§5 / ADR-3 / creative-vs-mechanical §4.4）──
@@ -26,7 +27,7 @@ import type { AgentNode, NodeResult, RunSnapshot } from '../contracts/run';
 // 挂 `route-agent` 后（design §2 挂点，CHAPTER_CHAIN_NODE_IDS chain 末段）——cross-arc verify 在 revision
 // 闭环外（4.4 不改本章稿，verdict 发 Director 影响后章规划，非走 route→revision）。
 //
-// 🔑 范式判据（ADR-3 / .trellis/spec/core/creative-vs-mechanical.md §4.4 段）：
+// 🔑 范式判据（ADR-3 / .trellis/spec/core/creative-vs-mechanical.md「Cross-arc 完整性维」条）：
 // - L1 step = 纯代码候选汇编（computeCompletenessCandidates）：5 类候选 + 机械事实（枚举/
 //   resolvePromiseFulfillment 派生/覆盖率统计/5.3 flag 透传）。**永不直接判 missing/under-developed**
 //   （假信心门红线：词库命中→极性加权→pass/fail 是假信心，feedback-l1-entity-extraction-false-confidence-gate）。
@@ -250,7 +251,7 @@ function renderWrittenChapters(
  * contract requiredArtifactKeys=[]（design §2 graceful，mirror emotion-verify-node.ts:62）。consumes 全 optional。
  */
 export function createCompletenessVerifyNode(deps: CompletenessVerifyNodeDeps): AgentNode {
-  const { generate, modelRef, thinking, signal } = deps;
+  const { generate, modelRef, thinking, signal, fallbacks, taskType, onDelta } = deps;
   const nodeId = 'completeness-verify-node';
   const role = 'completeness-verify-agent'; // yaml 文件名（prompts/completeness-verify-agent.yaml）
 
@@ -372,7 +373,26 @@ export function createCompletenessVerifyNode(deps: CompletenessVerifyNodeDeps): 
       let lastErr: unknown = null;
       for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
         try {
-          const result = await generate(messages, system, [], abortSignal, { modelRef, thinking });
+          // 09-12 子2（H2）：fallbacks 透传（空链不占位）。
+          // 09-12 usage-panel：taskType 透传（未标注不占位）。
+          // 09-13 子2 W2b（思考流，design §1）：onDelta 随 opts 透传——每次尝试预分配轮 messageId
+          //（mirror llm-node attemptMessageId：重试轮换 id，UI 侧按轮分段防重试混流）；tool 通道
+          // 滤除（R2 #30 同款）。缺省不占位（非流式路径零回归）。
+          const attemptMessageId = randomUUID();
+          const result = await generate(messages, system, [], abortSignal, {
+            modelRef,
+            thinking,
+            taskType,
+            ...(fallbacks?.length ? { fallbacks } : {}),
+            ...(onDelta
+              ? {
+                  onDelta: (d: GenerationDelta) => {
+                    if (d.type === 'tool') return;
+                    onDelta({ messageId: attemptMessageId, channel: d.type, delta: d.delta });
+                  },
+                }
+              : {}),
+          });
           const parsed = completenessVerifyResultSchema.parse(JSON.parse(extractJson(result.content)));
           return { stateKey: COMPLETENESS_VERIFY_RESULT_KEY, artifact: parsed };
         } catch (err) {

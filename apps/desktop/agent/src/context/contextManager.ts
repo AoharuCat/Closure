@@ -22,6 +22,12 @@ export interface ContextState {
   lastCompactionAt?: number;
   totalCompactedMessages: number;
   tokenCalibrationRatio: number;
+  /**
+   * system 稳定化（09-12）：最近一次追加的 session_state_note 注记内容 sha256——
+   * turn 开始快照 hash 与此一致则不追加（幂等门）。additive optional：旧会话 / fork
+   * 会话 undefined → 首轮必发全量注记。经 session meta 持久化通道落盘，重启幂等。
+   */
+  lastSessionStateNoteHash?: string;
 }
 
 export function createDefaultContextState(): ContextState {
@@ -66,10 +72,17 @@ export interface PreparedContext {
   compactionOccurred: boolean;
   compactedCount: number;
   cacheConfig: CacheConfig;
+  /**
+   * 09-12 子5 R6（design §11）：本步实际装载量（system + pinned + summary + messages
+   * 四段相加口径——与红线/顶满判定同一次计算，只读携带不改判定）。压缩/硬截断后按
+   * finalMessages/finalSummary 重算（未压缩时恒等 totalTokens）——消费方（runLoop
+   * onContextUsage × 校准比）拿到的即「即将发出的载荷量」。additive required：唯一
+   * 生产者本函数，全返回点携带。
+   */
+  loadTokens: number;
 }
 
 export interface CacheConfig {
-  enablePromptCache: boolean;
   pinnedContent?: string;
   compactedSummary?: string;
 }
@@ -262,8 +275,8 @@ export async function prepareContext(input: ContextManagerInput): Promise<Prepar
         contextState,
         compactionOccurred: false,
         compactedCount: 0,
+        loadTokens: totalTokens,
         cacheConfig: {
-          enablePromptCache: true,
           pinnedContent: pinnedContent || undefined,
           compactedSummary: contextState.compactedSummary,
         },
@@ -280,8 +293,8 @@ export async function prepareContext(input: ContextManagerInput): Promise<Prepar
         contextState,
         compactionOccurred: false,
         compactedCount: 0,
+        loadTokens: totalTokens,
         cacheConfig: {
-          enablePromptCache: true,
           pinnedContent: pinnedContent || undefined,
           compactedSummary: contextState.compactedSummary,
         },
@@ -329,8 +342,12 @@ export async function prepareContext(input: ContextManagerInput): Promise<Prepar
     );
   }
 
+  // spread 打头保留 additive 字段（lastSessionStateNoteHash——注记幂等门；mirror loop.ts
+  // hardCut 的 spread 形态）：整体枚举字段重建会丢 hash → 压缩后同快照重发注记（注记在
+  // 消息尾，preserveRecent 保尾必存活 → 流里出现重复注记，违反幂等门语义）。
   const finalState: ContextState = compactionOccurred
     ? {
+        ...contextState,
         compactedSummary: finalSummary,
         compactionCount: contextState.compactionCount + 1,
         lastCompactionAt: Date.now(),
@@ -339,13 +356,17 @@ export async function prepareContext(input: ContextManagerInput): Promise<Prepar
       }
     : contextState;
 
+  // 09-12 子5 R6（design §11）：本步实际装载量（final 态四段重算——未压缩时恒等
+  // totalTokens：finalSummary/finalMessages 即输入原值）。
+  const loadTokens = systemTokens + pinnedTokens + estimateTokens(finalSummary ?? '') + estimateMessagesTokens(finalMessages);
+
   return {
     messages: finalMessages,
     contextState: finalState,
     compactionOccurred,
     compactedCount,
+    loadTokens,
     cacheConfig: {
-      enablePromptCache: true,
       pinnedContent: pinnedContent || undefined,
       compactedSummary: finalState.compactedSummary,
     },

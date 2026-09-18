@@ -16,6 +16,10 @@ import { BatchReportCard } from './BatchReportCard';
 // dogfood T1 Stage 6（design §4/§7.5）：写章链运行卡——当前会话有活跃（含中断/失败保留、
 // paused 精简）链 run 时挂载；completed 卸载（审阅/落盘流程接管）。
 import { ChainRunCard } from './ChainRunCard';
+// 09-12 子2 fallback chains（design §8②⑤）：运行期模型可见性——当前模型 chip + 回退通知条。
+import { fallbackKindLabelKey, modelDisplayName } from '../../shared/model/modelDisplay';
+import type { ModelConfig } from '@orison/shared-contracts';
+import type { ModelFallbackNotice, BridgeNotice } from '../../shared/store/agentEvents';
 import {
   groupMessages,
   hasLivePlaceholder,
@@ -28,6 +32,12 @@ type Props = {
   loading: boolean;
   error: string | null;
 };
+
+// CR-22：稳定空数组引用（selector 的 ?? 兜底）——模块级常量。组件体内声明会在每次
+// render 重建引用，恰好击穿「避免 useSyncExternalStore 快照抖动」的注释意图（selector
+// 闭包引用模块级常量没有障碍，原先「不可行」的注释是错的）。
+const EMPTY_NOTICES: ModelFallbackNotice[] = [];
+const EMPTY_BRIDGE_NOTICES: BridgeNotice[] = [];
 
 export function AgentMessages({ messages, loading, error }: Props) {
   const { resolvedLocale } = useAppStore(useShallow((s) => ({ resolvedLocale: s.resolvedLocale })));
@@ -78,7 +88,13 @@ export function AgentMessages({ messages, loading, error }: Props) {
     if (!result.ok) showToast(t('agent.truncateBlocked'), 'error');
   }, [loading, t, truncateAgentMessages, requestConfirm, showToast]);
 
-  const grouped = useMemo(() => groupMessages(messages), [messages]);
+  // system 稳定化（09-12）：session_state_note = turn 开始追加的 interaction 状态注记
+  //（user-role 系统消息，给 LLM 的状态广播）——UI 静默不渲染（jsonl 落盘保留审计）。
+  // 在分组上游过滤，连 BatchGroup/single 分组逻辑都不进。
+  const grouped = useMemo(
+    () => groupMessages(messages.filter((m) => m.kind !== 'session_state_note')),
+    [messages],
+  );
   // dogfood R2 #9：全流已落地的 toolCallId 集（结果卡已渲染的调用）——传给各消息项隐去
   // 对应调用徽标（一次动作不再「徽标 + 结果卡」双打；徽标退为执行中指示）。
   // useMemo 保持引用稳定（AgentMessageItem 是 memo 的，每 render 新 Set 会击穿）。
@@ -100,7 +116,11 @@ export function AgentMessages({ messages, loading, error }: Props) {
     }
     return -1;
   }, [grouped]);
-  const lastMessage = messages[messages.length - 1];
+  // CR-P8（09-13 稳定化 CR 批）：isLatest 判定基线取**渲染流**末条——原始 messages 末条在
+  // 注记垫尾窗口恒指隐藏的 session_state_note，isLatest/isLastOverall 恒不命中任何渲染组。
+  // 与 grouped 同口径过滤（单一 truth：kind ≠ session_state_note）。
+  const renderableMessages = messages.filter((m) => m.kind !== 'session_state_note');
+  const lastMessage = renderableMessages[renderableMessages.length - 1];
   // dogfood T1 Stage 4（design §6.2 尾坑 / r4 必踩坑）：流式 delta 更新**同一条**消息的
   // content（messages.length 不变）——旧依赖数组不触发跟随滚动，用户看流式正文时面板不跟。
   // dogfood T1 CR-T1-044：口径统一为**全表扫** streaming 游标——并行 spawn_agent 双占位时
@@ -150,6 +170,27 @@ export function AgentMessages({ messages, loading, error }: Props) {
   // 链卡流式正文同样触发 stick-to-bottom（mirror S4 lastContentLength 补丁——卡片不在
   // messages 里，长度游标单独进依赖）。
   const chainStreamLength = chainRun.run?.streamText.length ?? 0;
+
+  // ── 09-12 子2 fallback chains（design §8②⑤）：运行期模型可见性 ──
+  // 通知条 = 本会话「本次 run」的切换记录（send 重置 / 会话删除清）；当前模型 chip 的
+  // 初值 = UI 派生（dialogue 档 assignment——dialogueModelRefFromConfig 同款读法；无指派
+  // 显示「自动」），model-fallback 事件到达时翻为接管模型（activeModelBySession）。
+  const { fallbackNotices, activeModel, modelConfigForChip, bridgeNotices } = useAppStore(useShallow((s) => {
+    const sid = s.agentSessionId;
+    return {
+      fallbackNotices: sid !== null ? s.modelFallbackNotices[sid] ?? EMPTY_NOTICES : EMPTY_NOTICES,
+      activeModel: sid !== null ? s.activeModelBySession[sid] : undefined,
+      modelConfigForChip: s.modelConfig as ModelConfig | undefined,
+      // 子4 W6：桥运行期通知（本次 run 的记录；send 重置 / 会话删除清）。
+      bridgeNotices: sid !== null ? s.bridgeNoticesBySession[sid] ?? EMPTY_BRIDGE_NOTICES : EMPTY_BRIDGE_NOTICES,
+    };
+  }));
+  const generating = loading || hasStreamingMessage;
+  const dialogueAssignment = modelConfigForChip?.taskModels?.dialogue;
+  const chipModelRef = activeModel
+    ?? (dialogueAssignment && dialogueAssignment.keyId && dialogueAssignment.modelId
+      ? { keyId: dialogueAssignment.keyId, modelId: dialogueAssignment.modelId }
+      : undefined);
 
   useEffect(() => {
     const el = containerRef.current;
@@ -321,6 +362,35 @@ export function AgentMessages({ messages, loading, error }: Props) {
           onResume={chainResumeAvailable ? handleChainResume : undefined}
         />
       )}
+      {/* 09-12 子2：回退通知条（mirror stream-stalled 警示条形态——细条 role=status，非弹窗
+          打扰）；本次 run 发生过切换才渲染。当前模型 chip 仅生成中显示（运行阶段可见性）。 */}
+      {fallbackNotices.length > 0 && (
+        <div className="agent-fallback-notices">
+          {fallbackNotices.map((notice) => (
+            <ModelFallbackNoticeStrip key={notice.id} notice={notice} t={t} modelConfig={modelConfigForChip} />
+          ))}
+        </div>
+      )}
+      {/* 子4 W6（design §8）：桥运行期通知（打回/二次未调/软拒）——运行阶段可见性纪律：
+          不静默。mirror 回退通知条形态；soft-denied 带 warning 强度（AC7 指向授权机制）。 */}
+      {bridgeNotices.length > 0 && (
+        <div className="agent-bridge-notices">
+          {bridgeNotices.map((notice) => (
+            <BridgeNoticeStrip key={notice.id} notice={notice.notice} t={t} />
+          ))}
+        </div>
+      )}
+      {generating && (
+        <div className="agent-current-model-chip" role="status">
+          <span className="material-symbols-outlined" aria-hidden="true">neurology</span>
+          <span className="agent-current-model-label">{t('agent.currentModel')}</span>
+          <span className="agent-current-model-value">
+            {chipModelRef
+              ? modelDisplayName(modelConfigForChip, chipModelRef)
+              : t('agent.modelAuto')}
+          </span>
+        </div>
+      )}
       {loading && !hasStreamingMessage && (
         <div className="agent-message-loading">
           <span className="agent-loading-dot" />
@@ -361,3 +431,68 @@ function renderError(error: string, t: (key: string) => string): string {
   const detail = error.slice(sep + 2);
   return `${t(key)}: ${detail}`;
 }
+
+/**
+ * 09-12 子2：单条回退通知（「A 失败（配额或限流）→ 已切换 B」+ 链节点/子代理范围标注）。
+ * 失败原因取 classifyGenerationFailure 的 kind 前缀映射短标签（未知 kind 回显原文前缀）。
+ */
+function ModelFallbackNoticeStrip({
+  notice,
+  t,
+  modelConfig,
+}: {
+  notice: ModelFallbackNotice;
+  t: (key: string, vars?: Record<string, string | number>) => string;
+  modelConfig: ModelConfig | undefined;
+}) {
+  const kindKey = fallbackKindLabelKey(notice.reason);
+  const reasonLabel = kindKey
+    ? t(kindKey)
+    : (notice.reason.split(':')[0]?.trim() || notice.reason);
+  return (
+    <div className="agent-fallback-notice" role="status">
+      <span className="material-symbols-outlined" aria-hidden="true">swap_horiz</span>
+      <span>
+        {t('agent.modelFallbackNotice', {
+          from: modelDisplayName(modelConfig, notice.from),
+          to: modelDisplayName(modelConfig, notice.to),
+          reason: reasonLabel,
+        })}
+        {notice.scopeLabel ? (
+          <span className="agent-fallback-notice-scope"> · {notice.scopeLabel}</span>
+        ) : null}
+      </span>
+    </div>
+  );
+}
+
+/**
+ * 子4 W6：单条桥运行期通知（三信号各有可见形态——运行阶段可见性纪律：不静默）：
+ * - sendback（中性）：present_result 未按协议收尾 → 已打回重跑一次；
+ * - sendback-missed（警示）：重跑后仍未收尾 → 接受结果并记录；
+ * - soft-denied（警示）：工具调用被预授权策略拦下 → 指向设置页授权入口（AC7）。
+ */
+function BridgeNoticeStrip({
+  notice,
+  t,
+}: {
+  notice: BridgeNotice['notice'];
+  t: (key: string, vars?: Record<string, string | number>) => string;
+}) {
+  const meta = BRIDGE_NOTICE_PRESENTATION[notice];
+  return (
+    <div className={`agent-bridge-notice agent-bridge-notice--${meta.tone}`} role="status">
+      <span className="material-symbols-outlined" aria-hidden="true">{meta.icon}</span>
+      <span>{t(meta.key)}</span>
+    </div>
+  );
+}
+
+const BRIDGE_NOTICE_PRESENTATION: Record<
+  BridgeNotice['notice'],
+  { icon: string; key: string; tone: 'neutral' | 'warn' }
+> = {
+  sendback: { icon: 'replay', key: 'agent.bridgeNoticeSendback', tone: 'neutral' },
+  'sendback-missed': { icon: 'warning', key: 'agent.bridgeNoticeSendbackMissed', tone: 'warn' },
+  'soft-denied': { icon: 'gpp_maybe', key: 'agent.bridgeNoticeSoftDenied', tone: 'warn' },
+};

@@ -616,11 +616,12 @@ export function registerBuiltinTools() {
   }));
 
   // ── Story 8.7 S8：mention 共现账链内写工具（design §2.2/§2.3）──
-  // Mirror materialize_chapter_summary 定位：链段节点（mention-ledger-node / targeted-revision 降档包装）
-  // 经 registry 直调触发，非 LLM 主动调用面——chain node 直接 registry.execute 不经 filterToolsForPolicy
+  // Mirror materialize_chapter_summary 定位：链段节点（mention-ledger-node）经 registry 直调触发，
+  // 非 LLM 主动调用面——chain node 直接 registry.execute 不经 filterToolsForPolicy
   // （permission 由链段调用上下文保证），无 field_patch envelope → 无 B01 面 / 无 UI WRITE_TOOLS 登记。
   // BMad CR-002（2026-08-19）：toolPolicy WRITE_TOOLS 显式收录（classifyTool='write'）——readonly/suggest
   // 档 LLM 直调被拦（record 是 per-episode 全量替换语义，误调即覆写真实账）；链内直调照旧不受影响。
+  // 链流程重排 W1d：targeted-revision 降档包装退役——degrade 的直调方改挂 W4 re-extract-chapter。
   // parameters = shared-contracts request schema 单源 import（N5）。
   registry.register(remoteToolProxy({
     id: 'record_episode_mentions',

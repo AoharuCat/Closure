@@ -1749,6 +1749,8 @@ describe('fs 章档案（.orison/chapter-archive/<episodeId>/research-brief.json
 
 describe('CR-001 — 生产装配 signal 接线（chapter-chain 装配形态）', () => {
   let dir = '';
+  /** CR-24：执行 seam 还原句柄（动态导入的模块函数类型，afterEach 配对还原）。 */
+  let signalSeamRestore: typeof import('../src/tool/remote')['setExecuteToolFn'] | undefined;
 
   beforeEach(async () => {
     dir = mkdtempSync(path.join(os.tmpdir(), 'orison-writer-signal-'));
@@ -1758,10 +1760,14 @@ describe('CR-001 — 生产装配 signal 接线（chapter-chain 装配形态）'
     registerBuiltinTools();
     const { setExecuteToolFn } = await import('../src/tool/remote');
     setExecuteToolFn(async (toolId) => ({ title: toolId, output: `(${toolId} unset)` }));
+    signalSeamRestore = setExecuteToolFn;
   });
 
   afterEach(() => {
     rmBestEffort(dir);
+    // CR-24（09-12 agy provider CR 批）：执行 seam 注入/还原配对——stub 不跨 describe 残留。
+    signalSeamRestore?.(undefined);
+    signalSeamRestore = undefined;
   });
 
   /** 生产装配链的 draft-writer 节点（真 createResearchVerifier 注入形态）。 */

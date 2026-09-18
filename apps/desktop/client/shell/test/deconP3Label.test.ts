@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { rmBestEffort } from './rmBestEffort';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { Material } from '@orison/shared-contracts';
+import type { DeconProgressEvent, Material } from '@orison/shared-contracts';
 
 // E10.3b W2：P3a 逐章打标测试——纯函数面（解析容错/段合并/prompt 装配）+ db 编排面
 // （全章跑通/编造 span·引文拦截/断点续跑零重调/capped 预算门+length 停因/边界停走/
@@ -441,7 +441,7 @@ maybe('runDeconP3a（db 编排）', () => {
     };
     const first = await runDeconP3a(jobId, { generateText: failing, readDerivedText: () => DERIVED, now: () => NOW });
     expect(first.status).toBe('failed');
-    if (first.status === 'failed') expect(first.message).toContain('第 1 章');
+    if (first.status === 'failed') expect(first.message).toContain('第 2 章'); // C5：index 1 的真实章标
     expect(getDeconJob(jobId)?.status).toBe('failed');
     expect(listDeconProducts(jobId, 'p3a')).toHaveLength(1); // 章 0 已落
     expect(getDeconPassState(jobId, 'p3a', '0')?.status).toBe('done');
@@ -497,7 +497,7 @@ maybe('runDeconP3a（db 编排）', () => {
     };
     const first = await runDeconP3a(jobId, { generateText: gen, readDerivedText: () => DERIVED, now: () => NOW });
     expect(first.status).toBe('capped');
-    if (first.status === 'capped') expect(first.message).toContain('第 1 章');
+    if (first.status === 'capped') expect(first.message).toContain('第 2 章'); // C5：index 1 的真实章标
     expect(capped).toBe(1); // 章 0 恰一次；章 1 预算门前置拦截不烧 token
     expect(getDeconJob(jobId)?.status).toBe('capped');
     expect(getDeconPassState(jobId, 'p3a', '0')?.status).toBe('done');
@@ -534,10 +534,49 @@ maybe('runDeconP3a（db 编排）', () => {
     });
     const result = await runDeconP3a(jobId, { generateText: gen, readDerivedText: () => DERIVED, now: () => NOW });
     expect(result.status).toBe('capped');
-    if (result.status === 'capped') expect(result.message).toContain('截断');
+    if (result.status === 'capped') {
+      expect(result.message).toContain('截断');
+      // C3：升帽重试一次后仍截断才挂——两笔 actual 各记各的（重试不绕记账）。
+      expect(result.message).toContain('已升帽重试一次仍截断');
+    }
+    expect(getDeconJob(jobId)?.cost.calls).toBe(2);
     expect(getDeconJob(jobId)?.status).toBe('capped');
     expect(getDeconPassState(jobId, 'p3a', '0')?.status).toBe('capped');
     expect(listDeconProducts(jobId, 'p3a')).toHaveLength(0); // 半程产物零落库
+  });
+
+  it('C3 截断升帽重试：首尝试 length → 升帽 ×2 重试成功 → 章照常落库（notify note 相位可见）', async () => {
+    const created = createDeconJob({ materialId: MAT_ID, tier: 'coarse' }, jobDeps());
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    const jobId = created.job.jobId;
+    expect(startDeconJob(jobId, jobDeps()).ok).toBe(true);
+
+    const notes: DeconProgressEvent[] = [];
+    const flat = flatCalls();
+    let calls = 0;
+    const gen = async (input: { maxTokens?: number }): Promise<{ text: string; finishReason?: 'length' | 'stop' }> => {
+      calls += 1;
+      const { ci, seg } = flat[0]!;
+      if (calls === 1) {
+        return { text: labelsJsonFor(ci, seg), finishReason: 'length' };
+      }
+      // 重试调用帽必须升 ×2（DECON_LLM_RETRY_ESCALATE 语义）。
+      if (calls === 2) expect(input.maxTokens).toBe(DECON_P3A_LABELS_MAX_TOKENS * 2);
+      const target = calls <= 2 ? flat[0]! : flat[calls - 2]!;
+      return { text: labelsJsonFor(target.ci, target.seg) };
+    };
+    const result = await runDeconP3a(jobId, {
+      generateText: gen,
+      readDerivedText: () => DERIVED,
+      now: () => NOW,
+      notify: (e) => notes.push(e),
+    });
+    expect(result.status).toBe('done');
+    expect(calls).toBe(flat.length + 1); // 章 0 两笔（截断+重试）+ 其余章各一笔
+    expect(notes.some((e) => e.note?.includes('升帽重试 1/1') && e.pass === 'p3a')).toBe(true);
+    expect(getDeconJob(jobId)?.cost.calls).toBe(flat.length + 1);
+    expect(listDeconProducts(jobId, 'p3a')).toHaveLength(flat.length);
   });
 
   it('中断韧性：章 1 调用期间 pause 翻态 → 本章完成落库后优雅停 → resume 续跑尾章', async () => {

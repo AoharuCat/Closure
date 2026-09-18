@@ -2,7 +2,7 @@ import { app, BrowserWindow, dialog, ipcMain, protocol, session } from 'electron
 import path from 'node:path';
 import { existsSync } from 'node:fs';
 import { setPromptsBaseDir } from '@orison/desktop-agent';
-import { INTERFACE_SCALE_DEFAULT } from '@orison/shared-contracts';
+import { INTERFACE_SCALE_DEFAULT, clampUsageRetentionDays } from '@orison/shared-contracts';
 import { getLogger, getLogsDirPath, installGlobalErrorHandlers } from './logger';
 import { registerProjectIpc } from './ipc/projectIpc';
 import { initProjectsRoot } from './ipc/pathGuard';
@@ -13,7 +13,31 @@ import { registerFieldSyncIpc } from './ipc/fieldSyncIpc';
 import { notifyUI } from './ipc/toolNotify';
 import { subscribeProjectSaved } from '@orison/desktop-local-bff';
 import { registerModelProviderIpc } from './ipc/modelProviderIpc';
+// 09-12 agy provider W4：CLI 形态（agy）模型发现端点（spawn `agy models` TSV 解析，
+// 独立于 modelProviderIpc 的 HTTP 发现路径）。
+import { registerModelCliDiscoveryIpc } from './ipc/modelCliDiscoveryIpc';
+// 09-12 agy provider W4：app 退出时关停 CLI 驱动器单例会话池（长驻 agy 进程 + 清扫
+// 定时器不得活过 app 生命周期）。CR-15（09-12 agy provider CR 批）shell 半：
+// wasAntigravityCliUsed 据此决定 quit 是否给 CLI 池的异步优雅关停留有界等待窗口。
+import { disposeAntigravityCliDriver, disposeAgyBridgeRuntime } from '@orison/model-protocols';
+import { wasAntigravityCliUsed } from './ipc/modelGatewayIpc';
 import { registerModelGatewayIpc } from './ipc/modelGatewayIpc';
+// 子4 agy MCP 工具桥（09-12-agy-mcp-tool-bridge W4）：桥内核装配（假宿四件套 + 管道注册
+// 表注入 model-protocols bridgeTurn）+ 启动清扫守卫 + 同意/状态三通道 + 退出关停。
+import {
+  defaultAgyBridgeHomeRoot,
+  getProductionAgyBridgeRegistry,
+  installShellAgyBridgeCore,
+  setProductionAgyBridgeRuntime,
+  sweepStaleBridgeHomes,
+} from './ipc/agyBridge';
+import { registerAgyBridgeIpc, wasAgyBridgeUsed } from './ipc/agyBridgeIpc';
+// 09-12 usage-panel（子5 W3）：应用内用量面两通道（usage:overview / usage:clear）+
+// 计量 sink 生产装配（installUsageMeteringProduction——协议层 wrapper → closure_llm_log
+// 落行，全仓唯一装配点）。
+import { installUsageMeteringProduction, registerUsageIpc } from './ipc/usageIpc';
+// 09-12 usage-panel（子5 R5）：启动期滚动保留裁剪（retention 带外值 clamp 单源归位）。
+import { pruneExpiredLedger } from './db/llmUsageLedgerRepository';
 import { registerStorySyncIpc } from './ipc/storySyncIpc';
 import { registerTaskIpc } from './ipc/taskIpc';
 import { registerAssetIpc } from './ipc/assetIpc';
@@ -77,6 +101,14 @@ import { stopChapterChunkWatcher } from './db/chapterChunkWatcher';
  * 下文 renderer 加载分支仍读该 env——那是取 URL 值，不是判态。
  */
 const isDev = !app.isPackaged;
+
+/**
+ * CR-15（09-12 agy provider CR 批）：CLI 池退出等待窗口 = 池内 belt 硬杀时限
+ *（antigravityCli/sessions.ts GRACEFUL_EXIT_KILL_MS = 5s）+ 1s 余量。窗口内优雅
+ * 关停（close stdin → idle 进程秒退）/ belt 硬杀（在途 turn）都有时间发生；到点
+ * app.exit(0) 强退兜底。
+ */
+const ANTIGRAVITY_CLI_QUIT_GRACE_MS = 6_000;
 
 /**
  * dev-only CDP 调试口：e2e/dogfood 的附着式自检约定——Claude 经
@@ -192,7 +224,13 @@ function registerAllIpc() {
   registerWindowIpc(getMainWindow);
   registerConfigIpc();
   registerModelProviderIpc();
+  // 09-12 agy provider W4：CLI 形态（agy）模型发现（model:list-cli-models）。
+  registerModelCliDiscoveryIpc();
   registerModelGatewayIpc();
+  // 子4 agy MCP 工具桥（W4）：同意/状态/关闭回收三通道（machine 级，无窗口面）。
+  registerAgyBridgeIpc();
+  // 09-12 usage-panel（子5 W3）：应用内用量面（聚合读 + 清空；machine 级，无窗口面）。
+  registerUsageIpc();
   registerStorySyncIpc();
   registerFieldSyncIpc();
   // dogfood R2 #77：creative fields 文档变更广播——盘上 project.yaml 是单一真相源，
@@ -404,6 +442,26 @@ app.whenReady().then(() => {
   // dogfood R2 #101①：失败路径弹原生错误框（详情+日志目录+重编指引）+ app.exit(1)；
   // 返回 false 即中止启动序列（不再注册 IPC / 开窗——与旧 throw 的中止语义等价但可诊断）。
   if (!initProjectRegistryOrExit()) return;
+  // 09-12 usage-panel（子5 W3）：生成计量 sink 生产装配——协议层两公共入口 wrapper
+  // （先行批已落）→ insertUsageLog 落 closure_llm_log。时序：db 已开（上一步）+ IPC
+  // 注册前（任何 generate 都不漏计）；mirror installDeconLlmCoreProduction 先例。
+  installUsageMeteringProduction();
+  // R5 启动期滚动保留裁剪：过期行删除（读时过滤会让表无界增长）。retention 读侧
+  // lenient——preferences 的 usageRetentionDays 经 readUserPreferencesFromDisk 读入并钳回
+  // 合法带 [7,730]（缺键/带外 → clamp 默认 90）；prune best-effort（失败不阻启动）。
+  try {
+    const pruned = pruneExpiredLedger(
+      clampUsageRetentionDays(readUserPreferencesFromDisk().usageRetentionDays),
+    );
+    if (pruned > 0) {
+      getLogger().info({ pruned }, 'usage ledger: startup retention prune removed expired rows');
+    }
+  } catch (err) {
+    getLogger().warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'usage ledger: startup retention prune failed (non-fatal)',
+    );
+  }
   // E10.3a（task 09-05，CR-1）：拆解 job 启动对账——kill/崩溃残留的 status='running' 拆解
   // job 翻 paused（可续跑态——pass_state 台账在，用户 start 即重入；否则 startDeconJob 的
   // running no-op 分支会让 AC2 的 IPC 断点路径永远打不开）。进程重启时在途注册表恒空，
@@ -442,6 +500,34 @@ app.whenReady().then(() => {
   // E10.3a（task 09-05）W2：拆解管线 LLM 内核装配（同上先装后用——拆解由用户触发，装配点在
   // registerAllIpc 之前即满足时序；温度随档契约见 deconLlmCore.ts）。
   installDeconLlmCoreProduction();
+  // 子4 agy MCP 工具桥（W4）：桥内核装配（model-protocols bridgeTurn 内核注入——假宿
+  // 四件套 + 管道注册表 + 桥会话池）+ 生产单例登记。时序：先于 registerAllIpc（agentIpc
+  // 的桥 seam 注入经单例取注册表）且先于任何桥 turn。启动清扫守卫（design §2.4）：扫
+  // `~/.orison/agy-bridge/home/*` 残留凭据副本——pid 死/无 marker/超龄即删（CR-4 参数：
+  // 活跃集取刚装配注册表的快照，启动时恒空——ownPid 分支删除不会命中自家活动桥假宿）。
+  // best-effort fire-and-forget（清扫失败不阻启动）。
+  // CR-10（子4 CR 批）：装配失败降级桥 off（生产单例保持 undefined——turn 入口响亮拒、
+  // lane resolver 未注入回纯文本），**不得断 whenReady 链**（IPC/窗口创建不得被桥拖死）。
+  let agyBridgeRegistry: ReturnType<typeof installShellAgyBridgeCore> | undefined;
+  try {
+    agyBridgeRegistry = installShellAgyBridgeCore();
+    setProductionAgyBridgeRuntime(agyBridgeRegistry);
+  } catch (err) {
+    getLogger().warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'agy-bridge core install failed — bridge disabled for this run (non-fatal)',
+    );
+  }
+  void sweepStaleBridgeHomes({
+    homeRoot: defaultAgyBridgeHomeRoot(),
+    activeSessionIds: new Set((agyBridgeRegistry?.activeSessions() ?? []).map((r) => r.sessionId)),
+    warn: (message) => getLogger().warn({ component: 'agy-bridge' }, message),
+  }).catch((err) => {
+    getLogger().warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'agy-bridge: startup sweep of stale bridge homes failed (non-fatal)',
+    );
+  });
   // Story 2.1: scan the global craft KB (~/.orison/craft-kb/ + bundled seeds) and
   // incrementally reindex new/changed docs into closure_craft_* on startup. Fire-
   // and-forget: craft reindex does async embeds (slow), must not block app launch.
@@ -515,7 +601,10 @@ app.on('window-all-closed', () => {
 // Release the SQLite handle on quit. In WAL mode an open handle keeps a file
 // lock that, on Windows, blocks deleting/reopening the DB file. Without this the
 // connection only closed in tests, never on real app exit.
-app.on('will-quit', () => {
+app.on('will-quit', (event) => {
+  // Electron 37 typings：will-quit 的 event 可缺席——本守卫只在在场时拦默认退出
+  //（CR-15 CLI quit grace；缺席 = 无从 preventDefault，按原同步路径退出）。
+  const quitEvent = event ?? undefined;
   // Stop the craft KB watcher + clear its debounce timer so no fs watcher / timer
   // outlives the process (Story 2.1 CR-craft-kb-011).
   try {
@@ -558,6 +647,47 @@ app.on('will-quit', () => {
     stopProjectMaterialWatcher();
   } catch (err) {
     getLogger().warn({ err: err instanceof Error ? err.message : String(err) }, 'stopProjectMaterialWatcher on quit failed');
+  }
+  // 09-12 agy provider W4：关停 CLI 驱动器单例会话池——优雅关停全部长驻 agy 进程
+  //（close stdin，5s 硬杀兜底在池内）+ 停 idle 清扫定时器。
+  try {
+    disposeAntigravityCliDriver();
+  } catch (err) {
+    getLogger().warn({ err: err instanceof Error ? err.message : String(err) }, 'disposeAntigravityCliDriver on quit failed');
+  }
+  // 子4 agy MCP 工具桥（W4）：桥池 + 注册表关停——disposeAgyBridgeRuntime 关停桥专属
+  // AgySessionPool（长驻桥 agy 进程优雅退出 + 假宿删除），registry.disposeAll 关管道
+  // server + abort 在途工具 + 停 idle 清扫器。fire-and-forget 异步——有界等待窗在下方。
+  try {
+    disposeAgyBridgeRuntime();
+  } catch (err) {
+    getLogger().warn({ err: err instanceof Error ? err.message : String(err) }, 'disposeAgyBridgeRuntime on quit failed');
+  }
+  try {
+    getProductionAgyBridgeRegistry()?.disposeAll();
+  } catch (err) {
+    getLogger().warn({ err: err instanceof Error ? err.message : String(err) }, 'agy-bridge registry disposeAll on quit failed');
+  }
+  // CR-15（09-12 agy provider CR 批）shell 半：上面的关停是异步 fire-and-forget——
+  // will-quit 同步走完会让主进程先死，Windows 下子进程不随父进程消亡，agy.exe 活过
+  // app（在途 turn 跑完为止，belt 硬杀来不及发）。本会话用过 CLI 生成或桥 turn 时
+  // preventDefault + 有界等待（池内 belt 5s + 余量），窗口到点 closeDb + app.exit(0)
+  // 强退（app.exit 不重发 will-quit，无死循环）；两者都没用过的会话保持原同步退出路径
+  //（零新增退出延迟）。
+  if ((wasAntigravityCliUsed() || wasAgyBridgeUsed()) && quitEvent !== undefined) {
+    quitEvent.preventDefault();
+    // 刻意不持句柄也不 unref：本 timer 是 quit 的唯一出口（preventDefault 后 Electron
+    // 不再自行退出），unref 会让事件循环在 timer 到点前排干 → 进程无出口悬挂。
+    setTimeout(() => {
+      try {
+        closeDb();
+      } catch (err) {
+        getLogger().warn({ err: err instanceof Error ? err.message : String(err) }, 'closeDb on quit failed');
+      }
+      getLogger().info('antigravity-cli quit grace elapsed — forcing app exit');
+      app.exit(0);
+    }, ANTIGRAVITY_CLI_QUIT_GRACE_MS);
+    return;
   }
   try {
     closeDb();

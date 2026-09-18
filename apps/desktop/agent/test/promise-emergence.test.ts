@@ -471,4 +471,44 @@ describe('createPromiseEmergenceNode', () => {
     expect(art.applied).toBeUndefined();
     expect(art.writeError).toMatch(/locked/);
   });
+
+  it('CR 批 CR-4：LLM 超额产出 60 条 → artifact.actions 封顶 50 + actionsProduced 保全量；builtin 落盘不受 cap 影响（携全量）', async () => {
+    // query_world_slice mock 沿用（返 cognitive gap patches → 段 1 产 gap → 段 2 LLM）。
+    // promise_ledger_update mock 捕获实收 actions——验「落盘全量、artifact 观测面封顶」两侧分离。
+    const received: unknown[] = [];
+    registry.register({
+      id: 'promise_ledger_update',
+      description: 'mock',
+      parameters: (await import('zod')).z.object({}),
+      async execute(params) {
+        const rec = params as { actions?: unknown[] };
+        received.push(...(rec.actions ?? []));
+        return { title: 'mock', output: '', metadata: { ok: true, applied: true, promiseCount: 0, beatCount: 60 } };
+      },
+    });
+    // remove_beat 是 schema 最小形态（type + beatId）——60 条全过逐条 safeParse。
+    const actions = Array.from({ length: 60 }, (_, i) => ({ type: 'remove_beat', beatId: `b-${i}` }));
+    const generate = vi.fn<GenerateFn>(async () => ({
+      content: JSON.stringify({ actions }),
+      finishReason: 'stop',
+    }));
+    const node = createPromiseEmergenceNode({ generate });
+    const result = await node.run({
+      run: makeRun({
+        'draft.initial': { text: '国王微笑。' },
+        'world_state.events': { writes: [], totalPatches: 0, totalSubjects: 0, writeErrors: [] },
+        scene_graph: { nodes: [], edges: [], lines: [] },
+      }),
+      requirement: '',
+    });
+    const art = result.artifact as PromiseEmergenceArtifact;
+    // 全量计数保真（投影 total 的数据源——截断可观测「N/total」）。
+    expect(art.actionsProduced).toBe(60);
+    // artifact 侧封顶 50（与产出快照投影 cap 同常数——persist chainSnapshot 不膨胀）。
+    expect(art.actions).toHaveLength(50);
+    expect(art.actions![0]).toEqual({ type: 'remove_beat', beatId: 'b-0' });
+    expect(art.actions![49]).toEqual({ type: 'remove_beat', beatId: 'b-49' });
+    // 落盘不受 cap 影响：builtin 实收全量 60 条（cap 只管 run.artifacts 观测面）。
+    expect(received).toHaveLength(60);
+  });
 });

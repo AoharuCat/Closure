@@ -11,10 +11,11 @@ import { AboutSettingsPage } from './settings/AboutSettingsPage';
 import { ModelSettingsPage } from '../../features/model-settings/ModelSettingsPage';
 import { KbIndexSettingsPage } from '../../features/kb-index/KbIndexSettingsPage';
 import { ResearchSettingsPage } from '../../features/research-settings/ResearchSettingsPage';
+import { UsageSettingsPage } from '../../features/usage/UsageSettingsPage';
 import { useToastStore } from '../store/toastStore';
 
 type Props = { onClose: () => void };
-type SettingsPageId = 'general' | 'appearance' | 'writing' | 'model' | 'agent' | 'kb-index' | 'research' | 'about';
+type SettingsPageId = 'general' | 'appearance' | 'writing' | 'model' | 'agent' | 'kb-index' | 'research' | 'usage' | 'about';
 
 const SETTINGS_PAGES: Array<{ id: SettingsPageId; icon: string; labelKey: string }> = [
   { id: 'general', icon: 'tune', labelKey: 'settings.general' },
@@ -24,6 +25,7 @@ const SETTINGS_PAGES: Array<{ id: SettingsPageId; icon: string; labelKey: string
   { id: 'agent', icon: 'smart_toy', labelKey: 'settings.agent' },
   { id: 'kb-index', icon: 'database', labelKey: 'settings.kbIndex' },
   { id: 'research', icon: 'travel_explore', labelKey: 'settings.research' },
+  { id: 'usage', icon: 'monitoring', labelKey: 'settings.usage' },
   { id: 'about', icon: 'info', labelKey: 'settings.about' },
 ];
 
@@ -158,6 +160,8 @@ export function SettingsDialog({ onClose }: Props) {
         return <KbIndexSettingsPage t={t} />;
       case 'research':
         return <ResearchSettingsPage t={t} />;
+      case 'usage':
+        return <UsageSettingsPage t={t} />;
       case 'about':
         return (
           <AboutSettingsPage

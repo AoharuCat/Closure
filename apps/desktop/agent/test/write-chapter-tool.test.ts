@@ -961,8 +961,13 @@ describe('write_chapter tool chapter_accept metadata（4.1 Step 4 / CR-15b）', 
       completedNodes: ['brief-compiler-node'],
       pendingNodes: [],
       // 与本次 params.chapterBrief 同内容（key 序故意不同——验 stableStringify 稳定比对）。
+      // W2：draft 位停的活形态 = 出发核查挂起（suspended 在）——纯 stage 停已退役会被拦截门废弃。
       artifacts: {
         chapter_brief_input: { brief: { tone: '紧张', goal: 'REACH_B_CITY' }, episodeId: 'ep1' },
+        research_brief: {
+          briefHash: 'sha256:x',
+          suspended: { kind: 'research_contradiction', rounds: 1, evidence: { contradictions: [], deviations: [] } },
+        },
       },
       review: null,
       archive: null,

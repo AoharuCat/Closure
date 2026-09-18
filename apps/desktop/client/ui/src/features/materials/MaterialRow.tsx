@@ -16,6 +16,7 @@
  *
  * 纯展示 + 回调上抛（操作编排归 MaterialsPage——mirror SettingCardList/CardSummary 分层）。
  */
+import { useEffect, useRef } from 'react';
 import type { MaterialSummary } from '@orison/shared-contracts';
 import { useI18n } from '../../shared/i18n/useI18n';
 import { useAppStore } from '../../shared/store/appStore';
@@ -81,12 +82,30 @@ export function MaterialRow({
 }: MaterialRowProps) {
   const resolvedLocale = useAppStore((s) => s.resolvedLocale);
   const { t } = useI18n(resolvedLocale);
+  // F1 belt（dogfood R3）：busy（重摄取/删除 await 窗）期间分章列冻结预 busy 值——事件
+  // 驱动的清单重拉若读到中间态不闪「0 章」。根治在 shell belt（markers=0 不落 0 章中间行，
+  // W3b）；此处 UI 纵深防御，busy 结束即回清新鲜值。质量徽章（failed）保持实时——诚实态。
+  //
+  // CR-20 seenIdle 守卫：组件可能在 busy 窗内挂载（scope 切换/页面重进——MaterialsPage 的
+  // actionBusyId 存活而列表行重挂），此时挂载瞬间的行本身就是中间态快照，冻结它等于把假值
+  // 钉死。只有见过非 busy 瞬照（用户看到的真实预值）后才启用冻结；挂载即 busy → 如实呈现
+  // 实时行（shell belt 已保证 0 章中间行不再产生，实时是诚实的）。
+  const preBusyRowRef = useRef<MaterialSummary | null>(null);
+  const seenIdleRef = useRef(false);
+  useEffect(() => {
+    if (!busy) {
+      seenIdleRef.current = true;
+      preBusyRowRef.current = row;
+    }
+  }, [busy, row]);
+  const frozenRow = busy && seenIdleRef.current ? preBusyRowRef.current : null;
+  const chapterRow = frozenRow ?? row;
   // CR-015：method='none' 伪章 = 讲义/访谈类常态终态（F-09：<2 万字语义类直进，非待校验）
   // ——不挂「章界待校对」琥珀徽章（走中性「未分章」muted chip）；status='low-confidence'
-  // （登记行显式挂起）仍挂徽章。
+  // （登记行显式挂起）仍挂徽章。判定随 F1 belt 用冻结值（busy 期间分章面整体一致冻结）。
   const lowConfidence =
-    row.status === 'low-confidence' ||
-    (row.chapterConfidence === 'low' && row.chapterMethod !== 'none');
+    chapterRow.status === 'low-confidence' ||
+    (chapterRow.chapterConfidence === 'low' && chapterRow.chapterMethod !== 'none');
   const failed = row.status === 'failed';
   // CR-012：parseNotes 服务器原文（LLM 挂起原因/端点降级原因等）进质量徽章 tooltip；
   // data-quality-notes 锚 = tooltip 组料单源（测试/调试可断言）。
@@ -224,7 +243,7 @@ export function MaterialRow({
         })()}
       </div>
       <div className="materials-cell materials-cell--chapters">
-        <span className="materials-chip">{t('materials.chapter.count', { count: row.chapterCount })}</span>
+        <span className="materials-chip">{t('materials.chapter.count', { count: chapterRow.chapterCount })}</span>
         {lowConfidence ? (
           <Tooltip label={t('materials.chapter.lowConfidenceHint')} placement="top">
             <span className="materials-badge materials-badge--amber" data-low-confidence="true">
@@ -233,7 +252,7 @@ export function MaterialRow({
           </Tooltip>
         ) : (
           <span className="materials-chip materials-chip--muted">
-            {t(`materials.chapter.method.${row.chapterMethod}`)}·{t(`materials.chapter.confidence.${row.chapterConfidence}`)}
+            {t(`materials.chapter.method.${chapterRow.chapterMethod}`)}·{t(`materials.chapter.confidence.${chapterRow.chapterConfidence}`)}
           </span>
         )}
       </div>

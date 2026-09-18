@@ -11,6 +11,7 @@ import {
   resolveChapterIdForEpisode,
   resolveEpisodeIdForChapter,
   sanitizeChapterStemSegment,
+  stripChapterFrontmatter,
   type ChapterAcceptArtifact,
   type ChapterAcceptResult,
   type ChapterIntegrationProject,
@@ -793,5 +794,45 @@ describe('preserveChapterFrontmatter — 覆写保序（#107 check 批）', () =
 
   it('旧块 EOF 无换行 + 新内容空串 → 原样（无需补分隔）', () => {
     expect(preserveChapterFrontmatter('---\norder: 1\n---', '')).toBe('---\norder: 1\n---');
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// stripChapterFrontmatter —— 章文件正文剥离（链流程重排 W4 / R6 链外重提取）
+//
+// re-extract-chapter 从盘上 chapters/<id>.md 读正文喂 E 段：链上 draft.initial.text 是纯正文，
+// frontmatter（order 登记载体）不是正文。与 preserveChapterFrontmatter 共用同一块形状
+// （CHAPTER_FILE_FRONTMATTER_RE，BOM/CRLF/EOF 容忍）——此处锚定剥离侧形状，防两函数漂移。
+// ════════════════════════════════════════════════════════════════════════════
+
+describe('stripChapterFrontmatter — 正文剥离（W4 链外重提取）', () => {
+  it('frontmatter + 正文 → 剥块返正文（块尾单个换行随块走，其余按落盘原样含前导空行）', () => {
+    // mirror preserve 测试 1 的输入形状：块匹配含 closing --- 后单个 \n，正文从第二空行起原样保留。
+    expect(stripChapterFrontmatter('---\norder: 3\n---\n\n# 标题\n\n正文')).toBe('\n# 标题\n\n正文');
+  });
+
+  it('无 frontmatter（历史 body-only 章）→ 原样返回（零行为变化）', () => {
+    const body = '# 标题\n\n正文';
+    expect(stripChapterFrontmatter(body)).toBe(body);
+  });
+
+  it('BOM + CRLF + 注释行 frontmatter → 剥离后正文无 BOM 无块残留', () => {
+    const BOM = String.fromCharCode(0xfeff);
+    const out = stripChapterFrontmatter(`${BOM}---\r\n#注释\r\norder: 0\r\n---\r\n\r\n正文`);
+    expect(out).toBe('\r\n正文');
+    expect(out.includes(BOM)).toBe(false);
+    expect(out.includes('order')).toBe(false);
+  });
+
+  it('EOF 收尾无换行（骨架章全删正文）→ 剥离后空串（caller 判「正文为空」graceful）', () => {
+    expect(stripChapterFrontmatter('---\norder: 1\n---')).toBe('');
+  });
+
+  it('CR-12③：BOM + body-only（无 frontmatter 块）→ BOM 兜底剥（不泄入正文）', () => {
+    const BOM = String.fromCharCode(0xfeff);
+    // 修前：leadingFrontmatterBlock 对无块形态返 null → BOM 原样泄入「正文」（prompt/字数/提取全带）。
+    expect(stripChapterFrontmatter(`${BOM}# 标题\n\n正文`)).toBe('# 标题\n\n正文');
+    // 无 BOM body-only 原样返回不变（零回归）。
+    expect(stripChapterFrontmatter('# 标题\n\n正文')).toBe('# 标题\n\n正文');
   });
 });

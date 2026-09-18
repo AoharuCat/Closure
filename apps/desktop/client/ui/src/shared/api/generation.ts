@@ -1,7 +1,9 @@
 import type {
+  CliModelDiscoveryResult,
   ImageGenerationRequest,
   ImageGenerationResponse,
   ImageInput,
+  ListCliModelsRequest,
   ListRemoteModelsRequest,
   ModelRef,
   RemoteModel,
@@ -35,6 +37,15 @@ type GenerateTextInput = {
 export async function loadRemoteModels(request: ListRemoteModelsRequest): Promise<RemoteModel[]> {
   if (window.orisonDesktop?.listRemoteModels) {
     return window.orisonDesktop.listRemoteModels(request);
+  }
+  throw new Error('Desktop model provider bridge is unavailable');
+}
+
+// 09-12 agy provider W4：CLI 形态（agy）模型发现——`agy models` TSV 解析，类型化
+// 结果（未登录/路径缺失/失败三态带 UI 引导语义）。
+export async function discoverCliModels(request: ListCliModelsRequest): Promise<CliModelDiscoveryResult> {
+  if (window.orisonDesktop?.listCliModels) {
+    return window.orisonDesktop.listCliModels(request);
   }
   throw new Error('Desktop model provider bridge is unavailable');
 }

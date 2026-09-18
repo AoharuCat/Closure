@@ -26,17 +26,24 @@ import {
   extractReasoningMiddleware,
 } from 'ai';
 import { createOpenAI } from '@ai-sdk/openai';
-import { base64ToBlob, normalizeBaseUrl, postJson, postMultipart, postSse } from './http';
+import { base64ToBlob, getInsecureDispatcher, normalizeBaseUrl, postJson, postMultipart, postSse } from './http';
 import { normalizeImageResponse } from './imageNormalize';
 import {
   ProtocolContextOverflowError,
   ProtocolHttpError,
   ProtocolTimeoutError,
   StreamInterruptedError,
+  classifyGenerationFailure,
   isContextOverflowError,
 } from './errors';
 import { withRetry, isRetryableProtocolError } from './retry';
-import type { ProtocolCallContext } from './types';
+import type { GenerationDelta, ProtocolCallContext } from './types';
+import { antigravityCliGenerateText } from './antigravityCli/driver';
+import { dispatchGenerationCallRecord } from './usageSink';
+
+// 09-12 agy provider：GenerationDelta 已迁至 types.ts（driver 同型消费免环）；此处
+// 再导出保既有 `from './generate'` / 包入口导入路径零变化。
+export type { GenerationDelta };
 
 // ── Dogfood T1 D2 resilience constants ──
 //
@@ -78,6 +85,21 @@ const BACKGROUND_FALLBACK_TOTAL_TIMEOUT_MS = 600_000;
  */
 function firstEventWindowMs(ctx: ProtocolCallContext | undefined): number {
   return ctx?.lane === 'background' ? BACKGROUND_FIRST_EVENT_TIMEOUT_MS : FIRST_EVENT_TIMEOUT_MS;
+}
+
+/**
+ * 09-12 子3 §3 ⑨（窗口值源覆盖）: a per-key `timeoutSeconds` REPLACES the lane
+ * default as the window VALUE — it feeds every firstEventWindowMs consumer
+ * (the OpenAI stream's connectTimeoutMs + first-event guard, the Anthropic
+ * stream's guard; the quick-retry attempt rebuilds through here too, so the
+ * override stays source-identical across retries). The window's DISPOSITION is
+ * untouched: dialogue still throws on timeout, background still gets the
+ * bounded 600s non-streaming fallback. Non-streaming paths never consult it
+ * (unchanged — their duration bound is the maxTokens guardrail). Exported for
+ * unit tests (pure value-source selection).
+ */
+export function streamWindowMs(model: ResolvedModel, ctx: ProtocolCallContext | undefined): number {
+  return model.timeoutSeconds !== undefined ? model.timeoutSeconds * 1000 : firstEventWindowMs(ctx);
 }
 /**
  * Compose `outer` with a hard `ms` ceiling (dogfood R2 #7). Caller-cancel
@@ -143,10 +165,18 @@ export function createProvider(
   const base = opts?.connectTimeoutMs
     ? withConnectTimeout(surfacingBase, opts.connectTimeoutMs)
     : surfacingBase;
+  const patched = opts?.bodyPatch ? withBodyPatch(base, opts.bodyPatch) : base;
+  // 09-12 子3：customHeaders 挂最外层（同名覆盖内建头）；verifySsl dispatcher 同位。
+  // 零配置键零包装——无这两个字段时 fetch 链与子3 前字节级一致。
+  const withHeaders =
+    model.customHeaders !== undefined && Object.keys(model.customHeaders).length > 0
+      ? withCustomHeaders(patched, model.customHeaders)
+      : patched;
+  const fetchFn = model.verifySsl === true ? withVerifySsl(withHeaders) : withHeaders;
   const openai = createOpenAI({
     baseURL: normalizeBaseUrl(model.baseUrl),
     apiKey: model.apiKey,
-    fetch: opts?.bodyPatch ? withBodyPatch(base, opts.bodyPatch) : base,
+    fetch: fetchFn,
   });
   return openai.chat(model.modelId);
 }
@@ -172,6 +202,43 @@ function withBodyPatch(
       } catch { /* not JSON, pass through */ }
     }
     return inner(input, init);
+  };
+}
+
+/**
+ * 09-12 子3 §3 ①: per-key custom headers on the OpenAI-path fetch chain —
+ * the SDK builds its headers internally, so the OUTERMOST wrapper is the only
+ * seam where a same-name override can win (documented gateway semantics:
+ * HTTP-Referer / X-Route-* / replacement auth). `new Headers(init?.headers)`
+ * tolerates all three init.headers shapes (Headers instance / [string,string][]
+ * / plain object). Independent of withBodyPatch (headers vs body) — order
+ * irrelevant, same as patchNullContentFetch's pairing.
+ */
+function withCustomHeaders(
+  inner: typeof globalThis.fetch,
+  customHeaders: Record<string, string>,
+): typeof globalThis.fetch {
+  return async (input, init) => {
+    const headers = new Headers(init?.headers);
+    for (const [name, value] of Object.entries(customHeaders)) {
+      headers.set(name, value);
+    }
+    return inner(input, init === undefined ? { headers } : { ...init, headers });
+  };
+}
+
+/**
+ * 09-12 子3 §3 ⑧: per-key TLS skip. `dispatcher` is a non-standard fetch init
+ * field consumed by undici's fetch (Node's global fetch is undici-backed;
+ * lib.dom's RequestInit doesn't carry it — local cast). The insecure Agent is
+ * the lazy process singleton from http.ts (getInsecureDispatcher) — never
+ * globally installed; only keys that explicitly set verifySsl route through it.
+ */
+function withVerifySsl(inner: typeof globalThis.fetch): typeof globalThis.fetch {
+  return async (input, init) => {
+    const next: RequestInit = init === undefined ? {} : { ...init };
+    (next as { dispatcher?: unknown }).dispatcher = getInsecureDispatcher();
+    return inner(input, next);
   };
 }
 
@@ -527,6 +594,22 @@ function warnKindProtocolSkipOnce(
   );
 }
 
+// 09-12 子3 §4.2: Anthropic Messages API has no frequency/presence penalty
+// fields — a per-model default for them cannot be delivered on this path.
+// drop + warn-once per (keyId, modelId), mirroring the CR-006 form above
+// (silent drop would leave the user believing the knobs are live).
+const penaltySkipWarned = new Set<string>();
+
+function warnPenaltySkipOnce(model: ResolvedModel): void {
+  const key = `${model.keyId}:${model.modelId}`;
+  if (penaltySkipWarned.has(key)) return;
+  penaltySkipWarned.add(key);
+  // 日志红线：只记模型名，不记任何 headers/extraBody 内容。
+  console.warn(
+    `[model-protocols] frequency/presence penalty defaults are not accepted by the Anthropic Messages API; dropping them (model ${model.modelId})`,
+  );
+}
+
 /**
  * Translate thinking controls onto a request body (design §2.1 dispatch
  * table). Returns whether anything was injected — callers use it to tell
@@ -754,6 +837,37 @@ function buildOpenAiReasoningRoundTripPatch(
   };
 }
 
+/** Plain-object check for the extraBody deep merge (arrays/null/scalars are leaves). */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * 09-12 子3 §4.3: deep-merge a per-model extraBody into a request body — per
+ * key: both sides plain objects → recurse; otherwise the extraBody value
+ * REPLACES the protocol-layer value (user-explicit wins — the escape hatch's
+ * whole point, consistent with the priority-chain direction).
+ */
+function mergeExtraBody(target: Record<string, unknown>, extra: Record<string, unknown>): void {
+  for (const [key, value] of Object.entries(extra)) {
+    const existing = target[key];
+    if (isPlainObject(existing) && isPlainObject(value)) {
+      mergeExtraBody(existing, value);
+    } else {
+      target[key] = value;
+    }
+  }
+}
+
+/** Per-model extraBody attachment as one OpenAI-path patch (design §4.3 — bodyPatch seam, thinking 注入同缝). */
+function buildOpenAiExtraBodyPatch(
+  model: ResolvedModel,
+): ((body: Record<string, unknown>) => void) | undefined {
+  const extra = model.extraBody;
+  if (extra === undefined || Object.keys(extra).length === 0) return undefined;
+  return (body) => mergeExtraBody(body, extra);
+}
+
 /** Combined request-level patch for one OpenAI-compatible call site. */
 function buildOpenAiRequestPatch(
   model: ResolvedModel,
@@ -762,6 +876,7 @@ function buildOpenAiRequestPatch(
   const patches = [
     buildOpenAiThinkingPatch(model, request),
     buildOpenAiReasoningRoundTripPatch(model, request),
+    buildOpenAiExtraBodyPatch(model), // 子3：extraBody 尾部合并（在 thinking/round-trip 之后 = 用户显式最优先）
   ].filter((p): p is (body: Record<string, unknown>) => void => p !== undefined);
   if (patches.length === 0) return undefined;
   return (body) => {
@@ -825,12 +940,101 @@ function mapAnthropicFinishReason(raw: string | null | undefined): GenerationFin
   }
 }
 
+// ── 09-12 usage-panel：两公共入口计量 wrapper（design §1）──────────────────────
+//
+// 插桩单源 = 两公共入口（generateText/generateTextStream）的最外层——CLI 早退三分派
+// 在 wrapper **之内**（CLI 调用同落行）。wrapper 只观察：run 恰被调一次、失败原样重抛
+// （计量绝不改变错误语义）、sink 分发 best-effort（dispatchGenerationCallRecord 内
+// try/catch）——不是重试/韧性包装，「CLI 早退先于一切重试/韧性包装」的既有纪律不受
+// 影响（早退仍先于 generateTextInternal/流式韧性层，只多一层单发观测）。
+//
+// 单行性：流式内部降级走 generateTextInternal（不回公共入口）——一条逻辑调用恒一行。
+//
+// CR-18 零伪造：usage 单源 = response.usage，缺的计数器落 ABSENT（≠0）、totalTokens
+// 缺席不由 input+output 合成；失败行 token 恒 ABSENT（abort/中断的部分消耗不可知）。
+
+/** 失败行错误摘要上限（design §2 error_message 列口径：≤500 字符，本地 db 无外发）。 */
+const LEDGER_ERROR_MESSAGE_CHAR_CAP = 500;
+
+function truncateForLedger(value: string): string {
+  return value.length > LEDGER_ERROR_MESSAGE_CHAR_CAP ? value.slice(0, LEDGER_ERROR_MESSAGE_CHAR_CAP) : value;
+}
+
+/** 计量 wrapper 的 run 钩子：markFirstDelta 在首个 delta 抵达时调（流式 first_delta_ms）。 */
+type UsageMeteringHooks = { markFirstDelta: () => void };
+
+async function withUsageMetering(
+  meta: {
+    model: ResolvedModel;
+    request: TextGenerationRequest;
+    ctx: ProtocolCallContext | undefined;
+    stream: boolean;
+  },
+  run: (hooks: UsageMeteringHooks) => Promise<TextGenerationResponse>,
+): Promise<TextGenerationResponse> {
+  const startedAt = Date.now();
+  let firstDeltaAt: number | undefined;
+  const identity = {
+    ts: startedAt,
+    protocol: meta.model.protocol,
+    keyId: meta.model.keyId,
+    modelId: meta.model.modelId,
+    taskType: meta.request.taskType,
+    lane: meta.ctx?.lane,
+    sessionKey: meta.request.sessionKey,
+    stream: meta.stream,
+  };
+  try {
+    const response = await run({
+      markFirstDelta: () => {
+        if (firstDeltaAt === undefined) firstDeltaAt = Date.now();
+      },
+    });
+    dispatchGenerationCallRecord({
+      ...identity,
+      success: true,
+      inputTokens: response.usage?.promptTokens,
+      outputTokens: response.usage?.completionTokens,
+      thinkingTokens: response.usage?.thinkingTokens,
+      cacheReadTokens: response.usage?.cacheReadTokens,
+      // 缺席不合成（CR-18）——provider 没报 total 就记 ABSENT。
+      totalTokens: response.usage?.totalTokens,
+      latencyMs: Date.now() - startedAt,
+      firstDeltaMs: firstDeltaAt !== undefined ? firstDeltaAt - startedAt : undefined,
+    });
+    return response;
+  } catch (err) {
+    // 分类单源 = 子2 classifyGenerationFailure（errors.ts）——失败行 error_kind 与回退
+    // 环 trace.reason 同一判据（行级可对账）。原样重抛：溢出标记/abort/中断语义全保。
+    const classified = classifyGenerationFailure(err);
+    dispatchGenerationCallRecord({
+      ...identity,
+      success: false,
+      errorKind: classified.kind,
+      errorMessage: truncateForLedger(errorMessage(err)),
+      latencyMs: Date.now() - startedAt,
+      firstDeltaMs: firstDeltaAt !== undefined ? firstDeltaAt - startedAt : undefined,
+    });
+    throw err;
+  }
+}
+
 export async function generateText(
   model: ResolvedModel,
   request: TextGenerationRequest,
   ctx?: ProtocolCallContext,
 ): Promise<TextGenerationResponse> {
-  return generateTextInternal(model, request, ctx, {});
+  return withUsageMetering({ model, request, ctx, stream: false }, () => {
+    // 09-12 agy provider（design §1 复核 H2）：CLI 形态顶部早退——先于一切重试/降级包装。
+    // 否则 CLI 502 会落进 generateTextInternal 的 catch（max_tokens 兼容重试 / thinking 剥离
+    // 重试）甚至流式层的「回退非流式重发」= 静默冷重启全量重发一次，违反「driver 内不自动
+    // 重试」（重试/回退归调用方与子2 链）。CLI 路径自身无超时/护栏包装（print-timeout 即
+    // 唯一时长闸，外层兜底在 driver 内）。
+    if (model.protocol === 'antigravity-cli') {
+      return antigravityCliGenerateText(model, request, ctx);
+    }
+    return generateTextInternal(model, request, ctx, {});
+  });
 }
 
 /**
@@ -848,12 +1052,26 @@ type GenerateTextInternalOpts = {
   skipQuickRetry?: boolean;
 };
 
+/**
+ * 09-12 子3 design §4.2：per-model defaultTemperature 缺省补位（fill-the-slot，
+ * NOT an override——请求级显式值仍然优先；厂商思考约束在 body 组装后仍最高）。
+ * 零分配快径：请求级已带值且模型无默认时返回**同一引用**（零配置键字节级不变）。
+ * 幂等：流式降级重入（generateTextStreamInner → generateTextInternal）与本函数
+ * 自身顶部的二次归一均为 no-op。
+ */
+function withDefaultTemperature(model: ResolvedModel, request: TextGenerationRequest): TextGenerationRequest {
+  if (request.temperature !== undefined || model.defaultTemperature === undefined) return request;
+  return { ...request, temperature: model.defaultTemperature };
+}
+
 async function generateTextInternal(
   model: ResolvedModel,
   request: TextGenerationRequest,
   ctx: ProtocolCallContext | undefined,
   opts: GenerateTextInternalOpts,
 ): Promise<TextGenerationResponse> {
+  // 09-12 子3 §4.2：非流式入口（含流式降级重入）顶部归一——per-model 默认补位。
+  request = withDefaultTemperature(model, request);
   // D2 guardrail: an unset maxTokens used to mean "uncapped" on the OpenAI
   // path (minute-long hangs on #50) and 16384 on Anthropic. Both now default
   // to a 32K guardrail, with a one-shot compat degradation below for endpoints
@@ -1191,6 +1409,11 @@ async function generateOpenAiText(
         system,
         messages,
         temperature: request.temperature,
+        // 09-12 子3 §4.2：per-model 采样缺省补位（非覆盖）——undefined 不占位 = 不发字段
+        //（ai CallSettings 原生通道，镜像请求级 temperature 的形态）。
+        topP: model.defaultTopP,
+        frequencyPenalty: model.defaultFrequencyPenalty,
+        presencePenalty: model.defaultPresencePenalty,
         maxOutputTokens,
         tools,
         abortSignal: ctx?.signal,
@@ -1245,20 +1468,6 @@ function buildOpenAiResponse(
 // ── Streaming text generation (dogfood T1 #50 / #27②) ──
 
 /**
- * Incremental streaming chunk surfaced to the caller's onDelta callback.
- * dogfood R2 #30：新增 `tool` 通道——工具调用参数流式期（正文已毕、tool-call JSON
- * 参数仍在流）的活性信号；`toolName` 在每个调用的首块携带（tool-input-start /
- * content_block_start(tool_use)），后续参数块缺省。UI 用它渲染「正在准备工具调用」
- * 指示——旧态该窗口完全静默（正文不长、无徽标、流式标志又压着全局三点 loading）。
- */
-export interface GenerationDelta {
-  type: 'text' | 'reasoning' | 'tool';
-  delta: string;
-  /** `tool` 通道：调用首块携带的工具名（后续参数块缺省）。 */
-  toolName?: string;
-}
-
-/**
  * Streaming variant of `generateText` (design §1.1): same dual-protocol
  * dispatch, same terminal `TextGenerationResponse` frame, plus incremental
  * `onDelta` callbacks. `reasoning` (when the provider surfaces one) is both
@@ -1281,6 +1490,33 @@ export async function generateTextStream(
   ctx: ProtocolCallContext | undefined,
   onDelta: (d: GenerationDelta) => void,
 ): Promise<TextGenerationResponse> {
+  // 09-12 usage-panel（design §1）：计量 wrapper 最外层——CLI 早退在 wrapper 之内（CLI
+  // 调用同落行）；首 delta 经 meteredOnDelta 打点（first_delta_ms），与内部
+  // state.producedDelta 判定互不干扰（同一 onDelta 链，纯增量观察）。
+  return withUsageMetering({ model, request, ctx, stream: true }, ({ markFirstDelta }) => {
+    const meteredOnDelta = (d: GenerationDelta) => {
+      markFirstDelta();
+      onDelta(d);
+    };
+    return generateTextStreamInner(model, request, ctx, meteredOnDelta);
+  });
+}
+
+async function generateTextStreamInner(
+  model: ResolvedModel,
+  request: TextGenerationRequest,
+  ctx: ProtocolCallContext | undefined,
+  onDelta: (d: GenerationDelta) => void,
+): Promise<TextGenerationResponse> {
+  // 09-12 agy provider（复核 H2）：CLI 形态顶部早退——不经本函数的流式韧性层（快速
+  // 重试 / 首事件窗 / 非流式回退对 CLI 形态全部不适用——那是 SSE 语义；agy stream-json
+  // 的事件活性由 driver 的外层兜底罩）。流式/非流式两态在 driver 内单实现消费。
+  if (model.protocol === 'antigravity-cli') {
+    return antigravityCliGenerateText(model, request, ctx, onDelta);
+  }
+  // 09-12 子3 §4.2：流式入口顶部归一（CLI 早退之后——CLI 键无 defaultTemperature，
+  // refine 拒收，归一对 CLI 是恒等）。降级重入 generateTextInternal 时二次归一 no-op。
+  request = withDefaultTemperature(model, request);
   const state = { producedDelta: false };
   const trackedOnDelta = (d: GenerationDelta) => {
     state.producedDelta = true;
@@ -1491,7 +1727,8 @@ async function openAiStreamAttempt(
 ): Promise<TextGenerationResponse> {
   // dogfood R2 #7: lane-selected liveness window — background (child agents /
   // chapter chains) gets 240s, everything else keeps the 60s design default.
-  const windowMs = firstEventWindowMs(ctx);
+  // 09-12 子3: a per-key timeoutSeconds replaces the lane value (streamWindowMs).
+  const windowMs = streamWindowMs(model, ctx);
   const wrapped = wrapLanguageModel({
     model: createProvider(model, {
       connectTimeoutMs: windowMs,
@@ -1553,6 +1790,10 @@ async function openAiStreamAttempt(
       system,
       messages,
       temperature: request.temperature,
+      // 09-12 子3 §4.2：per-model 采样缺省补位（非覆盖）——undefined 不占位 = 不发字段。
+      topP: model.defaultTopP,
+      frequencyPenalty: model.defaultFrequencyPenalty,
+      presencePenalty: model.defaultPresencePenalty,
       maxOutputTokens,
       tools,
       abortSignal: guard.signal,
@@ -1688,32 +1929,46 @@ async function openAiStreamAttempt(
 
 // ── Anthropic-compatible streaming path (hand-written SSE, r6) ──
 
+// C batch (09-12 system stabilization / C3.4): official prompt-caching marker.
+// cache_control is legal on ANY content block, so it rides as an additive
+// optional field on every union member (per-member intersection keeps the
+// `type` discriminant intact for narrowing).
+type CacheControlMarker = { cache_control?: { type: 'ephemeral' } };
+
 type AnthropicContentBlock =
-  | { type: 'text'; text: string }
+  | ({ type: 'text'; text: string } & CacheControlMarker)
   // Thinking adapters task (B block): thinking blocks carry a `signature`
   // that must round-trip verbatim in tool loops (captured onto the response
   // as `reasoningSignature`). Absent on older/non-thinking endpoints.
-  | { type: 'thinking'; thinking: string; signature?: string }
-  | { type: 'tool_use'; id: string; name: string; input: unknown }
-  | { type: 'tool_result'; tool_use_id: string; content: string }
+  | ({ type: 'thinking'; thinking: string; signature?: string } & CacheControlMarker)
+  | ({ type: 'tool_use'; id: string; name: string; input: unknown } & CacheControlMarker)
+  | ({ type: 'tool_result'; tool_use_id: string; content: string } & CacheControlMarker)
   // Story 3.6 vision seam: image block for multimodal user messages. Anthropic
   // strictly 400s when `media_type` does not match the actual image bytes — the
   // caller (shell visionAnalysis) is responsible for strict byte-level matching.
-  | { type: 'image'; source: { type: 'base64'; media_type: string; data: string } };
+  | ({ type: 'image'; source: { type: 'base64'; media_type: string; data: string } } & CacheControlMarker);
 
 type AnthropicMessage = {
   role: 'user' | 'assistant';
   content: string | AnthropicContentBlock[];
 };
 
+// C 批 CR P10：Anthropic usage 的 cache 计数桶（非流式响应 / 流式 message_start /
+// 流式 message_delta 三处同形）。官方语义：input_tokens **不含** cache 桶——真实输入
+// 量 = input + cache_read + cache_creation 三桶求和，直接取 input_tokens 会低估
+// （agent 校准环 / 压缩阈值随之漂移）。
+type AnthropicUsage = {
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_read_input_tokens?: number;
+  cache_creation_input_tokens?: number;
+};
+
 type AnthropicResponse = {
   model?: string;
   content?: AnthropicContentBlock[];
   stop_reason?: string | null;
-  usage?: {
-    input_tokens?: number;
-    output_tokens?: number;
-  };
+  usage?: AnthropicUsage;
 };
 
 /** Shared request-body assembly for the Anthropic non-streaming + streaming paths. */
@@ -1798,8 +2053,53 @@ function buildAnthropicBody(
     max_tokens: maxTokens,
     messages,
   };
-  if (systemParts.length) body.system = systemParts.join('\n');
+  // C batch (09-12 system stabilization / C3.4): explicit cache_control wiring —
+  // TWO breakpoints when request.cacheControl === true (≤ the official cap of 4):
+  //   ① system tail block — system becomes an array block with the ephemeral
+  //      marker; join('\n') preserves byte order.
+  //   ② conversation tail — the LAST message's LAST content block (the official
+  //      recommendation for growing conversations: the breakpoint follows the
+  //      tail, each turn writes the fresh prefix, subsequent turns read it back).
+  // Absent/false keeps both forms exactly as before — plain-string system and
+  // string message content stay strings (byte-identical wire body, zero
+  // regression).
+  if (systemParts.length) {
+    const systemText = systemParts.join('\n');
+    // C 批 CR P11：join 产物空串时不进数组块形——Anthropic 拒空 text 块（400），
+    // 旧 `body.system = ''` 字符串形态可发，保原形态。
+    body.system = request.cacheControl === true && systemText !== ''
+      ? [{ type: 'text', text: systemText, cache_control: { type: 'ephemeral' } }]
+      : systemText;
+  }
+  if (request.cacheControl === true && messages.length > 0) {
+    // Every entry in `messages` was freshly assembled in the loop above, so
+    // upgrading the tail in place is side-effect-free. Content forms: string →
+    // single text block; blocks array → the marker rides the last block
+    // (text / tool_use / tool_result / image alike). A degenerate empty blocks
+    // array (assistant with no content, no toolCalls) has nothing to mark — no-op.
+    const last = messages[messages.length - 1];
+    // C 批 CR P11：空串尾消息不升格——升格会产出 `{type:'text',text:''}` 空 text 块
+    // （Anthropic 400）；旧 '' string 形态可发，保原形态。
+    if (typeof last.content === 'string') {
+      if (last.content !== '') {
+        last.content = [{ type: 'text', text: last.content, cache_control: { type: 'ephemeral' } }];
+      }
+    } else if (last.content.length > 0) {
+      const idx = last.content.length - 1;
+      last.content[idx] = { ...last.content[idx], cache_control: { type: 'ephemeral' } };
+    }
+    // 20-block lookback window: when a turn appends >20 content blocks the tail
+    // breakpoint drifts past the previous write's window — each such turn pays a
+    // fresh cache write (1.25× once) instead of a read (0.1×). That is the
+    // expected incremental cost of a tail-following breakpoint, not a defect.
+  }
   if (request.temperature !== undefined) body.temperature = request.temperature;
+  // 09-12 子3 §4.2：topP 直发（Messages API 原生 top_p，drop 会砍掉 Anthropic 用户的
+  // 第二旋钮）；双 penalty 协议不收——drop + warn-once（上方法氏）。
+  if (model.defaultTopP !== undefined) body.top_p = model.defaultTopP;
+  if (model.defaultFrequencyPenalty !== undefined || model.defaultPresencePenalty !== undefined) {
+    warnPenaltySkipOnce(model);
+  }
   if (request.tools?.length) {
     body.tools = request.tools.map((t) => ({
       name: t.function.name,
@@ -1816,6 +2116,10 @@ function buildAnthropicBody(
     skipWarnKey: model.thinkingKind !== undefined ? `${model.keyId}:${model.thinkingKind}` : undefined,
     limits: model.limits,
   });
+  // 09-12 子3 §4.3：extraBody 组装尾部深合并（同键覆盖协议层默认——用户显式最优先）。
+  if (model.extraBody !== undefined && Object.keys(model.extraBody).length > 0) {
+    mergeExtraBody(body, model.extraBody);
+  }
   return body;
 }
 
@@ -1834,9 +2138,13 @@ async function generateAnthropicText(
       headers: {
         'x-api-key': model.apiKey,
         'anthropic-version': ANTHROPIC_VERSION,
+        // 09-12 子3 §3 ②：customHeaders 在内建头之后展开（同名覆盖生效）。
+        ...model.customHeaders,
       },
       body,
       signal: ctx?.signal,
+      // 09-12 子3 §3 ⑧：per-key 跳过证书校验（ABSENT = 默认校验，init 不变）。
+      dispatcher: model.verifySsl === true ? getInsecureDispatcher() : undefined,
     });
   // CR-T1-007: withRetry suppressed on the streaming-degradation call — that
   // layer already quick-retried its connection window; stacking loops would
@@ -1884,8 +2192,20 @@ async function generateAnthropicText(
       name: block.name,
       arguments: typeof block.input === 'string' ? block.input : JSON.stringify(block.input ?? {}),
     }));
-  const promptTokens = response.usage?.input_tokens;
-  const completionTokens = response.usage?.output_tokens;
+  // C 批 CR P10：三桶口径——input_tokens 不含 cache 桶，真实输入量 = 三桶求和；
+  // 三桶全缺席时保持 undefined 语义（不造假 0）。cacheReadTokens 透出（mirror agy
+  // driver 的 usage 形态，withUsageMetering 已有消费面）。
+  const reported = response.usage;
+  const completionTokens = reported?.output_tokens;
+  const anyInputBucket =
+    reported?.input_tokens !== undefined ||
+    reported?.cache_read_input_tokens !== undefined ||
+    reported?.cache_creation_input_tokens !== undefined;
+  const promptTokens = anyInputBucket
+    ? (reported?.input_tokens ?? 0) +
+      (reported?.cache_read_input_tokens ?? 0) +
+      (reported?.cache_creation_input_tokens ?? 0)
+    : undefined;
 
   return {
     model: response.model ?? model.modelId,
@@ -1893,10 +2213,14 @@ async function generateAnthropicText(
     reasoning: reasoning || undefined,
     reasoningSignature,
     finishReason: mapAnthropicFinishReason(response.stop_reason),
-    usage: response.usage
+    usage: reported
       ? {
           promptTokens,
           completionTokens,
+          // ABSENT ≠ 0（CR-18 纪律）：端点没报就不挂键。
+          ...(reported.cache_read_input_tokens !== undefined
+            ? { cacheReadTokens: reported.cache_read_input_tokens }
+            : {}),
           totalTokens: promptTokens !== undefined && completionTokens !== undefined ? promptTokens + completionTokens : undefined,
         }
       : undefined,
@@ -1908,7 +2232,7 @@ async function generateAnthropicText(
 type AnthropicStreamFrame = {
   type: string;
   index?: number;
-  message?: { usage?: { input_tokens?: number; output_tokens?: number } };
+  message?: { usage?: AnthropicUsage };
   content_block?: { type?: string; id?: string; name?: string };
   delta?: {
     type?: string;
@@ -1920,7 +2244,7 @@ type AnthropicStreamFrame = {
     partial_json?: string;
     stop_reason?: string | null;
   };
-  usage?: { input_tokens?: number; output_tokens?: number };
+  usage?: AnthropicUsage;
   error?: { type?: string; message?: string };
 };
 
@@ -2022,7 +2346,9 @@ async function anthropicStreamAttempt(
   const toolBlocks = new Map<number, { id: string; name: string; json: string }>();
   const toolCalls: Array<{ id: string; name: string; arguments: string }> = [];
   let stopReason: string | null | undefined;
-  let promptTokens: number | undefined;
+  let promptTokens: number | undefined; // raw input_tokens 桶（三桶求和在 return 处，CR P10）
+  let cacheReadTokens: number | undefined;
+  let cacheCreationTokens: number | undefined;
   let completionTokens: number | undefined;
   let sawMessageStop = false;
 
@@ -2030,7 +2356,8 @@ async function anthropicStreamAttempt(
   // passthrough + a 60s timer that is cleared the moment the first event
   // arrives (mid-stream silence timeout is an explicit non-goal).
   // dogfood R2 #7: the window is lane-selected (240s on background lanes).
-  const guard = createFirstEventGuard(ctx?.signal, firstEventWindowMs(ctx));
+  // 09-12 子3: a per-key timeoutSeconds replaces the lane value (streamWindowMs).
+  const guard = createFirstEventGuard(ctx?.signal, streamWindowMs(model, ctx));
 
   try {
     await postSse({
@@ -2038,9 +2365,12 @@ async function anthropicStreamAttempt(
       headers: {
         'x-api-key': model.apiKey,
         'anthropic-version': ANTHROPIC_VERSION,
+        // 09-12 子3 §3 ③：customHeaders 在内建头之后展开（同名覆盖生效）。
+        ...model.customHeaders,
       },
       body,
       signal: guard.signal,
+      dispatcher: model.verifySsl === true ? getInsecureDispatcher() : undefined,
       onEvent: (ev) => {
         const frame = parseSseJson(ev.data) as unknown as AnthropicStreamFrame | null;
         if (!frame || typeof frame.type !== 'string') return; // [DONE]-like / malformed frames ignored
@@ -2057,10 +2387,16 @@ async function anthropicStreamAttempt(
         }
         switch (frame.type) {
           case 'message_start': {
+            // C 批 CR P10：message_start 的 message.usage 携带 cache 桶（官方协议位）；
+            // message_delta.usage 只承诺累计 output_tokens，输入侧不读。
             const input = frame.message?.usage?.input_tokens;
             const output = frame.message?.usage?.output_tokens;
+            const cacheRead = frame.message?.usage?.cache_read_input_tokens;
+            const cacheCreation = frame.message?.usage?.cache_creation_input_tokens;
             if (typeof input === 'number') promptTokens = input;
             if (typeof output === 'number') completionTokens = output;
+            if (typeof cacheRead === 'number') cacheReadTokens = cacheRead;
+            if (typeof cacheCreation === 'number') cacheCreationTokens = cacheCreation;
             break;
           }
           case 'content_block_start': {
@@ -2192,6 +2528,14 @@ async function anthropicStreamAttempt(
     warnZenThinkingStripOnce(model);
   }
 
+  // C 批 CR P10：三桶口径（input + cache_read + cache_creation）与非流式路径同源；
+  // 三桶全缺席 → promptTokens 保持 undefined（不造假 0）。
+  const anyInputBucket =
+    promptTokens !== undefined || cacheReadTokens !== undefined || cacheCreationTokens !== undefined;
+  const summedPromptTokens = anyInputBucket
+    ? (promptTokens ?? 0) + (cacheReadTokens ?? 0) + (cacheCreationTokens ?? 0)
+    : undefined;
+
   return {
     model: model.modelId,
     text,
@@ -2199,13 +2543,15 @@ async function anthropicStreamAttempt(
     reasoningSignature: reasoningSignature || undefined,
     finishReason: mapAnthropicFinishReason(stopReason),
     usage:
-      promptTokens !== undefined || completionTokens !== undefined
+      anyInputBucket || completionTokens !== undefined
         ? {
-            promptTokens,
+            promptTokens: summedPromptTokens,
             completionTokens,
+            // ABSENT ≠ 0（CR-18 纪律）：端点没报就不挂键。
+            ...(cacheReadTokens !== undefined ? { cacheReadTokens } : {}),
             totalTokens:
-              promptTokens !== undefined && completionTokens !== undefined
-                ? promptTokens + completionTokens
+              summedPromptTokens !== undefined && completionTokens !== undefined
+                ? summedPromptTokens + completionTokens
                 : undefined,
           }
         : undefined,
@@ -2232,7 +2578,13 @@ function invokeOnDelta(onDelta: (d: GenerationDelta) => void, d: GenerationDelta
   }
 }
 
-function isDeltaCallbackError(err: unknown): boolean {
+/**
+ * Exported (09-12 子2 fallback chains, W2 L1): classifyGenerationFailure in
+ * errors.ts consumes these program-error predicates — reusing the module's own
+ * tagging instead of duplicating the classification. Additive export only;
+ * behavior unchanged.
+ */
+export function isDeltaCallbackError(err: unknown): boolean {
   return err instanceof Object && deltaCallbackErrors.has(err);
 }
 
@@ -2288,7 +2640,8 @@ function parseSseJson(data: string): Record<string, unknown> | null {
   }
 }
 
-function isAbortLikeError(err: unknown, signal?: AbortSignal): boolean {
+/** Exported additively for classifyGenerationFailure (errors.ts, 09-12 子2) — see isDeltaCallbackError. */
+export function isAbortLikeError(err: unknown, signal?: AbortSignal): boolean {
   if (signal?.aborted) return true;
   if (err instanceof Error && err.name === 'AbortError') return true;
   return signal !== undefined && err === signal.reason;
@@ -2300,7 +2653,7 @@ function isAbortLikeError(err: unknown, signal?: AbortSignal): boolean {
  * reaches the consumer, and timeouts must never degrade to the unbounded
  * non-streaming fallback (#50).
  */
-function findTimeoutError(err: unknown): ProtocolTimeoutError | undefined {
+export function findTimeoutError(err: unknown): ProtocolTimeoutError | undefined {
   let current: unknown = err;
   for (let depth = 0; current instanceof Error && depth < 5; depth++) {
     if (current instanceof ProtocolTimeoutError) return current;
@@ -2329,7 +2682,7 @@ function normalizeApiCallError(err: unknown): unknown {
   return err;
 }
 
-function errorMessage(err: unknown): string {
+export function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
@@ -2386,9 +2739,10 @@ async function generateFromPrompt(
   const raw = await withRetry(
     () => postJson<OpenAiImageResponse>({
       url: `${baseUrl}/images/generations`,
-      headers: { authorization: `Bearer ${model.apiKey}` },
+      headers: { authorization: `Bearer ${model.apiKey}`, ...model.customHeaders },
       body,
       signal: ctx?.signal,
+      dispatcher: model.verifySsl === true ? getInsecureDispatcher() : undefined,
     }),
     { signal: ctx?.signal },
   );
@@ -2417,9 +2771,10 @@ async function editImage(
 
       return postMultipart<OpenAiImageResponse>({
         url: `${baseUrl}/images/edits`,
-        headers: { authorization: `Bearer ${model.apiKey}` },
+        headers: { authorization: `Bearer ${model.apiKey}`, ...model.customHeaders },
         formData: form,
         signal: ctx?.signal,
+        dispatcher: model.verifySsl === true ? getInsecureDispatcher() : undefined,
       });
     },
     { signal: ctx?.signal },
@@ -2460,9 +2815,10 @@ export async function generateEmbeddings(
   const raw = await withRetry(
     () => postJson<OpenAiEmbeddingResponse>({
       url: `${baseUrl}/embeddings`,
-      headers: { authorization: `Bearer ${model.apiKey}` },
+      headers: { authorization: `Bearer ${model.apiKey}`, ...model.customHeaders },
       body: { model: model.modelId, input: request.input },
       signal: ctx?.signal,
+      dispatcher: model.verifySsl === true ? getInsecureDispatcher() : undefined,
     }),
     { signal: ctx?.signal },
   );

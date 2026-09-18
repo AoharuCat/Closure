@@ -231,6 +231,25 @@ interface SwitchPageBody { page: string; timeout?: number }
 interface HoverBody { selector?: string; text?: string; timeout?: number }
 interface EvalBody { expression: string }
 interface PressKeyBody { key: string }
+interface SetInputFilesBody { selector?: string; text?: string; files: string[]; timeout?: number }
+
+/**
+ * POST /set-input-files {selector?|text?, files, timeout?} -> set files on an
+ * `<input type="file">` (dogfood R3：材料页/附件上传的「浏览」按钮真实用户路径——
+ * Playwright 注入真路径，renderer 侧 `File.path` 有值，与用户从 OS 文件对话框选文件
+ * 走的是同一条 change 事件链）。多 input 同 class 时调用方用 `css=X >> nth=i` 消歧。
+ */
+export async function handleSetInputFiles(ctx: DriveContext, body: SetInputFilesBody): Promise<DriveResponse> {
+  if (!Array.isArray(body.files) || body.files.length === 0) {
+    throw new Error('missing "files" (non-empty string array of absolute paths)');
+  }
+  for (const f of body.files) {
+    if (typeof f !== 'string' || f.length === 0) throw new Error('"files" must be non-empty strings');
+  }
+  const loc = locatorFromBody(ctx.window, body);
+  await loc.setInputFiles(body.files, { timeout: timeoutFromBody(body) });
+  return { ok: true };
+}
 
 /** POST /click {selector?|text?, timeout?, button?, position?} -> click the element. */
 export async function handleClick(ctx: DriveContext, body: ClickBody): Promise<DriveResponse> {
@@ -458,6 +477,8 @@ export async function dispatchRoute(
         return await handleSwitchPage(ctx, (body ?? {}) as SwitchPageBody);
       case 'POST /press-key':
         return await handlePressKey(ctx, (body ?? {}) as PressKeyBody);
+      case 'POST /set-input-files':
+        return await handleSetInputFiles(ctx, (body ?? {}) as SetInputFilesBody);
       case 'POST /close':
         return { ok: true, closing: true };
       default:

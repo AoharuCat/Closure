@@ -296,7 +296,7 @@ export function OverviewPage() {
   const hasActivity = versions.length > 0 || recentChapters.length > 0;
 
   // Open a chapter's manuscript file as a tab (the source of truth). Shared with
-  // the side-nav writing entry via openWriting() so both drive one flow.
+  // the writing page chapter column via openWriting() so both drive one flow.
   const openChapter = (chapter?: NovelChapterMeta) => openWriting(chapter);
 
   // Pick a cover image, copy it into the project as cover.<ext>, and persist it

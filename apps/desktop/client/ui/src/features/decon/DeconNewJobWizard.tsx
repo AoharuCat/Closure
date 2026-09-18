@@ -11,17 +11,19 @@
  * validateDeconDimensions 的 UI mirror，省一次 IPC 往返；服务端仍是权威）。
  */
 import { useEffect, useMemo, useState } from 'react';
-import type { DeconTier, MaterialSummary } from '@orison/shared-contracts';
+import { DECON_DIMENSIONS, type DeconTier, type MaterialSummary } from '@orison/shared-contracts';
 import { useI18n } from '../../shared/i18n/useI18n';
 import { useAppStore } from '../../shared/store/appStore';
 import { useToastStore } from '../../shared/store/toastStore';
 import { listMaterials } from '../../shared/api/materials';
 import {
+  deconDimensionGranularityKey,
   deconDimensionLabelKey,
   deconDimensionSelectionIsValid,
   deconDimensionsForTier,
   deconDeepPrefilledDimensions,
   deconEligibleMaterials,
+  deconEstimateNoteKey,
   deconEstimateRows,
   deconPassLabel,
   parseDeconBudgetInput,
@@ -44,6 +46,8 @@ export function DeconNewJobWizard({ onClose }: { onClose: () => void }) {
   const [reviewGates, setReviewGates] = useState(true);
   const [budgetInput, setBudgetInput] = useState('');
   const [busy, setBusy] = useState(false);
+  /** U8：粗拆档「12 手艺维预览」展开态（默认折叠——可见性引导非默认可见）。 */
+  const [dimPreviewOpen, setDimPreviewOpen] = useState(false);
   /** create 回执（ok 面——预估卡数据源；null = 未创建）。 */
   const [created, setCreated] = useState<{
     jobId: string;
@@ -87,6 +91,8 @@ export function DeconNewJobWizard({ onClose }: { onClose: () => void }) {
   const visibleDims = deconDimensionsForTier(tier);
   const dimsValid = deconDimensionSelectionIsValid(tier, dims);
   const craftCount = dims.filter((d) => d !== 'style').length;
+  /** U8：12 手艺维目录（粗拆档预览数据源——granularity 字段契约现成）。 */
+  const craftDimCatalog = useMemo(() => DECON_DIMENSIONS.filter((d) => d.id !== 'style'), []);
 
   const toggleDim = (id: string) => {
     setDims((current) => (current.includes(id) ? current.filter((d) => d !== id) : [...current, id]));
@@ -138,11 +144,14 @@ export function DeconNewJobWizard({ onClose }: { onClose: () => void }) {
   const handleStart = async () => {
     if (created === null || busy) return;
     setBusy(true);
+    // F7 belt（点即关）：乐观 onClose 前置——启动结果由 job 面板横幅/红点/进度条承载，模态
+    // 留守无信息增量（R3 观察「job 已 running 而模态留守」与静态代码矛盾，真机复现窗口留
+    // 验收观察；点即关行为本身正确）。失败 toast 仍发（全局 toast store，不随组件卸载丢）。
+    onClose();
     try {
       const result = await startDeconJob(created.jobId);
       if (result.ok) {
-        showToast(t('decon.toast.started'), 'success');
-        onClose();
+        showToast(result.noop ? t('decon.toast.startNoop') : t('decon.toast.started'), 'success');
       } else {
         showToast(t('decon.toast.startFailed', { message: result.message }), 'error');
       }
@@ -151,8 +160,6 @@ export function DeconNewJobWizard({ onClose }: { onClose: () => void }) {
         t('decon.toast.startFailed', { message: err instanceof Error ? err.message : String(err) }),
         'error',
       );
-    } finally {
-      setBusy(false);
     }
   };
 
@@ -226,7 +233,8 @@ export function DeconNewJobWizard({ onClose }: { onClose: () => void }) {
               ))}
             </div>
 
-            {/* ③ 维度选择器（粗拆档只显风格维——拍板②）。 */}
+            {/* ③ 维度选择器（粗拆档只显风格维——拍板②；U8：chip 附 granularity 说明 title——
+                CR-14 i18n 键路由，en 用户不再见裸中文契约注记）。 */}
             <div className="materials-form-row">
               <span className="materials-form-label">{t('decon.wizard.dimensions')}</span>
             </div>
@@ -237,6 +245,7 @@ export function DeconNewJobWizard({ onClose }: { onClose: () => void }) {
                   type="button"
                   className={`materials-crafttag${dims.includes(dim.id) ? ' is-active' : ''}`}
                   onClick={() => toggleDim(dim.id)}
+                  title={t(deconDimensionGranularityKey(dim.id))}
                   data-decon-dim={dim.id}
                 >
                   {t(deconDimensionLabelKey(dim.id))}
@@ -250,6 +259,32 @@ export function DeconNewJobWizard({ onClose }: { onClose: () => void }) {
                   ? t('decon.wizard.dimDeepHint')
                   : t('decon.wizard.dimFineCount', { count: craftCount })}
             </div>
+            {/* U8：粗拆档「12 手艺维在细拆档解锁」可见性引导 + 可展开预览（granularity 现成）。 */}
+            {tier === 'coarse' && (
+              <div className="decon-dimpreview" data-decon-dim-preview={dimPreviewOpen ? 'open' : 'closed'}>
+                <span className="decon-dimpreview-hint">
+                  {t('decon.wizard.dimCoarseMore', { count: craftDimCatalog.length })}
+                </span>
+                <button
+                  type="button"
+                  className="materials-browsebtn"
+                  onClick={() => setDimPreviewOpen((v) => !v)}
+                  data-decon-action="dim-preview"
+                >
+                  {t(dimPreviewOpen ? 'decon.wizard.dimPreviewHide' : 'decon.wizard.dimPreviewShow')}
+                </button>
+                {dimPreviewOpen && (
+                  <div className="decon-dimpreview-list">
+                    {craftDimCatalog.map((dim) => (
+                      <div key={dim.id} className="decon-dimpreview-row" data-decon-dim-preview-item={dim.id}>
+                        <span className="decon-dimpreview-name">{t(deconDimensionLabelKey(dim.id))}</span>
+                        <span className="decon-dimpreview-gran">{t(deconDimensionGranularityKey(dim.id))}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
             {!dimsValid && (
               <div className="materials-form-error" data-decon-dim-invalid="true">
                 {t('decon.wizard.invalidDims')}
@@ -305,7 +340,8 @@ export function DeconNewJobWizard({ onClose }: { onClose: () => void }) {
           </>
         ) : (
           <>
-            {/* ⑥ 成本预估卡（byPass 明细 + P1 复用打折标记——F-07）。 */}
+            {/* ⑥ 成本预估卡（byPass 明细 + P1 复用打折标记——F-07；CR-17 每 pass 一句通俗
+                说明——R3 第二子项，网文作者受众、讲清钱花在哪/什么在推高费用）。 */}
             <div className="craft-grouphead">
               <span className="material-symbols-outlined" aria-hidden="true">payments</span>
               <span className="craft-grouphead-name">{t('decon.wizard.estimateTitle')}</span>
@@ -316,11 +352,16 @@ export function DeconNewJobWizard({ onClose }: { onClose: () => void }) {
                 const passText = [t(label.stemKey), ...label.suffixKeys.map((k) => t(k))].join('·');
                 return (
                   <div key={row.pass} className="decon-estimate-row" data-decon-estimate-pass={row.pass}>
-                    <span className="decon-estimate-pass">{passText}</span>
-                    <span className="decon-estimate-tokens">{row.tokens.toLocaleString()}</span>
-                    {row.inherited && (
-                      <span className="materials-badge materials-badge--ok">{t('decon.wizard.estimateInherited')}</span>
-                    )}
+                    <div className="decon-estimate-line">
+                      <span className="decon-estimate-pass">{passText}</span>
+                      <span className="decon-estimate-tokens">{row.tokens.toLocaleString()}</span>
+                      {row.inherited && (
+                        <span className="materials-badge materials-badge--ok">{t('decon.wizard.estimateInherited')}</span>
+                      )}
+                    </div>
+                    <div className="decon-estimate-note" data-decon-estimate-note={row.pass}>
+                      {t(deconEstimateNoteKey(row.pass))}
+                    </div>
                   </div>
                 );
               })}

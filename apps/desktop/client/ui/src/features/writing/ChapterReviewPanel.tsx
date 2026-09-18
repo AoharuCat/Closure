@@ -1,36 +1,40 @@
 import { useState } from 'react';
 import { useShallow } from 'zustand/react/shallow';
-import { revisionIntentSchema, GUARD_DRIFT_PATTERN_LABELS_ZH } from '@orison/shared-contracts';
+import { GUARD_DRIFT_PATTERN_LABELS_ZH } from '@orison/shared-contracts';
 import type { RevisionIntent } from '@orison/shared-contracts';
 import { useAppStore } from '../../shared/store/appStore';
 import { useI18n } from '../../shared/i18n/useI18n';
-import { TiptapEditor } from '../../features/editor/TiptapEditor';
-import { SideBySideDiff } from './SideBySideDiff';
-import { InsightCard } from './InsightCard';
+import { TiptapEditor } from '../editor/TiptapEditor';
+import { SideBySideDiff } from '../agent-panel/SideBySideDiff';
+import { InsightCard } from '../agent-panel/InsightCard';
+// 09-13 子3 W5（design §4.1/§4.2）：final 分支迁 FinalReviewCard + 确认卡提取共用组件；
+// interim 终稿 accept 本地 handler 退役（slice reviewAcceptFinal 接管）。
+import { RevisionIntentConfirmCard } from './RevisionIntentConfirmCard';
 
 /**
  * Story 4.3 Step 4（design §3.6 / §5）：draft checkpoint prose-review 面板。
  * Story 7.1 B1（design §4.2）：draft stage 选区指挥精修扩展。
  *
- * 写章链段在 draft checkpoint pause 时（半自动/微操模式），leader write_chapter 产 chapter_review
+ * 写章链段在 checkpoint pause 时（半自动/微操模式），leader write_chapter 产 chapter_review
  * metadata → chapterReviewSlice.setPausedReview → 本面板渲染正文 + 三动作（continue/redo/abort）。
  *
- * Story 7.1 B1 扩展：draft stage 把只读 `<pre>` 换成 `<TiptapEditor editable={false}>`（复用 SelectionInfo
- * 回调），加「指挥这段」按钮 + 粗指令输入 → revision-optimizer 子 agent 编译 RevisionIntent（IPC
- * `closure:compile-revision-intent`）→ 确认卡片（人改/确认/取消）→ confirmRedoWithIntent 走段落级
- * 改稿执行（resume-chapter-chain redo + revisionIntent，design §3.2 Route 1）。
+ * 09-13 子3 W4（design §5.1）：迁移 features/agent-panel → features/writing（审批迁写作页宽区），
+ * props `sessionId?` 化（缺省兜底 = 视图会话 agentSessionId——键控读取 + 动作尾参传该 sid，
+ * 后台会话直审不切走）。**样式类名不动**（chapter-review* 族仍在 agent-panel.css 原位生效）。
  *
- * 三动作调 chapterReviewSlice 的 reviewContinue/reviewRedo/reviewAbort → 结构化 IPC
+ * 09-13 子3 W5（design §4.2）：写作页审阅相位的卡片路由（ReviewPhaseView）按 pauseKind 分派——
+ * **stage='final' 迁 FinalReviewCard**（终稿全幅可编辑 + 手改追踪 + accept slice 化），本面板
+ * 承载 brief / 挂起（researchSuspension）/ 护栏（revision-guard）/ legacy draft 四形态；final
+ * 载荷防御性渲染 null（路由侧不派发，旧挂载点直挂时零重复）。
+ *
+ * 三动作调 chapterReviewSlice 的 reviewContinue/reviewRedo/reviewAbort（尾参传 sid）→ 结构化 IPC
  * `closure:resume-chapter-chain`（mirror 4.6 PatchReview accept/reject，非 leader LLM 解释）。
  *
  * brief stage：渲染 briefContent 摘要 + continue/abort（design §5 brief 软门 = Step 5）。
- * verdict stage：复用 4.6 PatchReview（本面板若遇 verdict 只轻提示 + continue/abort，不崩）。
  *
  * 范式判据（ADR-3）：本面板只渲染 review 载荷 + 派发机械控制信号；意图编译归 LLM revision-optimizer
  * （IPC 内部 dispatch）；语义判断（draft 好不好 / 锁定项推断）归 LLM。
  * RevisionIntent.scope.anchor 由 revision-optimizer 产（IPC 内构造），UI 只透 selectedPassage（quote）。
- *
- * art-mode（强行放行）defer Story 7.2——护栏建好后「越界报告→放行」才有意义（prd Out of Scope）。
  *
  * Story 7.2 art-mode（design §1.5）：revision-guard soft-violation pause → art-mode 确认卡（本面板
  * stage='revision-guard' 分支）。作者三档：强行放行（forceAcceptGuard→redo+guardOverride 重跑 guard
@@ -43,9 +47,10 @@ import { InsightCard } from './InsightCard';
  *   卡级三档才是决策单位）；卡级三档 + SideBySideDiff 原位不动。
  * - #6 RevisionIntent 确认卡视觉对齐 insight-* class 族（来源/authority badge 位 + 按钮共用 class）；
  *   全部内容字段与三按钮行为零变更；不折叠（确认卡信息即操作上下文，D7 明确不硬塞折叠范式）。
+ *   09-13 子3 W5：确认卡提取 RevisionIntentConfirmCard 共用组件（draft 精修与终稿卡指令精修两消费面）。
  */
 
-export function ChapterReviewPanel() {
+export function ChapterReviewPanel({ sessionId: propsSessionId }: { sessionId?: string }) {
   const {
     pausedReview,
     reviewResuming,
@@ -63,35 +68,40 @@ export function ChapterReviewPanel() {
     clearCompiledIntent,
     // Story 7.2 art-mode：revision-guard soft-violation 强行放行 action。
     forceAcceptGuard,
+    agentSessionId,
     resolvedLocale,
-  } = useAppStore(useShallow((s) => ({
-    // dogfood T1 Stage 3（r8 键控）：只渲染当前视图会话的 pausedReview（后台会话的链段
-    // pause 不顶前台面板——切回再现）。三动作（reviewContinue 等）内部绑视图会话。
-    pausedReview: s.agentSessionId ? s.pausedReviewBySession[s.agentSessionId] : undefined,
-    reviewResuming: s.reviewResuming,
-    reviewContinue: s.reviewContinue,
-    reviewRedo: s.reviewRedo,
-    reviewAbort: s.reviewAbort,
-    reviewSelection: s.reviewSelection,
-    compiledIntent: s.compiledIntent,
-    intentCompiling: s.intentCompiling,
-    intentCompileError: s.intentCompileError,
-    setReviewSelection: s.setReviewSelection,
-    compileIntent: s.compileIntent,
-    confirmRedoWithIntent: s.confirmRedoWithIntent,
-    clearCompiledIntent: s.clearCompiledIntent,
-    forceAcceptGuard: s.forceAcceptGuard,
-    resolvedLocale: s.resolvedLocale,
-  })));
+  } = useAppStore(useShallow((s) => {
+    // W4 键控：props.sessionId 优先（写作页后台会话直审），兜底视图会话（既有挂载形态零变化）。
+    const sid = propsSessionId ?? s.agentSessionId;
+    return {
+      pausedReview: sid ? s.pausedReviewBySession[sid] : undefined,
+      reviewResuming: sid ? s.reviewResumingBySession[sid] === true : false,
+      reviewContinue: s.reviewContinue,
+      reviewRedo: s.reviewRedo,
+      reviewAbort: s.reviewAbort,
+      reviewSelection: sid ? s.reviewSelectionBySession[sid] : undefined,
+      compiledIntent: sid ? s.compiledIntentBySession[sid] : undefined,
+      intentCompiling: sid ? s.intentCompilingBySession[sid] === true : false,
+      intentCompileError: sid ? s.intentCompileErrorBySession[sid] : undefined,
+      setReviewSelection: s.setReviewSelection,
+      compileIntent: s.compileIntent,
+      confirmRedoWithIntent: s.confirmRedoWithIntent,
+      clearCompiledIntent: s.clearCompiledIntent,
+      forceAcceptGuard: s.forceAcceptGuard,
+      agentSessionId: s.agentSessionId,
+      resolvedLocale: s.resolvedLocale,
+    };
+  }));
+  // 动作尾参的目标会话（props 优先；未解析到会话时动作内部 no-op）。
+  const sid = propsSessionId ?? agentSessionId;
   const { t } = useI18n(resolvedLocale);
   const [feedback, setFeedback] = useState('');
-  // Story 7.1 B1: 本地 UI 状态——粗指令输入 + 确认卡片 JSON edit mode + 编辑态 JSON 文本 + 编辑态 parse 错误。
+  // Story 7.1 B1: 本地 UI 状态——粗指令输入。
   const [instructionInput, setInstructionInput] = useState('');
-  const [editMode, setEditMode] = useState(false);
-  const [editedJson, setEditedJson] = useState('');
-  const [editError, setEditError] = useState<string | null>(null);
 
   if (!pausedReview) return null;
+  // W5：final 分支归 FinalReviewCard（ReviewPhaseView 路由）；防御性 null 防旧挂载点双卡。
+  if (pausedReview.stage === 'final') return null;
 
   const stage = pausedReview.stage;
   const stageLabel =
@@ -120,6 +130,12 @@ export function ChapterReviewPanel() {
 
   const isDraft = stage === 'draft';
   const isRevisionGuard = stage === 'revision-guard';
+  // 09-13 子3 W5（design §4.2 / D-c 意见必填）：挂起重跑 + brief 打回规划环 = 文字必填（空意见
+  // 禁用提交——防 AI 瞎猜修订方向）；legacy draft redo 维持可选（既有行为）。guard 打回走 abort
+  // 车道回草稿重编译（reviewAbort——abort 无 feedback IPC 通道，「必填指令」在重编译步兑现）。
+  const isBrief = stage === 'brief';
+  const redoRequired = isSuspended || isBrief;
+  const redoFeedbackEmpty = feedback.trim() === '';
   // dogfood R2 #83/#84：按钮矩阵由载荷 resumeOptions 驱动（agentEvents/metadataFromPausedSummary 已
   // 透传——挂起卡 ['redo','abort']，真 checkpoint 三钮）。缺省三钮（旧载荷防御）。
   const options = pausedReview.resumeOptions.length > 0
@@ -128,13 +144,14 @@ export function ChapterReviewPanel() {
   // soft-violation pause 时 revisionGuard 必在（slice metadataFromPausedSummary 保证 stage==='revision-guard'
   // && summary.revisionGuard → meta.revisionGuard）；TS optional → 消费处守卫（design §1.5）。
   const revisionGuard = isRevisionGuard ? pausedReview.revisionGuard : undefined;
-  // 编译意图 / 确认 intent 时也视作 resuming（IPC flight），禁用三动作按钮防重入。
+  // 编译意图 / 确认 intent 时也视作 resuming（IPC flight），禁用动作按钮防重入。
   const anyInFlight = reviewResuming || intentCompiling;
 
   const handleRedo = () => {
     const fb = feedback.trim();
+    if (redoRequired && fb === '') return; // D-c：必填门（按钮已禁用——程序化路径双 belt）
     setFeedback('');
-    void reviewRedo(fb || undefined);
+    void reviewRedo(fb || undefined, sid ?? undefined);
   };
 
   // ── Story 7.1 B1：选区指挥精修 handlers ──
@@ -150,58 +167,16 @@ export function ChapterReviewPanel() {
     const draft = typeof draftContent === 'string' ? draftContent : '';
     // chapterContext = 本章 brief（若 pausedReview 带了 briefContent，stringify 作 optimizer 上下文）。
     const ctx = briefDisplay || undefined;
-    void compileIntent(passage, instr, from, to, draft, ctx);
+    void compileIntent(passage, instr, from, to, draft, ctx, sid ?? undefined);
   };
 
   const handleConfirmIntent = (intentToConfirm: RevisionIntent) => {
-    setEditMode(false);
-    setEditedJson('');
-    setEditError(null);
     setInstructionInput('');
-    void confirmRedoWithIntent(intentToConfirm);
-  };
-
-  const handleEditToggle = () => {
-    if (!compiledIntent) return;
-    if (!editMode) {
-      // 进入 edit mode：预填当前 intent 的 JSON。
-      setEditedJson(JSON.stringify(compiledIntent, null, 2));
-      setEditError(null);
-      setEditMode(true);
-    } else {
-      // 退出 edit mode：丢弃编辑态。
-      setEditedJson('');
-      setEditError(null);
-      setEditMode(false);
-    }
-  };
-
-  const handleConfirmFromEdit = () => {
-    if (!editMode) {
-      if (compiledIntent) handleConfirmIntent(compiledIntent);
-      return;
-    }
-    // edit mode：parse editedJson + schema 校验。
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(editedJson);
-    } catch (e) {
-      setEditError(e instanceof Error ? e.message : String(e));
-      return;
-    }
-    const validation = revisionIntentSchema.safeParse(parsed);
-    if (!validation.success) {
-      setEditError(validation.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; '));
-      return;
-    }
-    handleConfirmIntent(validation.data);
+    void confirmRedoWithIntent(intentToConfirm, sid ?? undefined);
   };
 
   const handleCancelCompiled = () => {
-    clearCompiledIntent();
-    setEditMode(false);
-    setEditedJson('');
-    setEditError(null);
+    if (sid) clearCompiledIntent(sid);
   };
 
   return (
@@ -254,7 +229,7 @@ export function ChapterReviewPanel() {
               format="markdown"
               editable={false}
               disableFind
-              onSelectionChange={setReviewSelection}
+              onSelectionChange={(sel) => { if (sid) setReviewSelection(sid, sel); }}
             />
             <p className="chapter-review-meta">{t('agent.reviewWordCount', { count: wordCount })}</p>
           </div>
@@ -296,6 +271,8 @@ export function ChapterReviewPanel() {
                 rightLabel={t('agent.guardAfterLabel')}
               />
             ) : null}
+            {/* 09-13 子3 W5（design §4.2）：锚外零改动说明——diff 只覆盖锚定段落，其余正文未动。 */}
+            <p className="chapter-review-meta chapter-review-guard-anchor-note">{t('agent.guardAnchorNote')}</p>
 
             <div className="chapter-review-intent-field">
               <strong>{t('agent.guardFindingsLabel')}</strong>
@@ -332,7 +309,7 @@ export function ChapterReviewPanel() {
               <button
                 type="button"
                 className="chapter-review-intent-confirm-btn primary chapter-review-guard-force-btn"
-                onClick={() => void forceAcceptGuard()}
+                onClick={() => void forceAcceptGuard(sid ?? undefined)}
                 disabled={anyInFlight}
               >
                 {t('agent.guardForceAccept')}
@@ -340,7 +317,7 @@ export function ChapterReviewPanel() {
               <button
                 type="button"
                 className="chapter-review-intent-edit-btn chapter-review-guard-revise-btn"
-                onClick={() => void reviewAbort()}
+                onClick={() => void reviewAbort(sid ?? undefined)}
                 disabled={anyInFlight}
                 title={t('agent.guardReviseHint')}
               >
@@ -349,7 +326,7 @@ export function ChapterReviewPanel() {
               <button
                 type="button"
                 className="chapter-review-intent-cancel-btn chapter-review-guard-cancel-btn"
-                onClick={() => void reviewAbort()}
+                onClick={() => void reviewAbort(sid ?? undefined)}
                 disabled={anyInFlight}
               >
                 {t('agent.cancel')}
@@ -389,7 +366,7 @@ export function ChapterReviewPanel() {
             <button
               type="button"
               className="chapter-review-clear-selection-btn"
-              onClick={() => setReviewSelection(null)}
+              onClick={() => { if (sid) setReviewSelection(sid, null); }}
               disabled={anyInFlight}
             >
               {t('agent.clearSelection')}
@@ -403,170 +380,77 @@ export function ChapterReviewPanel() {
         <p className="chapter-review-intent-error">{t('agent.intentCompileFailed', { error: intentCompileError })}</p>
       ) : null}
 
-      {/* Story 7.1 B1：RevisionIntent 确认卡片（design §1[3] / §4.2）。 */}
+      {/* Story 7.1 B1：RevisionIntent 确认卡片（design §1[3] / §4.2）。W5 提取共用组件
+          （RevisionIntentConfirmCard——draft 精修与终稿卡指令精修两消费面，DOM/类名/键名零变更）。 */}
       {isDraft && compiledIntent ? (
-        <div className="chapter-review-intent-card" role="region" aria-label={t('agent.intentCardTitle')}>
-          {/* Story 3.7 #6（design D7）：来源 badge（修订指令）并入标题行——视觉对齐 InsightCard header
-              语言；纯展示加法，内容与操作零变更，不折叠（确认卡信息即操作上下文）。 */}
-          <div className="chapter-review-intent-card-title-row">
-            <h4 className="chapter-review-intent-card-title">{t('agent.intentCardTitle')}</h4>
-            <span className="insight-card-badge insight-card-badge--source">
-              {t('agent.insight.sourceRevisionIntent')}
-            </span>
-          </div>
-
-          <div className="chapter-review-intent-field">
-            <strong>{t('agent.intentChangeLabel')}</strong>
-            <span>{compiledIntent.change.summary}</span>
-            {compiledIntent.change.details && compiledIntent.change.details.length > 0 ? (
-              <ul className="chapter-review-intent-details">
-                {compiledIntent.change.details.map((d, i) => (
-                  <li key={i}>{d}</li>
-                ))}
-              </ul>
-            ) : null}
-          </div>
-
-          <div className="chapter-review-intent-field">
-            <strong>{t('agent.intentLockedLabel')}</strong>
-            {compiledIntent.lockedItems.length === 0 ? (
-              <span className="chapter-review-intent-locked-empty">{t('agent.intentNoLocked')}</span>
-            ) : (
-              <ul className="chapter-review-intent-locked-list">
-                {compiledIntent.lockedItems.map((item, i) => (
-                  <li key={i} className={`chapter-review-intent-locked-item is-${item.authority}`}>
-                    {/* Story 3.7 #6（design D7）：authority 标签并入 badge 位（insight-card-badge 基座 +
-                        hard/soft 语义色 modifier，原 is-hard/is-soft token 色分保留）。 */}
-                    <span className={`insight-card-badge insight-card-badge--${item.authority}`}>
-                      {item.authority === 'hard' ? t('agent.intentHardLock') : t('agent.intentSoftLock')}
-                    </span>
-                    <span className="chapter-review-intent-locked-field">{item.field}</span>
-                    {item.evidence ? (
-                      <span className="chapter-review-intent-locked-evidence">{item.evidence}</span>
-                    ) : null}
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
-
-          <div className="chapter-review-intent-field">
-            <strong>{t('agent.intentRationaleLabel')}</strong>
-            <span>{compiledIntent.rationale.note}</span>
-          </div>
-
-          <div className="chapter-review-intent-field">
-            <strong>{t('agent.intentProvenanceLabel')}</strong>
-            <div className="chapter-review-intent-provenance">
-              <p>
-                <span className="insight-card-badge insight-card-badge--hard">{t('agent.intentHardTag')}</span>
-                {compiledIntent.provenance.rawUserInstruction}
-              </p>
-              <p>
-                <span className="insight-card-badge insight-card-badge--soft">{t('agent.intentSoftTag')}</span>
-                {compiledIntent.provenance.compilerNote}
-              </p>
-            </div>
-          </div>
-
-          {/* Edit mode：JSON textarea（人改 intent，动锁定项或调整 change）。 */}
-          {editMode ? (
-            <div className="chapter-review-intent-edit">
-              <label htmlFor="chapter-review-intent-json">{t('agent.intentEditJson')}</label>
-              <textarea
-                id="chapter-review-intent-json"
-                className="chapter-review-intent-json"
-                value={editedJson}
-                onChange={(e) => {
-                  setEditedJson(e.target.value);
-                  setEditError(null);
-                }}
-                disabled={anyInFlight}
-                rows={10}
-              />
-              {editError ? (
-                <p className="chapter-review-intent-error">{t('agent.intentEditParseFailed', { error: editError })}</p>
-              ) : null}
-            </div>
-          ) : null}
-
-          <div className="chapter-review-intent-actions">
-            {/* Story 3.7 #6（design D7）：三按钮并入 InsightCard 按钮语言（共用 insight-card-btn class
-                族：主操作=apply 填充 / 编辑·取消=secondary 描边）——纯 class 组合，事件处理零变更。 */}
-            <button
-              type="button"
-              className="chapter-review-intent-confirm-btn insight-card-btn insight-card-btn--apply"
-              onClick={handleConfirmFromEdit}
-              disabled={anyInFlight}
-            >
-              {t('agent.intentConfirmRedo')}
-            </button>
-            <button
-              type="button"
-              className="chapter-review-intent-edit-btn insight-card-btn insight-card-btn--secondary"
-              onClick={handleEditToggle}
-              disabled={anyInFlight}
-            >
-              {editMode ? t('agent.intentExitEdit') : t('agent.intentRevise')}
-            </button>
-            <button
-              type="button"
-              className="chapter-review-intent-cancel-btn insight-card-btn insight-card-btn--secondary"
-              onClick={handleCancelCompiled}
-              disabled={anyInFlight}
-            >
-              {t('agent.cancel')}
-            </button>
-          </div>
-        </div>
+        <RevisionIntentConfirmCard
+          compiledIntent={compiledIntent}
+          inFlight={anyInFlight}
+          onConfirm={handleConfirmIntent}
+          onCancel={handleCancelCompiled}
+        />
       ) : null}
 
-      {/* C trigger（redo 反馈升级 defer 7.1；现有路径保留——design §0）：textarea + Redo 按钮。 */}
-      {isDraft ? (
-        <textarea
-          className="chapter-review-feedback"
-          value={feedback}
-          onChange={(e) => setFeedback(e.target.value)}
-          placeholder={t('agent.reviewRedoFeedback')}
-          disabled={anyInFlight}
-          rows={3}
-        />
+      {/* C trigger（redo 反馈升级 defer 7.1；现有路径保留——design §0）：textarea + Redo 按钮。
+          W5（D-c 意见必填）：挂起/brief 的 redo 意见必填（空意见禁用——placeholder 引导方向）；
+          legacy draft 维持可选。 */}
+      {isDraft || isSuspended || isBrief ? (
+        <div className="chapter-review-feedback-block">
+          <textarea
+            className="chapter-review-feedback"
+            value={feedback}
+            onChange={(e) => setFeedback(e.target.value)}
+            placeholder={t(
+              isSuspended ? 'agent.suspensionRedoPlaceholder'
+                : isBrief ? 'agent.briefRedoPlaceholder'
+                  : 'agent.reviewRedoFeedback',
+            )}
+            disabled={anyInFlight}
+            rows={3}
+          />
+          {redoRequired && redoFeedbackEmpty ? (
+            <p className="chapter-review-feedback-required">{t('agent.reviewRedoRequired')}</p>
+          ) : null}
+        </div>
       ) : null}
 
       {/* Story 7.2：revision-guard art-mode 卡自带三档按钮（强行放行/改指令/取消），不重复默认 actions。 */}
       {/* dogfood R2 #83/#84：按钮由 resumeOptions 驱动——挂起卡 ['redo','abort']（无「继续写」：挂起无正文
           可续且不带偏离批准，continue 是死循环入口）；真 checkpoint 三钮照旧。redo 在 draft 审阅与挂起
           决断两态都给（挂起 redo = 维持原案/带指令重跑——章档案 approvedDeviations 机制使已亮牌偏离
-          不再挂起，writer-node 单源）。 */}
+          不再挂起，writer-node 单源）。W5：brief 亦给 redo（打回规划环——shell 侧 isPlanLoopPause 切
+          brief-compiler 重编）。 */}
       {!isRevisionGuard ? (
         <div className="chapter-review-actions">
           {/* check 补：!isSuspended 双 belt——挂起卡恒无「继续写」不只靠上游载荷卫生（agentEvents 缺省
               回退三钮 / 旧回放载荷均可能带 continue），渲染层结构性封死 #84 死循环入口。 */}
+          {/* W5：'accept' 钮随 final 分支迁 FinalReviewCard（本面板 stage 恒非 final——旧载荷防御位
+              不再渲染 accept）。 */}
           {options.includes('continue') && !isSuspended ? (
             <button
               type="button"
               className="chapter-review-continue-btn primary"
-              onClick={() => void reviewContinue()}
+              onClick={() => void reviewContinue(sid ?? undefined)}
               disabled={anyInFlight}
             >
               {t('agent.reviewContinue')}
             </button>
           ) : null}
-          {options.includes('redo') && (isDraft || isSuspended) ? (
+          {options.includes('redo') && (isDraft || isSuspended || isBrief) ? (
             <button
               type="button"
               className="chapter-review-redo-btn"
               onClick={handleRedo}
-              disabled={anyInFlight}
+              disabled={anyInFlight || (redoRequired && redoFeedbackEmpty)}
             >
-              {t('agent.reviewRedo')}
+              {isBrief ? t('agent.briefRedo') : t('agent.reviewRedo')}
             </button>
           ) : null}
           {options.includes('abort') ? (
             <button
               type="button"
               className="chapter-review-abort-btn"
-              onClick={() => void reviewAbort()}
+              onClick={() => void reviewAbort(sid ?? undefined)}
               disabled={anyInFlight}
             >
               {t('agent.reviewAbort')}

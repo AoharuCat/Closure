@@ -147,8 +147,14 @@ export type CreativeFieldsSlice = {
   setPendingPatch: (sessionId: string, patch: ProjectFieldPatch | null) => void;
   /** 清某会话的挂起 patch 键（deleteAgentSession 用）。 */
   clearPendingPatchFor: (sessionId: string) => void;
-  togglePatchSelection: (field: string) => void;
-  applySelectedPatches: () => ProjectFieldPatch | null;
+  /** W4（D-g 切分）：尾参 sessionId?——写作页产物区按链会话挂载 chapter_candidate 审阅时传目标会话（缺省 = 视图会话）。 */
+  togglePatchSelection: (field: string, sessionId?: string) => void;
+  /**
+   * W4（D-g 切分）：尾参 sessionId?（同上）+ excludeFields?——对话栏过滤挂载（chapter_candidate
+   * 不渲染全尺寸卡）传排除集：隐藏的 chapter_candidate 不随「Apply Selected」静默落盘（把关面
+   * 看不到内容不应用），且**继续挂起**（重 stage 进原键——写作页产物区审阅落盘，不清丢）。
+   */
+  applySelectedPatches: (sessionId?: string, excludeFields?: string[]) => ProjectFieldPatch | null;
   /** 写入 one-shot 跳转目标（null 等价清空）。 */
   setOutlineFocusTarget: (target: OutlineFocusTarget | null) => void;
   /** 消费后清空（幂等——OutlineEditor effect 清费，StrictMode 双跑无害）。 */
@@ -402,16 +408,17 @@ export const createCreativeFieldsSlice: StateCreator<
     return { pendingPatchBySession: next };
   }),
 
-  togglePatchSelection: (field) => {
+  togglePatchSelection: (field, sessionId) => {
     // 视图会话作用域（PatchReviewPanel 只渲染视图会话的键，toggle 从面板发出）。
-    const sessionId = get().agentSessionId;
-    if (!sessionId) return;
-    const entry = get().pendingPatchBySession[sessionId];
+    // W4（D-g 切分）：尾参 sessionId?——写作页产物区挂载时按目标会话键控 toggle。
+    const sid = sessionId ?? get().agentSessionId;
+    if (!sid) return;
+    const entry = get().pendingPatchBySession[sid];
     if (!entry) return;
     set({
       pendingPatchBySession: {
         ...get().pendingPatchBySession,
-        [sessionId]: {
+        [sid]: {
           ...entry,
           selections: { ...entry.selections, [field]: !entry.selections[field] },
         },
@@ -433,9 +440,11 @@ export const createCreativeFieldsSlice: StateCreator<
     return cur;
   },
 
-  applySelectedPatches: () => {
+  applySelectedPatches: (sessionIdParam, excludeFields) => {
     // 视图会话作用域（PatchReviewPanel accept 从面板发出，owner 恒 = agentSessionId）。
-    const sessionId = get().agentSessionId;
+    // W4（D-g 切分）：尾参 sessionId?（写作页产物区按链会话挂载）+ excludeFields?（对话栏
+    // 过滤挂载排除 chapter_candidate——隐藏 patch 不静默落盘且继续挂起供写作页审阅）。
+    const sessionId = sessionIdParam ?? get().agentSessionId;
     const entry = sessionId ? get().pendingPatchBySession[sessionId] : undefined;
     if (!entry || !sessionId) return null;
     const { patch: pendingPatch, selections: patchSelections, issues: pendingPatchIssues } = entry;
@@ -448,9 +457,36 @@ export const createCreativeFieldsSlice: StateCreator<
       return { pendingPatchBySession: next };
     });
 
-    const selectedPatches = pendingPatch.patches.filter((p) => patchSelections[p.field]);
+    // W4（D-g 切分）：被排除的 patch（对话栏过滤隐藏的 chapter_candidate——链产物）不随本批
+    // 落盘清场——重 stage 进原键继续挂起（写作页产物区审阅落盘，防静默清丢），selections
+    // 重置默认选中；排除集空 = 全批语义照旧清键。
+    const excludedPatches = excludeFields
+      ? pendingPatch.patches.filter((p) => excludeFields.includes(p.field as string))
+      : [];
+    const settlePending = () => {
+      if (excludedPatches.length === 0) {
+        clearPending();
+        return;
+      }
+      const restagedSelections: Record<string, boolean> = {};
+      for (const p of excludedPatches) restagedSelections[p.field] = true;
+      set({
+        pendingPatchBySession: {
+          ...get().pendingPatchBySession,
+          [sessionId]: {
+            patch: { ...pendingPatch, patches: excludedPatches },
+            selections: restagedSelections,
+            issues: [],
+          },
+        },
+      });
+    };
+
+    const selectedPatches = pendingPatch.patches.filter(
+      (p) => patchSelections[p.field] && !(excludeFields ?? []).includes(p.field as string),
+    );
     if (selectedPatches.length === 0) {
-      clearPending();
+      settlePending();
       return null;
     }
 
@@ -581,7 +617,7 @@ export const createCreativeFieldsSlice: StateCreator<
         ? { currentProject: mergeOverviewIntoProject(currentProject, overviewData) }
         : {})
     });
-    clearPending();
+    settlePending();
 
     // Persist to disk. Creative fields → fieldSyncBridge (project.yaml, with
     // version/lock checks). Overview → saveProject (project.json + .yaml).

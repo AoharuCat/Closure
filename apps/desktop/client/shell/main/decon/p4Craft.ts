@@ -25,29 +25,25 @@ import {
   listDeconProducts,
   upsertDeconProduct,
 } from '../db/closure-decon';
-import { getMaterialRow } from '../db/materialIndexer';
 import { getLogger } from '../logger';
 import { splitParagraphBlocks, type MaterialParagraphBlock } from '../ipc/toolHandlers/materialIngest';
 import {
   DECON_STALE_NOTE,
   capDeconUnit,
   checkDeconRunBoundary,
-  deconErrMsg,
-  estimateDeconCallTokens,
   failDeconUnit,
+  loadExtractableMaterial,
   loadRunningDeconJob,
   readDeconDerivedTextFor,
-  resolveDeconActualTokens,
+  runDeconLlmCall,
   sha256DeconContent,
-  writeDeconCost,
   writeDeconPassState,
   type DeconBoundaryStop,
 } from './deconRun';
+import { buildChapterHeadings as buildDeconChapterHeadings, chapterShortLabel as deconChapterShortLabel, chapterFullLabel as deconChapterFullLabel, joinChapterShortLabels as joinDeconChapterShortLabels } from '../db/chapterHeadings';
 import { getDeconLlmCore, type DeconGenerateText } from './deconLlmCore';
 import {
   DECON_HUOKE_CHAPTER_WINDOW,
-  accumulateDeconCost,
-  wouldExceedDeconBudget,
 } from './deconBudget';
 import { decideDeconPassReentry, extractMaterialId, transitionDeconJob } from './deconJob';
 import { buildDeconAnchor, isQuoteInSpan, type DeconParaRange } from './p1Extract';
@@ -309,15 +305,18 @@ function sliceQuote(derived: string, span: DeconSpan): string {
   return derived.slice(span.charStart, span.charEnd).slice(0, DECON_P4_ARC_QUOTE_CHAR_CAP).replace(/\s+/g, ' ').trim();
 }
 
-/** 弧级单章块装配（事件/伏笔的引文 = facts span 切原文硬截——可引用窗口随行）。纯函数。 */
+/**
+ * 弧级单章块装配（事件/伏笔的引文 = facts span 切原文硬截——可引用窗口随行）。纯函数。
+ * `chapterLabel` = chapterIndex → 真实章标行（C5——index+1 算术在简介伪章形态下错位，F19）。
+ */
 export function buildDeconP4ArcChapterBlock(
   ch: { index: number; title: string | null; facts: DeconFacts | null },
   derived: string,
+  chapterLabel: (chapterIndex: number) => string,
 ): DeconP4ArcChapterBlock {
   const windows: DeconP4AnchorWindow[] = [];
   const lines: string[] = [];
-  const title = ch.title !== null ? `《${ch.title}》` : '';
-  lines.push(`第${ch.index + 1}章${title}概要：${ch.facts?.synopsis ?? '（无概要——该章无事实提取行）'}`);
+  lines.push(`${chapterLabel(ch.index)}概要：${ch.facts?.synopsis ?? '（无概要——该章无事实提取行）'}`);
   if (ch.facts !== null) {
     for (const e of ch.facts.events) {
       lines.push(
@@ -337,10 +336,15 @@ export function buildDeconP4ArcChapterBlock(
   return { chapterIndex: ch.index, text: lines.join('\n'), windows };
 }
 
-/** 出场退场表（弧内实体 → 弧内出现章 + 全书首末章——renshe 等弧级维预注）。纯函数。 */
+/**
+ * 出场退场表（弧内实体 → 弧内出现章 + 全书首末章——renshe 等弧级维预注）。纯函数。
+ * `chapterLabel` = chapterIndex → 真实章标短标签（C5——F19 章号错位根治；多章并排走
+ * joinDeconChapterShortLabels 压缩形态）。
+ */
 export function buildDeconP4Appearances(
   arc: Pick<DeconArc, 'fromChapter' | 'toChapter'>,
   factsByChapter: ReadonlyMap<number, DeconFacts>,
+  chapterLabel: (chapterIndex: number) => string,
 ): { lines: string[]; droppedForCap: number } {
   const arcChapters: number[] = [];
   for (const [chapterIndex, facts] of factsByChapter) {
@@ -368,7 +372,7 @@ export function buildDeconP4Appearances(
     .sort((a, b) => b[1].length - a[1].length || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
     .map(([name, chapters]) => {
       const wide = nameBookWide.get(name) ?? { first: chapters[0]!, last: chapters.at(-1)! };
-      return `- ${name}：弧内出现第 ${chapters.map((c) => c + 1).join('、')} 章；全书首现第 ${wide.first + 1} 章、末现第 ${wide.last + 1} 章`;
+      return `- ${name}：弧内出现${joinDeconChapterShortLabels(chapters.map(chapterLabel))}；全书首现 ${chapterLabel(wide.first)}、末现 ${chapterLabel(wide.last)}`;
     });
   const kept = rows.slice(0, DECON_P4_APPEARANCE_CAP);
   return { lines: kept, droppedForCap: rows.length - kept.length };
@@ -471,6 +475,8 @@ export interface DeconP4ArcPromptInput {
   clusters: readonly DeconSceneClusterGroup[];
   /** 抽样段（限 wenbi 细读维——design §3.2；当前登记 wenbi 无弧面，参数保留演进位）。 */
   sampleBlocks: ReadonlyArray<{ chapterIndex: number; blockIndex: number }>;
+  /** chapterIndex → 真实章标短标签（C5——弧信息头/组范围的章号展示不再 index 算术）。 */
+  chapterLabel: (chapterIndex: number) => string;
 }
 
 /** 弧级 user prompt（概要+统计+出场退场+引文窗口+聚类+可选抽样段）。 */
@@ -494,7 +500,7 @@ export function buildDeconP4ArcUserPrompt(input: DeconP4ArcPromptInput): {
   ];
   const arcTitle = input.arc.title !== null ? `（${input.arc.title}）` : '';
   const sections: string[] = [
-    `【本弧信息：弧 ${input.arc.index}${arcTitle}——第 ${input.arc.fromChapter + 1} 至 ${input.arc.toChapter + 1} 章${input.chapterBlocks.length < input.arc.chapterCount ? `（本组含第 ${(input.chapterBlocks[0]?.chapterIndex ?? 0) + 1}–${(input.chapterBlocks.at(-1)?.chapterIndex ?? 0) + 1} 章，弧输入过大分组分析——跨组结论如有出入保留分歧如实写）` : ''}）】`,
+    `【本弧信息：弧 ${input.arc.index}${arcTitle}——${input.chapterLabel(input.arc.fromChapter)} 至 ${input.chapterLabel(input.arc.toChapter)}${input.chapterBlocks.length < input.arc.chapterCount ? `（本组含 ${input.chapterLabel(input.chapterBlocks[0]?.chapterIndex ?? input.arc.fromChapter)}–${input.chapterLabel(input.chapterBlocks.at(-1)?.chapterIndex ?? input.arc.toChapter)}，弧输入过大分组分析——跨组结论如有出入保留分歧如实写）` : ''}）】`,
     '【弧计量统计（纯代码算数——数字直接采信，不重算）】',
     ...statLines,
     '',
@@ -512,7 +518,7 @@ export function buildDeconP4ArcUserPrompt(input: DeconP4ArcPromptInput): {
       '',
       '【同类场景聚类（纯代码候选——按人物阵容相似度归组；变奏判断归你）】',
       ...input.clusters.map(
-        (g) => `- 组：第 ${g.chapters.map((c) => c + 1).join('、')} 章（共同人物：${g.sharedEntities.join('、')}）`,
+        (g) => `- 组：${joinDeconChapterShortLabels(g.chapters.map(input.chapterLabel))}（共同人物：${g.sharedEntities.join('、')}）`,
       ),
     );
   }
@@ -610,6 +616,8 @@ export interface DeconP4CraftDeps {
   readDerivedText?: (material: Material) => string | null;
   /** 逐 unit running 进度事件注入（CR-8——runDeconPassSequence 传 stamped notify）。 */
   notify?: (event: DeconProgressEvent) => void;
+  /** 材料读重试等待注入（C4-F12——测试零延迟；缺省 ~1s×10 实时钟）。 */
+  waitMs?: (ms: number) => Promise<void>;
   now?: () => Date;
 }
 
@@ -702,7 +710,7 @@ export async function runDeconP4Craft(
   for (const dim of dimensions) {
     if (DECON_P4_GRANULARITY[dim] === undefined) {
       const message = `维度 ${dim} 不在手艺粒度登记（DECON_P4_GRANULARITY）——job 维度子集与目录漂移`;
-      failDeconUnit(jobId, `p4:${dim}`, 'all', message, nowIso());
+      transitionDeconJob(jobId, 'fail', message);
       return { status: 'failed', message, stats: emptyStats() };
     }
   }
@@ -710,16 +718,18 @@ export async function runDeconP4Craft(
     return { status: 'done', stats: { ...emptyStats(), dimensions: 0 } }; // 零手艺维（coarse/coarse+style）——无 unit 直接 done
   }
 
-  const material = getMaterialRow(extractMaterialId(job.materialRef));
-  if (material === null || material.chapters.length === 0) {
-    const message = `材料 ${job.materialRef} 不存在或零章——P4 无可分析章`;
-    failDeconUnit(jobId, `p4:${dimensions[0]!}`, 'all', message, nowIso());
-    return { status: 'failed', message, stats: emptyStats() };
+  // C4-F12 材料读重试 + C4-F16 写侧（材料级/登记级前置失败只 transitionDeconJob——
+  // job 行 error 承载，不写 (pass,'all',failed) 化石行）。
+  const loaded = await loadExtractableMaterial(extractMaterialId(job.materialRef), { waitMs: deps.waitMs });
+  if (!loaded.ok) {
+    transitionDeconJob(jobId, 'fail', loaded.message);
+    return { status: 'failed', message: loaded.message, stats: emptyStats() };
   }
+  const material = loaded.material;
   const derived = (deps.readDerivedText ?? readDeconDerivedTextFor)(material);
   if (derived === null) {
     const message = '派生 .md 读取失败（缺失或车道不可解析）——无法锚定手艺层基面';
-    failDeconUnit(jobId, `p4:${dimensions[0]!}`, 'all', message, nowIso());
+    transitionDeconJob(jobId, 'fail', message);
     return { status: 'failed', message, stats: emptyStats() };
   }
   if (sha256DeconContent(derived) !== job.derivedHash) {
@@ -729,9 +739,14 @@ export async function runDeconP4Craft(
   const blocks = splitParagraphBlocks(derived);
   if (blocks.length === 0) {
     const message = '材料无有效段落（派生 .md 全空白）——不可分析';
-    failDeconUnit(jobId, `p4:${dimensions[0]!}`, 'all', message, nowIso());
+    transitionDeconJob(jobId, 'fail', message);
     return { status: 'failed', message, stats: emptyStats() };
   }
+
+  // C5：chapterIndex → 真实章标行映射（弧信息头/出场退场/聚类/概要块的章号展示——F19）。
+  const headings = buildDeconChapterHeadings(derived, material.chapters);
+  const chShort = (chapterIndex: number): string => deconChapterShortLabel(headings.get(chapterIndex), chapterIndex);
+  const chFull = (chapterIndex: number): string => deconChapterFullLabel(headings.get(chapterIndex), chapterIndex);
 
   // 惰性资源面（CR-10）：facts / labels / arcs / stats 只在首个消费 unit 前加载。
   let generate: DeconGenerateText | undefined;
@@ -877,11 +892,11 @@ export async function runDeconP4Craft(
           const facts = requireFacts();
           const arcChapters = material.chapters.filter((c) => c.index >= arc.fromChapter && c.index <= arc.toChapter);
           const chapterBlocks = arcChapters.map((c) =>
-            buildDeconP4ArcChapterBlock({ index: c.index, title: c.title, facts: facts.get(c.index) ?? null }, derived),
+            buildDeconP4ArcChapterBlock({ index: c.index, title: c.title, facts: facts.get(c.index) ?? null }, derived, chFull),
           );
           const groups = splitDeconArcGroups(chapterBlocks.map((b) => b.text.length));
           stats.arcGroups += groups.length;
-          const appearances = buildDeconP4Appearances(arc, facts);
+          const appearances = buildDeconP4Appearances(arc, facts, chShort);
           const clusters =
             dim === 'duizhao'
               ? clusterDeconSameScenes(
@@ -899,6 +914,7 @@ export async function runDeconP4Craft(
               appearances,
               clusters,
               sampleBlocks,
+              chapterLabel: chShort,
             });
             prompts.push(built.prompt);
             promptWindows.push([...built.windows]);
@@ -923,38 +939,36 @@ export async function runDeconP4Craft(
         const parts: DeconP4FindingsResponse[] = [];
         for (let gi = 0; gi < prompts.length; gi++) {
           const user = prompts[gi]!;
-          const est = estimateDeconCallTokens(systemPrompt, user, DECON_P4_FINDINGS_MAX_TOKENS);
-          if (wouldExceedDeconBudget(job.budget, cost, pass, est)) {
-            const note = `${pass} ${unit} 问题单预算超限（本次预估 ${est} tokens，已累计 ${cost.totalTokens}）——已诚实挂起（不烧 token），调整预算后续跑`;
-            capDeconUnit(jobId, pass, unit, note, nowIso());
-            return { status: 'capped', message: note, stats };
+          // C3 脚手架单源（预算门→调用→记账→length 升帽重试一次）；截断仍挂 = failed
+          // （findings 语义面——半程产物不可续，mirror p1b 旧语义）。
+          const call = await runDeconLlmCall({
+            jobId,
+            pass,
+            unit,
+            slot: 'review-judge',
+            system: systemPrompt,
+            user,
+            maxTokens: DECON_P4_FINDINGS_MAX_TOKENS,
+            budget: job.budget,
+            cost,
+            job,
+            generate,
+            notify: deps.notify,
+            nowIso,
+            label: `${pass} ${unit} 问题单`,
+          });
+          if (!call.ok) {
+            if (call.kind === 'budget-capped') {
+              capDeconUnit(jobId, pass, unit, call.note, nowIso());
+              return { status: 'capped', message: call.note, stats };
+            }
+            if (call.kind === 'length') {
+              return failUnit(`${call.note}——已挂起（不落半程产物）`);
+            }
+            return failUnit(call.note); // error / empty
           }
-          let text = '';
-          let finishReason: string | undefined;
-          let usage: { promptTokens?: number; completionTokens?: number; totalTokens?: number } | undefined;
-          try {
-            const response = await generate({
-              slot: 'review-judge',
-              system: systemPrompt,
-              user,
-              maxTokens: DECON_P4_FINDINGS_MAX_TOKENS,
-            });
-            text = (response?.text ?? '').trim();
-            finishReason = response?.finishReason;
-            usage = response?.usage;
-          } catch (err) {
-            return failUnit(`${pass} ${unit} 问题单调用失败：${deconErrMsg(err)}`);
-          }
-          const actual = resolveDeconActualTokens(systemPrompt, user, text, usage);
-          cost = accumulateDeconCost(cost, pass, actual.tokens, 1, actual.estimated);
-          writeDeconCost(jobId, job, cost, nowIso());
-          if (finishReason === 'length') {
-            // findings 语义面（mirror p1b）：截断的半程 findings 不可续——failed 诚实挂起。
-            return failUnit(`${pass} ${unit} 问题单输出因 token 上限截断（finishReason=length）——已挂起（不落半程产物）`);
-          }
-          if (!text) {
-            return failUnit(`${pass} ${unit} 问题单返回空回复——已挂起`);
-          }
+          const text = call.text;
+          cost = call.cost;
           const parsed = parseDeconFindingsResponse(text);
           if (parsed === null) {
             return failUnit(`${pass} ${unit} 问题单输出不可解析为 JSON 对象——整体拒收（不硬给 findings）`);

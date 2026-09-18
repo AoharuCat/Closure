@@ -210,6 +210,9 @@ export async function runVisionAnalysis(opts: {
   try {
     const response: TextGenerationResponse = await generateText(resolved, {
       model: resolved.modelId,
+      // 09-12 usage-panel：视觉分析主调用 = vision-analysis 流程标签（design §0 表；
+      // canary 探针是设置页诊断调用，刻意不标注）。
+      taskType: 'vision-analysis',
       messages: [{
         role: 'user',
         content: [

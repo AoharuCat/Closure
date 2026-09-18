@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import path from 'node:path';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { rmBestEffort } from './rmBestEffort';
 import type { ApiKeyEntry, ModelConfig } from '@orison/shared-contracts';
 
@@ -20,8 +21,8 @@ vi.mock('electron', () => ({
 }));
 
 import { _setModelConfigDirForTest, registerConfigIpc } from '../main/ipc/configIpc';
-import { handleGenerateText, handleGenerateTextStream, registerModelGatewayIpc, resolveEmbeddingModel, resolveModel, _resetLaneWarnForTest } from '../main/ipc/modelGatewayIpc';
-import { ProtocolTimeoutError } from '@orison/model-protocols';
+import { enrichSlotAssignment, handleGenerateText, handleGenerateTextStream, registerModelGatewayIpc, resolveEmbeddingModel, resolveModel, wasAntigravityCliUsed, _resetAntigravityCliUsedForTest, _resetLaneWarnForTest } from '../main/ipc/modelGatewayIpc';
+import { ProtocolTimeoutError, setAntigravityCliGenerateForTest } from '@orison/model-protocols';
 
 const TEST_MODEL_DIR = path.join(process.cwd(), 'test-tmp-model-gateway');
 const ORIGINAL_FETCH = globalThis.fetch;
@@ -490,6 +491,194 @@ describe('resolveModel vision assembly (B1)', () => {
   });
 });
 
+// 09-12 agy provider：resolveModel 的第三形态装配（mirror thinkingKind/limits、vision
+// 两轮的 conditional-spread 写法）。CLI 键：cliExecutable 挂上 + HTTP 凭据填 ''（字段
+// 非可选保形）；HTTP 键：cliExecutable 键 ABSENT、凭据原值直通（?? 永不触发）；CLI 键
+// 缺 cliExecutable（手改盘文件——读盘路径不经 refine）在解析点响亮报错。
+describe('resolveModel CLI form assembly (09-12 agy provider)', () => {
+  const AGY_KEY: ApiKeyEntry = {
+    id: 'key_agy',
+    name: 'Antigravity CLI',
+    protocol: 'antigravity-cli',
+    cliExecutable: 'C:\\Users\\me\\AppData\\Local\\agy\\bin\\agy.exe',
+    models: [
+      { id: 'gemini-3.8-pro-high', alias: 'Gemini 3.8 Pro (high)', capability: 'text', enabled: true },
+    ],
+  };
+  const HTTP_KEY: ApiKeyEntry = {
+    id: 'key_http',
+    name: 'HTTP relay',
+    protocol: 'openai-compatible',
+    apiKey: 'sk-http',
+    baseUrl: 'https://relay.example.com/v1',
+    models: [
+      { id: 'gpt-4o-mini', alias: 'GPT 4o mini', capability: 'text', enabled: true },
+    ],
+  };
+  const CONFIG: ModelConfig = { keys: [AGY_KEY, HTTP_KEY] };
+
+  it('CLI 键 → cliExecutable 挂上 + baseUrl/apiKey 填 \'\'（协议层 CLI 驱动器消费面）', () => {
+    const resolved = resolveModel({ keyId: 'key_agy', modelId: 'gemini-3.8-pro-high' }, CONFIG);
+    expect(resolved.protocol).toBe('antigravity-cli');
+    expect(resolved.cliExecutable).toBe('C:\\Users\\me\\AppData\\Local\\agy\\bin\\agy.exe');
+    expect(resolved.baseUrl).toBe('');
+    expect(resolved.apiKey).toBe('');
+  });
+
+  it('CLI 键的 vision 标记形态感知省略（09-12 子2 W6——gemini-* registry 标 vision 但 CLI 通道不收 b64 图片，转述安全路径判据）', () => {
+    const cliResolved = resolveModel({ keyId: 'key_agy', modelId: 'gemini-3.8-pro-high' }, CONFIG);
+    expect('vision' in cliResolved).toBe(false);
+    // 对照：同族模型挂 HTTP 键 vision 照标（HTTP 行为零变化）。
+    const AGY_MODEL_ON_HTTP: ApiKeyEntry = {
+      id: 'key_gemini_http',
+      name: 'Gemini HTTP relay',
+      protocol: 'openai-compatible',
+      apiKey: 'sk-g',
+      baseUrl: 'https://gemini.example.com/v1',
+      models: [{ id: 'gemini-3.8-pro-high', alias: 'Gemini 3.8 Pro', capability: 'text', enabled: true }],
+    };
+    const httpResolved = resolveModel(
+      { keyId: 'key_gemini_http', modelId: 'gemini-3.8-pro-high' },
+      { keys: [AGY_MODEL_ON_HTTP] },
+    );
+    expect(httpResolved.vision).toBe(true);
+  });
+
+  it('HTTP 键 → cliExecutable 键 ABSENT + 凭据原值直通（零回归门）', () => {
+    const resolved = resolveModel({ keyId: 'key_http', modelId: 'gpt-4o-mini' }, CONFIG);
+    expect('cliExecutable' in resolved).toBe(false);
+    expect(resolved.baseUrl).toBe('https://relay.example.com/v1');
+    expect(resolved.apiKey).toBe('sk-http');
+  });
+
+  it('CLI 键缺 cliExecutable（病态盘文件）→ 解析点响亮报错（不静默降级 HTTP）', () => {
+    const broken: ModelConfig = {
+      keys: [{ ...AGY_KEY, cliExecutable: undefined }],
+    };
+    expect(() => resolveModel({ keyId: 'key_agy', modelId: 'gemini-3.8-pro-high' }, broken))
+      .toThrow(/cliExecutable/);
+  });
+
+  // ── CR-19（09-12 agy provider CR 批）：HTTP 键缺凭据响亮化 ──
+  // 盘上手编坏配置（读盘路径不经 entry refine）此前被 `?? ''` 静默化成空凭据 →
+  // 神秘网络失败；现在在 resolveModel 报配置错误（对齐 CLI 面）。
+  it('HTTP 键缺 baseUrl → 解析点响亮报错（配置错误非神秘网络失败，CR-19）', () => {
+    const broken: ModelConfig = { keys: [{ ...HTTP_KEY, baseUrl: undefined }] };
+    expect(() => resolveModel({ keyId: 'key_http', modelId: 'gpt-4o-mini' }, broken))
+      .toThrow(/baseUrl/);
+  });
+
+  it('HTTP 键缺 apiKey（含空串/空白串）→ 解析点响亮报错（CR-19）', () => {
+    const noKey: ModelConfig = { keys: [{ ...HTTP_KEY, apiKey: undefined }] };
+    expect(() => resolveModel({ keyId: 'key_http', modelId: 'gpt-4o-mini' }, noKey))
+      .toThrow(/apiKey/);
+    const blankKey: ModelConfig = { keys: [{ ...HTTP_KEY, apiKey: '   ' }] };
+    expect(() => resolveModel({ keyId: 'key_http', modelId: 'gpt-4o-mini' }, blankKey))
+      .toThrow(/apiKey/);
+  });
+
+  it('坏 HTTP 键不拖垮 embedding 自动探测（resolver catch → 跳过继续扫，CR-19 兼容面）', () => {
+    const config: ModelConfig = {
+      keys: [
+        { ...HTTP_KEY, apiKey: undefined }, // 坏键（capability text）在扫描序首位
+        {
+          id: 'key_emb_ok',
+          name: 'Emb OK',
+          protocol: 'openai-compatible',
+          apiKey: 'sk-emb',
+          baseUrl: 'https://emb.example.com/v1',
+          models: [{ id: 'bge-m3', alias: 'BGE M3', capability: 'embedding', enabled: true }],
+        },
+      ],
+    };
+    const resolved = resolveEmbeddingModel(config);
+    expect(resolved?.keyId).toBe('key_emb_ok');
+  });
+});
+
+// ── CR-20 + CR-15（09-12 agy provider CR 批）──
+// CLI 形态豁免 CR-34 的 600s 非流式背景顶（driver 自带 print-timeout + belt 是唯一
+// 时长闸）；handleGenerateText 的 CLI 解析同时置 CR-15 的 quit 守卫旗。
+describe('CLI dispatch — ceiling exemption (CR-20) + quit-guard flag (CR-15)', () => {
+  const CLI_TEST_MODEL_DIR = path.join(process.cwd(), 'test-tmp-model-gateway-cli');
+  const CLI_CONFIG: ModelConfig = {
+    keys: [
+      {
+        id: 'key_agy',
+        name: 'Antigravity CLI',
+        protocol: 'antigravity-cli',
+        apiKey: '',
+        cliExecutable: 'C:\\agy\\bin\\agy.exe',
+        models: [
+          { id: 'gemini-3.8-pro-high', alias: 'Gemini 3.8 Pro (High)', capability: 'text', enabled: true },
+        ],
+      },
+    ],
+  };
+
+  beforeEach(async () => {
+    _resetAntigravityCliUsedForTest();
+    handle.mockReset();
+    _setModelConfigDirForTest(CLI_TEST_MODEL_DIR);
+    rmBestEffort(CLI_TEST_MODEL_DIR);
+    registerConfigIpc();
+    const saveCall = handle.mock.calls.find(([channel]) => channel === 'config:save-model');
+    await saveCall![1]({}, CLI_CONFIG);
+  });
+
+  afterEach(() => {
+    setAntigravityCliGenerateForTest(undefined);
+    _resetAntigravityCliUsedForTest();
+    _setModelConfigDirForTest(null);
+    rmBestEffort(CLI_TEST_MODEL_DIR);
+    globalThis.fetch = ORIGINAL_FETCH;
+    vi.restoreAllMocks();
+  });
+
+  it('CLI background lane: 不套 600s 非流式顶（700s 仍挂；signal 原样直通）且置 quit 旗', async () => {
+    vi.useFakeTimers();
+    try {
+      let seenSignal: AbortSignal | undefined | null = null;
+      // 挂死 CLI 驱动器（死进程形态）：只在所持 signal 中止时 reject——上限豁免只有在
+      // 「永不自行结算」的调用上才可观察（mirror CR-34 hangingFetchMock 套路）。
+      setAntigravityCliGenerateForTest((_model, _request, ctx) =>
+        new Promise((_resolve, reject) => {
+          seenSignal = ctx?.signal ?? null;
+          const signal = ctx?.signal;
+          const onAbort = () => reject(signal?.reason ?? new DOMException('Aborted', 'AbortError'));
+          if (signal?.aborted) onAbort();
+          else signal?.addEventListener('abort', onAbort, { once: true });
+        }));
+
+      const controller = new AbortController();
+      const generating = handleGenerateText({
+        ref: { keyId: 'key_agy', modelId: 'gemini-3.8-pro-high' },
+        request: {
+          model: 'gemini-3.8-pro-high',
+          messages: [{ role: 'user', content: 'hi' }],
+          lane: 'background',
+        },
+      }, controller.signal);
+      let settled = false;
+      generating.then(() => { settled = true; }, () => { settled = true; });
+
+      // 600s 顶（+100s 余量）不裁 CLI——print-timeout/belt 在 driver 内是唯一时长闸。
+      await vi.advanceTimersByTimeAsync(700_000);
+      expect(settled).toBe(false);
+      // ceiling 包装会换 signal 对象（signalWithCeiling 返回 controller.signal）；
+      // 豁免路径 signal 引用原样直通。
+      expect(seenSignal).toBe(controller.signal);
+      // CR-15：CLI 生成路径置 quit 守卫旗。
+      expect(wasAntigravityCliUsed()).toBe(true);
+
+      controller.abort(new DOMException('Aborted', 'AbortError'));
+      await expect(generating).rejects.toThrow(/abort/i);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 // resolveEmbeddingModel takes an optional ModelConfig so it is unit-testable
 // without disk I/O — these tests pass configs directly and never seed the keys
 // dir, so they run under plain vitest (no better-sqlite3 ABI concern).
@@ -847,5 +1036,359 @@ describe('model gateway streaming (handleGenerateTextStream)', () => {
       vi.useRealTimers();
       warnSpy.mockRestore();
     }
+  });
+});
+
+// ── 09-12 子3 W3（design §4.1/§2#4）：resolveModel 的 per-model defaults limits 合成 + 九投影字段 ──
+describe('resolveModel per-model defaults synthesis + projection fields (09-12 子3)', () => {
+  const PARAMS_KEY: ApiKeyEntry = {
+    id: 'key_p3',
+    name: 'Params relay',
+    protocol: 'openai-compatible',
+    apiKey: 'sk-p3',
+    baseUrl: 'https://relay.example.com/v1',
+    models: [
+      // registry-known（glm-5.3 全量 limits）+ 只填 contextWindow → 逐字段覆盖。
+      { id: 'glm-5.3', alias: 'GLM 5.3', capability: 'text', enabled: true, defaults: { contextWindow: 8_000 } },
+      // registry-unknown + 只填 maxOutputTokens → 单键 limits（未知模型显式覆盖形态）。
+      { id: 'totally-unknown-model', alias: 'Unknown', capability: 'text', enabled: true, defaults: { maxOutputTokens: 4_096 } },
+      // registry-unknown 无 defaults → limits ABSENT（既有语义回归锚）。
+      { id: 'mystery-model', alias: 'Mystery', capability: 'text', enabled: true },
+    ],
+  };
+  const CONFIG: ModelConfig = { keys: [PARAMS_KEY] };
+
+  it('registry 有 × defaults 只填 contextWindow → 逐字段覆盖（sibling maxOutputTokens 保留）', () => {
+    const resolved = resolveModel({ keyId: 'key_p3', modelId: 'glm-5.3' }, CONFIG);
+    expect(resolved.limits).toEqual({ contextWindow: 8_000, maxOutputTokens: 131_072 });
+    expect(resolved.thinkingKind).toBe('glm-forced-effort'); // 非 limits 派生字段不受合成影响
+  });
+
+  it('registry 无 × defaults 只填 maxOutputTokens → 单键 limits（contextWindow 不伪造）', () => {
+    const resolved = resolveModel({ keyId: 'key_p3', modelId: 'totally-unknown-model' }, CONFIG);
+    expect(resolved.limits).toEqual({ maxOutputTokens: 4_096 });
+  });
+
+  it('registry 无 × 无 defaults → limits 保持 ABSENT（协议层兜底语义零变化）', () => {
+    const resolved = resolveModel({ keyId: 'key_p3', modelId: 'mystery-model' }, CONFIG);
+    expect('limits' in resolved).toBe(false);
+  });
+
+  it('九投影字段条件展开（ABSENT 语义——零配置键全 ABSENT）', () => {
+    const FULL_KEY: ApiKeyEntry = {
+      id: 'key_full',
+      name: 'Full face',
+      protocol: 'openai-compatible',
+      apiKey: 'sk-full',
+      baseUrl: 'https://relay.example.com/v1',
+      customHeaders: { 'X-Route-Tag': 'closure' },
+      timeoutSeconds: 120,
+      streamingDisabled: true,
+      verifySsl: true,
+      models: [
+        {
+          id: 'm-full',
+          alias: 'Full',
+          capability: 'text',
+          enabled: true,
+          defaults: { temperature: 0.7, topP: 0.9, frequencyPenalty: -0.2, presencePenalty: 0.3 },
+          extraBody: { safe_prompt: true },
+        },
+        { id: 'm-plain', alias: 'Plain', capability: 'text', enabled: true },
+      ],
+    };
+    const fullConfig: ModelConfig = { keys: [FULL_KEY] };
+    const full = resolveModel({ keyId: 'key_full', modelId: 'm-full' }, fullConfig);
+    expect(full.customHeaders).toEqual({ 'X-Route-Tag': 'closure' });
+    expect(full.extraBody).toEqual({ safe_prompt: true });
+    expect(full.defaultTemperature).toBe(0.7);
+    expect(full.defaultTopP).toBe(0.9);
+    expect(full.defaultFrequencyPenalty).toBe(-0.2);
+    expect(full.defaultPresencePenalty).toBe(0.3);
+    expect(full.timeoutSeconds).toBe(120);
+    expect(full.verifySsl).toBe(true);
+    expect(full.streamingDisabled).toBe(true);
+
+    const plain = resolveModel({ keyId: 'key_p3', modelId: 'mystery-model' }, CONFIG);
+    for (const absentKey of [
+      'customHeaders', 'extraBody', 'defaultTemperature', 'defaultTopP',
+      'defaultFrequencyPenalty', 'defaultPresencePenalty', 'timeoutSeconds', 'verifySsl', 'streamingDisabled',
+    ] as const) {
+      expect(absentKey in plain).toBe(false);
+    }
+  });
+});
+
+// ── 09-12 子3 W3（design §4.4）：slot assignment 的 contextWindow enrichment（runtime-only）──
+describe('enrichSlotAssignment (09-12 子3 §4.4)', () => {
+  const KEY: ApiKeyEntry = {
+    id: 'key_e',
+    name: 'Enrich relay',
+    protocol: 'openai-compatible',
+    apiKey: 'sk-e',
+    baseUrl: 'https://relay.example.com/v1',
+    models: [
+      { id: 'unknown-m', alias: 'Unknown', capability: 'text', enabled: true, defaults: { contextWindow: 131_072 } },
+      { id: 'plain-m', alias: 'Plain', capability: 'text', enabled: true },
+    ],
+  };
+  const CONFIG: ModelConfig = { keys: [KEY] };
+
+  it('key defaults.contextWindow → 注入 contextWindowTokens', () => {
+    expect(enrichSlotAssignment({ keyId: 'key_e', modelId: 'unknown-m' }, CONFIG)).toEqual({
+      keyId: 'key_e',
+      modelId: 'unknown-m',
+      contextWindowTokens: 131_072,
+    });
+  });
+
+  it('模型无 defaults → 原样返回同一引用（恒等回退，零配置零行为变化）', () => {
+    const assignment = { keyId: 'key_e', modelId: 'plain-m' };
+    expect(enrichSlotAssignment(assignment, CONFIG)).toBe(assignment);
+  });
+
+  it('stale ref（键已删 / 模型不在键内）→ 原样返回同一引用（容错不抛）', () => {
+    const gone = { keyId: 'key_gone', modelId: 'unknown-m' };
+    expect(enrichSlotAssignment(gone, CONFIG)).toBe(gone);
+    const wrongModel = { keyId: 'key_e', modelId: 'not-in-key' };
+    expect(enrichSlotAssignment(wrongModel, CONFIG)).toBe(wrongModel);
+  });
+
+  it('assignment 缺席 → undefined；fallbacks 原样透传不碰（链上条目不获 enrichment）', () => {
+    expect(enrichSlotAssignment(undefined, CONFIG)).toBeUndefined();
+    const fallbacks = [{ keyId: 'key_e', modelId: 'plain-m' }];
+    const withChain = { keyId: 'key_e', modelId: 'unknown-m', fallbacks };
+    const enriched = enrichSlotAssignment(withChain, CONFIG);
+    expect(enriched?.contextWindowTokens).toBe(131_072);
+    expect(enriched?.fallbacks).toBe(fallbacks); // 同一引用——enrichment 的 spread 不碰链
+    expect(enriched?.fallbacks?.[0]).toEqual({ keyId: 'key_e', modelId: 'plain-m' }); // 条目自身无 contextWindowTokens
+  });
+
+  // ── CR-4（09-12 子3 CR 批）注入侧 belt：非正整数 override 不注入 ──
+  it('CR-4: 非正整数 override（0/负/小数）→ 原样返回同一引用（预算/压缩红线数学不被毒化到 0）', () => {
+    for (const bad of [0, -5, 1.5]) {
+      const KEY: ApiKeyEntry = {
+        id: 'key_bad',
+        name: 'Bad override',
+        protocol: 'openai-compatible',
+        apiKey: 'sk-bad',
+        baseUrl: 'https://relay.example.com/v1',
+        models: [{ id: 'unknown-m', alias: 'Unknown', capability: 'text', enabled: true, defaults: { contextWindow: bad } }],
+      };
+      const assignment = { keyId: 'key_bad', modelId: 'unknown-m' };
+      expect(enrichSlotAssignment(assignment, { keys: [KEY] })).toBe(assignment);
+    }
+  });
+
+  // ── CR-1（09-12 子3 CR 批）：缺省参数先评估的洞——assignment 缺席仍全量读盘 ──
+  it('CR-1: assignment 缺席 → 零读盘（config 读移进守卫后——毒化 dir 若被读必抛）', () => {
+    // 毒化 config dir：keys 路径被普通文件占用 → existsSync 真 + readdirSync 抛 ENOTDIR
+    // → readModelConfigFromDisk 必抛。enrichSlotAssignment(undefined) 不抛即证零读盘。
+    const LAZY_DIR = path.join(process.cwd(), 'test-tmp-model-gateway-lazy');
+    _setModelConfigDirForTest(LAZY_DIR);
+    rmBestEffort(LAZY_DIR);
+    mkdirSync(LAZY_DIR, { recursive: true });
+    writeFileSync(path.join(LAZY_DIR, 'keys'), 'not-a-dir', 'utf8');
+    try {
+      expect(enrichSlotAssignment(undefined)).toBeUndefined();
+    } finally {
+      _setModelConfigDirForTest(null);
+      rmBestEffort(LAZY_DIR);
+    }
+  });
+});
+
+// ── 09-12 子3 W3（design §3 ⑩）：键级 streamingDisabled 保险丝——流式入口短路回非流式 ──
+describe('streamingDisabled fuse (09-12 子3 §3 ⑩)', () => {
+  const FUSE_CONFIG: ModelConfig = {
+    keys: [
+      {
+        id: 'key_fuse',
+        name: 'Broken SSE gateway',
+        protocol: 'openai-compatible',
+        apiKey: 'sk-fuse',
+        baseUrl: 'https://relay.example.com/v1',
+        streamingDisabled: true,
+        models: [{ id: 'gpt-4o-mini', alias: 'GPT 4o mini', capability: 'text', enabled: true }],
+      },
+    ],
+  };
+
+  async function seedFuseConfig() {
+    registerConfigIpc();
+    const saveCall = handle.mock.calls.find(([channel]) => channel === 'config:save-model');
+    await saveCall![1]({}, FUSE_CONFIG);
+  }
+
+  beforeEach(() => {
+    handle.mockReset();
+    _setModelConfigDirForTest(TEST_MODEL_DIR);
+    rmBestEffort(TEST_MODEL_DIR);
+  });
+
+  afterEach(() => {
+    _setModelConfigDirForTest(null);
+    rmBestEffort(TEST_MODEL_DIR);
+    globalThis.fetch = ORIGINAL_FETCH;
+    vi.restoreAllMocks();
+  });
+
+  it('禁流式键 → handleGenerateTextStream 走非流式：onDelta 不触发、body 无 stream 键、终帧直达', async () => {
+    await seedFuseConfig();
+    const responseBody = JSON.stringify({
+      id: 'chatcmpl-fuse',
+      object: 'chat.completion',
+      created: 0,
+      model: 'gpt-4o-mini',
+      choices: [{ index: 0, message: { role: 'assistant', content: 'complete frame' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    });
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      headers: new Headers(),
+      json: async () => JSON.parse(responseBody),
+      text: async () => responseBody,
+    } as unknown as Response));
+    globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch;
+
+    const onDelta = vi.fn();
+    const result = await handleGenerateTextStream(
+      {
+        ref: { keyId: 'key_fuse', modelId: 'gpt-4o-mini' },
+        request: { model: 'gpt-4o-mini', messages: [{ role: 'user', content: 'hi' }] },
+      },
+      undefined,
+      onDelta,
+    );
+    expect(result.text).toBe('complete frame'); // 终帧直达（功能完整）
+    expect(onDelta).not.toHaveBeenCalled(); // 流式相位放弃
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const fuseArgs = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    const body = JSON.parse((fuseArgs[1]?.body as string) ?? '{}');
+    expect('stream' in body).toBe(false); // 非流式请求形态（流式 body 携带 stream:true）
+  });
+
+  it('未禁用键（回归锚）→ 流式路径照常（stream:true 在 body、onDelta 收帧）', async () => {
+    await seedConfig();
+    const fetchMock = vi.fn(async () => {
+      const encoder = new TextEncoder();
+      const frame = (payload: Record<string, unknown>) =>
+        `data: ${JSON.stringify({ id: 'chatcmpl-1', object: 'chat.completion.chunk', created: 0, model: 'gpt-4o-mini', ...payload })}\n\n`;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode(frame({ choices: [{ index: 0, delta: { role: 'assistant', content: 'ok' }, finish_reason: null }] })));
+          controller.enqueue(encoder.encode(frame({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })));
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+          controller.close();
+        },
+      });
+      return new Response(stream, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+    });
+    globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch;
+
+    const onDelta = vi.fn();
+    const result = await handleGenerateTextStream(
+      {
+        ref: { keyId: 'key_text', modelId: 'gpt-4o-mini' },
+        request: { model: 'gpt-4o-mini', messages: [{ role: 'user', content: 'hi' }] },
+      },
+      undefined,
+      onDelta,
+    );
+    expect(result.text).toBe('ok');
+    expect(onDelta).toHaveBeenCalled();
+    const streamArgs = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    const body = JSON.parse((streamArgs[1]?.body as string) ?? '{}');
+    expect(body.stream).toBe(true);
+  });
+
+  // ── CR-14（09-12 子3 CR 批）：streamingDisabled per-attempt 混合 case ──
+  // 主 key 禁流式 + 回退家在别的键（未禁）——链上每 attempt 各自按键判定：主 attempt
+  // 走非流式（body 无 stream 键），回退 attempt 保留流式（stream:true + onDelta 收帧）。
+  it('CR-14: 禁流式主 key + 可流式 fallback key 混合链——主 attempt 非流式 body、回退 attempt 流式 body + onDelta', async () => {
+    registerConfigIpc();
+    const saveCall = handle.mock.calls.find(([channel]) => channel === 'config:save-model');
+    await saveCall![1](
+      {},
+      {
+        keys: [
+          {
+            id: 'key_fuse',
+            name: 'Broken SSE gateway',
+            protocol: 'openai-compatible',
+            apiKey: 'sk-fuse',
+            baseUrl: 'https://fuse.example.com/v1',
+            streamingDisabled: true,
+            models: [{ id: 'gpt-4o-mini', alias: 'GPT 4o mini', capability: 'text', enabled: true }],
+          },
+          {
+            id: 'key_ok',
+            name: 'SSE OK relay',
+            protocol: 'openai-compatible',
+            apiKey: 'sk-ok',
+            baseUrl: 'https://ok.example.com/v1',
+            models: [{ id: 'gpt-4o-mini', alias: 'GPT 4o mini', capability: 'text', enabled: true }],
+          },
+        ],
+      } satisfies ModelConfig,
+    );
+
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input instanceof Request ? input.url : input);
+      if (url.startsWith('https://fuse.example.com')) {
+        // 主 attempt（非流式）：502 → eligible 失败 → 链推进。
+        return new Response(JSON.stringify({ error: { message: 'bad gateway' } }), {
+          status: 502,
+          headers: new Headers(),
+        });
+      }
+      // 回退 attempt（流式）：OpenAI SSE 成功。
+      const encoder = new TextEncoder();
+      const frame = (payload: Record<string, unknown>) =>
+        `data: ${JSON.stringify({ id: 'chatcmpl-1', object: 'chat.completion.chunk', created: 0, model: 'gpt-4o-mini', ...payload })}\n\n`;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode(frame({ choices: [{ index: 0, delta: { role: 'assistant', content: 'rescued' }, finish_reason: null }] })));
+          controller.enqueue(encoder.encode(frame({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })));
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+          controller.close();
+        },
+      });
+      return new Response(stream, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+    });
+    globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch;
+
+    const onDelta = vi.fn();
+    const result = await handleGenerateTextStream(
+      {
+        ref: { keyId: 'key_fuse', modelId: 'gpt-4o-mini' },
+        request: { model: 'gpt-4o-mini', messages: [{ role: 'user', content: 'hi' }] },
+        fallbacks: [{ ref: { keyId: 'key_ok', modelId: 'gpt-4o-mini' } }],
+      },
+      undefined,
+      onDelta,
+    );
+
+    expect(result.text).toBe('rescued');
+    expect(result.modelRef).toEqual({ keyId: 'key_ok', modelId: 'gpt-4o-mini' });
+    expect(onDelta).toHaveBeenCalled(); // 回退家的流式相位保留
+
+    // 主 attempt：全部出站为非流式 body（无 stream 键；含协议层重试次数）。
+    const fuseCalls = (fetchMock.mock.calls as unknown as [string, RequestInit][]).filter(
+      ([url]) => String(url).startsWith('https://fuse.example.com'),
+    );
+    expect(fuseCalls.length).toBeGreaterThan(0);
+    for (const call of fuseCalls) {
+      const body = JSON.parse((call[1]?.body as string) ?? '{}');
+      expect('stream' in body).toBe(false);
+    }
+    // 回退 attempt：流式 body（stream:true）恰一次成功出站。
+    const okCalls = (fetchMock.mock.calls as unknown as [string, RequestInit][]).filter(
+      ([url]) => String(url).startsWith('https://ok.example.com'),
+    );
+    expect(okCalls).toHaveLength(1);
+    const okBody = JSON.parse((okCalls[0]![1]?.body as string) ?? '{}');
+    expect(okBody.stream).toBe(true);
   });
 });

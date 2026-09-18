@@ -134,7 +134,12 @@ const DOC_SUMMARY_PROMPT = [
 export async function defaultGenerateSummary(model: ResolvedModel, body: string): Promise<string> {
   const res = await generateText(
     model,
-    { model: model.modelId, messages: [{ role: 'user', content: `${DOC_SUMMARY_PROMPT}\n\n${body}` }] },
+    {
+      model: model.modelId,
+      messages: [{ role: 'user', content: `${DOC_SUMMARY_PROMPT}\n\n${body}` }],
+      // 09-12 usage-panel：文档一句话简述 = doc-summary 流程标签（design §0 表）。
+      taskType: 'doc-summary',
+    },
     { signal: AbortSignal.timeout(30_000) },
   );
   return res.text

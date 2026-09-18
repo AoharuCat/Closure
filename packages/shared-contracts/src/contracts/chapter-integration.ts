@@ -418,7 +418,8 @@ function leadingFrontmatterBlock(text: string): string | null {
  * 1. `acceptChapterCandidate`（standalone，shell direct 车道）——`candidate.content` = draft 正文
  *    （`buildChapterAccept` 产，无 frontmatter）整体覆盖 `sections[0].content_file`；
  * 2. `applyFieldPatches` chapter_candidate 分支（PatchReview 人审 accept 车道）——同上；
- * 3. `chapter_write` handler 的 auto_revise splice / targeted-revision 落盘（body-only 正文）。
+ * 3. ~~`chapter_write` handler 的 auto_revise splice / targeted-revision 落盘~~（body-only 正文；
+ *    该路径已随链流程重排退役——09-13 W1a 环内收敛，规则保留防未来 body-only 覆写路径回归）。
  *
  * 抹掉的后果：混合态（部分章文件带 order、部分被抹）触发派生排序全局开关
  * `hasExplicitOrder` → 被抹章垫底 MAX_SAFE_INTEGER → sort_order 错位 → episode↔chapter
@@ -446,6 +447,28 @@ export function preserveChapterFrontmatter(
   // mirror ui frontmatter.ts restoreFrontmatter：空 body 原样返回（不加行分隔）。
   if (newContent === '') return existingFm;
   return existingFm.endsWith('\n') ? existingFm + newContent : `${existingFm}\n${newContent}`;
+}
+
+// ── stripChapterFrontmatter：章文件正文剥离（链流程重排 W4 / R6 链外重提取）──
+
+/**
+ * 剥掉章文件开头的 frontmatter 块，返回正文（含其后的标题行/空行——按落盘原样，非语义重构）。
+ *
+ * 重提取（re-extract-chapter）从盘上 `chapters/<id>.md` 读正文喂 E 段：链上 `draft.initial.text` 是纯
+ * 正文，frontmatter（order 登记载体）不是正文的一部分——用本函数把盘上文件还原到 E 段消费形态。
+ * 无 frontmatter（历史 body-only 章）→ 原样返回（零行为变化）。与 preserveChapterFrontmatter 共用
+ * 同一 frontmatter 块形状（CHAPTER_FILE_FRONTMATTER_RE，BOM/CRLF/尾随空白容忍）。
+ *
+ * CR-12③：**前置剥 BOM**——body-only 文件带 BOM 时 `leadingFrontmatterBlock` 对无块形态返 null，
+ * BOM 会原样泄入「正文」（E 段 prompt / 字数 / 提取全带 U+FEFF 字符）。有 frontmatter 块时 BOM 随
+ * 块剥（正则已容 BOM），body-only 时此处兜底剥首字符（mirror setting-md-edit bomStripped 同款）。
+ *
+ * 范式判据（ADR-3）：纯机械字符串剥离，非语义。
+ */
+export function stripChapterFrontmatter(content: string): string {
+  const bomStripped = content.charCodeAt(0) === 0xfeff ? content.slice(1) : content;
+  const fm = leadingFrontmatterBlock(bomStripped);
+  return fm ? bomStripped.slice(fm.length) : bomStripped;
 }
 
 // ── buildAcceptStoryDecisions：accept 登记 StoryDecision 构造单源（#107 R1.1c 提取）──

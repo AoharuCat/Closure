@@ -32,6 +32,8 @@ import { createSettingSlice, type SettingSlice } from './settingSlice';
 import { createMaterialsSlice, type MaterialsSlice } from './materialsSlice';
 import { createCraftSlice, type CraftSlice } from './craftSlice';
 import { createDeconSlice, type DeconSlice } from './deconSlice';
+import { createWritingPageSlice, type WritingPageSlice } from './writingPageSlice';
+import { createChapterDerivationSlice, type ChapterDerivationSlice } from './chapterDerivationSlice';
 import { installProjectSubscription } from './projectSubscription';
 import { initAgentEvents } from './agentEvents';
 
@@ -70,7 +72,9 @@ type AppState = ProjectSlice &
   SettingSlice &
   MaterialsSlice &
   CraftSlice &
-  DeconSlice;
+  DeconSlice &
+  WritingPageSlice &
+  ChapterDerivationSlice;
 
 export const useAppStore = create<AppState>()((...a) => ({
   ...createProjectSlice(...a),
@@ -106,6 +110,8 @@ export const useAppStore = create<AppState>()((...a) => ({
   ...createMaterialsSlice(...a),
   ...createCraftSlice(...a),
   ...createDeconSlice(...a),
+  ...createWritingPageSlice(...a),
+  ...createChapterDerivationSlice(...a),
 }));
 
 installProjectSubscription(useAppStore);

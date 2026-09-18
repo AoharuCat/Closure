@@ -341,7 +341,7 @@ export function mapLevel(kind: ThinkingKind, level: UnifiedLevel | 'auto'): Mapp
 export function validateCustom(
   kind: ThinkingKind,
   custom: string,
-  limits?: ModelLimits,
+  limits?: Partial<ModelLimits>,
 ): { ok: true; value: string } | { ok: false; reason: string } {
   const profile = THINKING_PROFILES[kind];
   if (profile.customHint === 'enum') {
@@ -357,7 +357,9 @@ export function validateCustom(
     // CR-020: known limits REPLACE the base ceiling (not just raise it) — the
     // vendor constraint is budget < max_tokens ≤ output ceiling, so a model
     // with a smaller known ceiling tightens the range too.
-    const max = limits !== undefined ? limits.maxOutputTokens - 1 : baseMax;
+    // 09-12 子3: limits is per-field partial (user-override synthesis) — an
+    // ABSENT maxOutputTokens means the ceiling is unknown → base range.
+    const max = limits?.maxOutputTokens !== undefined ? limits.maxOutputTokens - 1 : baseMax;
     const budget = Number(custom);
     if (Number.isInteger(budget) && budget >= min && budget <= max) {
       return { ok: true, value: String(budget) };

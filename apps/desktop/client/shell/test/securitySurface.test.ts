@@ -13,6 +13,10 @@ describe('preload security surface', () => {
     expect(Object.keys(exposedDesktopApi).sort()).toEqual([
       'abortAgentRun',
       'acceptSettingMdPatch',
+      // 子4 agy MCP 工具桥（W4）：同意/状态/关闭回收三通道。
+      'agyBridgeRevoke',
+      'agyBridgeSetConsent',
+      'agyBridgeStatus',
       'applyAgentFieldPatch',
       'applyAuthorProfileNote',
       'canaryProbeVision',
@@ -108,6 +112,8 @@ describe('preload security surface', () => {
       'listAgentSessions',
       'listAgentSkills',
       'listAssets',
+      // 09-12 agy provider W4：CLI 形态模型发现（model:list-cli-models）。
+      'listCliModels',
       'listImportedFonts',
       // Story 10.1 Wave D：材料库管理面。
       'listMaterials',
@@ -193,6 +199,9 @@ describe('preload security surface', () => {
       'updateTaskStatus',
       'upsertAsset',
       'upsertTask',
+      // 09-12 usage-panel（子5 W3）：应用内用量面两通道（usage:overview / usage:clear）。
+      'usageClear',
+      'usageOverview',
       'watchProject',
       'wordCount',
       'worldOverview',

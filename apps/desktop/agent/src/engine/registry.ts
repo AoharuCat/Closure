@@ -17,11 +17,17 @@ interface NodeRegistryEntry {
  * producedArtifactKeys`（节点契约，单源真值）。本 map 仅服务于 `createNodeRegistry` /
  * `createExtendedNodeRegistry`（dormant DEFAULT_CHAIN，仅 registryContractMatch.test.ts 消费）。
  *
- * CR-3 ADR-4 drift 注记：'targeted-revision-agent' → 'revision.output' 是 legacy 映射；链段的
- * targeted-revision 节点实际 overwrite 'draft.initial'（design §4 决断：multi-review/route 读
- * draft.initial = 最新稿，闭环真正「改了再审」）。链段契约 TARGETED_REVISION_CONTRACT.producedArtifactKeys
- * = ['draft.initial'] 才是真值；此处 legacy 映射保留（不动 dormant DEFAULT_CHAIN），不影响链段。
- * summarizeRunSnapshot 的 revision.output 死 fallback 已删（chainRunner.ts，CR-3）。
+ * CR-3 ADR-4 drift 注记：链段（chapter-chain，Story 4.0）**不用本 map**——链段节点用
+ * `ReusableAgentNodeContract.producedArtifactKeys`（节点契约，单源真值）。本 map 仅服务于
+ * `createNodeRegistry` / `createExtendedNodeRegistry`（dormant DEFAULT_CHAIN，仅
+ * registryContractMatch.test.ts 消费）。
+ *
+ * 链流程重排（09-13 W1d）迁移注记：'targeted-revision-agent' → 'revision.output' 条目已删——
+ * 节点从生产链退役（职能被环内 C1 编译 + 写手 directive 重跑覆盖；DEFAULT_CHAIN /
+ * EXTENDED_CHAIN 本就不含该 id，条目无消费者）。CR-25（09-13 CR 修复批）：prompts yaml /
+ * tool wrapper / UI 词表 / i18n / 单测 + dormant 工厂 createTargetedRevisionNode +
+ * agentContracts 条目已全量清除（grep 零代码残留）。summarizeRunSnapshot 的 revision.output
+ * 死 fallback 已删（chainRunner.ts，CR-3）。
  */
 const STATE_KEY_MAP: Record<string, string> = {
   'intake-agent': 'creative_brief',
@@ -35,7 +41,6 @@ const STATE_KEY_MAP: Record<string, string> = {
   'draft-writer-agent': 'draft.initial',
   'continuity-memory-agent': 'memory.continuity',
   'multi-review-agent': 'review.latest',
-  'targeted-revision-agent': 'revision.output',
   // Story 4.0 Step 5：route-agent 反馈路由节点产 route_decision（链段临时 artifact，ADR-4 双重表示同步）。
   'route-agent': 'route_decision',
 };

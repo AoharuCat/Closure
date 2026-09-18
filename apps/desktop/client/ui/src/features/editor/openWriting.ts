@@ -10,8 +10,10 @@ import { normalizePath } from '../../shared/utils/paths';
  * when the project has no chapters yet or the file can't be read, so the
  * "writing" entry point always lands somewhere useful instead of a dead editor.
  *
- * Shared by the overview "Continue writing" action and the side-nav writing
- * entry so both drive the exact same file-editor flow.
+ * Shared by the overview "Continue writing" action, the world panel's scene jump
+ * and the writing page's chapter column so all drive the exact same file-editor
+ * flow. (The side-nav writing entry became a page route in task
+ * 09-13-writing-page-ui; it is no longer an openWriting caller.)
  *
  * dogfood R2 #20：无章节 fallback 只切大纲页——用户已在大纲页时是视觉 no-op，
  * 点击「无反应」。补 toast 引导（说明为什么落大纲页 + 下一步），反馈不再静默。

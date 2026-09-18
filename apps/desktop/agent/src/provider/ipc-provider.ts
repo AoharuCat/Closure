@@ -1,6 +1,6 @@
 import type { SessionImagePointer, SessionMessage, ToolCall, ToolDefinition } from '../types';
 import type { CacheConfig } from '../context/contextManager';
-import type { GenerationLane, ThinkingControl } from '@orison/shared-contracts';
+import type { GenerateFallbackEntry, GenerationLane, ModelFallbackSwitchEvent, ThinkingControl } from '@orison/shared-contracts';
 import { zodToJsonSchema } from 'zod-to-json-schema';
 
 export interface GenerateOptions {
@@ -33,7 +33,53 @@ export interface GenerateOptions {
    * optional：装配点逐个接线（leader 两车道 + 子 agent 派发族），未接的调用日志降级 'unknown'。
    */
   sessionId?: string;
+  /**
+   * 09-12 agy provider（design §2 会话键贯穿）：逻辑会话键——session-capable provider
+   *（Antigravity CLI 常驻会话驱动）按键 `(sessionKey, keyId, modelId)` 复用温进程、增量
+   * 发送。undefined = 单发冷路径（per-call spawn，零常驻态）。装配点：leader 对话车道 /
+   * 写手 agent 循环 / 链 run（design §3.1）；每处 key = 该逻辑会话的稳定 id。
+   */
+  sessionKey?: string;
+  /**
+   * 09-12 子2 fallback chains（design §4）：有序回退链（wire 形态——assignmentFallbackChain
+   * 归一的 `{ref, thinking}` 条目）。undefined/空 = 零默认链（网关单模型直通，字节级现行为）。
+   * 纯用户配置零注入：链只来自 task-models sidecar 的显式 fallbacks 条目。
+   */
+  fallbacks?: GenerateFallbackEntry[];
+  /**
+   * 09-12 usage-panel（design §2 task_type 列）：任务档位/流程标签（'dialogue' /
+   * 'writer-draft' / 'vision-relay' / 'doc-summary' / 'context-summary'…自由值——
+   * 词表演进归调用方，ledger 列不设 CHECK 同因。注意：拆书/蒸馏管线〔deconLlmCore /
+   * craftDistillLlmCore〕实发 **input.slot 档位值**（extraction 等），不存在字面
+   * 'decon' 发射）。undefined = 未标注（NULL 组）。两态纪律 mirror sessionKey：''
+   * 归一为缺席（schema transform 双保险——agent 缝 as any 直调豁免 zod parse）。
+   */
+  taskType?: string;
+  /**
+   * C 批（09-12 system 稳定化 / C3.4）：Anthropic 显式 prompt-cache 断点开关——请求级
+   * 协议事实（协议层 buildAnthropicBody 消费：system 尾块 + 对话尾块双断点 ≤4 帽）。
+   * undefined/false = 不注入（wire body 字节级零变化）；OpenAI 路径读而不动（隐式
+   * 前缀缓存无协议字段）、agy 路径 mirror 内建（flag 天然无效）。装配点：leader
+   * dialogue 两车道（sendMessage / streamMessage generate opts）；链/child/摘要车道零装配。
+   */
+  cacheControl?: boolean;
+  /**
+   * 09-12 子2（design §7）：模型切换回调——网关环每次推进时回传（from 失败家解析身份 /
+   * to 接管条目 / reason 分类摘要 / attempt 序号）。装配点（leader 对话车道 / dispatch
+   * child / 链 writer 循环）转成 'model-fallback' 运行期事件；未传的调用面由网关
+   * logger.warn 兜底可见。与 onDelta 同族：本包保持 provider-agnostic，形态在此本地声明
+   *（与 shell FallbackSwitchEvent 结构一致）。
+   */
+  onFallback?: (event: ModelFallbackSwitch) => void;
 }
+
+/**
+ * 09-12 子2：模型切换事件。CR-15（09-12 子2 CR 批）形态单源 = shared-contracts
+ * `ModelFallbackSwitchEvent`（contracts/generation.ts）——shell FallbackSwitchEvent 同引
+ * 该契约类型，本包不再本地重声明结构（GenerationDelta 的本地声明先例在此让位：
+ * generation.ts 同包已有契约定义）。
+ */
+export type ModelFallbackSwitch = ModelFallbackSwitchEvent;
 
 export interface GenerateResult {
   content: string;
@@ -58,6 +104,14 @@ export interface GenerateResult {
    * generate() 映射时丢弃。无 usage 的 provider 照旧 undefined（零行为变化）。
    */
   usage?: GenerateTextUsage;
+  /**
+   * 09-12 子2 fallback chains（design §7.2）：实际服务本响应的模型（网关环成功注记——
+   * 解析真实身份，auto-pick 时非 {default,default} 哨兵）。只在档位配了链（回退机械
+   * 运行过）时携带；runLoop 据此盖 SessionMessage.generatedBy（终态标注实际模型）。
+   */
+  modelRef?: { keyId: string; modelId: string };
+  /** 仅发生过回退时携带（二态——≥1 条逐家失败记录）。 */
+  fallbackTrace?: Array<{ keyId: string; modelId: string; reason: string }>;
 }
 
 export interface GenerateTextRequest {
@@ -71,8 +125,20 @@ export interface GenerateTextRequest {
     thinking?: ThinkingControl;
     /** dogfood R2 #7：派发车道透传（undefined = dialogue 语义，不占位）。 */
     lane?: GenerationLane;
+    /** 09-12 agy provider：会话键透传（undefined = 单发冷路径，不占位）。 */
+    sessionKey?: string;
+    /** 09-12 usage-panel：任务档位/流程标签透传（undefined = 未标注；'' 已在拼装侧归一）。 */
+    taskType?: string;
+    /** C 批（09-12 稳定化 / C3.4）：prompt-cache 断点开关透传（undefined = 缺省零行为，不占位）。 */
+    cacheControl?: boolean;
     tools?: unknown[];
   };
+  /**
+   * 09-12 子2 fallback chains：wire 载荷第三面（generateTextPayloadSchema.fallbacks 的
+   * 手拼 body 镜像——agent 缝 `as any` 直调豁免 zod parse，靠装配测试钉到达）。空链不
+   * 占位（二态纪律）。
+   */
+  fallbacks?: GenerateFallbackEntry[];
 }
 
 /**
@@ -95,17 +161,29 @@ export interface GenerationDelta {
  */
 export interface GenerateTextCallbacks {
   onDelta?: (d: GenerationDelta) => void;
+  /**
+   * 09-12 子2 fallback chains（design §7）：模型切换回调透传面——与 onDelta 同一
+   * callbacks 对象，shell 分派点（agentIpc generateTextImpl）转交两网关 handler 的
+   * onFallback 参数。未传 = 网关 logger.warn 兜底可见。
+   */
+  onFallback?: (event: ModelFallbackSwitch) => void;
 }
 
 /**
  * Usage counters surfaced by the protocol layer on the terminal frame. TYPE
  * SEAM ONLY for now — zero agent-side consumption (the C3.1 metering
  * interface position; not wired in this task).
+ *
+ * thinkingTokens / cacheReadTokens (09-12 agy provider): mirror of
+ * generationUsageSchema's additive fields — the Antigravity CLI driver is
+ * their first producer (same names, same semantics, no second vocabulary).
  */
 export interface GenerateTextUsage {
   promptTokens?: number;
   completionTokens?: number;
   totalTokens?: number;
+  thinkingTokens?: number;
+  cacheReadTokens?: number;
 }
 
 export type GenerateTextFn = (
@@ -122,6 +200,9 @@ export type GenerateTextFn = (
   /** Anthropic thinking-block signature (S4b B block, design §5.1) — round-trips verbatim. */
   reasoningSignature?: string;
   usage?: GenerateTextUsage;
+  /** 09-12 子2 fallback chains：实际服务模型（网关环成功注记；无链路径缺席）。 */
+  modelRef?: { keyId: string; modelId: string };
+  fallbackTrace?: Array<{ keyId: string; modelId: string; reason: string }>;
 }>;
 
 let _generateText: GenerateTextFn | undefined;
@@ -165,15 +246,15 @@ export function buildImagesParts(
 }
 
 function messagesToPayload(messages: SessionMessage[], system: string, tools: ToolDefinition[], cacheConfig?: CacheConfig, sessionId?: string) {
-  // NOTE: Prompt caching (e.g. Anthropic's cache_control) is not currently
-  // supported by the ai-sdk generateText path. The cacheConfig is retained in
-  // the interface for future provider-level integration.
+  // NOTE: explicit prompt-cache breakpoints (Anthropic cache_control) are wired
+  // at the request level (GenerateOptions.cacheControl → buildAnthropicBody,
+  // 09-12 稳定化 C 批/C3.4)——cacheConfig 在此只承载下方 pinned/summary 两个注入载荷。
   const formatted: unknown[] = [{
     role: 'system',
     content: system,
   }];
 
-  // Inject pinned context as a stable prefix (benefits from prompt caching when supported)
+  // Inject pinned context as a stable prefix (prompt-cache friendly position)
   if (cacheConfig?.pinnedContent) {
     formatted.push({
       role: 'user',
@@ -354,15 +435,34 @@ export async function generate(
       thinking: opts.thinking,
       // dogfood R2 #7：车道透传（undefined 自然缺席 = dialogue 零行为变化）。
       lane: opts.lane,
+      // 09-12 agy provider CR-13：会话键透传——'' 归一为缺席（两态纪律，与 lane/thinking
+      // 的 absent 语义一致；schema transform 双保险：agent 缝 as any 直调豁免 zod parse）。
+      sessionKey: opts.sessionKey || undefined,
+      // 09-12 usage-panel：任务档位/流程标签透传——'' 同归一为缺席（两态纪律同上）。
+      taskType: opts.taskType || undefined,
+      // C 批（09-12 稳定化 / C3.4）：prompt-cache 断点开关透传——三面同步的 agent 缝面
+      //（另两面：wire schema textGenerationRequestSchema.cacheControl + buildAnthropicBody
+      // 消费）。=== true 才占位（undefined/false 序列化自然缺席 = 缺省 wire body 零变化）。
+      cacheControl: opts.cacheControl === true ? true : undefined,
       tools: payload.tools,
     },
+    // 09-12 子2 fallback chains：链透传（空链不占位——网关按缺席走零默认链快径）。
+    ...(opts.fallbacks?.length ? { fallbacks: opts.fallbacks } : {}),
   };
 
   // Dogfood T1 Stage 1: only onDelta-bearing calls pass a third argument — the
   // no-callback path invokes the seam with exactly the same two arguments as
   // before the streaming upgrade (zero-regression call shape).
-  const data = opts.onDelta
-    ? await _generateText(body, abortSignal, { onDelta: opts.onDelta })
+  // 09-12 子2：onFallback 与 onDelta 同一 callbacks 对象（onFallback 单独在场也传——
+  // 非流式调用同样可配链，切换事件不依赖流式路径）。
+  const callbacks = (opts.onDelta || opts.onFallback)
+    ? {
+        ...(opts.onDelta ? { onDelta: opts.onDelta } : {}),
+        ...(opts.onFallback ? { onFallback: opts.onFallback } : {}),
+      }
+    : undefined;
+  const data = callbacks
+    ? await _generateText(body, abortSignal, callbacks)
     : await _generateText(body, abortSignal);
 
   const toolCalls: ToolCall[] | undefined = data.toolCalls?.map(tc => ({
@@ -379,5 +479,8 @@ export async function generate(
     reasoningSignature: data.reasoningSignature,
     // S4b（design §4.2）：usage 透出——S4a runLoop 校准环的生产激活开关。
     usage: data.usage,
+    // 09-12 子2：网关环成功注记透出——runLoop 盖 SessionMessage.generatedBy。
+    modelRef: data.modelRef,
+    fallbackTrace: data.fallbackTrace,
   };
 }

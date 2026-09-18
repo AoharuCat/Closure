@@ -82,7 +82,7 @@ vi.mock('../main/db/projectRepository', () => ({ getProjectById, getProject }));
 vi.mock('../main/db/index', () => ({ getDb }));
 vi.mock('../main/logger', () => ({ getLogger: () => ({ warn, info }) }));
 
-import { _setModelConfigDirForTest, registerConfigIpc, embeddingModelChanged, reindexAllForChangedModel, readTaskModelSlots } from '../main/ipc/configIpc';
+import { _setModelConfigDirForTest, registerConfigIpc, embeddingModelChanged, reindexAllForChangedModel, readTaskModelSlots, readModelConfigFromDisk } from '../main/ipc/configIpc';
 import { isEmbeddingSweepInflight, runWithEmbeddingSweepGate } from '../main/db/embeddingSweepGate';
 
 const TEST_MODEL_DIR = path.join(process.cwd(), 'test-tmp-model-config');
@@ -240,6 +240,394 @@ describe('model config IPC', () => {
     expect(result.keys[0].id).toBe('key_001');
     expect(result.keys[0].models[0].id).toBe('gpt-4o-mini');
     expect(result.keys[1].id).toBe('key_002');
+  });
+
+  // 09-12 agy provider：CLI 键的盘面往返——写侧不落 HTTP 凭据（形态互斥的盘面镜像），
+  // cliExecutable 是判别载荷；读回 strict face 原样通过。HTTP 键文件键集不变（零回归门）。
+  it('round-trips an antigravity-cli key: cliExecutable persisted, no HTTP credentials on disk', async () => {
+    registerConfigIpc();
+    const saveCall = handle.mock.calls.find(([channel]) => channel === 'config:save-model');
+    const loadCall = handle.mock.calls.find(([channel]) => channel === 'config:load-model');
+
+    const config: ModelConfig = {
+      keys: [
+        ...SAMPLE_CONFIG.keys,
+        {
+          id: 'key_agy',
+          name: 'Antigravity CLI',
+          protocol: 'antigravity-cli',
+          // 渲染层 apiKey '' 哨兵（save face tolerate；CLI 分支写侧忽略该字段）。
+          apiKey: '',
+          cliExecutable: 'C:\\Users\\me\\AppData\\Local\\agy\\bin\\agy.exe',
+          models: [
+            { id: 'gemini-3.8-pro-high', alias: 'Gemini 3.8 Pro (high)', capability: 'text', enabled: true },
+          ],
+        },
+      ],
+    };
+    await saveCall![1]({}, config);
+
+    const agyFile = parseFlatYaml(readFileSync(path.join(TEST_MODEL_DIR, 'keys', 'key_agy.yaml'), 'utf-8'));
+    expect(agyFile).toMatchObject({
+      id: 'key_agy',
+      protocol: 'antigravity-cli',
+      cliExecutable: 'C:\\Users\\me\\AppData\\Local\\agy\\bin\\agy.exe',
+      'models.0.id': 'gemini-3.8-pro-high',
+    });
+    // 不落 HTTP 凭据（键不存在，而非空串占位）。
+    expect(Object.keys(agyFile)).not.toContain('baseUrl');
+    expect(Object.keys(agyFile)).not.toContain('apiKey');
+
+    // HTTP 键文件键集不变（既有写入序零回归）。
+    const httpFile = parseFlatYaml(readFileSync(path.join(TEST_MODEL_DIR, 'keys', 'key_001.yaml'), 'utf-8'));
+    expect(httpFile).toMatchObject({ protocol: 'openai-compatible', baseUrl: 'https://relay.example.com/v1' });
+    expect(Object.keys(httpFile)).toContain('apiKey');
+
+    // 读回：CLI 键 cliExecutable 在场；baseUrl undefined（盘上本就缺席）。apiKey ''
+    // 是 renderer-facing redaction 形态（redactModelConfig 对所有键统一打 ''，非 CLI
+    // 键特有——盘级断言已证键不存在）。
+    const result = (await loadCall![1]({})) as ModelConfig;
+    const agyKey = result.keys.find((k) => k.id === 'key_agy');
+    expect(agyKey?.protocol).toBe('antigravity-cli');
+    expect(agyKey?.cliExecutable).toContain('agy.exe');
+    expect(agyKey?.baseUrl).toBeUndefined();
+    expect(agyKey?.apiKey).toBe('');
+  });
+
+  // ── 09-12 子3 W3（design §7）：provider 参数面盘格式往返 + 旧格式字节不变 + lenient 读 ──
+  it('round-trips the 子3 params face: headers 平铺 / timeout / 流式禁用 / 证书 / defaults / extraBody JSON-string / pricing', async () => {
+    registerConfigIpc();
+    const saveCall = handle.mock.calls.find(([channel]) => channel === 'config:save-model');
+    const loadCall = handle.mock.calls.find(([channel]) => channel === 'config:load-model');
+
+    const config: ModelConfig = {
+      keys: [
+        {
+          id: 'key_p3rt',
+          name: 'Params RT',
+          protocol: 'openai-compatible',
+          apiKey: 'sk-rt',
+          baseUrl: 'https://relay.example.com/v1',
+          customHeaders: { 'X-Route-Tag': 'closure', 'X-Num': '12345', 'X-Drift-Null': 'null', 'X-Drift-Yes': 'yes' },
+          timeoutSeconds: 90,
+          streamingDisabled: true,
+          verifySsl: true,
+          models: [
+            {
+              id: 'rt-model',
+              alias: 'RT Model',
+              capability: 'text',
+              enabled: true,
+              defaults: {
+                temperature: 0.7,
+                topP: 0.9,
+                frequencyPenalty: -0.2,
+                presencePenalty: 0.3,
+                contextWindow: 131_072,
+                maxOutputTokens: 16_384,
+              },
+              extraBody: { safe_prompt: true, vendor: { min_p: 0.05 } },
+              pricing: { inputPerMillion: 1.5, outputPerMillion: 7.5, cachedInputPerMillion: 0.2 },
+            },
+          ],
+        },
+      ],
+    };
+    await saveCall![1]({}, config);
+
+    const flat = parseFlatYaml(readFileSync(path.join(TEST_MODEL_DIR, 'keys', 'key_p3rt.yaml'), 'utf-8'));
+    expect(flat).toMatchObject({
+      'headers.X-Route-Tag': 'closure',
+      // CR-6：header 字符串值写侧一律 flatQuoted（双引号 JSON 串）——裸写时精确数值/布尔
+      // 族字符串会被 parseScalar 重释成 number/bool/null（'null' 直接丢头）。测试自身的
+      // parseFlatYaml 因此读回 string（下方 load 断言钉逐字保真）。
+      'headers.X-Num': '12345',
+      'headers.X-Drift-Null': 'null',
+      'headers.X-Drift-Yes': 'yes',
+      timeoutSeconds: 90,
+      streamingDisabled: true,
+      verifySsl: true,
+      'models.0.defaults.temperature': 0.7,
+      'models.0.defaults.topP': 0.9,
+      'models.0.defaults.frequencyPenalty': -0.2,
+      'models.0.defaults.presencePenalty': 0.3,
+      'models.0.defaults.contextWindow': 131_072,
+      'models.0.defaults.maxOutputTokens': 16_384,
+      'models.0.pricing.inputPerMillion': 1.5,
+      'models.0.pricing.outputPerMillion': 7.5,
+      'models.0.pricing.cachedInputPerMillion': 0.2,
+    });
+    // extraBody = 单键 JSON-string（嵌套/带点键不能展平为 dotted 子键）。
+    expect(JSON.parse(flat['models.0.extraBody'] as string)).toEqual({
+      safe_prompt: true,
+      vendor: { min_p: 0.05 },
+    });
+
+    const result = (await loadCall![1]({})) as ModelConfig;
+    const key = result.keys.find((k) => k.id === 'key_p3rt');
+    expect(key?.customHeaders).toEqual({
+      'X-Route-Tag': 'closure',
+      'X-Num': '12345', // 数值形态读回还原 string（引号形态逐字保真）
+      'X-Drift-Null': 'null', // CR-6：漂移族字符串逐字保真（裸写会被重释成 null 而丢头）
+      'X-Drift-Yes': 'yes',
+    });
+    expect(key?.timeoutSeconds).toBe(90);
+    expect(key?.streamingDisabled).toBe(true);
+    expect(key?.verifySsl).toBe(true);
+    expect(key?.models[0]?.defaults).toEqual({
+      temperature: 0.7,
+      topP: 0.9,
+      frequencyPenalty: -0.2,
+      presencePenalty: 0.3,
+      contextWindow: 131_072,
+      maxOutputTokens: 16_384,
+    });
+    expect(key?.models[0]?.extraBody).toEqual({ safe_prompt: true, vendor: { min_p: 0.05 } });
+    expect(key?.models[0]?.pricing).toEqual({ inputPerMillion: 1.5, outputPerMillion: 7.5, cachedInputPerMillion: 0.2 });
+  });
+
+  it('旧格式文件字节不变：无子3 字段的键写盘与既有序列化逐字节一致（零迁移硬门）', async () => {
+    registerConfigIpc();
+    const saveCall = handle.mock.calls.find(([channel]) => channel === 'config:save-model');
+    await saveCall![1]({}, {
+      keys: [SAMPLE_CONFIG.keys[0]],
+    } satisfies ModelConfig);
+
+    const text = readFileSync(path.join(TEST_MODEL_DIR, 'keys', 'key_001.yaml'), 'utf-8');
+    expect(text).toBe(
+      [
+        'id: key_001',
+        'name: "Main relay"',
+        'protocol: openai-compatible',
+        'baseUrl: https://relay.example.com/v1',
+        'apiKey: sk-test',
+        'models.0.id: gpt-4o-mini',
+        'models.0.capability: text',
+        'models.0.alias: "GPT 4o mini"',
+        'models.0.enabled: true',
+        '',
+      ].join('\n'),
+    );
+  });
+
+  it('lenient 读：病态新键按缺席（坏 header 名/非数字 defaults/坏 JSON extraBody/非正整数超时），合法兄弟键存活', async () => {
+    registerConfigIpc();
+    const keysDir = path.join(TEST_MODEL_DIR, 'keys');
+    mkdirSync(keysDir, { recursive: true });
+    writeFileSync(
+      path.join(keysDir, 'key_hand.yaml'),
+      [
+        'id: key_hand',
+        'name: Hand',
+        'protocol: openai-compatible',
+        'baseUrl: https://relay.example.com/v1',
+        'apiKey: sk-hand',
+        'headers.X-Good: fine',
+        'headers.Bad.Name: dropped',
+        'headers.X-Num: 12345',
+        'timeoutSeconds: abc',
+        'streamingDisabled: maybe',
+        'verifySsl: true',
+        'models.0.id: m1',
+        'models.0.capability: text',
+        'models.0.alias: m1',
+        'models.0.enabled: true',
+        'models.0.defaults.temperature: 0.5',
+        'models.0.defaults.topP: xyz',
+        'models.0.extraBody: {"broken":',
+        'models.1.id: m2',
+        'models.1.capability: text',
+        'models.1.alias: m2',
+        'models.1.enabled: true',
+        'models.1.defaults.contextWindow: 131072',
+        'models.1.pricing.inputPerMillion: 1.5',
+      ].join('\n') + '\n',
+      'utf8',
+    );
+
+    const config = readModelConfigFromDisk();
+    const key = config.keys.find((k) => k.id === 'key_hand');
+    expect(key).toBeTruthy();
+    expect(key?.customHeaders).toEqual({ 'X-Good': 'fine', 'X-Num': '12345' }); // 病态名丢弃、数值形态还原
+    expect(key?.timeoutSeconds).toBeUndefined(); // 非数字按缺席
+    expect(key?.streamingDisabled).toBeUndefined(); // 非布尔按缺席
+    expect(key?.verifySsl).toBe(true);
+    expect(key?.models[0]?.defaults).toEqual({ temperature: 0.5 }); // topP 非数字丢弃、兄弟字段存活
+    expect(key?.models[0]?.extraBody).toBeUndefined(); // 坏 JSON 按缺席
+    expect(key?.models[1]?.defaults).toEqual({ contextWindow: 131_072 });
+    expect(key?.models[1]?.pricing).toEqual({ inputPerMillion: 1.5 });
+  });
+
+  // ── CR-13（09-12 子3 CR 批）：清除 round-trip——populate → clear → save → reload ──
+  // 写侧是从 parsed 键全量重建 flat（仅 apiKey 有 '' 哨兵合并），子3 字段全部条件展开
+  // （缺席不落键）——clear 语义 = 删键。本测试钉死「不 merge-with-existing 复活已删字段」。
+  it('CR-13: 清除 round-trip——populate → clear → save → reload 后子3 字段全缺席（无 merge 复活）', async () => {
+    registerConfigIpc();
+    const saveCall = handle.mock.calls.find(([channel]) => channel === 'config:save-model');
+    const loadCall = handle.mock.calls.find(([channel]) => channel === 'config:load-model');
+
+    // populate：headers/timeout/流式/证书/defaults/extraBody/pricing 全配。
+    await saveCall![1]({}, {
+      keys: [{
+        id: 'key_clr',
+        name: 'Clear RT',
+        protocol: 'openai-compatible',
+        apiKey: 'sk-clr',
+        baseUrl: 'https://relay.example.com/v1',
+        customHeaders: { 'X-Route-Tag': 'closure' },
+        timeoutSeconds: 90,
+        streamingDisabled: true,
+        verifySsl: true,
+        models: [{
+          id: 'm-clr',
+          alias: 'M',
+          capability: 'text',
+          enabled: true,
+          defaults: { temperature: 0.7, contextWindow: 131_072 },
+          extraBody: { safe_prompt: true },
+          pricing: { inputPerMillion: 1.5 },
+        }],
+      }],
+    } satisfies ModelConfig);
+    let seeded = (await loadCall![1]({})) as ModelConfig;
+    expect(seeded.keys[0]?.customHeaders).toEqual({ 'X-Route-Tag': 'closure' });
+
+    // clear：同键保存但子3 字段全部缺席（UI 清空后投影的二态空侧）。
+    await saveCall![1]({}, {
+      keys: [{
+        id: 'key_clr',
+        name: 'Clear RT',
+        protocol: 'openai-compatible',
+        apiKey: 'sk-clr',
+        baseUrl: 'https://relay.example.com/v1',
+        models: [{ id: 'm-clr', alias: 'M', capability: 'text', enabled: true }],
+      }],
+    } satisfies ModelConfig);
+
+    const cleared = (await loadCall![1]({})) as ModelConfig;
+    const key = cleared.keys.find((k) => k.id === 'key_clr');
+    expect(key?.customHeaders).toBeUndefined();
+    expect(key?.timeoutSeconds).toBeUndefined();
+    expect(key?.streamingDisabled).toBeUndefined();
+    // verifySsl 是 CLI 容忍字段且写侧分支外共写——本用例不设即不落键。
+    expect(key?.verifySsl).toBeUndefined();
+    expect(key?.models[0]?.defaults).toBeUndefined();
+    expect(key?.models[0]?.extraBody).toBeUndefined();
+    expect(key?.models[0]?.pricing).toBeUndefined();
+    // 盘面断言：flat 键不残留（不是「读侧忽略」而是「写侧删键」）。
+    const flat = parseFlatYaml(readFileSync(path.join(TEST_MODEL_DIR, 'keys', 'key_clr.yaml'), 'utf-8'));
+    expect(Object.keys(flat).some((k) => k.startsWith('headers.'))).toBe(false);
+    expect('timeoutSeconds' in flat).toBe(false);
+    expect('streamingDisabled' in flat).toBe(false);
+    expect('verifySsl' in flat).toBe(false);
+    expect(Object.keys(flat).some((k) => k.includes('.defaults.'))).toBe(false);
+    expect(Object.keys(flat).some((k) => k.endsWith('.extraBody'))).toBe(false);
+    expect(Object.keys(flat).some((k) => k.includes('.pricing.'))).toBe(false);
+  });
+
+  // ── CR-2/3/5/7（09-12 子3 CR 批）：lenient 读侧三道闸 + 范围外丢弃 + warn 留痕 ──
+  it('CR-2/3/5/7: 读侧守卫——blocked header 名/控制字符 header 值/越域 defaults/超界 timeout 丢弃且 warn，合法兄弟键存活', async () => {
+    registerConfigIpc();
+    const keysDir = path.join(TEST_MODEL_DIR, 'keys');
+    mkdirSync(keysDir, { recursive: true });
+    writeFileSync(
+      path.join(keysDir, 'key_guard.yaml'),
+      [
+        'id: key_guard',
+        'name: Guard',
+        'protocol: openai-compatible',
+        'baseUrl: https://relay.example.com/v1',
+        'apiKey: sk-guard',
+        'headers.X-Good: fine',
+        // CR-3：wire 序列化关键头黑名单（与 save 面同源常量集）——手改注入不得零过滤上
+        // wire。（authorization 刻意不在黑名单——网关替代鉴权语义，契约测试钉过放行。）
+        'headers.Content-Length: 99999',
+        // CR-2：控制字符值（引号 JSON 转义读回真实 \t/\n）——undici Headers.set 会抛。
+        'headers.X-Tab: "a\tb"',
+        // 文件里是两字符转义 `\n`（JS 源双反斜杠）——parseScalar JSON 路径读回真实换行。
+        'headers.X-Lf: "line1\\nline2"',
+        // CR-7：超界 timeout（86400 上界外 = 数日级 abort 窗）。
+        'timeoutSeconds: 9999999',
+        'models.0.id: m1',
+        'models.0.capability: text',
+        'models.0.alias: m1',
+        'models.0.enabled: true',
+        // CR-7：范围外采样值（temperature 99 → 每请求 400）与 CR-4 的 0 值窗口。
+        'models.0.defaults.temperature: 99',
+        'models.0.defaults.contextWindow: 0',
+        'models.0.defaults.topP: 0.9',
+      ].join('\n') + '\n',
+      'utf8',
+    );
+
+    const config = readModelConfigFromDisk();
+    const key = config.keys.find((k) => k.id === 'key_guard');
+    expect(key).toBeTruthy();
+    // 合法兄弟键存活；三道闸各自拦截。
+    expect(key?.customHeaders).toEqual({ 'X-Good': 'fine' });
+    expect(key?.timeoutSeconds).toBeUndefined();
+    expect(key?.models[0]?.defaults).toEqual({ topP: 0.9 });
+    // CR-5：每类丢弃 warn 留痕（静默丢弃 = 配置神秘丢失无迹可查）。
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ keyId: 'key_guard', name: 'Content-Length' }),
+      expect.stringContaining('wire-serialization header'),
+    );
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ keyId: 'key_guard', name: 'X-Tab' }),
+      expect.stringContaining('illegal custom header value'),
+    );
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ keyId: 'key_guard' }),
+      expect.stringContaining('illegal timeoutSeconds'),
+    );
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ keyId: 'key_guard', field: 'temperature' }),
+      expect.stringContaining('illegal model default value'),
+    );
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ keyId: 'key_guard', field: 'contextWindow' }),
+      expect.stringContaining('illegal model default value'),
+    );
+  });
+
+  // 09-12 agy provider W4：CLI 键的 alias 是 `agy models` TSV 的官方显示名——
+  // healDerivedModelFields 不覆盖（registry 族名兜底会把 gemini-* 全落「Gemini」×N
+  // 不可分辨）；capability 仍以 registry 重算。
+  it('load keeps the provider-supplied alias for CLI keys while healing capability', async () => {
+    registerConfigIpc();
+    const saveCall = handle.mock.calls.find(([channel]) => channel === 'config:save-model');
+    const loadCall = handle.mock.calls.find(([channel]) => channel === 'config:load-model');
+
+    const config: ModelConfig = {
+      keys: [
+        {
+          id: 'key_agy',
+          name: 'Antigravity CLI',
+          protocol: 'antigravity-cli',
+          apiKey: '',
+          cliExecutable: 'C:/agy/bin/agy.exe',
+          models: [
+            { id: 'gemini-3.8-pro-high', alias: 'Gemini 3.8 Pro (High)', capability: 'text', enabled: true },
+            { id: 'claude-sonnet-4-6', alias: 'Claude Sonnet 4.6', capability: 'text', enabled: true },
+          ],
+        },
+      ],
+    };
+    await saveCall![1]({}, config);
+    const result = (await loadCall![1]({})) as ModelConfig;
+    const models = result.keys[0]!.models;
+    // TSV 显示名原样保留（旧 heal 行为会把两者分别改成「Gemini 3.8-pro-high」/
+    // 「Claude sonnet-4-6」的 registry 族别名形态）。
+    expect(models[0]).toMatchObject({
+      id: 'gemini-3.8-pro-high',
+      alias: 'Gemini 3.8 Pro (High)',
+      capability: 'text',
+    });
+    expect(models[1]).toMatchObject({
+      id: 'claude-sonnet-4-6',
+      alias: 'Claude Sonnet 4.6',
+      capability: 'text',
+    });
   });
 
   it('CR-craft-kb-001: a rerank capability survives config reload (not downgraded to text)', async () => {
@@ -455,6 +843,78 @@ describe('model config IPC', () => {
     // Ref-only slots write no policy keys (zero migration on the encoding side).
     expect(Object.keys(sidecar)).not.toContain('extraction.thinking');
     expect(Object.keys(sidecar)).not.toContain('extraction.thinkingCustom');
+  });
+
+  // ── 09-12 子2：fallback 链 sidecar 往返（flat 键 `${slot}.fallbacks.N.*`）──
+
+  it('round-trips a slot fallback chain via sidecar flat keys; chain-free slots write no fallback keys (子2)', async () => {
+    registerConfigIpc();
+    const saveCall = handle.mock.calls.find(([channel]) => channel === 'config:save-model');
+    const loadCall = handle.mock.calls.find(([channel]) => channel === 'config:load-model');
+
+    const taskModels: NonNullable<ModelConfig['taskModels']> = {
+      'writer-draft': {
+        keyId: 'key_001',
+        modelId: 'qwen-max',
+        fallbacks: [
+          { keyId: 'key_002', modelId: 'qwen-plus', thinking: 'low' },
+          { keyId: 'key_001', modelId: 'qwen-flash', thinkingCustom: '4096' },
+        ],
+      },
+      dialogue: { keyId: 'key_001', modelId: 'qwen-max' }, // chain-free slot
+    };
+    await saveCall![1]({}, { ...SAMPLE_CONFIG, taskModels } satisfies ModelConfig);
+    // Load path = redactModelConfig(readModelConfig()) — passing means the
+    // aggregation AND the sidecar read both carry the chain (kindless models
+    // keep their per-entry policies read-side; numeric custom canonicalizes
+    // back to the schema's string form, mirror of the 08-25 policy test).
+    const result = (await loadCall![1]({})) as ModelConfig;
+    expect(result.taskModels).toEqual(taskModels);
+
+    const sidecar = parseFlatYaml(readFileSync(path.join(TEST_MODEL_DIR, 'task-models.yaml'), 'utf-8'));
+    expect(sidecar).toMatchObject({
+      'writer-draft.keyId': 'key_001',
+      'writer-draft.fallbacks.0.keyId': 'key_002',
+      'writer-draft.fallbacks.0.modelId': 'qwen-plus',
+      'writer-draft.fallbacks.0.thinking': 'low',
+      'writer-draft.fallbacks.1.keyId': 'key_001',
+      'writer-draft.fallbacks.1.modelId': 'qwen-flash',
+      'writer-draft.fallbacks.1.thinkingCustom': 4096, // unquoted numeric round-trips number-coerced
+    });
+    // Unset policy keys and chain-free slots stay absent (two-state write side).
+    expect(Object.keys(sidecar)).not.toContain('writer-draft.fallbacks.1.thinking');
+    expect(Object.keys(sidecar)).not.toContain('dialogue.fallbacks.0.keyId');
+  });
+
+  // ── 09-12 子2 CR 批（CR-18）：空 `fallbacks: []` 载荷的 lenient 归一 ──
+
+  it('CR-18: slot 携 `fallbacks: []` 的 save 载荷 → lenient 归一为缺席再 parse（不砖死整次 save），sidecar 落链-free 形态', async () => {
+    registerConfigIpc();
+    const saveCall = handle.mock.calls.find(([channel]) => channel === 'config:save-model');
+    const loadCall = handle.mock.calls.find(([channel]) => channel === 'config:load-model');
+
+    // 一个 slot 携空数组链（手编/装配边缘形态）+ 一个正常 slot 同载荷——空数组曾使
+    // modelConfigSaveSchema.parse（.min(1) 拒收）砖死整次 save（用户连无关设置都存不了）。
+    await saveCall![1](
+      {},
+      {
+        ...SAMPLE_CONFIG,
+        taskModels: {
+          dialogue: { keyId: 'key_001', modelId: 'qwen-max', fallbacks: [] },
+          extraction: { keyId: 'key_001', modelId: 'gpt-4o-mini' },
+        },
+      } as unknown as ModelConfig,
+    );
+    const result = (await loadCall![1]({})) as ModelConfig;
+
+    // 归一语义 = 空链 ≡ 无链：slot 的 ref 保留、fallbacks 键缺席（二态契约空侧）。
+    expect(result.taskModels).toEqual({
+      dialogue: { keyId: 'key_001', modelId: 'qwen-max' },
+      extraction: { keyId: 'key_001', modelId: 'gpt-4o-mini' },
+    });
+    const sidecar = parseFlatYaml(readFileSync(path.join(TEST_MODEL_DIR, 'task-models.yaml'), 'utf-8'));
+    expect(sidecar['dialogue.keyId']).toBe('key_001');
+    expect(Object.keys(sidecar).some((k) => k.startsWith('dialogue.fallbacks'))).toBe(false);
   });
 
   it('save path loudly rejects an illegal slot.thinking value (zod) — leniency is disk-read only (08-25)', async () => {
@@ -792,6 +1252,150 @@ describe('readTaskModelSlots defensive parsing (C3.2)', () => {
       expect.objectContaining({ slot: 'extraction', modelId: 'glm-4.7' }),
       expect.stringContaining('slot.thinkingCustom not supported by this model'),
     );
+  });
+
+  // ── 09-12 子2：fallback 链读侧防御（连续扫描 / 重复 drop / 坏行链止 / 逐条 thinking 合法性）──
+
+  it('reads a hand-edited chain; an index gap stops the scan (contiguous 0..N, 子2)', () => {
+    mkdirSync(TEST_MODEL_DIR, { recursive: true });
+    writeFileSync(
+      path.join(TEST_MODEL_DIR, 'task-models.yaml'),
+      [
+        'dialogue.keyId: key_001',
+        'dialogue.modelId: qwen-max',
+        'dialogue.fallbacks.0.keyId: key_002',
+        'dialogue.fallbacks.0.modelId: qwen-plus',
+        // index 1 deleted by hand → chain stops; index 2 is NEVER read (a gap
+        // is a missing entry, not a reason to keep scanning).
+        'dialogue.fallbacks.2.keyId: key_001',
+        'dialogue.fallbacks.2.modelId: qwen-flash',
+      ].join('\n') + '\n',
+      'utf-8',
+    );
+    expect(readTaskModelSlots()).toEqual({
+      dialogue: {
+        keyId: 'key_001',
+        modelId: 'qwen-max',
+        fallbacks: [{ keyId: 'key_002', modelId: 'qwen-plus' }],
+      },
+    });
+  });
+
+  it('duplicate entries (vs the main assignment / an earlier entry) drop with a warn; later entries survive (子2)', () => {
+    mkdirSync(TEST_MODEL_DIR, { recursive: true });
+    writeFileSync(
+      path.join(TEST_MODEL_DIR, 'task-models.yaml'),
+      [
+        'dialogue.keyId: key_001',
+        'dialogue.modelId: qwen-max',
+        'dialogue.fallbacks.0.keyId: key_001',
+        'dialogue.fallbacks.0.modelId: qwen-max', // dup of the MAIN assignment
+        'dialogue.fallbacks.1.keyId: key_002',
+        'dialogue.fallbacks.1.modelId: qwen-plus',
+        'dialogue.fallbacks.2.keyId: key_002',
+        'dialogue.fallbacks.2.modelId: qwen-plus', // dup of entry 1
+        'dialogue.fallbacks.3.keyId: key_003',
+        'dialogue.fallbacks.3.modelId: deepseek-r1',
+      ].join('\n') + '\n',
+      'utf-8',
+    );
+    expect(readTaskModelSlots()).toEqual({
+      dialogue: {
+        keyId: 'key_001',
+        modelId: 'qwen-max',
+        fallbacks: [
+          { keyId: 'key_002', modelId: 'qwen-plus' },
+          { keyId: 'key_003', modelId: 'deepseek-r1' },
+        ],
+      },
+    });
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ slot: 'dialogue', entry: 0 }),
+      expect.stringContaining('duplicate fallback entry'),
+    );
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ slot: 'dialogue', entry: 2 }),
+      expect.stringContaining('duplicate fallback entry'),
+    );
+  });
+
+  it('a comment-contaminated entry stops the chain (warn); the slot ref and earlier entries survive (子2)', () => {
+    mkdirSync(TEST_MODEL_DIR, { recursive: true });
+    writeFileSync(
+      path.join(TEST_MODEL_DIR, 'task-models.yaml'),
+      [
+        'extraction.keyId: key_001',
+        'extraction.modelId: qwen-max',
+        'extraction.fallbacks.0.keyId: key_002',
+        'extraction.fallbacks.0.modelId: qwen-plus',
+        'extraction.fallbacks.1.keyId: key_003 # 备用',
+        'extraction.fallbacks.1.modelId: deepseek-r1',
+        'extraction.fallbacks.2.keyId: key_004',
+        'extraction.fallbacks.2.modelId: glm-5.3',
+      ].join('\n') + '\n',
+      'utf-8',
+    );
+    expect(readTaskModelSlots()).toEqual({
+      extraction: {
+        keyId: 'key_001',
+        modelId: 'qwen-max',
+        fallbacks: [{ keyId: 'key_002', modelId: 'qwen-plus' }],
+      },
+    });
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ slot: 'extraction', entry: 1 }),
+      expect.stringContaining('trailing comment'),
+    );
+  });
+
+  it('per-entry thinking legality is judged against EACH entry model — off on a forced kind drops; kindless keeps (子2)', () => {
+    mkdirSync(TEST_MODEL_DIR, { recursive: true });
+    // Entry 0 targets glm-5.3 (forced thinking, offLegal=false) with 'off' →
+    // dropped with a per-entry warn; entry 1 targets a kindless model and keeps
+    // its policy (registry silence is not a legality verdict, CR-016).
+    writeFileSync(
+      path.join(TEST_MODEL_DIR, 'task-models.yaml'),
+      [
+        'dialogue.keyId: key_001',
+        'dialogue.modelId: qwen-max',
+        'dialogue.fallbacks.0.keyId: key_002',
+        'dialogue.fallbacks.0.modelId: glm-5.3',
+        'dialogue.fallbacks.0.thinking: off',
+        'dialogue.fallbacks.1.keyId: key_003',
+        'dialogue.fallbacks.1.modelId: qwen-plus',
+        'dialogue.fallbacks.1.thinking: low',
+      ].join('\n') + '\n',
+      'utf-8',
+    );
+    expect(readTaskModelSlots()).toEqual({
+      dialogue: {
+        keyId: 'key_001',
+        modelId: 'qwen-max',
+        fallbacks: [
+          { keyId: 'key_002', modelId: 'glm-5.3' },
+          { keyId: 'key_003', modelId: 'qwen-plus', thinking: 'low' },
+        ],
+      },
+    });
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ slot: 'dialogue', entry: 0, modelId: 'glm-5.3', value: 'off' }),
+      expect.stringContaining('not legal for this model'),
+    );
+  });
+
+  it('fallback keys under a slot with no valid main assignment are never read (the chain hangs off the assignment, 子2)', () => {
+    mkdirSync(TEST_MODEL_DIR, { recursive: true });
+    writeFileSync(
+      path.join(TEST_MODEL_DIR, 'task-models.yaml'),
+      [
+        'dialogue.keyId: "   "', // blank-after-trim → slot skipped entirely
+        'dialogue.modelId: qwen-max',
+        'dialogue.fallbacks.0.keyId: key_002',
+        'dialogue.fallbacks.0.modelId: qwen-plus',
+      ].join('\n') + '\n',
+      'utf-8',
+    );
+    expect(readTaskModelSlots()).toBeUndefined();
   });
 
   it('an unreadable sidecar (name occupied by a directory) → undefined, never throws', () => {

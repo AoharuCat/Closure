@@ -245,6 +245,8 @@ export interface SessionMetaState {
   participationGear?: ParticipationGear;
   balancedAskCategories?: BalancedAskCategory[];
   trustAdjudication?: boolean;
+  /** 链流程重排 W2：auto 档强难停点子开关（'ask' 缺省 / 'auto' 真全自动；消费归 write_chapter 编排层）。 */
+  hardEscalatePolicy?: 'ask' | 'auto';
   parentId?: string;
   children: string[];
   branchFromMessageId?: string;
@@ -277,6 +279,8 @@ function persistSessionMeta(session: SessionState): void {
     participationGear: session.participationGear,
     balancedAskCategories: session.balancedAskCategories,
     trustAdjudication: session.trustAdjudication,
+    // 链流程重排 W2：hardEscalatePolicy 持久化（mirror trustAdjudication）。
+    hardEscalatePolicy: session.hardEscalatePolicy,
     parentId: session.parentId,
     children: session.children ?? [],
     branchFromMessageId: session.branchFromMessageId,

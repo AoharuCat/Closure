@@ -5,25 +5,27 @@ import { describe, expect, it, vi } from 'vitest';
 // 钉死（deconLlmCore.ts JSDoc 指定链）：
 // - 档位随 slot 路由：extraction（P1a/P1b/P3a——判别面温度 0）/ review-judge（P1c 裁决/
 //   P4 应答——语义裁判面温度 0.2）/ writer-draft（P5 读法/细批——**自钉 0.3 非创作温度**，F-17）；
-//   assignment → resolveModel 收窄引用。
-// - 缺档/未注入 → default 哨兵 {keyId:'default', modelId:'default'} → resolveModel 自动选择。
+//   assignment → 窄引用直达环入口 payload.ref。
+// - 缺档/未注入 → default 哨兵 {keyId:'default',modelId:'default'}（环内 resolveModel 自动选择）。
 // - 思考策略随档（assignmentThinkingControl 镜像——非法值不注入）。
 // - maxTokens 调用方传入优先；缺省 belt 常量。
 // - finishReason 透传（CR-2——截断判定权威信号）。
+//
+// 09-12 子2（复核 H1 重接）：生产面改经网关环入口 handleGenerateText——mock 面从 protocol
+// generateText 换到环入口（resolveModel 已上移进环 per-attempt 解析，环行为在
+// modelGatewayFallbackLoop.test.ts 钉死，此处只钉「档位 → payload 组装」）。
 
-const { resolveTaskModel, assignmentThinkingControl, resolveModel, generateText, readModelConfigFromDisk } =
+const { resolveTaskModel, assignmentThinkingControl, assignmentFallbackChain, handleGenerateText } =
   vi.hoisted(() => ({
     resolveTaskModel: vi.fn(),
     assignmentThinkingControl: vi.fn(),
-    resolveModel: vi.fn(),
-    generateText: vi.fn(),
-    readModelConfigFromDisk: vi.fn(),
+    // 09-12 子2：链投影 helper 缺省返 undefined（零链）。
+    assignmentFallbackChain: vi.fn(() => undefined),
+    handleGenerateText: vi.fn(),
   }));
 
-vi.mock('@orison/desktop-agent', () => ({ resolveTaskModel, assignmentThinkingControl }));
-vi.mock('@orison/model-protocols', () => ({ generateText }));
-vi.mock('../main/ipc/configIpc', () => ({ readModelConfigFromDisk }));
-vi.mock('../main/ipc/modelGatewayIpc', () => ({ resolveModel }));
+vi.mock('@orison/desktop-agent', () => ({ resolveTaskModel, assignmentThinkingControl, assignmentFallbackChain }));
+vi.mock('../main/ipc/modelGatewayIpc', () => ({ handleGenerateText }));
 
 import {
   DECON_DEFAULT_MAX_TOKENS,
@@ -32,14 +34,11 @@ import {
   installDeconLlmCoreProduction,
 } from '../main/decon/deconLlmCore';
 
-function stubResolvedModel() {
-  return {
-    keyId: 'key-ext',
-    modelId: 'decon-extractor-x',
-    protocol: 'openai-compatible' as const,
-    baseUrl: 'http://endpoint.example.com/v1',
-    apiKey: 'sk-stub',
-    capability: 'text' as const,
+/** 取第 i 次环入口调用的 payload（ref + request）。 */
+function payloadAt(i: number): { ref: { keyId: string; modelId: string }; request: Record<string, unknown> } {
+  return handleGenerateText.mock.calls[i]![0] as unknown as {
+    ref: { keyId: string; modelId: string };
+    request: Record<string, unknown>;
   };
 }
 
@@ -48,9 +47,7 @@ describe('installDeconLlmCoreProduction（生产装配链）', () => {
     vi.clearAllMocks();
     resolveTaskModel.mockReturnValue({ keyId: 'key-ext', modelId: 'decon-extractor-x', thinking: 'low' });
     assignmentThinkingControl.mockReturnValue({ level: 'low' });
-    resolveModel.mockImplementation(() => stubResolvedModel());
-    generateText.mockImplementation(async () => ({ text: '[]' }));
-    readModelConfigFromDisk.mockReturnValue({ keys: [] });
+    handleGenerateText.mockImplementation(async () => ({ text: '[]' }));
     installDeconLlmCoreProduction();
     const core = getDeconLlmCore()!;
     expect(core).not.toBeNull();
@@ -58,77 +55,61 @@ describe('installDeconLlmCoreProduction（生产装配链）', () => {
     const out = await core.generateText({ slot: 'extraction', system: 'SYS', user: 'USER', maxTokens: 16384 });
     expect(out).toEqual({ text: '[]' });
     expect(resolveTaskModel).toHaveBeenCalledWith('extraction');
-    expect(resolveModel).toHaveBeenCalledWith(
-      { keyId: 'key-ext', modelId: 'decon-extractor-x' },
-      readModelConfigFromDisk(),
-    );
-    const [modelArg, reqArg] = generateText.mock.calls[0] as unknown as [
-      ReturnType<typeof stubResolvedModel>,
-      Record<string, unknown>,
-    ];
-    expect(modelArg.modelId).toBe('decon-extractor-x');
-    expect(reqArg.messages).toEqual([
+    const { ref, request } = payloadAt(0);
+    expect(ref).toEqual({ keyId: 'key-ext', modelId: 'decon-extractor-x' });
+    expect(request.messages).toEqual([
       { role: 'system', content: 'SYS' },
       { role: 'user', content: 'USER' },
     ]);
-    expect(reqArg.temperature).toBe(0);
-    expect(reqArg.maxTokens).toBe(16384); // 调用方预算优先（按缝输出量独立核算）
-    expect(reqArg.thinking).toEqual({ level: 'low' });
+    expect(request.temperature).toBe(0);
+    expect(request.maxTokens).toBe(16384); // 调用方预算优先（按缝输出量独立核算）
+    expect(request.thinking).toEqual({ level: 'low' });
   });
 
   it('review-judge 档（P1c 裁决/P4 应答）：档位 key + 温度 0.2 + 缺省 maxTokens belt + default 哨兵链', async () => {
     vi.clearAllMocks();
     resolveTaskModel.mockReturnValue(undefined);
     assignmentThinkingControl.mockReturnValue(undefined);
-    resolveModel.mockImplementation(() => stubResolvedModel());
-    generateText.mockImplementation(async () => ({ text: '{"same":true}' }));
-    readModelConfigFromDisk.mockReturnValue({ keys: [] });
+    handleGenerateText.mockImplementation(async () => ({ text: '{"same":true}' }));
     installDeconLlmCoreProduction();
     await getDeconLlmCore()!.generateText({ slot: 'review-judge', user: 'ONLY-USER' });
 
     expect(resolveTaskModel).toHaveBeenCalledWith('review-judge');
-    // 缺档 → default 哨兵 → resolveModel 自动选择。
-    expect(resolveModel).toHaveBeenCalledWith(
-      { keyId: 'default', modelId: 'default' },
-      readModelConfigFromDisk(),
-    );
-    const [, reqArg] = generateText.mock.calls[0] as unknown as [unknown, Record<string, unknown>];
-    expect(reqArg.temperature).toBe(0.2);
-    expect(reqArg.maxTokens).toBe(DECON_DEFAULT_MAX_TOKENS); // 缺省 belt
-    expect(reqArg.messages).toEqual([{ role: 'user', content: 'ONLY-USER' }]); // system 缺省不占位
-    expect('thinking' in reqArg).toBe(false); // 无思考注入
+    // 缺档 → default 哨兵（环内 resolveModel 自动选择）。
+    const { ref, request } = payloadAt(0);
+    expect(ref).toEqual({ keyId: 'default', modelId: 'default' });
+    expect(request.temperature).toBe(0.2);
+    expect(request.maxTokens).toBe(DECON_DEFAULT_MAX_TOKENS); // 缺省 belt
+    expect(request.messages).toEqual([{ role: 'user', content: 'ONLY-USER' }]); // system 缺省不占位
+    expect('thinking' in request).toBe(false); // 无思考注入
   });
 
   it('writer-draft 档（P5 读法/细批）：自钉温度 0.3（F-17——分析性叙事报告非创作文本，不沿用创作温度）', async () => {
     vi.clearAllMocks();
     resolveTaskModel.mockReturnValue(undefined);
     assignmentThinkingControl.mockReturnValue(undefined);
-    resolveModel.mockImplementation(() => stubResolvedModel());
-    generateText.mockImplementation(async () => ({ text: '# 读法' }));
-    readModelConfigFromDisk.mockReturnValue({ keys: [] });
+    handleGenerateText.mockImplementation(async () => ({ text: '# 读法' }));
     installDeconLlmCoreProduction();
     await getDeconLlmCore()!.generateText({ slot: 'writer-draft', user: 'U', maxTokens: 12000 });
 
     expect(resolveTaskModel).toHaveBeenCalledWith('writer-draft');
-    const [, reqArg] = generateText.mock.calls[0] as unknown as [unknown, Record<string, unknown>];
-    expect(reqArg.temperature).toBe(0.3);
-    expect(reqArg.maxTokens).toBe(12000);
+    const { request } = payloadAt(0);
+    expect(request.temperature).toBe(0.3);
+    expect(request.maxTokens).toBe(12000);
   });
 
   it('finishReason 透传（CR-2）：协议层停因进 seam 返回——截断判定权威信号', async () => {
     vi.clearAllMocks();
     resolveTaskModel.mockReturnValue(undefined);
     assignmentThinkingControl.mockReturnValue(undefined);
-    resolveModel.mockImplementation(() => stubResolvedModel());
-    readModelConfigFromDisk.mockReturnValue({ keys: [] });
     installDeconLlmCoreProduction();
     // 'length' = 输出被 token 上限截断 → 透传（调用方 capped/失败挂起）。
-    generateText.mockImplementation(async () => ({ text: '{"synopsis":', finishReason: 'length' }));
+    handleGenerateText.mockImplementation(async () => ({ text: '{"synopsis":', finishReason: 'length' }));
     const out = await getDeconLlmCore()!.generateText({ slot: 'extraction', user: 'U' });
     expect(out.text).toBe('{"synopsis":');
     expect(out.finishReason).toBe('length');
     // 端点未回报停因 → undefined 透传。
-    generateText.mockImplementationOnce(async () => ({ text: '[]' }));
+    handleGenerateText.mockImplementationOnce(async () => ({ text: '[]' }));
     const out2 = await getDeconLlmCore()!.generateText({ slot: 'extraction', user: 'U' });
     expect(out2.finishReason).toBeUndefined();
   });
@@ -137,10 +118,8 @@ describe('installDeconLlmCoreProduction（生产装配链）', () => {
     vi.clearAllMocks();
     resolveTaskModel.mockReturnValue(undefined);
     assignmentThinkingControl.mockReturnValue(undefined);
-    resolveModel.mockImplementation(() => stubResolvedModel());
-    readModelConfigFromDisk.mockReturnValue({ keys: [] });
     installDeconLlmCoreProduction();
-    generateText.mockImplementation(async () => ({
+    handleGenerateText.mockImplementation(async () => ({
       text: '[]',
       finishReason: 'stop',
       usage: { promptTokens: 1200, completionTokens: 80, totalTokens: 1280 },
@@ -148,7 +127,7 @@ describe('installDeconLlmCoreProduction（生产装配链）', () => {
     const out = await getDeconLlmCore()!.generateText({ slot: 'extraction', user: 'U' });
     expect(out.usage).toEqual({ promptTokens: 1200, completionTokens: 80, totalTokens: 1280 });
     // 端点未回报 usage → undefined 透传（调用方回退字符近似 + estimated 标注）。
-    generateText.mockImplementationOnce(async () => ({ text: '[]' }));
+    handleGenerateText.mockImplementationOnce(async () => ({ text: '[]' }));
     const out2 = await getDeconLlmCore()!.generateText({ slot: 'extraction', user: 'U' });
     expect(out2.usage).toBeUndefined();
   });

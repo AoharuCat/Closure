@@ -70,6 +70,13 @@ export function DeconPage() {
     return materialNames[parsed.materialId] ?? `${parsed.materialId.slice(0, 8)}…`;
   };
 
+  // U7：createdAt 本地化时间戳（数据在 decon:list 行——纯渲染；坏 ISO 串防御回落原样）。
+  const formatJobTime = (iso: string): string => {
+    const ts = Date.parse(iso);
+    if (!Number.isFinite(ts)) return iso;
+    return new Date(ts).toLocaleString(resolvedLocale);
+  };
+
   return (
     <div className="materials-page decon-page" data-decon-page="true">
       <div className="decon-layout">
@@ -135,6 +142,18 @@ export function DeconPage() {
                       {t(deconStatusKey(job.status))}
                     </span>
                   </span>
+                  {/* U7：创建时间（本地化）。 */}
+                  <span className="decon-jobrow-meta">
+                    <span className="decon-jobrow-time" data-decon-job-created={job.createdAt}>
+                      {formatJobTime(job.createdAt)}
+                    </span>
+                  </span>
+                  {/* U17：failed 态 error 一行截断摘要（全文在详情横幅/title 悬浮）。 */}
+                  {job.status === 'failed' && job.error !== null && job.error !== '' && (
+                    <span className="decon-jobrow-error" data-decon-job-error="true" title={job.error}>
+                      {job.error}
+                    </span>
+                  )}
                 </button>
               ))}
             </div>

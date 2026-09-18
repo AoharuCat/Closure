@@ -19,26 +19,23 @@ import {
 } from '@orison/shared-contracts';
 import { getDb } from '../db/index';
 import { getDeconDictionary, getDeconPassState, getDeconProduct, upsertDeconProduct } from '../db/closure-decon';
-import { getMaterialRow } from '../db/materialIndexer';
 import { getLogger } from '../logger';
 import { splitParagraphBlocks, type MaterialParagraphBlock } from '../ipc/toolHandlers/materialIngest';
 import {
   DECON_STALE_NOTE,
   capDeconUnit,
   checkDeconRunBoundary,
-  deconErrMsg,
-  estimateDeconCallTokens,
   failDeconUnit,
+  loadExtractableMaterial,
   loadRunningDeconJob,
   readDeconDerivedTextFor,
-  resolveDeconActualTokens,
+  runDeconLlmCall,
   sha256DeconContent,
-  writeDeconCost,
   writeDeconPassState,
   type DeconBoundaryStop,
 } from './deconRun';
+import { buildChapterHeadings as buildDeconChapterHeadings, chapterShortLabel as deconChapterShortLabel } from '../db/chapterHeadings';
 import { getDeconLlmCore, type DeconGenerateText } from './deconLlmCore';
-import { accumulateDeconCost, wouldExceedDeconBudget } from './deconBudget';
 import { decideDeconPassReentry, extractMaterialId, transitionDeconJob } from './deconJob';
 import { buildChapterSegments, buildDeconAnchor, isQuoteInSpan, type DeconParaRange, type DeconP1bSegment } from './p1Extract';
 
@@ -367,6 +364,8 @@ export interface DeconP3aDeps {
   readDerivedText?: (material: Material) => string | null;
   /** 逐章 running 进度事件注入（CR-8——runDeconPassSequence 传 stamped notify；直调测试缺省不发）。 */
   notify?: (event: DeconProgressEvent) => void;
+  /** 材料读重试等待注入（C4-F12——测试零延迟；缺省 ~1s×10 实时钟）。 */
+  waitMs?: (ms: number) => Promise<void>;
   now?: () => Date;
 }
 
@@ -410,16 +409,17 @@ export async function runDeconP3a(jobId: string, deps: DeconP3aDeps = {}): Promi
   }
   const job: DeconJob = gate.job;
 
-  const material = getMaterialRow(extractMaterialId(job.materialRef));
-  if (material === null || material.chapters.length === 0) {
-    const message = `材料 ${job.materialRef} 不存在或零章——P3a 无可打标章`;
-    failDeconUnit(jobId, 'p3a', 'all', message, nowIso());
-    return { status: 'failed', message, stats: emptyStats(0) };
+  // C4-F12 材料读重试 + C4-F16 写侧（材料级前置失败只 transitionDeconJob，不写 'all' 化石行）。
+  const loaded = await loadExtractableMaterial(extractMaterialId(job.materialRef), { waitMs: deps.waitMs });
+  if (!loaded.ok) {
+    transitionDeconJob(jobId, 'fail', loaded.message);
+    return { status: 'failed', message: loaded.message, stats: emptyStats(0) };
   }
+  const material = loaded.material;
   const derived = (deps.readDerivedText ?? readDeconDerivedTextFor)(material);
   if (derived === null) {
     const message = '派生 .md 读取失败（缺失或车道不可解析）——无法锚定打标基面';
-    failDeconUnit(jobId, 'p3a', 'all', message, nowIso());
+    transitionDeconJob(jobId, 'fail', message);
     return { status: 'failed', message, stats: emptyStats(material.chapters.length) };
   }
   if (sha256DeconContent(derived) !== job.derivedHash) {
@@ -429,9 +429,13 @@ export async function runDeconP3a(jobId: string, deps: DeconP3aDeps = {}): Promi
   const blocks = splitParagraphBlocks(derived);
   if (blocks.length === 0) {
     const message = '材料无有效段落（派生 .md 全空白）——不可打标';
-    failDeconUnit(jobId, 'p3a', 'all', message, nowIso());
+    transitionDeconJob(jobId, 'fail', message);
     return { status: 'failed', message, stats: emptyStats(material.chapters.length) };
   }
+
+  // C5：chapterIndex → 真实章标行映射（note 展示不再 index 算术）。
+  const headings = buildDeconChapterHeadings(derived, material.chapters);
+  const chLabel = (chapterIndex: number): string => deconChapterShortLabel(headings.get(chapterIndex), chapterIndex);
 
   // 惰性资源面（CR-10）：LLM 内核只在确有章需要打标时判定加载；词典可选（null = 不注入）。
   let generate: DeconGenerateText | undefined;
@@ -506,51 +510,41 @@ export async function runDeconP3a(jobId: string, deps: DeconP3aDeps = {}): Promi
 
     for (const segment of segments) {
       const user = buildDeconP3aUserPrompt({ dictionaryEntries, derived, blocks, segment });
-      const est = estimateDeconCallTokens(DECON_P3A_SYSTEM_PROMPT, user, DECON_P3A_LABELS_MAX_TOKENS);
-      if (wouldExceedDeconBudget(job.budget, cost, 'p3a', est)) {
-        const note = `p3a 第 ${chapter.index} 章打标预算超限（本次预估 ${est} tokens，已累计 ${cost.totalTokens}）——已诚实挂起（不烧 token），调整预算后续跑`;
-        capDeconUnit(jobId, 'p3a', unit, note, nowIso());
-        return { status: 'capped', message: note, stats };
+      // C3 脚手架单源（预算门→调用→记账→length 升帽重试一次）；截断仍挂 = capped——
+      // 纯枚举重打廉价，调预算/重试即可续（mirror 旧语义）。
+      const call = await runDeconLlmCall({
+        jobId,
+        pass: 'p3a',
+        unit,
+        slot: 'extraction',
+        system: DECON_P3A_SYSTEM_PROMPT,
+        user,
+        maxTokens: DECON_P3A_LABELS_MAX_TOKENS,
+        budget: job.budget,
+        cost,
+        job,
+        generate,
+        notify: deps.notify,
+        nowIso,
+        label: `p3a ${chLabel(chapter.index)}打标`,
+      });
+      if (!call.ok) {
+        if (call.kind === 'budget-capped' || call.kind === 'length') {
+          capDeconUnit(jobId, 'p3a', unit, call.note, nowIso());
+          return { status: 'capped', message: call.note, stats };
+        }
+        return failUnit(call.note); // error / empty
       }
-      let text = '';
-      let finishReason: string | undefined;
-      let usage: { promptTokens?: number; completionTokens?: number; totalTokens?: number } | undefined;
-      try {
-        const response = await generate({
-          slot: 'extraction',
-          system: DECON_P3A_SYSTEM_PROMPT,
-          user,
-          maxTokens: DECON_P3A_LABELS_MAX_TOKENS,
-        });
-        text = (response?.text ?? '').trim();
-        finishReason = response?.finishReason;
-        usage = response?.usage;
-      } catch (err) {
-        return failUnit(`第 ${chapter.index} 章打标调用失败：${deconErrMsg(err)}`);
-      }
-      // 实际记账（CR-13：provider usage 真值优先）并落 job 行——writeDeconCost 单源重读现值行
-      // （await 窗口翻态不被旧快照复活；行已删抛 DeconJobGoneError 静默中止）。
-      const actual = resolveDeconActualTokens(DECON_P3A_SYSTEM_PROMPT, user, text, usage);
-      cost = accumulateDeconCost(cost, 'p3a', actual.tokens, 1, actual.estimated);
-      writeDeconCost(jobId, job, cost, nowIso());
-      if (finishReason === 'length') {
-        // 输出预算型截断（权威停因）——capped 挂起：调预算/重试即可续（纯枚举重打廉价，
-        // 与 p1b 的 failed 处理不同面——彼处 synopsis 语义面损坏不可续）。
-        const note = `p3a 第 ${chapter.index} 章打标输出因 token 上限截断（finishReason=length）——已挂起（不落半程产物），调整预算后续跑`;
-        capDeconUnit(jobId, 'p3a', unit, note, nowIso());
-        return { status: 'capped', message: note, stats };
-      }
-      if (!text) {
-        return failUnit(`第 ${chapter.index} 章打标返回空回复——已挂起`);
-      }
+      const text = call.text;
+      cost = call.cost;
       const parsed = parseDeconLabelsSegmentResponse(text);
       if (parsed === null) {
-        return failUnit(`第 ${chapter.index} 章打标输出不可解析为 JSON 对象——整体拒收（不硬给标签）`);
+        return failUnit(`${chLabel(chapter.index)}打标输出不可解析为 JSON 对象——整体拒收（不硬给标签）`);
       }
       stats.droppedMalformed += parsed.droppedMalformed;
       if (parsed.itemCount > DECON_P3A_MAX_ITEMS_PER_CHAPTER) {
         return failUnit(
-          `第 ${chapter.index} 章打标条目数 ${parsed.itemCount} 超过上限 ${DECON_P3A_MAX_ITEMS_PER_CHAPTER}——为避免静默截断已挂起（材料可能异常，请人工检查）`,
+          `${chLabel(chapter.index)}打标条目数 ${parsed.itemCount} 超过上限 ${DECON_P3A_MAX_ITEMS_PER_CHAPTER}——为避免静默截断已挂起（材料可能异常，请人工检查）`,
         );
       }
       parts.push(parsed.output);
@@ -569,7 +563,7 @@ export async function runDeconP3a(jobId: string, deps: DeconP3aDeps = {}): Promi
       merged.expositionSpans.length;
     if (mergedItemCount > DECON_P3A_MAX_ITEMS_PER_CHAPTER) {
       return failUnit(
-        `第 ${chapter.index} 章打标条目合并后共 ${mergedItemCount} 条超过上限 ${DECON_P3A_MAX_ITEMS_PER_CHAPTER}——为避免静默截断已挂起（材料可能异常，请人工检查）`,
+        `${chLabel(chapter.index)}打标条目合并后共 ${mergedItemCount} 条超过上限 ${DECON_P3A_MAX_ITEMS_PER_CHAPTER}——为避免静默截断已挂起（材料可能异常，请人工检查）`,
       );
     }
 
@@ -626,7 +620,7 @@ export async function runDeconP3a(jobId: string, deps: DeconP3aDeps = {}): Promi
       arcBoundary: merged.arcBoundary,
     };
     if (!deconChapterLabelsSchema.safeParse(candidate).success) {
-      return failUnit(`第 ${chapter.index} 章合并标签未过契约校验（内部错误——锚定映射与契约漂移，请报告）`);
+      return failUnit(`${chLabel(chapter.index)}合并标签未过契约校验（内部错误——锚定映射与契约漂移，请报告）`);
     }
     const outputHash = hashDeconProductOutput(candidate);
 
@@ -645,7 +639,7 @@ export async function runDeconP3a(jobId: string, deps: DeconP3aDeps = {}): Promi
       return ok;
     })();
     if (!wrote) {
-      return failUnit(`第 ${chapter.index} 章标签落库被写侧门拒收（内部错误——payload 与契约漂移，请报告）`);
+      return failUnit(`${chLabel(chapter.index)}标签落库被写侧门拒收（内部错误——payload 与契约漂移，请报告）`);
     }
     if (stats.droppedNoAnchor > droppedBefore) {
       getLogger().warn(

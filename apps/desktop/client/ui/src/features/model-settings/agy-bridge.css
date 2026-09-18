@@ -1,0 +1,225 @@
+/* ── 设置页「MCP 工具桥」小节（09-12 子4 W6，design §4.4/§8 交付清单 2）──
+ * 骨架复用 layout/settings.css 的 settings-page-title 类；块级语汇 mirror
+ * usage.css 治理区（governance-row 布局 / status-chip 徽标 / 描边破坏性钮）。
+ * 全部 theme token，零裸色值，深浅主题同源。 */
+
+.agy-bridge-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2xs);
+  padding: var(--space-md) var(--space-lg);
+  border: 1px solid var(--outline-variant);
+  border-radius: var(--radius-md);
+  background: var(--surface-container);
+}
+
+.agy-bridge-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+}
+
+.agy-bridge-head .settings-page-title {
+  margin: 0;
+}
+
+/* 状态徽标（mirror .usage-status-chip 的填充 chip 语汇；配色对：
+ * ok = success/diff-add-bg；conflict = error/error-bg；未配置/已拒绝 = 中性 chip）。 */
+.agy-bridge-state-chip {
+  display: inline-block;
+  padding: 0.05rem var(--space-2xs);
+  border-radius: var(--radius-pill);
+  font-size: var(--text-2xs);
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+.agy-bridge-state-chip.is-ok {
+  color: var(--success);
+  background: var(--diff-add-bg);
+}
+
+.agy-bridge-state-chip.is-conflict {
+  color: var(--error);
+  background: var(--error-bg);
+  font-weight: 500;
+}
+
+.agy-bridge-state-chip.is-neutral {
+  color: var(--chip-text);
+  background: var(--chip-bg);
+}
+
+.agy-bridge-section-subtitle {
+  margin: 0;
+  font-size: var(--text-xs);
+  line-height: 1.45;
+  color: var(--on-surface-variant);
+}
+
+/* 副本根路径（机器路径原样展示，mirror .agybridge-disclosure-path）。 */
+.agy-bridge-fact {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.agy-bridge-fact-label {
+  font-size: var(--text-2xs);
+  font-weight: 600;
+  color: var(--on-surface-variant);
+}
+
+.agy-bridge-fact-value {
+  font-family: var(--font-mono, monospace);
+  font-size: var(--text-xs);
+  overflow-wrap: anywhere;
+  color: var(--on-surface-variant);
+}
+
+/* 冲突指引块（mirror 对话框 .agybridge-consent-conflict，紧凑一档）。 */
+.agy-bridge-conflict {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3xs);
+  padding: var(--space-2xs) var(--space-sm);
+  border: 1px solid color-mix(in srgb, var(--error) 45%, transparent);
+  border-radius: var(--radius-sm);
+  background: var(--surface-container-low);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+}
+
+.agy-bridge-conflict-title {
+  font-weight: 600;
+  color: var(--error);
+}
+
+.agy-bridge-conflict-rules {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.agy-bridge-conflict-rules code {
+  font-family: var(--font-mono, monospace);
+  font-size: var(--text-xs);
+  overflow-wrap: anywhere;
+  color: var(--on-surface-variant);
+}
+
+.agy-bridge-hint {
+  margin: 0;
+  font-size: var(--text-2xs);
+  line-height: 1.5;
+  color: var(--on-surface-variant);
+}
+
+/* 操作行（mirror .usage-governance-row）。 */
+.agy-bridge-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-md);
+  flex-wrap: wrap;
+  padding-top: var(--space-2xs);
+}
+
+/* 主操作（立即授权）= accent 描边（敏感但非破坏性——授权开启能力）。 */
+.agy-bridge-authorize-button {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2xs);
+  flex-shrink: 0;
+  padding: 0.35rem 0.8rem;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  font-size: var(--text-sm);
+  font-weight: 500;
+  cursor: pointer;
+  transition: background var(--duration-fast) ease;
+}
+
+.agy-bridge-authorize-button:hover {
+  background: var(--accent-soft);
+}
+
+.agy-bridge-authorize-button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.agy-bridge-authorize-button:disabled:hover {
+  background: transparent;
+}
+
+/* 破坏性/回收操作（关闭工具桥）——错误色描边（mirror .usage-clear-button）。 */
+.agy-bridge-revoke-button {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2xs);
+  flex-shrink: 0;
+  padding: 0.35rem 0.8rem;
+  border: 1px solid color-mix(in srgb, var(--error) 45%, transparent);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--error);
+  font: inherit;
+  font-size: var(--text-sm);
+  font-weight: 500;
+  cursor: pointer;
+  transition: background var(--duration-fast) ease;
+}
+
+.agy-bridge-revoke-button:hover:not(:disabled) {
+  background: var(--error-bg);
+}
+
+.agy-bridge-revoke-button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.agy-bridge-revoke-button:disabled:hover {
+  background: transparent;
+}
+
+/* 次级描边钮（重新检测——mirror .usage-retry-button）。 */
+.agy-bridge-recheck-button {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2xs);
+  flex-shrink: 0;
+  padding: 0.3rem 0.8rem;
+  border: 1px solid var(--outline-variant);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--on-surface);
+  font: inherit;
+  font-size: var(--text-sm);
+  cursor: pointer;
+  transition: background var(--duration-fast) ease;
+}
+
+.agy-bridge-recheck-button:hover {
+  background: var(--hover-overlay);
+}
+
+.agy-bridge-actions .material-symbols-outlined {
+  font-size: 1rem;
+}
+
+/* 加载/失败态（mirror .usage-hint 弱化小字）。 */
+.agy-bridge-state-block {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2xs);
+  font-size: var(--text-xs);
+  color: var(--on-surface-variant);
+}

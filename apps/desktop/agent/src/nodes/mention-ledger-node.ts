@@ -7,7 +7,6 @@ import {
   type SceneGraph,
 } from '@orison/shared-contracts';
 import type { AgentNode, NodeResult, NodeRunInput, RunSnapshot } from '../contracts/run';
-import { createTargetedRevisionNode, type ChapterLlmNodeDeps } from './chapter-nodes';
 import { registry } from '../tool/registry';
 import { logger } from '../logger';
 
@@ -28,10 +27,14 @@ import { logger } from '../logger';
 // 语义判断。汇账七步全在 shared-contracts 纯函数 + shell 组装核心（查询/汇编/计数）；申报的语义内容
 // （谁真登场了、梗概写什么）归写手 LLM（writer-node 阶段 2.5 已产 cast_declaration）。
 //
-// **修订降档接线（design §2.3，本文件第二件）**：createTargetedRevisionWithMentionDegrade 包装链内
-// targeted-revision 节点——修订实际落盘（review.latest 在 + 非错误产物）后调 degrade_episode_mentions
-// builtin（mention 行翻保守档 + synopsis 标 stale，幂等）。对话侧修订（rewrite_passage/7.4 落盘）无统一
-// hook 不在此接（S10 惰性指纹校验兜底，implement.md 风险清单已记）。
+// **修订降档接线退役（链流程重排 W1d，design §2.3 语义的结构性收编）**：原
+// createTargetedRevisionWithMentionDegrade 包装（targeted-revision 修订落盘 → degrade_episode_mentions
+// 降保守档 + synopsis 标 stale）随 targeted-revision 节点退役删除。理由（三条，非省略）：
+// ① 7.4 候选④后 wrapper 实际已 dormant（redo 恒清 review.latest → targeted-revision 恒 shouldSkip）；
+// ② 新链序下 mention 账恒在**终稿后**计算——mention-ledger（E8）在 route 终态后、自审环外，环内
+// 改稿期间账尚未存在，无 stale 可降；redo 重跑从写手位到链尾必经 E8 重收（per-episode 全量替换），
+// 修订落定后账必然新鲜；③ 落盘后手改的 stale 面归 R6/W4 re-extract-chapter（degrade_episode_mentions
+// 工具本体保留注册，供 W4 重提取/保守化消费）。
 //
 // graceful 契约（mirror chapter-summary-node「增强非硬约束」，mention 账是 DERIVED 可重收）：
 // - episodeId 缺（chapter_brief_input 无）→ 跳过记账（warn，链不破）。
@@ -43,8 +46,9 @@ import { logger } from '../logger';
 //   isErrorArtifact 终态形态，记账失败是增强降级非硬错误，mirror chapter-summary 哲学）。
 //
 // 链段节点（非 CONTRACTS[] 子 agent）：mirror chapter-summary / storytime-drift 先例。redo 每轮重跑
-// （orchestration-pattern 语义 2）→ per-episode 全量替换幂等（终轮账即终态）；revision loop 切片
-// [targeted-revision..route] 不含本节点 → auto_revise 闭环重跑不重复记账。
+// （orchestration-pattern 语义 2）→ per-episode 全量替换幂等（终轮账即终态）；自审环
+// [revision-optimizer..route] 不含本节点（链流程重排 W1d 后 = 提取段 E8，route 终态后）→ auto_revise
+// 环内回环不重复记账。
 //
 // expected_downstream_consumers:
 // - Story 8.7 S9：mention_signals artifact → leader 议题注入段（mirror 3.3 结构 issues 注入先例；
@@ -281,70 +285,7 @@ export function createMentionLedgerNode(): AgentNode {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// 修订降档接线（design §2.3）：targeted-revision 落盘后降档包装
+// 修订降档接线（design §2.3）——链流程重排 W1d 退役（结构性收编，见文件头注释三条理由）。
+// createTargetedRevisionWithMentionDegrade 已删除：新链序 mention 账恒在终稿后计算（E8 提取后置
+// + redo 重跑必经重收），环内改稿不再留 stale 账窗口；落盘后手改的保守化归 W4 re-extract-chapter。
 // ════════════════════════════════════════════════════════════════════════════
-
-/** error artifact 形态判定（mirror chainRunner isErrorArtifact：{error:true} 终态形态）。 */
-function isErrorArtifact(artifact: unknown): boolean {
-  return (
-    !!artifact && typeof artifact === 'object' && (artifact as { error?: unknown }).error === true
-  );
-}
-
-/**
- * 经 degrade_episode_mentions builtin 降档一章 mention 账（graceful：工具未注册 / 失败 → warn 不破链，
- * mirror writeWorldEvents 容错——降档是保守化修正，失败只意味着本章账暂保持 full 档，重提取/重收自愈）。
- */
-async function degradeEpisodeMentionsViaTool(projectPath: string, episodeId: string): Promise<void> {
-  const tool = registry.get('degrade_episode_mentions');
-  if (!tool) {
-    logger.warn(
-      { episodeId },
-      'mention-ledger degrade: degrade_episode_mentions tool not registered → skip degrade (chain continues)',
-    );
-    return;
-  }
-  try {
-    await tool.execute({ episodeId }, makeToolContext(projectPath));
-  } catch (err) {
-    logger.warn(
-      { episodeId, err: err instanceof Error ? err.message : String(err) },
-      'mention-ledger degrade: degrade_episode_mentions failed → skip (mention rows stay full until re-collect)',
-    );
-  }
-}
-
-/**
- * 包装链内 targeted-revision 节点（chapter-chain 装配用）：修订实际落盘后降档本章 mention 账。
- *
- * 落盘判定（design §2.3「targeted-revision 落盘改章后」的链内确切时点）：
- * - 进入节点时 review.latest 在（= 闭环重跑态，节点将真改稿而非 shouldSkip 直通）；
- * - 且产物非 error artifact（LLM 失败时修订未落盘，不降档）。
- *
- * 降档动作：mention 行 declared 清位 + source 翻 conservative + synopsis 标 stale（幂等，handler 侧
- * 复合）。重提取（world redo）后重跑汇账自然重建 full 账——降档是保守化非删除。
- *
- * contract 透传 inner（chapter-chain 装配读 contract 形态不变）；shouldSkip/skipResult 语义在 inner
- * run 内部（createLlmNode），包装只在外层观察 review.latest 态 + 事后降档。
- */
-export function createTargetedRevisionWithMentionDegrade(deps: ChapterLlmNodeDeps): AgentNode {
-  const inner = createTargetedRevisionNode(deps);
-  return {
-    contract: inner.contract,
-    async run(input: NodeRunInput): Promise<NodeResult> {
-      const willRevise = input.run.artifacts['review.latest'] !== undefined;
-      const result = await inner.run(input);
-      if (willRevise && !isErrorArtifact(result.artifact)) {
-        const episodeId = resolveEpisodeId(input.run.artifacts['chapter_brief_input']);
-        if (episodeId !== undefined) {
-          logger.info(
-            { episodeId },
-            'mention-ledger degrade: targeted-revision landed → degrade episode mentions to conservative',
-          );
-          await degradeEpisodeMentionsViaTool(input.run.projectPath, episodeId);
-        }
-      }
-      return result;
-    },
-  };
-}

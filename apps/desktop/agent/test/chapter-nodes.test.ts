@@ -5,7 +5,9 @@ import { promiseRegistrySchema } from '@orison/shared-contracts';
 import {
   createDraftWriterNode,
   createReaderAuditNode,
-  createTargetedRevisionNode,
+  applyEditedDraft,
+  isLintSourceMechanicallyConfirmed,
+  recountDraftWordCount,
   createRouteNode,
 } from '../src/nodes/chapter-nodes';
 import type { GenerateFn } from '../src/nodes/llm-node';
@@ -13,8 +15,8 @@ import type { RunSnapshot } from '../src/contracts/run';
 import type { GenerateResult } from '../src/provider/ipc-provider';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Story 4.0 §4.2/§4.4 / implement.md 3.6：四 LLM 节点（draft-writer / multi-review /
-// targeted-revision / route）实例化测试。
+// Story 4.0 §4.2/§4.4 / implement.md 3.6：LLM 节点（draft-writer / multi-review / route）
+// 实例化测试。
 //
 // createLlmNode 工厂的「重试 + 兜底 + abort」逻辑已由 llm-node.test.ts 覆盖。此处只验：
 // 1. parseOutput（JSON.parse + inline Zod）—— valid fixture JSON → 正确 artifact shape + stateKey
@@ -297,12 +299,12 @@ const VALID_REVIEW = {
   reasons: ['主角动机铺垫不足', 'L1 cliché hotspot 已回应（句2，降级 info）'],
 };
 
-/** Reader-Audit 节点所需的最小 artifacts（draft + scene_graph + story.sync + chapter_brief 四 required）。 */
+/** Reader-Audit 节点所需的最小 artifacts（draft + scene_graph + chapter_brief 三 required——W1d/W3：
+ * story.sync 已移出 required 且 continuityMemory var 已删，story-sync 后移 E9 审读后无本章提取物）。 */
 function makeReaderAuditRun(overrides: Record<string, unknown> = {}): RunSnapshot {
   return makeRun({
     'draft.initial': { text: '正文……', wordCount: 100 },
     scene_graph: { nodes: [] },
-    'story.sync': { patches: [] },
     chapter_brief: { goal: 'g' },
     ...overrides,
   });
@@ -327,6 +329,8 @@ describe('Reader-Audit 节点（composite L1→L2）', () => {
     await node.run({
       run: makeReaderAuditRun({
         'draft.initial': { text: '突然，他嘴角微微上扬，璀璨的光芒绽放。然而，他注意到事情似乎并非如此。' },
+        // W3：story.sync 在场也不注入（continuityMemory var 已删——story-sync 后移 E9，审读对照源
+        // = 启动前快照 + 计划；本章自提物对照本章是循环论证）。
         'story.sync': { patches: [{ title: '伏笔X' }] },
         chapter_brief: {
           goal: '抵达 B 城',
@@ -341,8 +345,9 @@ describe('Reader-Audit 节点（composite L1→L2）', () => {
     const userContent = generate.mock.calls[0][0][0]?.content ?? '';
     // draftText 注入
     expect(userContent).toContain('嘴角微微上扬');
-    // continuityMemory（story.sync 序列化）
-    expect(userContent).toContain('伏笔X');
+    // W3（R5）：continuityMemory var 删除——story.sync 内容不注入（提取段后移，审读不再消费本章自提物）。
+    expect(userContent).not.toContain('伏笔X');
+    expect(userContent).not.toContain('连续性记忆');
     // briefIntent（chapter_brief 序列化，含 mustHide + gap_whitelist reason）
     expect(userContent).toContain('主角身份');
     expect(userContent).toContain('故意信息延迟');
@@ -1200,6 +1205,21 @@ describe('Reader-Audit 节点（composite L1→L2）', () => {
     expect(yaml).toContain('truncated=true');
   });
 
+  it('W3 prompt：multi-review-agent.yaml 含 source 来源标记条款；{{continuityMemory}} 已移除（提取段后移）', () => {
+    const yamlPath = resolve(__dirname, '../prompts/multi-review-agent.yaml');
+    const yaml = readFileSync(yamlPath, 'utf-8');
+    // W3（R2 H2）：lint 清单判真条目携带 source:'lint' 的标注纪律（system 段）+ 输出契约字段（user 段）。
+    expect(yaml).toContain('来源标记');
+    expect(yaml).toContain('"source": "lint"');
+    expect(yaml).toContain('source: 仅当你根据上方「lint 静态命中清单」');
+    // 两约束 ② 豁免划界（lint 条目例外可 auto_revise）+ verdict revise 档含 lint 确认 AI 味。
+    expect(yaml).toContain('source=lint 豁免除外');
+    expect(yaml).toContain('lint 确认的 AI 味未清');
+    // W3（R5）：continuityMemory var 已删——story-sync 后移 E9，审读不再消费本章自提物。
+    expect(yaml).not.toContain('{{continuityMemory}}');
+    expect(yaml).not.toContain('连续性记忆');
+  });
+
   // ── Story 5.4：情绪维注入（Reader-Audit emotion-landing + pacing-breath 数据源，mirror 6.2/6.5 pattern）──
 
   it('5.4：emotion_curve artifact 在 → emotionCurve 注入 user prompt（含 per-scene 目标情绪）', async () => {
@@ -1445,66 +1465,10 @@ describe('Reader-Audit 节点（composite L1→L2）', () => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
-// targeted-revision 节点
+// targeted-revision 节点——测试已随 W4 F-1 清理删除（yaml/prompts/targeted-revision-agent.yaml
+// 已删，dormant 工厂 createTargetedRevisionNode 的 yaml 加载不再可测）；CR 批（CR-25）工厂本体与
+// CONTRACTS 条目已一并清零（见 chapter-nodes.ts / agentContracts.ts 退役注记）。
 // ════════════════════════════════════════════════════════════════════════════
-
-const VALID_REVISION = {
-  title: '第二章 B 城（修订）',
-  text: '黄昏的荒野上，主角深吸一口气……',
-  wordCount: 2950,
-  chapterId: 'ch_2',
-  revisionNotes: ['第 3 段补主角内心动机'],
-};
-
-describe('targeted-revision 节点（5.1b：skip 首跑 / overwrite 闭环）', () => {
-  it('有 review.latest → parseOutput: revised draft + revisionNotes + stateKey=draft.initial（overwrite）', async () => {
-    const generate = vi.fn<GenerateFn>(async () => makeOkResult(VALID_REVISION));
-    const node = createTargetedRevisionNode({ generate });
-
-    const result = await node.run({
-      run: makeRun({ 'draft.initial': { text: '原稿' }, 'review.latest': { verdict: 'revise' } }),
-      requirement: '',
-    });
-
-    // overwrite draft.initial（非 revision.output）——multi-review/route 读 draft.initial = 最新稿
-    expect(result.stateKey).toBe('draft.initial');
-    expect(result.artifact).toEqual(VALID_REVISION);
-  });
-
-  it('buildPrompt（有 review.latest 时）: draftText 抽 draft.initial.text + reviewResult 序列化 review.latest', async () => {
-    const generate = vi.fn<GenerateFn>(async () => makeOkResult(VALID_REVISION));
-    const node = createTargetedRevisionNode({ generate });
-
-    await node.run({
-      run: makeRun({
-        'draft.initial': { text: 'ORIGINAL_DRAFT' },
-        'review.latest': { verdict: 'revise', reasons: ['动机不足'] },
-      }),
-      requirement: '',
-    });
-
-    const userContent = generate.mock.calls[0][0][0]?.content ?? '';
-    expect(userContent).toContain('ORIGINAL_DRAFT');
-    expect(userContent).toContain('动机不足');
-  });
-
-  it('首跑无 review.latest → skip（pass-through draft.initial，不调 generate）', async () => {
-    const generate = vi.fn<GenerateFn>(async () => makeOkResult(VALID_REVISION));
-    const node = createTargetedRevisionNode({ generate });
-
-    const initialDraft = { title: '初稿', text: '原稿正文', wordCount: 100, chapterId: 'ch_1' };
-    const result = await node.run({
-      run: makeRun({ 'draft.initial': initialDraft }), // 无 review.latest
-      requirement: '',
-    });
-
-    // 不调 generate（shouldSkip 命中）
-    expect(generate).not.toHaveBeenCalled();
-    // pass-through：返回同 draft.initial artifact（stateKey + 原对象）
-    expect(result.stateKey).toBe('draft.initial');
-    expect(result.artifact).toBe(initialDraft);
-  });
-});
 
 // ════════════════════════════════════════════════════════════════════════════
 // route 节点（ADR-17 反馈路由）
@@ -1771,6 +1735,288 @@ describe('route 节点', () => {
     expect((result.artifact as { decision: string }).decision).toBe('escalate_user');
   });
 
+  // ── 链流程重排 W3（R2 去味门禁 H2 机械门豁免，AC2d）+ CR-5（W-CR 批机械交叉核对）──
+  // lint 来源（source='lint'）的叙事特征 block = 机械引擎命中 + L2 判真的确认 AI 味（明确缺陷）→
+  // 豁免强制 escalate，可环内 auto_revise；非 lint 来源叙事特征 block 维持强制 escalate（人导演域）。
+  // CR-5：豁免须过 isLintSourceMechanicallyConfirmed——source 是 LLM 自报字段，须与 lint_report 机械
+  // 命中清单匹配（quote 互含 / ruleId 相等）才确认（design H2「机械标注非 LLM 自报」）。
+
+  /** 机械命中清单 fixture（raw lint_report artifact 形态——issue.match 与 finding quote 逐字对齐）。 */
+  const LINT_REPORT = {
+    issues: [
+      {
+        ruleId: 'story-deslop.not-is-comparison',
+        namespace: 'story-deslop',
+        title: '不是X而是Y',
+        level: 'medium',
+        review: 'agent',
+        fixability: 'suggest',
+        chapterId: 'ch_001',
+        line: 1,
+        column: 1,
+        endLine: 1,
+        endColumn: 20,
+        match: '不是怯懦，而是清醒',
+        context: { before: '他停下脚步。', current: '那不是怯懦，而是清醒的抉择。', after: '随后转身离开。' },
+      },
+    ],
+    densityIssues: [
+      { ruleId: 'story-deslop.hollow-summary', chapterId: 'ch_001', line: 3, column: 1, hits: 5, perKilo: 2.5, samples: ['这一切终将过去'] },
+    ],
+  };
+
+  it('AC2d 正向：narrative-feature block + source=lint + lint_report 机械匹配（quote 互含）→ 豁免强制 escalate，LLM 判 auto_revise 保留', async () => {
+    const generate = vi.fn<GenerateFn>(async () => makeOkResult({ decision: 'auto_revise', reason: '去味' }));
+    const node = createRouteNode({ generate });
+
+    const result = await node.run({
+      run: makeRun({
+        'review.latest': {
+          verdict: 'revise',
+          dimensions: [
+            {
+              name: 'narrative-feature',
+              findings: [
+                // lint 来源（llmlint 静态命中清单判真 + 机械核对过）——判源不判义豁免。
+                { subClass: 'story-deslop.not-is-comparison', severity: 'block', quote: '不是怯懦，而是清醒', location: '句1', explanation: 'lint 确认套话', source: 'lint' },
+              ],
+            },
+          ],
+        },
+        lint_report: LINT_REPORT,
+        chapter_brief: {},
+        'draft.initial': { text: 't' },
+      }),
+      requirement: '',
+    });
+
+    // lint-sourced block 机械核对过 → 不触发 guard → 环内 auto_revise 去味（不强制 escalate）。
+    expect((result.artifact as { decision: string }).decision).toBe('auto_revise');
+  });
+
+  it('AC2d 反向：narrative-feature block 无 source（人导演域语义判定）→ 仍强制 escalate_user', async () => {
+    const generate = vi.fn<GenerateFn>(async () => makeOkResult({ decision: 'auto_revise', reason: '改' }));
+    const node = createRouteNode({ generate });
+
+    const result = await node.run({
+      run: makeRun({
+        'review.latest': {
+          verdict: 'revise',
+          dimensions: [
+            {
+              name: 'narrative-feature',
+              // source 缺省（L2 自判 / semantic 8 条——无机械确认）→ 人导演域硬规则不动。
+              findings: [{ severity: 'block', quote: '意象陈腐', location: '句1', explanation: '语义判定陈腐' }],
+            },
+          ],
+        },
+        chapter_brief: {},
+        'draft.initial': { text: 't' },
+      }),
+      requirement: '',
+    });
+
+    expect((result.artifact as { decision: string }).decision).toBe('escalate_user');
+  });
+
+  it('AC2d 混合来源：同维 lint-sourced block + 非 lint block 并存 → 非 lint 条目触发强制 escalate（豁免只放行条目不放行维度）', async () => {
+    const generate = vi.fn<GenerateFn>(async () => makeOkResult({ decision: 'auto_revise', reason: '改' }));
+    const node = createRouteNode({ generate });
+
+    const result = await node.run({
+      run: makeRun({
+        'review.latest': {
+          verdict: 'revise',
+          dimensions: [
+            {
+              name: 'narrative-feature',
+              findings: [
+                { subClass: 'story-deslop.not-is-comparison', severity: 'block', quote: '不是怯懦，而是清醒', location: '句1', explanation: 'lint 确认', source: 'lint' },
+                { severity: 'block', quote: '意象陈腐', location: '句2', explanation: '语义判定' },
+              ],
+            },
+          ],
+        },
+        lint_report: LINT_REPORT,
+        chapter_brief: {},
+        'draft.initial': { text: 't' },
+      }),
+      requirement: '',
+    });
+
+    expect((result.artifact as { decision: string }).decision).toBe('escalate_user');
+  });
+
+  it('AC2d 豁免限 block 修复路径非 accept 直通：lint-sourced block + LLM 误判 accept_as_truth → 仍被 guard 豁免放行（去味条款归 route prompt 约束）', async () => {
+    // guard 只判「lint 条目不强制 escalate」；「AI 味未清不可 accept」是 route prompt 去味条款（LLM 判），
+    // 机械面由 summarize.lintUnresolved（hardEscalate 消费）承载——guard 不在此重复拦截（判源不判义）。
+    const generate = vi.fn<GenerateFn>(async () => makeOkResult({ decision: 'accept_as_truth', reason: '接受' }));
+    const node = createRouteNode({ generate });
+
+    const result = await node.run({
+      run: makeRun({
+        'review.latest': {
+          verdict: 'pass',
+          dimensions: [
+            {
+              name: 'narrative-feature',
+              findings: [{ subClass: 'story-deslop.not-is-comparison', severity: 'block', quote: '不是怯懦，而是清醒', location: '句1', explanation: 'lint 确认', source: 'lint' }],
+            },
+          ],
+        },
+        lint_report: LINT_REPORT,
+        chapter_brief: {},
+        'draft.initial': { text: 't' },
+      }),
+      requirement: '',
+    });
+
+    expect((result.artifact as { decision: string }).decision).toBe('accept_as_truth');
+  });
+
+  it('W3 source 字段 schema 容忍：非法 source 值 → .catch(undefined) 丢字段不丢 finding（block 非 lint 来源照常触发 guard）', async () => {
+    // 单坏值（LLM 返 source:'engine' 非法枚举）→ schema 降级无 source → guard 视为非 lint 来源（保守归人导演域）。
+    const generate = vi.fn<GenerateFn>(async () => makeOkResult({ decision: 'auto_revise', reason: 'r' }));
+    const node = createRouteNode({ generate });
+
+    const result = await node.run({
+      run: makeRun({
+        'review.latest': {
+          verdict: 'revise',
+          dimensions: [
+            {
+              name: 'narrative-feature',
+              findings: [{ severity: 'block', quote: 'q', location: '句1', explanation: 'e', source: 'engine' as never }],
+            },
+          ],
+        },
+        chapter_brief: {},
+        'draft.initial': { text: 't' },
+      }),
+      requirement: '',
+    });
+
+    expect((result.artifact as { decision: string }).decision).toBe('escalate_user');
+  });
+
+  // ── CR-5（W-CR 批）：source='lint' 自报须经机械交叉核对——核对不过按 agent 来源强制 escalate ──
+
+  it('CR-5：source=lint 自报但 lint_report artifact 缺 → 无机械确认不豁免 → 强制 escalate', async () => {
+    const generate = vi.fn<GenerateFn>(async () => makeOkResult({ decision: 'auto_revise', reason: '去味' }));
+    const node = createRouteNode({ generate });
+
+    const result = await node.run({
+      run: makeRun({
+        'review.latest': {
+          verdict: 'revise',
+          dimensions: [
+            {
+              name: 'narrative-feature',
+              findings: [{ severity: 'block', quote: '不是怯懦，而是清醒', location: '句1', explanation: '自报 lint', source: 'lint' }],
+            },
+          ],
+        },
+        // lint_report 缺（L2 幻觉自标 / 旧链）→ 机械清单不存在 = 无机械确认。
+        chapter_brief: {},
+        'draft.initial': { text: 't' },
+      }),
+      requirement: '',
+    });
+
+    expect((result.artifact as { decision: string }).decision).toBe('escalate_user');
+  });
+
+  it('CR-5：source=lint 自报 + lint_report 在但 quote/ruleId 均不匹配 → 不豁免 → 强制 escalate', async () => {
+    const generate = vi.fn<GenerateFn>(async () => makeOkResult({ decision: 'auto_revise', reason: '去味' }));
+    const node = createRouteNode({ generate });
+
+    const result = await node.run({
+      run: makeRun({
+        'review.latest': {
+          verdict: 'revise',
+          dimensions: [
+            {
+              name: 'narrative-feature',
+              // quote 与清单命中无包含关系，subClass 非 ruleId——LLM 给语义判定条目自贴 lint 标签。
+              findings: [{ subClass: 'imagery-staleness', severity: 'block', quote: '月光如水倾泻', location: '句1', explanation: '语义陈腐但自报 lint', source: 'lint' }],
+            },
+          ],
+        },
+        lint_report: LINT_REPORT,
+        chapter_brief: {},
+        'draft.initial': { text: 't' },
+      }),
+      requirement: '',
+    });
+
+    expect((result.artifact as { decision: string }).decision).toBe('escalate_user');
+  });
+
+  it('CR-5：ruleId 相等通道——subClass=命中规则 id（quote 无文本关联）→ 机械确认豁免 → auto_revise 保留', async () => {
+    const generate = vi.fn<GenerateFn>(async () => makeOkResult({ decision: 'auto_revise', reason: '去味' }));
+    const node = createRouteNode({ generate });
+
+    const result = await node.run({
+      run: makeRun({
+        'review.latest': {
+          verdict: 'revise',
+          dimensions: [
+            {
+              name: 'narrative-feature',
+              // quote 引的是改写方向描述非原句，但 subClass 精确回填 ruleId——rule id 相等通道确认。
+              findings: [{ subClass: 'story-deslop.not-is-comparison', severity: 'block', quote: '该段套用不是而是句式', location: '句1', explanation: 'lint 确认', source: 'lint' },
+              ],
+            },
+          ],
+        },
+        lint_report: LINT_REPORT,
+        chapter_brief: {},
+        'draft.initial': { text: 't' },
+      }),
+      requirement: '',
+    });
+
+    expect((result.artifact as { decision: string }).decision).toBe('auto_revise');
+  });
+
+  it('CR-5 helper：isLintSourceMechanicallyConfirmed 逐通道（match 互含 / context.current / density 样本 / 空白归一 / 坏形态）', () => {
+    // quote ⊇ issue.match（L2 引文包住机械命中片段）。
+    expect(isLintSourceMechanicallyConfirmed(
+      { quote: '那不是怯懦，而是清醒的抉择。', subClass: undefined },
+      LINT_REPORT,
+    )).toBe(true);
+    // quote ⊆ issue.context.current（引用命中行的一部分）。
+    expect(isLintSourceMechanicallyConfirmed(
+      { quote: '清醒的抉择', subClass: undefined },
+      LINT_REPORT,
+    )).toBe(true);
+    // density 样本互含。
+    expect(isLintSourceMechanicallyConfirmed(
+      { quote: '这一切终将过去，一切都将成为过去', subClass: undefined },
+      LINT_REPORT,
+    )).toBe(true);
+    // 空白归一：LLM 引文压平换行后互含。
+    expect(isLintSourceMechanicallyConfirmed(
+      { quote: '不是怯懦，\n而是 清醒', subClass: undefined },
+      LINT_REPORT,
+    )).toBe(true);
+    // ruleId 相等。
+    expect(isLintSourceMechanicallyConfirmed(
+      { quote: '无文本关联', subClass: 'story-deslop.not-is-comparison' },
+      LINT_REPORT,
+    )).toBe(true);
+    // 无任何关联 → false。
+    expect(isLintSourceMechanicallyConfirmed(
+      { quote: '月光如水倾泻', subClass: 'imagery-staleness' },
+      LINT_REPORT,
+    )).toBe(false);
+    // 坏形态 lint_report / 空 finding → false（无机械确认）。
+    expect(isLintSourceMechanicallyConfirmed({ quote: 'q', subClass: 's' }, undefined)).toBe(false);
+    expect(isLintSourceMechanicallyConfirmed({ quote: 'q', subClass: 's' }, 'not-an-object')).toBe(false);
+    expect(isLintSourceMechanicallyConfirmed({}, LINT_REPORT)).toBe(false);
+    expect(isLintSourceMechanicallyConfirmed({ quote: 'q', subClass: 's' }, { issues: 'bad' })).toBe(false);
+  });
+
   it('R6② route-agent.yaml system 含 narrative-feature→escalate 约束（prompt 编码 + defense guard 双保险）', async () => {
     const generate = vi.fn<GenerateFn>(async () => makeOkResult(VALID_ROUTE));
     const node = createRouteNode({ generate });
@@ -1781,6 +2027,17 @@ describe('route 节点', () => {
     // route yaml system 段编码 R6② 约束（prompt 层）——defense guard 是兜底
     expect(systemArg).toContain('narrative-feature');
     expect(systemArg).toContain('escalate_user');
+  });
+
+  it('W3 去味条款：route-agent.yaml system 含「lint 确认的 AI 味未清不可 accept」+ 人导演域划界', () => {
+    const yamlPath = resolve(__dirname, '../prompts/route-agent.yaml');
+    const yaml = readFileSync(yamlPath, 'utf-8');
+    // 去味门禁条款（R2）：source=lint 条目未清不得 accept_as_truth，应 auto_revise 去味。
+    expect(yaml).toContain('去味门禁');
+    expect(yaml).toContain('未清不得走 accept_as_truth');
+    // 与 narrative-feature 人导演域划界说明（本条款只针对机械确认缺陷）。
+    expect(yaml).toContain('source="lint"');
+    expect(yaml).toContain('划清界限');
   });
 });
 
@@ -1798,23 +2055,16 @@ describe('四 LLM 节点契约元数据', () => {
     expect(node.contract?.requiredArtifactKeys).toContain('chapter_brief');
   });
 
-  it('Reader-Audit contract（4.2）: reads draft.initial+scene_graph+story.sync+chapter_brief → owns review.latest', () => {
+  it('Reader-Audit contract（4.2）: reads draft.initial+scene_graph+chapter_brief → owns review.latest（W1d：story.sync 移出 required）', () => {
     const node = createReaderAuditNode({ generate: noopGenerate });
     expect(node.contract?.producedArtifactKeys).toEqual(['review.latest']);
-    // design §3：加 chapter_brief（喂 gap 白名单 intent）——四 required
+    // design §3：加 chapter_brief（喂 gap 白名单 intent）。链流程重排 W1d：story.sync 移出 required
+    //（story-sync 后移提取段 E9——hard required 会让每章在审读位 blocked，W0-3 断链级适配）。
     expect(node.contract?.requiredArtifactKeys).toEqual([
       'draft.initial',
       'scene_graph',
-      'story.sync',
       'chapter_brief',
     ]);
-  });
-
-  it('targeted-revision contract（5.1b）: reads draft.initial → owns draft.initial（overwrite 闭环）', () => {
-    const node = createTargetedRevisionNode({ generate: noopGenerate });
-    expect(node.contract?.producedArtifactKeys).toEqual(['draft.initial']);
-    // review.latest drop 出 required（首跑无 review.latest 不 blocked）
-    expect(node.contract?.requiredArtifactKeys).toEqual(['draft.initial']);
   });
 
   it('route contract: reads review.latest+chapter_brief+draft.initial → owns route_decision', () => {
@@ -1822,5 +2072,54 @@ describe('四 LLM 节点契约元数据', () => {
     expect(node.contract?.nodeId).toBe('route-agent');
     expect(node.contract?.producedArtifactKeys).toEqual(['route_decision']);
     expect(node.contract?.requiredArtifactKeys).toEqual(['review.latest', 'chapter_brief', 'draft.initial']);
+  });
+});
+
+
+// ════════════════════════════════════════════════════════════════════════════
+// 链流程重排 W2（R3 终稿手改通道）：applyEditedDraft / recountDraftWordCount 单源单测
+// ════════════════════════════════════════════════════════════════════════════
+
+describe('W2 applyEditedDraft — editedDraft 覆写单源（终稿手改）', () => {
+  it('覆写 draft.initial.text + wordCount 机械重算 + 剥段落级 passageText；title 保留', () => {
+    const artifacts = {
+      'draft.initial': { title: '章题', text: '原稿正文', wordCount: 4, passageText: '改后段' },
+    };
+    const next = applyEditedDraft(artifacts, '手 改 后 的 终稿正文');
+    expect(next['draft.initial']).toMatchObject({
+      title: '章题',
+      text: '手 改 后 的 终稿正文',
+    });
+    // wordCount = 非空白字符数（空白剔除）
+    expect((next['draft.initial'] as { wordCount?: number }).wordCount).toBe(recountDraftWordCount('手 改 后 的 终稿正文'));
+    expect((next['draft.initial'] as { passageText?: unknown }).passageText).toBeUndefined();
+    // 原 artifacts 不被 mutate（纯函数）
+    expect((artifacts['draft.initial'] as { text: string }).text).toBe('原稿正文');
+  });
+
+  it('申报类 stale 清理：cast_declaration 删除 + research_brief.suspended 剥离（mirror stale 清理不变式）', () => {
+    const artifacts = {
+      'draft.initial': { title: 't', text: '原稿' },
+      cast_declaration: { declaration: { appearances: [{ assetRef: 'char-1' }] } },
+      research_brief: { briefHash: 'h', suspended: { kind: 'research_contradiction', rounds: 1 } },
+    };
+    const next = applyEditedDraft(artifacts, '改后');
+    expect(Object.prototype.hasOwnProperty.call(next, 'cast_declaration')).toBe(false);
+    expect((next['research_brief'] as { suspended?: unknown }).suspended).toBeUndefined();
+    expect((next['research_brief'] as { briefHash?: string }).briefHash).toBe('h');
+  });
+
+  it('draft.initial 缺（防御）→ 不覆写正文，申报清理照常', () => {
+    const next = applyEditedDraft({ cast_declaration: { declaration: {} } }, '改后');
+    expect(Object.prototype.hasOwnProperty.call(next, 'draft.initial')).toBe(false);
+    expect(Object.prototype.hasOwnProperty.call(next, 'cast_declaration')).toBe(false);
+  });
+});
+
+describe('W2 recountDraftWordCount — wordCount 机械重算（CJK 非空白口径）', () => {
+  it('空白剔除计数', () => {
+    expect(recountDraftWordCount('黄昏的荒野上，主角深吸一口气。')).toBe(15); // 含标点（非空白字符口径）
+    expect(recountDraftWordCount('a b\tc\nd')).toBe(4);
+    expect(recountDraftWordCount('')).toBe(0);
   });
 });

@@ -14,8 +14,9 @@
  * - 耗时格式化复用 craftView.formatElapsedMs（跨 feature 导入先例：MaterialsPage 消费
  *   materialDistillBadge）。
  */
-import { DECON_DIMENSIONS } from '@orison/shared-contracts';
+import { DECON_DIMENSIONS, isIllegalDeconAllUnitPass } from '@orison/shared-contracts';
 import type {
+  DeconDistribution,
   DeconJob,
   DeconJobStatus,
   DeconPassState,
@@ -95,6 +96,11 @@ export function deconDimensionLabelKey(id: string): string {
   return `decon.dim.${id}`;
 }
 
+/** 维度粒度说明键（CR-14——契约 granularity 字段是 zh 单语开发注记，en 用户经 i18n 键见译文）。 */
+export function deconDimensionGranularityKey(id: string): string {
+  return `decon.dimGranularity.${id}`;
+}
+
 export function deconReviewCheckpointKey(checkpoint: string): string {
   return `decon.review.${checkpoint}`;
 }
@@ -114,15 +120,32 @@ export function deconPassLabel(pass: string): { stemKey: string; suffixKeys: str
 }
 
 /**
- * pass_state unit 友好形：数字形态（'3' / 'ch:12' / 'arc:2' / 'scene:5'）的 N 是 **0 基索引**
- * （chapterIndex / arc index / scene rank——契约单源），呈现统一 **1 基**（「第 N+1 章」——CR-2
- * 与壳面 prompt/报告渲染同面，同一章跨面同号）。'all'/'arcs'/'stats' 单行哨兵走专项键
- * （progress 路径与 report 路径共用——CR-17）；其余字面 unit（如 p2 域名 'world'）返回 null
- * 由调用方回落原样。
+ * unit 标签路由产物（CR-1 拍板 B）：章引用优先**真实章标字面量**（`{literal}`——来自
+ * detail.chapterLabels，壳侧 chapterHeadings 单源构建，零序号算术）；标签表缺键/未装载时
+ * 回落 i18n 键 `decon.unit.materialChapter`（材料第 {index} 章——原始 index）。arc/scene 是
+ * 拆书自身产物序（无外部真值可错位），维持 1 基 i18n 键；'all'/'arcs'/'stats' 单行哨兵走
+ * 专项键（progress 路径与 report 路径共用——CR-17）；其余字面 unit（如 p2 域名 'world'）
+ * 返回 null 由调用方回落原样。
  */
-export function deconUnitLabelKey(unit: string): { key: string; index?: number } | null {
-  if (/^[0-9]+$/.test(unit)) return { key: 'decon.unit.chapter', index: Number(unit) + 1 };
-  if (unit.startsWith('ch:')) return { key: 'decon.unit.chapter', index: Number(unit.slice(3)) + 1 };
+export type DeconUnitLabel = { key: string; index?: number } | { literal: string };
+
+/** 章 unit 标签：chapterLabels 命中 → 真实章标字面量；缺失 → 「材料第 {index} 章」键回落。 */
+export function deconChapterUnitLabel(
+  chapterIndex: number,
+  chapterLabels?: Readonly<Record<number, string>>,
+): DeconUnitLabel {
+  const label = chapterLabels?.[chapterIndex];
+  return typeof label === 'string' && label.length > 0
+    ? { literal: label }
+    : { key: 'decon.unit.materialChapter', index: chapterIndex };
+}
+
+export function deconUnitLabel(
+  unit: string,
+  chapterLabels?: Readonly<Record<number, string>>,
+): DeconUnitLabel | null {
+  if (/^[0-9]+$/.test(unit)) return deconChapterUnitLabel(Number(unit), chapterLabels);
+  if (unit.startsWith('ch:')) return deconChapterUnitLabel(Number(unit.slice(3)), chapterLabels);
   if (unit.startsWith('arc:')) return { key: 'decon.unit.arc', index: Number(unit.slice(4)) + 1 };
   if (unit.startsWith('scene:')) return { key: 'decon.unit.scene', index: Number(unit.slice(6)) + 1 };
   if (unit === 'all') return { key: 'decon.unit.all' };
@@ -148,18 +171,93 @@ export function summarizeDeconPassStates(
   passStates: readonly DeconPassState[],
 ): DeconPassSummary[] {
   const order: string[] = [];
-  const byPass = new Map<string, DeconPassSummary>();
+  const rowsByPass = new Map<string, DeconPassState[]>();
   for (const row of passStates) {
-    let summary = byPass.get(row.pass);
-    if (summary === undefined) {
-      summary = { pass: row.pass, total: 0, done: 0, running: 0, failed: 0, capped: 0, pending: 0 };
-      byPass.set(row.pass, summary);
+    const bucket = rowsByPass.get(row.pass);
+    if (bucket === undefined) {
+      rowsByPass.set(row.pass, [row]);
       order.push(row.pass);
+    } else {
+      bucket.push(row);
     }
-    summary.total += 1;
-    summary[row.status] += 1;
   }
-  return order.map((pass) => byPass.get(pass)!);
+  const summaries: DeconPassSummary[] = [];
+  for (const pass of order) {
+    const rows = rowsByPass.get(pass)!;
+    const summary: DeconPassSummary = {
+      pass, total: 0, done: 0, running: 0, failed: 0, capped: 0, pending: 0,
+    };
+    for (const row of rows) {
+      // U18/CR-6 化石防御（F16）：多 unit pass 的 ('all','failed') 行是非法形态化石（判据单源
+      // = 契约 DECON_ILLEGAL_ALL_UNIT_PASSES——覆盖数字/ch:/arc:/域 unit 族与纯预检失败 job），
+      // 不计入分母/不触发红点。合法单 unit pass（p1a/p1c/p6/p4:style/p5:book_reading）不受影响。
+      if (row.unit === 'all' && row.status === 'failed' && isIllegalDeconAllUnitPass(row.pass)) continue;
+      summary.total += 1;
+      summary[row.status] += 1;
+    }
+    // 化石-only pass（如纯预检失败 job 只剩 ('p2','all','failed') 一行）整行不呈现——0/0 行是噪音。
+    if (summary.total > 0) summaries.push(summary);
+  }
+  return summaries;
+}
+
+// ── failed 续跑落点 / pass ETA（C7 / U4——面板进度面纯函数）──
+
+/**
+ * failed 续跑落点章（CR-8 条件化）：**仅失败点确在 p1b 时**返回落点章 index（存在非 done 的
+ * p1b 章号行 = 重入点在 p1b——N = 最大 done 章 + 1，无 done 章时 0）；p1b 章号行全 done（或
+ * 无 p1b 行）= 失败在后续 pass → null（调用方用中性「继续拆解」，不假造章号）。化石 'all' 行
+ * 天然排除（只认章号 unit）。
+ */
+export function deconResumeNextChapter(passStates: readonly DeconPassState[]): number | null {
+  let max = -1;
+  let hasPendingChapter = false;
+  for (const row of passStates) {
+    if (row.pass !== 'p1b' || !/^[0-9]+$/.test(row.unit)) continue;
+    if (row.status !== 'done') {
+      hasPendingChapter = true;
+      continue;
+    }
+    const n = Number(row.unit);
+    if (n > max) max = n;
+  }
+  return hasPendingChapter ? max + 1 : null;
+}
+
+/**
+ * 当前 pass 剩余耗时外推（U4；CR-7 韧性）：连续 done 时间戳的**区间中位数** × 剩余单位数。
+ * - 剩余只计 pending/running 行（capped/failed 是挂起待处理面，不进分母——暂停数小时后
+ *   ETA 不虚报）；
+ * - 中位数（非均值）——暂停数小时的旧区间不再拉爆估计；
+ * - 诚实省略：done < 3（样本不足）、区间中位数 ≤ 0（同拍时间戳无序列真值）或无剩余时
+ *   返回 null。
+ */
+export function deconPassEtaMs(passStates: readonly DeconPassState[], pass: string): number | null {
+  const rows = passStates.filter((row) => row.pass === pass);
+  const doneTs: number[] = [];
+  let remaining = 0;
+  for (const row of rows) {
+    if (row.status === 'done') {
+      const ts = Date.parse(row.updatedAt);
+      if (Number.isFinite(ts)) doneTs.push(ts);
+    } else if (row.status === 'pending' || row.status === 'running') {
+      remaining += 1;
+    }
+  }
+  if (doneTs.length < 3 || remaining <= 0) return null;
+  doneTs.sort((a, b) => a - b);
+  const intervals: number[] = [];
+  for (let i = 1; i < doneTs.length; i++) {
+    intervals.push(doneTs[i]! - doneTs[i - 1]!);
+  }
+  intervals.sort((a, b) => a - b);
+  const mid = Math.floor(intervals.length / 2);
+  const median =
+    intervals.length % 2 === 1
+      ? intervals[mid]!
+      : Math.round((intervals[mid - 1]! + intervals[mid]!) / 2);
+  if (!(median > 0)) return null;
+  return Math.round(median * remaining);
 }
 
 // ── 材料过滤（F-12——low-confidence 分章/零章不可拆）──
@@ -247,6 +345,18 @@ export function deconEstimateRows(
     rows.push({ pass: stem, tokens: 0, inherited: true });
   }
   return rows.sort((a, b) => a.pass.localeCompare(b.pass));
+}
+
+/**
+ * 预估行通俗说明键路由（CR-17）：pass 全值 → `decon.wizard.estimateNote.<slug>`。i18n 键段
+ * 不用冒号（shell 词形 `p4:huoke` 不可直做键段）——p4:<手艺维> 归 'p4' 茎、p4:style 特化
+ * 'p4style'、p5:<kind> 取 kind 首词段（book/chapter/scene）。
+ */
+export function deconEstimateNoteKey(pass: string): string {
+  if (pass === 'p4:style') return 'decon.wizard.estimateNote.p4style';
+  if (pass.startsWith('p4:')) return 'decon.wizard.estimateNote.p4';
+  if (pass.startsWith('p5:')) return `decon.wizard.estimateNote.p5${pass.slice(3).split('_')[0]}`;
+  return `decon.wizard.estimateNote.${pass}`;
 }
 
 // ── 向导预算输入解析（CR-23——NaN 不静默吞）──
@@ -337,15 +447,61 @@ export function isDeconStylePayloadLike(
   );
 }
 
+/**
+ * canon 条目 payload 守卫（U2/F17——canon payload 是 `{evidence} + passthrough`，域内字段
+ * 形状落注释不实施）。只做结构性最小守卫（非空对象）；域内字段由消费侧逐字段形态守卫
+ * （字段不在即折叠，勿假设必在——spec/ui/state-management unknown seam 纪律）。
+ */
+export function isDeconCanonPayloadLike(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/** deconDistributionSchema 形态守卫（count/min/avg/max/sigma 全有限数——stats 行消费前核验）。 */
+function isDeconDistributionLike(value: unknown): value is DeconDistribution {
+  if (value === null || typeof value !== 'object') return false;
+  const v = value as Record<string, unknown>;
+  return (
+    typeof v.count === 'number' && Number.isFinite(v.count) &&
+    typeof v.min === 'number' && Number.isFinite(v.min) &&
+    typeof v.avg === 'number' && Number.isFinite(v.avg) &&
+    typeof v.max === 'number' && Number.isFinite(v.max) &&
+    typeof v.sigma === 'number' && Number.isFinite(v.sigma)
+  );
+}
+
+/**
+ * p3b stats 行的 styleStats 守卫（F18——粗拆档风格 tab 回落数据源：句长/段落分布 + 对话行
+ * 占比三数字面，纯代码 stylometry）。
+ */
+export function isDeconStyleStatsLike(
+  value: unknown,
+): value is {
+  sentenceChars: DeconDistribution;
+  paragraphChars: DeconDistribution;
+  dialogueLineRatio: number;
+} {
+  if (value === null || typeof value !== 'object') return false;
+  const v = value as Record<string, unknown>;
+  return (
+    isDeconDistributionLike(v.sentenceChars) &&
+    isDeconDistributionLike(v.paragraphChars) &&
+    typeof v.dialogueLineRatio === 'number' &&
+    Number.isFinite(v.dialogueLineRatio) &&
+    v.dialogueLineRatio >= 0 &&
+    v.dialogueLineRatio <= 1
+  );
+}
+
 // ── 报告 unit / kind 展示 ──
 
 /**
- * report unit 友好形（'ch:12' → 第 13 章〔0 基 +1——CR-2〕；'scene:3' → 名场面 4；'all'/
- * 'arcs'/'stats' → 专项键；其余字面回落 literal 键）。完全委托 deconUnitLabelKey——progress
- * 与 report 两路径同一单源（CR-17）。
+ * report unit 友好形（'ch:12' → 真实章标字面量〔chapterLabels 命中——CR-1 拍板 B〕或
+ * 「材料第 12 章」回落；'scene:3' → 名场面 4；'all'/'arcs'/'stats' → 专项键；其余字面回落
+ * literal 键）。完全委托 deconUnitLabel——progress 与 report 两路径同一单源（CR-17）。
  */
-export function deconReportUnitLabelKey(unit: string): { key: string; index?: number } {
-  const parsed = deconUnitLabelKey(unit);
-  if (parsed !== null) return parsed;
-  return { key: 'decon.unit.literal' };
+export function deconReportUnitLabel(
+  unit: string,
+  chapterLabels?: Readonly<Record<number, string>>,
+): DeconUnitLabel {
+  return deconUnitLabel(unit, chapterLabels) ?? { key: 'decon.unit.literal' };
 }

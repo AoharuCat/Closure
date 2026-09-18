@@ -84,6 +84,8 @@ function buildTextRequest(
     model: resolved.modelId,
     messages,
     temperature: 0.2,
+    // 09-12 usage-panel：story-sync LLM 提取 = story-sync 流程标签（design §0 表）。
+    taskType: 'story-sync',
   };
 }
 

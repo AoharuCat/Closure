@@ -103,6 +103,38 @@ export const DECON_ARC_CHARS = 60_000;
 /** canon 六域（shared-contracts DECON_CANON_DOMAINS 同值——预估侧钉死 6）。 */
 const CANON_DOMAIN_COUNT = 6;
 
+// ── C6（dogfood R3 修复批）：预估思考口径 ──
+//
+// 旧预估假设零思考——thinking 开启档位下思考 token 吃完成帽、输出被压缩（R3 截断三连的
+// 口径根源）。系数表由 deconIpc.createDecon 读 task-models sidecar（readTaskModelSlots +
+// assignmentThinkingControl 解析「thinking 开启」）后传入；estimateDeconCost 保持纯函数零 IO。
+
+/** 预估思考系数的 slot 键（deconLlmCore.DeconGenerateSlot 字面 mirror——防环不 import 缝文件）。 */
+export type DeconEstimateThinkingSlot = 'extraction' | 'review-judge' | 'writer-draft';
+
+/** thinking 开启档位的预估乘数（保守初值——pass 全额乘系数近似输出主导项；dogfood 标定）。 */
+export const DECON_THINKING_TOKEN_FACTOR = 1.5;
+
+/** pass → 缝任务档（与实跑调用点同映射：p1Dictionary/p1Extract/p3Label/p6Craft=extraction、p1Aggregate/p2Canon/p4Craft=review-judge、p4Style/p5Output=writer-draft）。 */
+const DECON_ESTIMATE_SLOT_BY_PASS: Readonly<Record<string, DeconEstimateThinkingSlot>> = {
+  p1a: 'extraction',
+  p1b: 'extraction',
+  p3a: 'extraction',
+  p6: 'extraction',
+  p1c: 'review-judge',
+  p2: 'review-judge',
+  'p4:style': 'writer-draft',
+  'p5:book_reading': 'writer-draft',
+  'p5:chapter_review': 'writer-draft',
+  'p5:scene_annotation': 'writer-draft',
+};
+
+function estimateSlotForPass(pass: string): DeconEstimateThinkingSlot | undefined {
+  const direct = DECON_ESTIMATE_SLOT_BY_PASS[pass];
+  if (direct !== undefined) return direct;
+  return pass.startsWith('p4:') ? 'review-judge' : undefined; // p4:<手艺维>（style 已显式登记）
+}
+
 /** 弧数估计（≥1——材料不足一弧按单弧）。 */
 export function estimateDeconArcCount(stats: DeconMaterialStats): number {
   return Math.max(1, Math.round(stats.charCount / DECON_ARC_CHARS));
@@ -115,6 +147,11 @@ export interface DeconEstimateInput {
   dimensions: readonly string[];
   stats: DeconMaterialStats;
   p1Reusable: DeconP1Inheritance;
+  /**
+   * 思考系数表（C6——thinking 开启 slot 对相关 pass 乘 DECON_THINKING_TOKEN_FACTOR 级系数；
+   * 缺省/空 = 零思考假设即旧行为）。纯输入零 IO——档位解析归 deconIpc.createDecon。
+   */
+  thinkingBySlot?: Partial<Record<DeconEstimateThinkingSlot, number>>;
 }
 
 /** 三档预估产出（byPass 键 = pass 全值：'p1a'/'p1b'/'p4:<dim>'/'p5:book_reading'…）。 */
@@ -183,6 +220,19 @@ export function estimateDeconCost(input: DeconEstimateInput): DeconEstimate {
     if (input.tier === 'deep') {
       const scenes = Math.max(1, Math.round(chapters * DECON_P5_SCENES_PER_CHAPTER));
       byPass['p5:scene_annotation'] = Math.round(scenes * DECON_P5_SCENE_ANNOTATION_TOKENS);
+    }
+  }
+
+  // C6：thinking 开启 slot 的相关 pass 全额乘系数（保守近似——思考吃帽压缩输出，输出主导项
+  // 上界即 pass 全额；纯输入系数表，缺省零思考假设不变）。
+  const thinkingBySlot = input.thinkingBySlot;
+  if (thinkingBySlot !== undefined) {
+    for (const passKey of Object.keys(byPass)) {
+      const slot = estimateSlotForPass(passKey);
+      const factor = slot !== undefined ? thinkingBySlot[slot] : undefined;
+      if (factor !== undefined && factor > 0 && factor !== 1) {
+        byPass[passKey] = Math.round(byPass[passKey]! * factor);
+      }
     }
   }
 

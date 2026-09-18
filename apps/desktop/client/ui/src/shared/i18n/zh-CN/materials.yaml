@@ -100,6 +100,13 @@ materials:
       sensitive: "源在敏感目录"
       missing: "源文件不可访问"
     failedTitle: "导入失败：{message}"
+    # ── 导入来源引导（C9/F3：反馈区「选来源（可跳过）」——落库复用 update-provenance patch）──
+    source:
+      title: "标注来源（可跳过——列表徽章、检索与拆书立即可用）"
+      skipMedium: "跳过（默认「其他」）"
+      skipTier: "跳过（默认「未标注」）"
+      saved: "已保存"
+    sourceSaveFailed: "来源标注失败：{message}"
   # ── provenance 表单（F-05 五字段后补；blur/change 落盘——无保存/关闭钮）──
   # 10.2a += 标题（name 列，materialId 路径身份不变）/ 简介（provenance.description）。
   provenance:

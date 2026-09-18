@@ -31,7 +31,7 @@
 
 ---
 
-**Closure** is an open-source, local-first AI novel-writing IDE for web-novel and long-form fiction authors, bringing outlines, chapters, characters, and worldbuilding asset cards into one workspace. Its principle is "you lead the creativity; the AI writes and self-checks": AI generation, continuation, polishing, review, and controlled edits, connected to any OpenAI-compatible model — with all creative data kept on your own computer. Windows is the priority platform; macOS / Linux are inherited from the upstream architecture. Closure is open source under AGPL-3.0-or-later (code derived from OrisonSpace retains Apache-2.0).
+**Closure** is an open-source, local-first AI novel-writing IDE for web-novel and long-form fiction authors, bringing outlines, chapters, characters, and worldbuilding asset cards into one workspace. Its principle is "you lead the creativity; the AI writes and self-checks": AI generation, continuation, polishing, review, and controlled edits; models connect to any OpenAI-compatible endpoint, or to the Gemini family directly through the Antigravity CLI — with all creative data kept on your own computer. Windows is the priority platform; macOS / Linux are inherited from the upstream architecture. Closure is open source under AGPL-3.0-or-later (code derived from OrisonSpace retains Apache-2.0).
 
 ## Why Build Closure
 
@@ -74,7 +74,7 @@ On top of OrisonSpace's writing-IDE base, Closure rebuilt the generation pipelin
 - **World-event system** — after each chapter is written, five kinds of changes (physical, cognitive, emotional, relational, factional) are extracted from the prose and merged into world-state snapshots that advance with the plot. The key is that the ledgers come in two layers: **factual truth** and **what the reader knows right now** are recorded separately — the gap between them is your foreshadow inventory; what should have been planted but wasn't, what should have been revealed but wasn't, the system can see. When a later chapter starts, who knows what right now and where each relationship stands enters the writer's context automatically
 - **World-state panel** — a "World" entry in the sidebar: a reading surface organized around world events, with three zoom levels (overview / point in time / entity) that refresh in real time as chapters are written — check "what the world looks like right now" anytime
 - **Engineered emotion loop** — set the target emotion for a scene before writing it; once written, automatically check whether the emotion actually landed, and bounce it back for revision if it didn't
-- **Write-chapter chain** — the full flow of writing one chapter: intent is dialogued, the director checks settings, context is assembled, the writer drafts, a checkpoint pauses for your review, review and revision run, and after the chapter lands it comes back to report. Every step pauses for a human; the steering wheel stays in your hands
+- **Write-chapter chain** — the full flow of writing one chapter: intent is dialogued, the director checks settings, context is assembled, the writer drafts, a checkpoint pauses for your review, review and revision run, and after the chapter lands it comes back to report. Every step pauses for a human; the steering wheel stays in your hands. The writing page lays the whole run out on one timeline — thinking, investigation, output, and the prose stream step by step — with approvals handled in place and the final draft editable by hand, or selectable for AI refinement
 - **Two-layer orchestration architecture** — the strategic layer is the commander in the dialog (you in the loop, redirecting anytime); the tactical layer is a node chain with explicit contracts (dependencies never dropped, artifact flow never relies on prompts implicitly carrying it); chain segments bring only summaries back to the dialog — internal process never eats your context; checkpoints can pause, resume, and rerun after edits
 - **Two-phase writer drafting** — the writer doesn't generate in one breath: it first self-checks for context gaps, lists an investigation checklist, and only starts writing after the researcher verifies every item. When the context budget runs out, pruning follows a degradation ladder — the story skeleton, the full-book table of contents, and queryable pointers are never pruned
 - **Web research** — check sources before writing: multiple search providers configurable (Tavily / Bocha / AnySearch; keys stored locally only). The researcher searches, the director verifies — anything contradicting existing settings gets bounced back for you to clarify, and research results settle into the workbench as cards. Useful for checking canon when writing fanfic, or industry details when writing urban fiction
@@ -89,6 +89,8 @@ On top of OrisonSpace's writing-IDE base, Closure rebuilt the generation pipelin
 - **Book-deconstruction engine** — pick an imported book and run a tiered deconstruction: factual canon (worldview / characters / factions), reading notes, chapter critiques, fine-grained annotations, and style features are produced layer by layer, with human review gates at the key points; style analysis exports as a style card, and writing experience distills into craft cards — see clearly why someone's writing works, then learn from it
 - **Two-layer review** — free pure-code rules run first; drafts with zero findings pass straight through; only flagged drafts go to the model for detailed review (six groups: consistency, narrative features, promise fulfillment, cognitive state, emotion landing, setting contracts). Two disciplines: **every finding must cite the original text** — no evidence, no opinion; and **false positives are preferred over misses** — the review layer is never allowed a "fake pass"
 - **Tiered model routing** — planning, prose writing, review, research, style analysis, and every other stage can each be assigned a different model and tier: the strongest model for prose, cheap models for chores; each stage's thinking depth (reasoning effort) is also individually adjustable — cost goes where it counts
+- **Antigravity CLI access** — a third model channel beyond OpenAI / Anthropic-compatible endpoints: connect through Google's official agy CLI to Antigravity and call the Gemini family directly — no third-party reverse proxy in between; keys and request data never pass through anyone else's hands, and there is no exposure to reseller risks like sudden shutdowns or padded metering. Within subscription quota, the cost sits far below token-priced official APIs. With the tool bridge, the dialog model can also call Closure's writing tools (chapter writing, setting lookup, research) after one-time authorization; the ToS gray area and account risk of indirect CLI use are disclosed at the in-app settings
+- **Usage panel** — a "Usage" page keeps the local account of every call: tokens and latency broken down by model and by task tier, with cost estimates, failure counts, and first-token latency at a glance; records auto-clean on a retention window and stay on your machine
 - **Creative decision records** — major creative choices are archived like architecture decision records (why it was decided this way, what the alternatives were); review uses them to check whether later chapters betray the promises you made
 
 ### Base Capabilities (Inherited from OrisonSpace)
@@ -119,7 +121,7 @@ On top of OrisonSpace's writing-IDE base, Closure rebuilt the generation pipelin
 | Desktop | Electron |
 | Frontend | React · TypeScript · Zustand · TipTap |
 | Agent | Custom Workflow Runtime (embedded library) |
-| Model Protocol | Unified OpenAI-compatible adapter (AI SDK) |
+| Model Protocol | Unified OpenAI / Anthropic-compatible adapters (AI SDK) · Antigravity CLI bridge |
 | Build | pnpm monorepo · Turbo · Vite · Vitest |
 
 ## The Structure Page: One Cockpit for the Whole Book
@@ -205,6 +207,8 @@ Download installers from [GitHub Releases](../../releases):
 - [x] Style cards and style-passage dialog
 - [x] World-state panel (world-event viewer UI)
 - [x] Book-deconstruction engine (universal ingestion, experience distillation, novel teardown)
+- [x] Antigravity CLI access (direct Gemini + dialog tool bridge)
+- [x] Usage panel and automatic model fallback
 
 ### In Progress
 
@@ -221,7 +225,7 @@ Download installers from [GitHub Releases](../../releases):
 - [ ] Worldline system
 - [ ] Character-card visualization (relationship graph, character radar, and other graphical views)
 - [ ] Fanfic creation pipeline (full original-work understanding, character portrayals, anchors, controlled deviation, OOC review) — one of this project's founding motivations; it will be done
-- [ ] Existing-work import / export enhancements / usage statistics
+- [ ] Existing-work import / export enhancements
 
 ## Project Status
 
@@ -241,7 +245,7 @@ It's a workbench for long-form writing, not a one-shot generator. Project struct
 No. Closure is local-first: your work is saved as plain files (`project.yaml`, `chapters/*.md`, etc.) on your own computer — no account required, and data never leaves your machine.
 
 **Which AI models are supported?**
-Any OpenAI-compatible endpoint. You connect with your own API key and freely choose text and image models; keys are stored encrypted, locally only.
+Any OpenAI or Anthropic-compatible endpoint; the Gemini family is also reachable directly through the Antigravity CLI. You connect with your own API key and freely choose text and image models; keys are stored encrypted, locally only.
 
 **Which operating systems are supported?**
 Windows, macOS (Intel and Apple Silicon), and Linux.

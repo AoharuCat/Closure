@@ -56,6 +56,8 @@ type SliceState = AgentSessionSlice & {
   clearSessionPending: (sessionId: string) => void;
   clearPausedReviewFor: (sessionId: string) => void;
   clearPendingPatchFor: (sessionId: string) => void;
+  /** 09-13 子3 W4：五审阅本地态键随会话消亡清理（deleteAgentSession 调用面）。 */
+  clearReviewLocalStateFor: (sessionId: string) => void;
 };
 
 type TestState = AgentDispatchState & {
@@ -67,9 +69,12 @@ type TestState = AgentDispatchState & {
   pendingAttachments: unknown[];
   newAgentSession: () => Promise<void>;
   switchAgentSession: (sessionId: string) => Promise<void>;
-  /** dogfood R2 #105 假中断守卫：resume 在途判据（chapterReviewSlice 面——dispatcher 结构读）。 */
-  reviewResuming: boolean;
+  /** dogfood R2 #105 假中断守卫：resume 在途判据（chapterReviewSlice 面——dispatcher 结构读）。
+   * 09-13 子3 W4：reviewResuming 单槽 → BySession 键控（done-probe 同批改读）。
+   * CR-9：escalate 车道第二载荷键（escalate 暂停无 pausedReview——resume fallback 落本键）。 */
+  reviewResumingBySession: Record<string, boolean>;
   pausedReviewBySession: Record<string, unknown>;
+  escalateFindingsBySession: Record<string, unknown>;
 };
 
 // 最小可跑 store：真 agentSessionSlice 的 run 态 + 视图字段，diff/patch/review 槽用结构面
@@ -115,8 +120,9 @@ const useTestStore = create<TestState & { agentRunStates: TestState['agentRunSta
   setPendingPatch: (sessionId, patch) => { patchWrites.push({ sid: sessionId, value: patch }); },
   fieldMetadata: {},
   resolvedLocale: 'zh-CN',
-  reviewResuming: false,
+  reviewResumingBySession: {},
   pausedReviewBySession: {},
+  escalateFindingsBySession: {},
   clearSessionPending: vi.fn(),
   clearPausedReviewFor: vi.fn(),
   clearPendingPatchFor: vi.fn(),
@@ -154,8 +160,9 @@ beforeEach(() => {
     chainRunBySession: {},
     chainRunAnchorByProject: {},
     resolvedLocale: 'zh-CN',
-    reviewResuming: false,
+    reviewResumingBySession: {},
     pausedReviewBySession: {},
+    escalateFindingsBySession: {},
   });
 });
 
@@ -273,6 +280,13 @@ describe('r7 分发谓词：活跃视图 / 后台双分支 + 项目隔离', () =
     useTestStore.getState().setAgentRunState('sess-b', { phase: 'running' });
     handleAgentStreamEvent(useTestStore, ev({ type: 'chain-node-done', data: { nodeId: '__chain_run__', status: 'error' } }, 'sess-b', '/proj-a'));
     expect(useTestStore.getState().agentRunStates['sess-b']?.phase).toBe('error');
+
+    // CR-22（W-CR 批）：legacy 'auto_revise_pending'（W1a 前哨兵终态值——dev 热重载/持久化时间线
+    // 回放会重放旧帧）→ idle 非 error（健康复跑卡不被错标失败；生产链已不再产该值）。
+    useTestStore.getState().setAgentRunState('sess-b', { phase: 'running' });
+    handleAgentStreamEvent(useTestStore, ev({ type: 'chain-node-done', data: { nodeId: '__chain_run__', status: 'auto_revise_pending' } }, 'sess-b', '/proj-a'));
+    expect(useTestStore.getState().agentRunStates['sess-b']?.phase).toBe('idle');
+    expect(useTestStore.getState().chainRunBySession['sess-b']?.status).toBe('completed');
   });
 });
 
@@ -646,7 +660,7 @@ describe('dogfood R2 #105 假中断根治（done 兜底前置守卫）', () => {
     expect(useTestStore.getState().agentRunStates['sess-a']?.phase).toBe('running');
     // resume IPC 在途（ChapterReviewPanel 三动作已发出、长跑 IPC 未返回）。
     useTestStore.setState({
-      reviewResuming: true,
+      reviewResumingBySession: { 'sess-a': true },
       pausedReviewBySession: { 'sess-a': { type: 'chapter_review', stage: 'draft' } },
     });
 
@@ -667,16 +681,55 @@ describe('dogfood R2 #105 假中断根治（done 兜底前置守卫）', () => {
 
   it('reviewResuming 在途但该会话无 pausedReview 键（双条件防残值误放行）→ 兜底照旧', () => {
     startRunningChain('sess-a');
-    useTestStore.setState({ reviewResuming: true, pausedReviewBySession: { 'sess-other': { type: 'chapter_review' } } });
+    useTestStore.setState({ reviewResumingBySession: { 'sess-a': true }, pausedReviewBySession: { 'sess-other': { type: 'chapter_review' } } });
     handleAgentStreamEvent(useTestStore, ev({ type: 'done', data: { status: 'completed' } }, 'sess-a', '/proj-a'));
     expect(useTestStore.getState().chainRunBySession['sess-a']?.status).toBe('aborted');
+  });
+
+  // 09-13 子3 W4：键控后两线交叉场景——链事件流键 = 事件 sid（stub 链会话）≠ 审阅动作键控的
+  // agentSessionId。resume 在途键挂在审阅会话（sess-a）时，stub 链 sid 的 done 事件守卫不命中
+  // （键空差）→ 该链照旧兜底 aborted——守卫只放行「自己会话」的在途 resume，不误放行他链。
+  it('W4 两线交叉：reviewResumingBySession 挂 sess-a，done 事件 sid = stub 链 → 守卫不命中照旧 aborted', () => {
+    startRunningChain('stub-chain-1');
+    useTestStore.setState({
+      reviewResumingBySession: { 'sess-a': true },
+      pausedReviewBySession: { 'sess-a': { type: 'chapter_review', stage: 'draft' } },
+    });
+    handleAgentStreamEvent(useTestStore, ev({ type: 'done', data: { status: 'completed' } }, 'stub-chain-1', '/proj-a'));
+    expect(useTestStore.getState().chainRunBySession['stub-chain-1']?.status).toBe('aborted');
   });
 
   it('pausedReview 在但 reviewResuming=false（IPC 已返回）→ 兜底照旧（守卫只在真在途窗口放行）', () => {
     startRunningChain('sess-a');
     useTestStore.setState({
-      reviewResuming: false,
+      reviewResumingBySession: {},
       pausedReviewBySession: { 'sess-a': { type: 'chapter_review', stage: 'draft' } },
+    });
+    handleAgentStreamEvent(useTestStore, ev({ type: 'done', data: { status: 'completed' } }, 'sess-a', '/proj-a'));
+    expect(useTestStore.getState().chainRunBySession['sess-a']?.status).toBe('aborted');
+  });
+
+  // CR-9：escalate 暂停不产 pausedReview（resume 载荷落 escalateFindingsBySession）——
+  // escalate 车道的 accept/redo flight 窗口同享守卫：resuming=true + escalate 键在（pausedReview
+  // 缺席）→ leader done 不误标 aborted。
+  it('CR-9 escalate 变体：resuming 在途 + escalate 键在（无 pausedReview）→ done 兜底不误终态化', () => {
+    startRunningChain('sess-a');
+    useTestStore.setState({
+      reviewResumingBySession: { 'sess-a': true },
+      pausedReviewBySession: {},
+      escalateFindingsBySession: { 'sess-a': { source: 'reader-audit', route: 'escalate_user', items: [], at: 1 } },
+    });
+    handleAgentStreamEvent(useTestStore, ev({ type: 'done', data: { status: 'completed' } }, 'sess-a', '/proj-a'));
+    expect(useTestStore.getState().chainRunBySession['sess-a']?.status).toBe('running');
+    expect(useTestStore.getState().agentRunStates['sess-a']?.phase).toBe('running');
+  });
+
+  it('CR-9 反向：resuming=true 但两载荷键都缺（残值）→ 兜底照旧 aborted（双条件防误放行不放松）', () => {
+    startRunningChain('sess-a');
+    useTestStore.setState({
+      reviewResumingBySession: { 'sess-a': true },
+      pausedReviewBySession: {},
+      escalateFindingsBySession: {},
     });
     handleAgentStreamEvent(useTestStore, ev({ type: 'done', data: { status: 'completed' } }, 'sess-a', '/proj-a'));
     expect(useTestStore.getState().chainRunBySession['sess-a']?.status).toBe('aborted');
@@ -756,6 +809,7 @@ describe('D4 UI 面（同项目单 run）——真 agentSessionSlice 驱动', ()
     clearSessionPending: vi.fn(),
     clearPausedReviewFor: vi.fn(),
     clearPendingPatchFor: vi.fn(),
+    clearReviewLocalStateFor: vi.fn(),
     ...createAgentSessionSlice(...args),
   }));
 

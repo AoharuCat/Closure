@@ -3,7 +3,7 @@ import type {
   RerankResponse,
   ResolvedModel,
 } from '@orison/shared-contracts';
-import { normalizeBaseUrl, postJson } from './http';
+import { normalizeBaseUrl, postJson, getInsecureDispatcher } from './http';
 import { withRetry } from './retry';
 import type { ProtocolCallContext } from './types';
 
@@ -64,9 +64,11 @@ export async function rerank(
     () =>
       postJson<RerankApiResponse>({
         url: `${baseUrl}/rerank`,
-        headers: { authorization: `Bearer ${model.apiKey}` },
+        // 09-12 子3 §3 ⑥：customHeaders 随该 key 全部请求发出 + per-key 证书校验跳过。
+        headers: { authorization: `Bearer ${model.apiKey}`, ...model.customHeaders },
         body,
         signal: ctx?.signal,
+        dispatcher: model.verifySsl === true ? getInsecureDispatcher() : undefined,
       }),
     { signal: ctx?.signal },
   );

@@ -3,7 +3,7 @@ import type { taskRequestSchema, taskResultSchema, patchOperationSchema, AgentBe
 
 export type WorkspaceModule = 'outline' | 'novel' | 'script';
 export type WorkspacePanel = 'overview' | 'image_gen' | 'assets';
-export type ActivePage = 'overview' | 'outline' | 'novel' | 'script' | 'image_gen' | 'assets' | 'structure' | 'setting' | 'materials' | 'craft' | 'decon';
+export type ActivePage = 'overview' | 'outline' | 'novel' | 'script' | 'image_gen' | 'assets' | 'structure' | 'setting' | 'materials' | 'craft' | 'decon' | 'writing';
 export type SidebarPanel = 'explorer' | 'search' | 'timeline' | 'world';
 export type BottomPanelTab = 'output' | 'tasks' | 'lint';
 export type ThemeSetting = 'system' | 'light' | 'dark' | (string & {});

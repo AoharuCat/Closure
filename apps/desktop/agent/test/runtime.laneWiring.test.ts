@@ -18,6 +18,9 @@ import { registry } from '../src/tool/registry';
 //   ④ 写章链 runChapterChain（全部节点经 wrapper 注入）
 // - dialogue（缺省 undefined = interactive 60s 红线，不带 lane）：
 //   ⑤⑥ leader sendMessage / streamMessage 两对话车道
+// - cacheControl（C 批 W_c2，09-12 稳定化 / C3.4）：Anthropic prompt-cache 断点开关仅
+//   ⑤⑥ dialogue 两车道置 true；①-④ child/skill/链车道恒 undefined（钉面——flag 缺省
+//   = 协议层零行为，装配面零扩散）。
 // ─────────────────────────────────────────────────────────────────────────────
 
 vi.mock('../src/skill/discovery', () => ({
@@ -62,6 +65,8 @@ describe('dogfood R2 #7 车道接线 — child / skill / 链 generate 带 lane:"
 
     expect(generate).toHaveBeenCalledTimes(1);
     expect(laneAt(generate, 0)).toBe('background');
+    // C 批 W_c2：cacheControl 仅 dialogue 两装配点置位——child 车道恒 undefined（钉面）。
+    expect(generate.mock.calls[0]?.[4]?.cacheControl).toBeUndefined();
   });
 
   it('runSubagent（.md 子 agent runChildAgent）→ generate 实收 lane:"background"', async () => {
@@ -74,6 +79,7 @@ describe('dogfood R2 #7 车道接线 — child / skill / 链 generate 带 lane:"
     expect(result.content).toBe('Expanded into 12 scene beats.');
     expect(generate).toHaveBeenCalledTimes(1);
     expect(laneAt(generate, 0)).toBe('background');
+    expect(generate.mock.calls[0]?.[4]?.cacheControl).toBeUndefined();
   });
 
   it('executeSkill（skill 指令节点 runLoop）→ generate 实收 lane:"background"', async () => {
@@ -101,12 +107,17 @@ describe('dogfood R2 #7 车道接线 — child / skill / 链 generate 带 lane:"
     expect(result.status).toBe('completed');
     expect(generate).toHaveBeenCalledTimes(1);
     expect(laneAt(generate, 0)).toBe('background');
+    expect(generate.mock.calls[0]?.[4]?.cacheControl).toBeUndefined();
   });
 
   it('runChapterChain（写章链全部节点）→ 每次 generate 实收 lane:"background"', async () => {
     // mirror runChapterChain.test.ts makeChainGenerate：按 system 标记返 fixture，链跑通（route 首判 accept）。
     const generate = vi.fn<GenerateFn>(async (_msgs, sys) => {
       const s = sys ?? '';
+      if (s.includes('规划审核')) {
+        // W1d：brief-reviewer（A2 规划审核）——pass 直通（须在 generic「审核」前，system 含「审核」子串）。
+        return { content: JSON.stringify({ verdict: 'pass', summary: '卡可写', findings: [] }), finishReason: 'stop' };
+      }
       if (s.includes('路由判决')) {
         return { content: JSON.stringify({ decision: 'accept_as_truth', reason: '达标' }), finishReason: 'stop' };
       }
@@ -138,9 +149,11 @@ describe('dogfood R2 #7 车道接线 — child / skill / 链 generate 带 lane:"
     });
 
     expect(summary.status).toBe('completed');
-    expect(generate.mock.calls.length).toBe(10); // legacy 直写链 happy-path 调用数（mirror runChapterChain 测试）
+    expect(generate.mock.calls.length).toBe(11); // W1d：+brief-reviewer（C1 首圈 no-op 零调用）
     for (let i = 0; i < generate.mock.calls.length; i += 1) {
       expect(laneAt(generate, i), `call#${i}（链车道）`).toBe('background');
+      // C 批 W_c2：链车道 cacheControl 恒 undefined（mirror sessionKey 链侧钉面形态）。
+      expect(generate.mock.calls[i]?.[4]?.cacheControl, `call#${i}（链车道）`).toBeUndefined();
     }
   });
 });
@@ -173,6 +186,11 @@ describe('dogfood R2 #7 车道接线 — leader 对话车道不带 lane（intera
 
     expect(generate).toHaveBeenCalledTimes(1);
     expect(laneAt(generate, 0)).toBeUndefined();
+    // 09-12 system 稳定化：dialogue 会话键接回（mirror 链侧 `chain:<id>:writer` 命名式）——
+    // system 恒定区落地后 agy 长驻会话 mirror 走 append 命中。
+    expect(generate.mock.calls[0]?.[4]?.sessionKey).toBe(`dialogue:${session.id}`);
+    // C 批 W_c2（09-12 稳定化 / C3.4）：dialogue 装配点置 Anthropic 断点开关——generate 实收。
+    expect(generate.mock.calls[0]?.[4]?.cacheControl).toBe(true);
   });
 
   it('streamMessage（流式对话车道）→ generate 实收 lane:undefined', async () => {
@@ -190,5 +208,9 @@ describe('dogfood R2 #7 车道接线 — leader 对话车道不带 lane（intera
 
     expect(generate).toHaveBeenCalledTimes(1);
     expect(laneAt(generate, 0)).toBeUndefined();
+    // 稳定化同上：流式对话车道会话键同款接回。
+    expect(generate.mock.calls[0]?.[4]?.sessionKey).toBe(`dialogue:${session.id}`);
+    // C 批 W_c2 同上：流式对话车道断点开关同款置位。
+    expect(generate.mock.calls[0]?.[4]?.cacheControl).toBe(true);
   });
 });

@@ -525,6 +525,78 @@ describe('ingestMaterial — 幂等与人工校对闭环', () => {
     expect(getRegisteredContentHash).toHaveBeenCalledTimes(1);
   });
 
+  it('C2 防清 belt：markers=0（章标记被剥）+ 登记行有章 → 保留既有章界 + note（不落 0 章中间行）', async () => {
+    const rel = writeSource('novel.txt', chapteredNovel());
+    const first = await ingestMaterial(scope(), rel, realParseDeps());
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+
+    // R10 剥离形态：派生 .md 标记全失 + 一处人工正文改动（内容变更 → CR-001 人工保留路径；
+    // markers=0 → 标记重建零章——旧形态此处装配 0 章 ready 行 = F1「0 章|章界待校对」假态）。
+    const derivedPath = derivedAbs(rel);
+    const stripped = `${stripChapterMarkerLines(readFileSync(derivedPath, 'utf-8'))}\n\n人工补记：本章伏笔在第三章回收。`;
+    writeFileSync(derivedPath, stripped, 'utf-8');
+
+    const getRegisteredContentHash = vi.fn(async () => first.material.contentHash);
+    const getRegisteredMaterial = vi.fn(() => first.material);
+    const second = await ingestMaterial(scope(), rel, {
+      ...realParseDeps(),
+      getRegisteredContentHash,
+      getRegisteredMaterial,
+    });
+    expect(second.ok).toBe(true);
+    if (!second.ok) return;
+    expect(second.outcome).toBe('reingest-skipped-manual');
+    // 🔑 既有章界 + 分章结论整体保留（非 0 章中间行；chapters/chapterDetection 同源，守 F-18）。
+    expect(second.material.chapters).toEqual(first.material.chapters);
+    expect(second.material.quality.chapterDetection).toEqual(first.material.quality.chapterDetection);
+    expect(second.material.status).toBe('ready');
+    const notes = second.material.quality.parseNotes.join('\n');
+    expect(notes).toContain('章标记缺失'); // 诚实标注保留行为（待重索引收敛）
+    expect(notes).toContain('人工编辑'); // CR-001 note 照常
+    expect(readFileSync(derivedPath, 'utf-8')).toBe(stripped); // 派生人工内容不覆写
+    expect(getRegisteredMaterial).toHaveBeenCalledTimes(1);
+  });
+
+  it('C2 belt 边界：缝未装配 / 既有行零章（首登挂起）→ 诚实零章现状保持（belt 无可保留不硬给）', async () => {
+    // ① 缝未装配（belt 退化——诚实零章，不因缺缝炸/不硬造）。
+    const rel = writeSource('novel.txt', chapteredNovel());
+    const first = await ingestMaterial(scope(), rel, realParseDeps());
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    const derivedPath = derivedAbs(rel);
+    const stripped = `${stripChapterMarkerLines(readFileSync(derivedPath, 'utf-8'))}\n\n人工补记。`;
+    writeFileSync(derivedPath, stripped, 'utf-8');
+    const noSeam = await ingestMaterial(scope(), rel, {
+      ...realParseDeps(),
+      getRegisteredContentHash: async () => first.material.contentHash,
+    });
+    expect(noSeam.ok).toBe(true);
+    if (!noSeam.ok) return;
+    expect(noSeam.outcome).toBe('reingest-skipped-manual');
+    expect(noSeam.material.chapters).toEqual([]); // 诚实零章（现状保持）
+    expect(noSeam.material.quality.parseNotes.join('\n')).not.toContain('章标记缺失');
+
+    // ② 缝装配但既有行零章（llm-fallback 挂起材料——派生本就无标记）：belt 无可保留。
+    const rel2 = writeSource('low.txt', lowConfidenceLongText(90));
+    const firstLow = await ingestMaterial(scope(), rel2, realParseDeps());
+    expect(firstLow.ok).toBe(true);
+    if (!firstLow.ok) return;
+    expect(firstLow.material.chapters).toEqual([]); // 挂起零章
+    const derived2 = derivedAbs(rel2);
+    const edited2 = `${readFileSync(derived2, 'utf-8')}\n\n人工补记。`;
+    writeFileSync(derived2, edited2, 'utf-8');
+    const secondLow = await ingestMaterial(scope(), rel2, {
+      ...realParseDeps(),
+      getRegisteredContentHash: async () => firstLow.material.contentHash,
+      getRegisteredMaterial: () => firstLow.material, // 零章行 → 缝侧判空 → belt 不触发
+    });
+    expect(secondLow.ok).toBe(true);
+    if (!secondLow.ok) return;
+    expect(secondLow.material.chapters).toEqual([]); // 诚实零章（无可保留）
+    expect(secondLow.material.quality.parseNotes.join('\n')).not.toContain('章标记缺失');
+  });
+
   it('登记 hash 与本次解析不一致（原件真变了）：CR-001 缝不拦——走既有自动路径（reingested）', async () => {
     const rel = writeSource('novel.txt', chapteredNovel());
     await ingestMaterial(scope(), rel, realParseDeps());

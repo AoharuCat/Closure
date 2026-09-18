@@ -6,8 +6,9 @@ import { logger } from '../logger';
 //  - ```json ... ``` 围栏（含/不含 `json` 标签）
 //  - 前导自然语言（"这是初稿：\n{...}"）+ 尾随文字
 //  - DashScope `"{}{...}"` 双对象前缀（runLoop `agent/loop.ts:210-229` tool-args 路径已遇）
-// 裸 JSON.parse 在这些形态下抛 → 4 个 parseOutput（draft-writer/multi-review/route/targeted-revision）
-// 两次重试同 prompt 同败 → error artifact → 链断在 draft-writer（dogfood gate 跨不过）。
+// 裸 JSON.parse 在这些形态下抛 → 单发 parseOutput 节点（draft-writer / multi-review / route /
+// brief-reviewer / revision-optimizer 等，createLlmNode 家族）两次重试同 prompt 同败 → error artifact
+// → 链断在产稿/审读位（dogfood gate 跨不过）。
 //
 // **复用核实（CR-5 要求）**：runLoop `agent/loop.ts:210-229` 有 `lastIndexOf('{')` brace-slice 逻辑，
 // 但它是 inline 的 tool-arguments 修复（耦合 `call.arguments = JSON.stringify(params)` 副作用），

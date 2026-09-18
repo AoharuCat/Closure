@@ -1034,6 +1034,111 @@
   color: var(--on-surface);
 }
 
+/* ── 09-12 子3 W4：provider 参数面（headers 键值行 / 高级折叠钮 / 模型行展开 + 默认参数面板）── */
+
+/* 折叠区开关（「高级设置」/「添加请求头」共用）：左对齐文字钮 + 前导图标。 */
+.settings-fold-button {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-3xs);
+  align-self: flex-start;
+  margin-top: var(--space-xs);
+  padding: 0.15rem 0.5rem;
+  border: none;
+  border-radius: var(--radius-2xs);
+  background: transparent;
+  color: var(--on-surface-variant);
+  font: inherit;
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+.settings-fold-button:hover {
+  background: var(--hover-overlay);
+}
+
+.settings-fold-button .material-symbols-outlined {
+  font-size: 1.05rem;
+}
+
+/* 请求头键值编辑行：名 / 值双输入 + 删除钮。 */
+.headers-editor-row {
+  display: grid;
+  grid-template-columns: minmax(8rem, 1fr) minmax(8rem, 1.4fr) auto;
+  align-items: center;
+  gap: var(--space-2xs);
+  margin-top: var(--space-2xs);
+}
+
+/* 模型行 + 其展开面板的外壳。 */
+.model-entry-block {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2xs);
+}
+
+.model-entry-expand {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: var(--radius-2xs);
+  background: transparent;
+  color: var(--on-surface-variant);
+  cursor: pointer;
+}
+
+.model-entry-expand:hover {
+  background: var(--hover-overlay);
+  color: var(--on-surface);
+}
+
+.model-entry-expand .material-symbols-outlined {
+  font-size: 1.1rem;
+}
+
+/* 模型默认参数子面板：行下方缩进的浅面板。 */
+.model-defaults-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2xs);
+  padding: 0.55rem 0.75rem 0.65rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--outline-variant);
+  background: var(--surface-container-lowest);
+}
+
+.model-defaults-advanced {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2xs);
+  padding-top: var(--space-2xs);
+  border-top: 1px dashed var(--outline-variant);
+}
+
+/* extraBody JSON 原文 textarea（等宽，防拼写检查红线）。 */
+.form-field-textarea {
+  width: 100%;
+  min-width: 0;
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--outline-variant);
+  border-radius: var(--radius-2xs);
+  background: var(--surface-container-lowest);
+  color: var(--on-surface);
+  font-family: var(--font-mono, monospace);
+  font-size: var(--text-sm);
+  line-height: 1.45;
+  resize: vertical;
+}
+
+.form-field-textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
 .model-editor-banner {
   display: flex;
   align-items: center;
@@ -1554,4 +1659,107 @@
 .kb-index-meta-empty {
   font-size: var(--text-sm);
   color: var(--on-surface-variant);
+}
+
+/* ── 09-12 子2 fallback chains：档位回退链编辑（design §8①）──
+   有序条目（序号 + 模型 select + 条目思考 + 上移/下移/删除）+ 添加钮。
+   条目缩进一档与主指派行区分；空链只显一行 hint。 */
+.model-fallback-chain {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  margin: 0.15rem 0 0 0.5rem;
+  padding-left: 0.75rem;
+  border-left: 2px solid var(--outline-variant, rgba(0, 0, 0, 0.12));
+}
+
+.model-fallback-chain-label {
+  font-size: var(--text-xs);
+  color: var(--outline);
+}
+
+.model-fallback-chain-hint {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--outline);
+  line-height: 1.4;
+}
+
+.model-fallback-entry {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.model-fallback-entry-order {
+  min-width: 1rem;
+  text-align: center;
+  font-size: var(--text-xs);
+  color: var(--outline);
+}
+
+.model-fallback-entry-model,
+.model-fallback-entry-thinking {
+  flex: 1;
+  min-width: 0;
+}
+
+.model-fallback-entry-custom {
+  flex: 1;
+  min-width: 0;
+}
+
+.model-fallback-entry-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.1rem;
+}
+
+.model-fallback-entry-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.5rem;
+  height: 1.5rem;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--outline);
+  cursor: pointer;
+}
+
+.model-fallback-entry-action:hover:not(:disabled) {
+  background: var(--surface-variant, rgba(0, 0, 0, 0.06));
+  color: var(--on-surface, inherit);
+}
+
+.model-fallback-entry-action:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.model-fallback-add {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2rem;
+  align-self: flex-start;
+  margin-top: 0.1rem;
+  padding: 0.15rem 0.5rem;
+  border: 1px dashed var(--outline-variant, rgba(0, 0, 0, 0.2));
+  border-radius: 4px;
+  background: transparent;
+  color: var(--outline);
+  font-size: var(--text-xs);
+  cursor: pointer;
+}
+
+.model-fallback-add:hover:not(:disabled) {
+  color: var(--on-surface, inherit);
+  border-color: var(--on-surface, currentColor);
+}
+
+.model-fallback-add:disabled {
+  opacity: 0.4;
+  cursor: default;
 }

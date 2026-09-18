@@ -15,13 +15,12 @@ import { logger } from '../logger';
 // + 本章场 storyTime 窗（`scene_graph` × episodeId，`isSceneInEpisode` 单源）→ detectStoryTimeDrift
 // 纯函数比对 → 产 `storytime_drift` artifact。窗外 → warnings（**零阻断**——warning 不进 errors 不停链）。
 //
-// **链位理由（design §3.3 定的 chapter-summary 链位旁，挂其紧后）**：
-// 1. 输入就绪时序：`world_state.events` 自 world-merge-node（链内 idx 8）已产——守卫在其后任意位
+// **链位理由（design §3.3 定的 chapter-summary 链位旁，挂其紧后；链流程重排 W1d 后 = 提取段 E7）**：
+// 1. 输入就绪时序：`world_state.events` 自 world-merge-node（E2）已产——守卫在其后任意位
 //    皆可跑；与 chapter-summary 同族（「提取落表后的机械观测步骤」：summary 物化状态账 / 本节点审
 //    提取 storyTime 漂移），邻位聚拢可读。
-// 2. 必在 route-agent（through 节点）之前——through-break 后 post-through 节点结构性不可达
-//    （orchestration-pattern 语义 1）。
-// 3. revision 闭环切片 [targeted-revision..route] 外 → auto_revise 闭环重跑不重复守卫；redo 重跑
+// 2. route 终态（accept）后自然前进进提取段 → 本节点对**最终稿**一次守卫；自审环
+//    [revision-optimizer..route] 不含本节点 → auto_revise 环内回环不重复守卫；redo 重跑
 //    到链尾全部（orchestration-pattern 语义 2）→ 本节点重跑幂等（纯函数 over artifacts，无副作用，
 //    warnings 覆盖重写）。
 //

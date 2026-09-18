@@ -108,9 +108,31 @@ function lintRulesetsCopyPlugin() {
   };
 }
 
+// 09-12 子4 agy MCP 工具桥：mcpServer.mjs 静态资产构建期拷贝——agy 按假宿 mcp_config
+// spawn 它（command=process.execPath + ELECTRON_RUN_AS_NODE，args=[dist/agy-bridge/
+// mcpServer.mjs 绝对路径]）。形态与 lintRulesetsCopyPlugin 同款（dist/** 已是 electron-
+// builder files 条目，拷到 dist/main 之外避开 vite outDir 清空）；默认解析由
+// agyBridge.ts defaultMcpServerAssetPath 给出（main chunk 平铺 dist/main → ../agy-bridge）。
+const agyBridgeAssetsSrc = path.resolve(__dirname, 'resources/agy-bridge');
+
+function agyBridgeAssetsCopyPlugin() {
+  return {
+    name: 'orison-agy-bridge-assets-copy',
+    buildStart() {
+      fs.cpSync(agyBridgeAssetsSrc, path.resolve(__dirname, 'dist', 'agy-bridge'), { recursive: true });
+    },
+  };
+}
+
 export default defineConfig({
   main: {
-    plugins: [externalizeDepsPlugin({ exclude: bundledWorkspaceDeps }), lintRulesetsCopyPlugin()],
+    plugins: [externalizeDepsPlugin({ exclude: bundledWorkspaceDeps }), lintRulesetsCopyPlugin(), agyBridgeAssetsCopyPlugin()],
+    resolve: {
+      alias: {
+        // 子4 agyBridge 三道闸深导入（agent index 未导出 toolPolicy；与 vitest.config 同步）。
+        '@orison/desktop-agent/runtime/toolPolicy': path.resolve(__dirname, '../../agent/src/runtime/toolPolicy'),
+      },
+    },
     build: {
       outDir: 'dist/main',
       lib: {

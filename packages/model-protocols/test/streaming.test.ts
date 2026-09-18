@@ -276,6 +276,7 @@ describe('generateTextStream (anthropic-compatible)', () => {
     expect(result.text).toBe('你好');
     expect(result.finishReason).toBe('stop');
     expect(result.usage).toEqual({ promptTokens: 11, completionTokens: 7, totalTokens: 18 });
+    expect('cacheReadTokens' in (result.usage ?? {})).toBe(false); // C 批 CR P10：全缺席键 ABSENT
   });
 
   it('streams thinking deltas and aggregates reasoning onto the terminal frame', async () => {
@@ -743,6 +744,71 @@ describe('generateTextStream (anthropic-compatible)', () => {
 
     expect((err as Error).name).toBe('AbortError');
     expect(captured.length).toBe(1);
+  });
+
+  // 09-12 system stabilization C 批（W_c1）：stream 路径与非流式同源
+  // buildAnthropicBody——断点形态随流式载荷（{...body, stream:true}）同样携带；
+  // flag 缺省时流式 body 同样字节不变。
+  it('cacheControl：缺省流式 body 不变 / 置位 → system 数组块 + 对话尾断点随流式载荷携带', async () => {
+    globalThis.fetch = queuedFetch(captured, [
+      (call) => sseResponse(ANTHROPIC_HAPPY, {}, call.init?.signal),
+      (call) => sseResponse(ANTHROPIC_HAPPY, {}, call.init?.signal),
+    ]);
+
+    await generateTextStream(
+      anthropicModel(),
+      {
+        model: 'claude-3-5-sonnet-latest',
+        messages: [{ role: 'system', content: 'You are concise.' }, { role: 'user', content: 'hi' }],
+      },
+      undefined,
+      () => {},
+    );
+    expect(typeof bodyOf(0).system).toBe('string');
+    expect(bodyOf(0).messages).toEqual([{ role: 'user', content: 'hi' }]);
+
+    await generateTextStream(
+      anthropicModel(),
+      {
+        model: 'claude-3-5-sonnet-latest',
+        messages: [{ role: 'system', content: 'You are concise.' }, { role: 'user', content: 'hi' }],
+        cacheControl: true,
+      },
+      undefined,
+      () => {},
+    );
+    const flagged = bodyOf(1);
+    expect(flagged.stream).toBe(true);
+    expect(flagged.system).toEqual([
+      { type: 'text', text: 'You are concise.', cache_control: { type: 'ephemeral' } },
+    ]);
+    expect(flagged.messages).toEqual([
+      { role: 'user', content: [{ type: 'text', text: 'hi', cache_control: { type: 'ephemeral' } }] },
+    ]);
+  });
+
+  // C 批 CR P10：流式三桶 usage——message_start 的 message.usage 是官方 cache 桶协议位
+  // （message_delta.usage 只承诺累计 output_tokens，输入侧不读）；promptTokens 三桶求和
+  // 与非流式路径同源，cacheReadTokens 透出（ABSENT ≠ 0 纪律）。
+  it('C 批 CR P10：流式三桶 usage——promptTokens=input+read+creation + cacheReadTokens 透出', async () => {
+    const chunks = [
+      anthEvent('message_start', { message: { usage: { input_tokens: 200, cache_read_input_tokens: 100, cache_creation_input_tokens: 50 } } }),
+      anthEvent('content_block_start', { index: 0, content_block: { type: 'text', text: '' } }),
+      anthEvent('content_block_delta', { index: 0, delta: { type: 'text_delta', text: '好' } }),
+      anthEvent('content_block_stop', { index: 0 }),
+      anthEvent('message_delta', { delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 7 } }),
+      anthEvent('message_stop'),
+    ];
+    globalThis.fetch = queuedFetch(captured, [(call) => sseResponse(chunks, {}, call.init?.signal)]);
+
+    const result = await generateTextStream(
+      anthropicModel(),
+      { model: 'claude-3-5-sonnet-latest', messages: [{ role: 'user', content: 'hi' }] },
+      undefined,
+      () => {},
+    );
+
+    expect(result.usage).toEqual({ promptTokens: 350, completionTokens: 7, cacheReadTokens: 100, totalTokens: 357 });
   });
 });
 

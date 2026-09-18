@@ -7,6 +7,9 @@
  *   徽章——CR-015；failed 红徽章 + parseNotes 锚——CR-030/CR-012）；
  * - scope 切换：tab 态 + 无项目时 project tab 禁用 + 页面 data-materials-scope 锚；
  * - 导入回报：materialsImportFeedback 三档拒收分类呈现（rejectedKind 键 + 拒收清单）；
+ * - 导入来源引导（C9/F3）：反馈区「选来源（可跳过）」——medium/tier 下拉 →
+ *   updateMaterialProvenance partial patch；跳过零调用；失败 toast + 回跳占位；
+ * - F1 belt：busy（重摄取在途）行分章列冻结预 busy 值——清单重拉中间态不闪「0 章」；
  * - 删除流：行删除钮 → 全局确认框（confirmStore）→ 确认 → 桥 deleteMaterial + toast；
  * - provenance 表单：medium 下拉受控词表 + **回声抑制保草稿**（编辑中 detail 服务器刷新
  *   不覆写草稿）+ blur 落盘（updateMaterialProvenance 桥 partial patch）。
@@ -29,6 +32,7 @@ vi.mock('../src/shared/i18n/useI18n', () => ({
 }));
 
 import { MaterialsPage } from '../src/features/materials/MaterialsPage';
+import { MaterialRow } from '../src/features/materials/MaterialRow';
 import { useAppStore } from '../src/shared/store/appStore';
 import { useConfirmStore } from '../src/shared/store/confirmStore';
 import { useToastStore } from '../src/shared/store/toastStore';
@@ -438,5 +442,258 @@ describe('provenance 表单（F-05 五字段 + 回声抑制保草稿）', () => 
         patch: { medium: 'lecture' },
       });
     });
+  });
+});
+
+describe('导入来源引导（C9/F3——反馈区选来源可跳过，落库走 update-provenance）', () => {
+  function feedbackFixture(
+    imported: Array<{ name: string; relPath: string; materialId: string | null; outcome: 'registered' | 'reused' | 'orphaned' }>,
+  ) {
+    return { ok: true as const, imported, rejected: [], failed: [] };
+  }
+
+  it('成功导入项渲染 medium/tier 下拉；orphaned（materialId=null）不渲染行', () => {
+    seedState({
+      materialsImportFeedback: feedbackFixture([
+        { name: 'a.txt', relPath: 'a.txt', materialId: 'mat-aaaaaaaaaaaa', outcome: 'registered' },
+        { name: 'b.txt', relPath: 'b.txt', materialId: null, outcome: 'orphaned' },
+      ]),
+    });
+    const { container } = render(<MaterialsPage />);
+    expect(container.querySelector('[data-import-source-medium="mat-aaaaaaaaaaaa"]')).not.toBeNull();
+    expect(container.querySelector('[data-import-source-tier="mat-aaaaaaaaaaaa"]')).not.toBeNull();
+    // orphaned 项无 materialId 可 patch——零行渲染（反馈摘要已计其数）。
+    const rows = container.querySelectorAll('[data-import-source-row]');
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.textContent).toContain('a.txt');
+  });
+
+  it('全部 orphaned（无 materialId）→ 整区不渲染', () => {
+    seedState({
+      materialsImportFeedback: feedbackFixture([
+        { name: 'b.txt', relPath: 'b.txt', materialId: null, outcome: 'orphaned' },
+      ]),
+    });
+    const { container } = render(<MaterialsPage />);
+    expect(container.querySelector('[data-import-source-pick="true"]')).toBeNull();
+  });
+
+  it('medium 选择 → partial patch {medium}（复用 update-provenance 零新通道）', async () => {
+    seedState({
+      materialsImportFeedback: feedbackFixture([
+        { name: 'a.txt', relPath: 'a.txt', materialId: 'mat-aaaaaaaaaaaa', outcome: 'registered' },
+      ]),
+    });
+    const { container } = render(<MaterialsPage />);
+    const select = container.querySelector('[data-import-source-medium="mat-aaaaaaaaaaaa"]') as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: 'lecture' } });
+    await waitFor(() => {
+      expect(updateProvenanceSpy).toHaveBeenCalledWith({
+        materialId: 'mat-aaaaaaaaaaaa',
+        patch: { medium: 'lecture' },
+      });
+    });
+    // 保存成功回执 → 「已保存」标记可见。
+    await waitFor(() => {
+      expect(container.querySelector('[data-import-source-saved="mat-aaaaaaaaaaaa"]')).not.toBeNull();
+    });
+  });
+
+  it('tier 选择 → partial patch {tier}', async () => {
+    seedState({
+      materialsImportFeedback: feedbackFixture([
+        { name: 'a.txt', relPath: 'a.txt', materialId: 'mat-aaaaaaaaaaaa', outcome: 'registered' },
+      ]),
+    });
+    const { container } = render(<MaterialsPage />);
+    const select = container.querySelector('[data-import-source-tier="mat-aaaaaaaaaaaa"]') as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: 'original' } });
+    await waitFor(() => {
+      expect(updateProvenanceSpy).toHaveBeenCalledWith({
+        materialId: 'mat-aaaaaaaaaaaa',
+        patch: { tier: 'original' },
+      });
+    });
+  });
+
+  it('跳过路径：两项均不选 → 零 patch 调用（保持摄取缺省不强制）', () => {
+    seedState({
+      materialsImportFeedback: feedbackFixture([
+        { name: 'a.txt', relPath: 'a.txt', materialId: 'mat-aaaaaaaaaaaa', outcome: 'registered' },
+      ]),
+    });
+    render(<MaterialsPage />);
+    expect(updateProvenanceSpy).not.toHaveBeenCalled();
+  });
+
+  it('patch 失败 → 错误 toast + 选择回跳「跳过」占位（下拉不谎报已存值）', async () => {
+    updateProvenanceSpy.mockImplementationOnce(async () => ({ ok: false, error: 'invalid-input', message: '坏值' }));
+    seedState({
+      materialsImportFeedback: feedbackFixture([
+        { name: 'a.txt', relPath: 'a.txt', materialId: 'mat-aaaaaaaaaaaa', outcome: 'registered' },
+      ]),
+    });
+    const { container } = render(<MaterialsPage />);
+    const select = container.querySelector('[data-import-source-medium="mat-aaaaaaaaaaaa"]') as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: 'lecture' } });
+    await waitFor(() => {
+      expect(useToastStore.getState().toasts[0]?.message).toContain('materials.import.sourceSaveFailed');
+    });
+    await waitFor(() => {
+      expect(select.value).toBe('');
+    });
+    // 失败路径无「已保存」标记。
+    expect(container.querySelector('[data-import-source-saved="mat-aaaaaaaaaaaa"]')).toBeNull();
+  });
+});
+
+describe('F1 belt：busy 行分章列冻结预 busy 值（dogfood R3）', () => {
+  it('重摄取在途时清单重拉读到 0 章中间态不闪变；busy 结束回清新鲜值', async () => {
+    seedState({ materialsList: [summaryFixture()] });
+    // 重摄取挂起（busy 窗口敞开——deferred 控 resolve）。
+    let resolveReingest: (v: unknown) => void = () => {};
+    (window as any).orisonDesktop.reingestMaterial = () =>
+      new Promise((resolve) => { resolveReingest = resolve; });
+    // busy 结束后终局重拉回 0 章新值（断言「解冻回鲜」用）。
+    listMaterialsSpy.mockImplementation(async () => [
+      summaryFixture({ chapterCount: 0, chapterMethod: 'none', chapterConfidence: 'low', status: 'low-confidence' }),
+    ]);
+    const { container } = render(<MaterialsPage />);
+    fireEvent.click(screen.getByRole('button', { name: 'materials.action.reingest' }));
+
+    // busy 窗口内：material:changed 驱动的清单重拉读到 0 章中间态（W3b 根治前的假态形状）。
+    act(() => {
+      useAppStore.setState({
+        materialsList: [
+          summaryFixture({ chapterCount: 0, chapterMethod: 'none', chapterConfidence: 'low', status: 'low-confidence' }),
+        ],
+      } as any);
+    });
+    const busyRow = container.querySelector('[data-material-id="mat-aaaaaaaaaaaa"]')!;
+    // 分章列仍显预 busy 值（regex chip 在场、非「未分章」、无琥珀徽章）。
+    expect(busyRow.textContent).toContain('materials.chapter.method.regex');
+    expect(busyRow.textContent).not.toContain('materials.chapter.method.none');
+    expect(busyRow.querySelector('[data-low-confidence="true"]')).toBeNull();
+
+    // busy 结束：冻结解除，清新鲜值呈现（琥珀徽章出现、预 busy regex chip 消失——
+    // low-confidence 行的分章位由琥珀徽章替代 method chip，见 MaterialRow 渲染分支）。
+    await act(async () => {
+      resolveReingest({ ok: true, outcome: 'reused', materialId: 'mat-aaaaaaaaaaaa' });
+    });
+    await waitFor(() => {
+      const fresh = container.querySelector('[data-material-id="mat-aaaaaaaaaaaa"]')!;
+      expect(fresh.querySelector('[data-low-confidence="true"]')).not.toBeNull();
+      expect(fresh.textContent).not.toContain('materials.chapter.method.regex');
+    });
+  });
+});
+
+describe('F1 belt seenIdle 守卫（CR-20——挂载即 busy 不冻结中间态快照）', () => {
+  const healthy = summaryFixture(); // 4 章 · regex · high
+  const zeroChapter = summaryFixture({
+    chapterCount: 0,
+    chapterMethod: 'none',
+    chapterConfidence: 'low',
+    status: 'low-confidence',
+  });
+
+  function rowEl(row: MaterialSummary, busy: boolean) {
+    return (
+      <MaterialRow
+        row={row}
+        expanded={false}
+        onToggleProvenance={() => {}}
+        onReingest={() => {}}
+        onDelete={() => {}}
+        onOpenDerived={() => {}}
+        onReveal={() => {}}
+        busy={busy}
+      />
+    );
+  }
+
+  it('挂载即 busy（scope 切换/页面重进重挂）：如实呈现实时行，不冻结挂载瞬间的 0 章快照', () => {
+    // busy 窗内挂载——行本身已是中间态（0 章/low-confidence 挂起：琥珀徽章替代 method chip）。
+    const view = render(rowEl(zeroChapter, true));
+    expect(view.container.querySelector('[data-low-confidence="true"]')).not.toBeNull();
+    expect(view.container.textContent).not.toContain('materials.chapter.method.regex');
+
+    // busy 未断，清单已收敛回健康值——无 idle 瞬照可冻结 → 实时呈现新值。
+    view.rerender(rowEl(healthy, true));
+    expect(view.container.textContent).toContain('materials.chapter.method.regex');
+    expect(view.container.querySelector('[data-low-confidence="true"]')).toBeNull();
+  });
+
+  it('busy 前有 idle 瞬照：冻结生效（belt 语义不变——预 busy 值扛中间态重拉）', () => {
+    const view = render(rowEl(healthy, false));
+    expect(view.container.textContent).toContain('materials.chapter.method.regex');
+
+    // 进入 busy + 清单重拉读到 0 章中间态——冻结预 busy 值（regex chip 在场、无琥珀徽章）。
+    view.rerender(rowEl(zeroChapter, true));
+    expect(view.container.textContent).toContain('materials.chapter.method.regex');
+    expect(view.container.querySelector('[data-low-confidence="true"]')).toBeNull();
+
+    // busy 结束回实时（解冻——中间态形状如实呈现）。
+    view.rerender(rowEl(zeroChapter, false));
+    expect(view.container.querySelector('[data-low-confidence="true"]')).not.toBeNull();
+    expect(view.container.textContent).not.toContain('materials.chapter.method.regex');
+  });
+});
+
+describe('导入来源引导批次语义（CR-13——新导入批重置 + 已保存可回跳）', () => {
+  function feedbackFixture(
+    imported: Array<{ name: string; relPath: string; materialId: string | null; outcome: 'registered' | 'reused' | 'orphaned' }>,
+  ) {
+    return { ok: true as const, imported, rejected: [], failed: [] };
+  }
+
+  it('同文件重导（新导入批）：选择态/「已保存」标记重置回跳过占位，不显陈旧值', async () => {
+    seedState({
+      materialsImportFeedback: feedbackFixture([
+        { name: 'a.txt', relPath: 'a.txt', materialId: 'mat-aaaaaaaaaaaa', outcome: 'registered' },
+      ]),
+    });
+    const { container } = render(<MaterialsPage />);
+    const select = container.querySelector('[data-import-source-medium="mat-aaaaaaaaaaaa"]') as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: 'lecture' } });
+    await waitFor(() => {
+      expect(container.querySelector('[data-import-source-saved="mat-aaaaaaaaaaaa"]')).not.toBeNull();
+    });
+    expect(select.value).toBe('lecture');
+
+    // 同 materialId 再次导入（新批反馈落地——store 换新 imported 数组）。
+    act(() => {
+      useAppStore.setState({
+        materialsImportFeedback: feedbackFixture([
+          { name: 'a.txt', relPath: 'a.txt', materialId: 'mat-aaaaaaaaaaaa', outcome: 'reused' },
+        ]),
+      } as any);
+    });
+    const fresh = container.querySelector('[data-import-source-medium="mat-aaaaaaaaaaaa"]') as HTMLSelectElement;
+    expect(fresh.value).toBe(''); // 回跳过占位，不显上一批的旧草稿
+    expect(container.querySelector('[data-import-source-saved="mat-aaaaaaaaaaaa"]')).toBeNull();
+  });
+
+  it('「已保存」后可回跳跳过占位：纯 UI 复位零 patch，落库值不撤销', async () => {
+    seedState({
+      materialsImportFeedback: feedbackFixture([
+        { name: 'a.txt', relPath: 'a.txt', materialId: 'mat-aaaaaaaaaaaa', outcome: 'registered' },
+      ]),
+    });
+    const { container } = render(<MaterialsPage />);
+    const select = container.querySelector('[data-import-source-medium="mat-aaaaaaaaaaaa"]') as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: 'lecture' } });
+    await waitFor(() => {
+      expect(container.querySelector('[data-import-source-saved="mat-aaaaaaaaaaaa"]')).not.toBeNull();
+    });
+
+    // 回跳占位（option 不再禁用）：'' 不触发 patch（非合法 medium 值——纯 UI 复位）。
+    fireEvent.change(select, { target: { value: '' } });
+    await waitFor(() => {
+      expect(select.value).toBe('');
+    });
+    expect(updateProvenanceSpy).toHaveBeenCalledTimes(1); // 只有 lecture 那一次
+    // 落库值未撤销——「已保存」标记仍在。
+    expect(container.querySelector('[data-import-source-saved="mat-aaaaaaaaaaaa"]')).not.toBeNull();
   });
 });

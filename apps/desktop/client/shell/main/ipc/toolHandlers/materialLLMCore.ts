@@ -20,11 +20,9 @@
  * wiring 测试 materialLLMWiring.test.ts 钉死：档位 key、default 哨兵链、装配后 ingest
  * 低置信材料真走 generateText。
  */
-import { assignmentThinkingControl, resolveTaskModel } from '@orison/desktop-agent';
+import { assignmentFallbackChain, assignmentThinkingControl, resolveTaskModel } from '@orison/desktop-agent';
 import type { ThinkingControl } from '@orison/shared-contracts';
-import { generateText } from '@orison/model-protocols';
-import { readModelConfigFromDisk } from '../configIpc';
-import { resolveModel } from '../modelGatewayIpc';
+import { handleGenerateText } from '../modelGatewayIpc';
 import { installMaterialLLMCore, type MaterialGenerateText } from './materialIngest';
 
 /** 兜底输出是 `{"selected":[行号...]}` 小 JSON——4096 上限宽裕（防畸形端点无限吐）。 */
@@ -36,21 +34,30 @@ const generateChapterFallback: MaterialGenerateText = async (input) => {
   const ref = assignment
     ? { keyId: assignment.keyId, modelId: assignment.modelId }
     : { keyId: 'default', modelId: 'default' };
-  const resolved = resolveModel(ref, readModelConfigFromDisk());
   const thinking: ThinkingControl | undefined = assignmentThinkingControl(assignment);
-  const response = await generateText(resolved, {
-    model: resolved.modelId,
-    messages: [
-      ...(input.system ? [{ role: 'system' as const, content: input.system }] : []),
-      { role: 'user' as const, content: input.user },
-    ],
-    // 结构提取任务：温度 0（候选行选择是判别不是创作）；lintIpc classify 用 0.2 是语义
-    // 裁判面，此处更窄一档。
-    temperature: 0,
-    // 调用方指定预算优先（E10.2a 整理档 POLISH_MAX_TOKENS=8000——生成式保义改写不能吃
-    // 4096 小 JSON 预算，否则长段静默截断〔复审 F-02〕）；未指定 = 分章兜底小 JSON 默认。
-    maxTokens: input.maxTokens ?? MATERIAL_FALLBACK_MAX_TOKENS,
-    ...(thinking ? { thinking } : {}),
+  // CR-14（09-12 子2 CR 批）：链投影单次求值再 spread。
+  const fallbacks = assignmentFallbackChain(assignment);
+  // 09-12 子2（复核 H1 重接）：直调面改经网关环入口（in-process handleGenerateText）——
+  // 无链快径字节级现行为；extraction 档配链时生效（resolveModel 上移进环 per-attempt 解析）。
+  const response = await handleGenerateText({
+    ref,
+    request: {
+      model: ref.modelId,
+      messages: [
+        ...(input.system ? [{ role: 'system' as const, content: input.system }] : []),
+        { role: 'user' as const, content: input.user },
+      ],
+      // 结构提取任务：温度 0（候选行选择是判别不是创作）；lintIpc classify 用 0.2 是语义
+      // 裁判面，此处更窄一档。
+      temperature: 0,
+      // 调用方指定预算优先（E10.2a 整理档 POLISH_MAX_TOKENS=8000——生成式保义改写不能吃
+      // 4096 小 JSON 预算，否则长段静默截断〔复审 F-02〕）；未指定 = 分章兜底小 JSON 默认。
+      maxTokens: input.maxTokens ?? MATERIAL_FALLBACK_MAX_TOKENS,
+      // 09-12 usage-panel：材料分章兜底 = extraction 档（与路由同 slot 名）。
+      taskType: 'extraction',
+      ...(thinking ? { thinking } : {}),
+    },
+    ...(fallbacks?.length ? { fallbacks } : {}),
   });
   // CR-2：透传 provider 停因（model-protocols TextGenerationResponse.finishReason——
   // GenerationFinishReason，OpenAI/Anthropic 双协议路径均产出；undefined = 端点未回报）。

@@ -1,0 +1,1975 @@
+/* ── 「写作」页（task 09-13-writing-page-ui W1 页面骨架）────────────────────────
+ *
+ * 形态权威：task research/design-mockup.html（v3 三轮过目定稿）+ design §1.2。
+ * CSS 纪律：类前缀 `.writing-*`，与既有面板零共享选择器；配色/间距/圆角/字号全走
+ * tokens.css + scales.css token，零字面色。
+ *
+ * 布局（三区，整页 flex row）：章节列（196px 贴边满高，左槽同族背景）+ 主区（flex
+ * column：多会话条/运行摘要条占位 + 相位区 flex:1）。滚动口纪律（spec ui/layout-and-pages
+ * 恒驻/滚动口前提族 + unsafe-center 反模式）：`.writing-chapters` 与 `.writing-phase`
+ * 是真正的滚动面，一律 flex-start 对齐；空态引导卡的居中诉求用 margin:auto 子元素实现
+ * （溢出时可缩回，不落负区）。
+ */
+
+/* ── 页面骨架 ── */
+.writing-page {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+/* 守卫/空态独居变体：整页只承载居中卡（margin:auto 居中——滚动面 unsafe-center 反模式豁免路径）。 */
+.writing-page--guarded {
+  display: flex;
+  overflow-y: auto;
+}
+
+/* ── 章节列（mockup .chapters：196px / surface-low / 右分隔线）── */
+.writing-chapters {
+  display: flex;
+  flex-direction: column;
+  width: 196px;
+  flex-shrink: 0;
+  padding: var(--space-lg) var(--space-sm);
+  background: var(--project-tree-bg);
+  border-right: 1px solid var(--border-faint);
+  overflow-y: auto;
+}
+
+.writing-chapters-title {
+  flex-shrink: 0;
+  padding: var(--space-3xs) var(--space-2xs) var(--space-2xs);
+  font-size: var(--text-2xs);
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--on-surface-variant);
+}
+
+.writing-chapters-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* CR-15（09-18 CR 批 B）：章行 = li 语义容器 + 两个平级独立 button（开稿件 / 重提取）——
+ * 交互不嵌套（原 role=button 容器吞内层按钮语义 + Enter 双触发源）。 */
+.writing-chapter {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2xs);
+  padding: var(--space-2xs) var(--space-xs);
+  border-radius: var(--radius-sm);
+  color: var(--on-surface-variant);
+  font-size: var(--text-base);
+}
+
+.writing-chapter:hover {
+  background: var(--hover-overlay);
+  color: var(--on-surface);
+}
+
+/* 开稿件钮：吸收原行容器的交互面（占满行剩余宽，num/title 为其内容）。 */
+.writing-chapter-open {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2xs);
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: none;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.writing-chapter-num {
+  min-width: 1.4rem;
+  flex-shrink: 0;
+  font-size: var(--text-2xs);
+  color: var(--on-surface-variant);
+  opacity: 0.75;
+  font-variant-numeric: tabular-nums;
+}
+
+.writing-chapter-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 链状态点（W1 占位恒透明；W5 起 pause 后按 pausedReview.chapterId 点亮——
+ * data-chain-dot 属性已在位，色态类届时接线，选择器先落定防漂移）。 */
+.writing-chapter-dot {
+  width: 7px;
+  height: 7px;
+  flex-shrink: 0;
+  border-radius: var(--radius-circle);
+  background: transparent;
+}
+
+.writing-chapter[data-chain-dot="paused"] .writing-chapter-dot {
+  background: var(--warning);
+}
+
+.writing-chapter[data-chain-dot="running"] .writing-chapter-dot,
+.writing-chapter[data-chain-dot="done"] .writing-chapter-dot {
+  background: var(--accent);
+}
+
+/* ── 章卡衍生状态（W6，design §6.3）：stale 徽标 + 重提取按钮（行尾，点不冒泡）。 ── */
+.writing-chapter-stale {
+  flex-shrink: 0;
+  font-size: var(--text-3xs);
+  color: var(--warning);
+  background: var(--warning-bg);
+  padding: 0 var(--space-2xs);
+  border-radius: var(--radius-pill);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.writing-chapter-reextract {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-2xs);
+  background: transparent;
+  color: var(--on-surface-variant);
+  font-size: var(--text-3xs);
+  padding: 1px var(--space-2xs);
+  cursor: pointer;
+  font-family: inherit;
+  white-space: nowrap;
+}
+
+.writing-chapter-reextract:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent-strong);
+}
+
+.writing-chapter-reextract:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.writing-chapter-reextract[data-reextract-busy="true"] {
+  color: var(--accent);
+  opacity: 1;
+}
+
+.writing-chapter-reextract-spin {
+  width: 9px;
+  height: 9px;
+  border-radius: var(--radius-circle);
+  border: 1.5px solid var(--accent);
+  border-top-color: transparent;
+  animation: writing-spin 0.8s linear infinite;
+}
+
+@keyframes writing-spin {
+  to { transform: rotate(360deg); }
+}
+
+.writing-chapters-empty {
+  margin: var(--space-2xs) var(--space-2xs) 0;
+  font-size: var(--text-2xs);
+  line-height: 1.7;
+  color: var(--on-surface-variant);
+}
+
+.writing-chapters-hint {
+  margin-top: auto;
+  padding: var(--space-lg) var(--space-2xs) var(--space-3xs);
+  border-top: 1px solid var(--border-faint);
+  font-size: var(--text-2xs);
+  line-height: 1.7;
+  color: var(--on-surface-variant);
+  opacity: 0.75;
+}
+
+/* ── 主区 ── */
+.writing-main {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* ── 多会话条（W6，design §1.2/§6.1 + mockup .chainbar）── */
+.writing-chainbar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  flex-shrink: 0;
+  padding: var(--space-2xs) var(--space-lg);
+  border-bottom: 1px solid var(--border-faint);
+  background: var(--project-tree-bg);
+}
+
+.writing-chainbar-lbl {
+  font-size: var(--text-2xs);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  font-weight: 600;
+  color: var(--on-surface-variant);
+  flex-shrink: 0;
+}
+
+.writing-chainbar-chips {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2xs);
+  min-width: 0;
+  overflow-x: auto;
+}
+
+.writing-chain-chip {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2xs);
+  flex-shrink: 0;
+  padding: var(--space-3xs) var(--space-xs);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-pill);
+  font-size: var(--text-2xs);
+  cursor: pointer;
+  background: var(--card-bg);
+  color: var(--on-surface-variant);
+  font-family: inherit;
+}
+
+.writing-chain-chip:hover {
+  background: var(--hover-overlay);
+}
+
+.writing-chain-chip[data-chain-active="true"] {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--on-surface);
+}
+
+.writing-chain-chip-st {
+  width: 7px;
+  height: 7px;
+  border-radius: var(--radius-circle);
+  background: var(--on-surface-variant);
+}
+
+.writing-chain-chip[data-chain-status="running"] .writing-chain-chip-st {
+  background: var(--accent);
+  animation: writing-node-breathe 1.8s var(--ease-standard) infinite;
+}
+
+.writing-chain-chip[data-chain-status="paused"] .writing-chain-chip-st {
+  background: var(--warning);
+}
+
+.writing-chain-chip[data-chain-status="completed"] .writing-chain-chip-st {
+  background: var(--success);
+}
+
+.writing-chain-chip[data-chain-status="error"] .writing-chain-chip-st {
+  background: var(--error);
+}
+
+.writing-chain-chip-label {
+  white-space: nowrap;
+}
+
+.writing-chain-chip-badge {
+  font-size: var(--text-3xs);
+  background: var(--warning-bg);
+  color: var(--warning);
+  padding: 0 var(--space-2xs);
+  border-radius: var(--radius-pill);
+  font-weight: 600;
+}
+
+.writing-chain-chip-state {
+  font-size: var(--text-3xs);
+  opacity: 0.75;
+  white-space: nowrap;
+}
+
+/* 相位区（W3 时间线落位；W1 只承载无链引导卡）。 */
+.writing-phase {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+/* ── 空态引导卡（无链 / 无项目守卫共用形态）── */
+.writing-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-2xs);
+  margin: auto; /* 居中诉求走 margin:auto（滚动面 unsafe-center 反模式豁免） */
+  max-width: 420px;
+  padding: var(--space-2xl) var(--space-2xl);
+  background: var(--card-bg);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-soft);
+  text-align: center;
+}
+
+.writing-empty-icon {
+  font-size: var(--text-2xl);
+  color: var(--accent);
+}
+
+.writing-empty-title {
+  margin: 0;
+  font-size: var(--text-md);
+  font-weight: 600;
+  color: var(--on-surface);
+}
+
+.writing-empty-body {
+  margin: 0;
+  font-size: var(--text-xs);
+  line-height: 1.8;
+  color: var(--on-surface-variant);
+}
+
+/* ── 运行摘要条（W3，design §1.2 / mockup .runmeta）──────────────────────────
+ * 章名（fallback「写章链」）· 相位与圈数 · 状态 · 时长（首个 entry.at 计时）· 模型 chip
+ * （主指派 + 回退标注）。无余量条（context-usage 是 leader 车道专属事件）。 */
+.writing-runmeta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  flex-shrink: 0;
+  padding: var(--space-sm) var(--space-xl);
+  border-bottom: 1px solid var(--border-faint);
+}
+
+.writing-runmeta-chapter {
+  font-size: var(--text-md);
+  font-weight: 600;
+  font-family: var(--font-display);
+  letter-spacing: 0.02em;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.writing-runmeta-phase {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--space-3xs);
+  flex-shrink: 0;
+  font-size: var(--text-2xs);
+  color: var(--on-surface-variant);
+  background: var(--chip-bg);
+  padding: var(--space-3xs) var(--space-xs);
+  border-radius: var(--radius-2xs);
+}
+
+.writing-runmeta-lap {
+  font-style: normal;
+  color: var(--accent-strong);
+  font-weight: 700;
+}
+
+/* CR-11（09-18 CR 批 B）：loop 完成后的「自审收敛 N 圈」常驻 chip（D-e 圈数三处可见之一）。 */
+.writing-runmeta-laps {
+  flex-shrink: 0;
+  font-size: var(--text-3xs);
+  font-weight: 600;
+  color: var(--accent-strong);
+  background: var(--accent-soft);
+  padding: var(--space-3xs) var(--space-2xs);
+  border-radius: var(--radius-pill);
+  font-variant-numeric: tabular-nums;
+}
+
+/* CR-4②（09-18 CR 批 B）：paused 链在 run 相位时摘要条上的「进审阅」手动再入钮。 */
+.writing-runmeta-enter-review {
+  flex-shrink: 0;
+  border: 1px solid var(--accent);
+  background: transparent;
+  color: var(--accent-strong);
+  font-size: var(--text-3xs);
+  font-weight: 600;
+  padding: var(--space-3xs) var(--space-sm);
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.writing-runmeta-enter-review:hover {
+  background: var(--accent-soft);
+}
+
+.writing-runmeta-status {
+  flex-shrink: 0;
+  font-size: var(--text-3xs);
+  font-weight: 600;
+  padding: var(--space-3xs) var(--space-2xs);
+  border-radius: var(--radius-pill);
+}
+
+.writing-runmeta-status--running { color: var(--accent); background: var(--accent-soft); }
+.writing-runmeta-status--paused { color: var(--warning); background: var(--warning-bg); }
+.writing-runmeta-status--completed { color: var(--success); background: var(--diff-add-bg); }
+.writing-runmeta-status--error { color: var(--error); background: var(--error-bg); }
+.writing-runmeta-status--aborted { color: var(--on-surface-variant); background: var(--chip-bg); }
+
+.writing-runmeta-elapsed {
+  flex-shrink: 0;
+  font-size: var(--text-2xs);
+  color: var(--on-surface-variant);
+  font-variant-numeric: tabular-nums;
+}
+
+.writing-runmeta-model {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-3xs);
+  margin-left: auto;
+  flex-shrink: 0;
+  max-width: 40%;
+  font-size: var(--text-2xs);
+  color: var(--on-surface-variant);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-2xs);
+  padding: var(--space-3xs) var(--space-xs);
+}
+
+.writing-runmeta-model-fb {
+  font-size: var(--text-3xs);
+  color: var(--warning);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── 运行时间线（W3，design §3 / mockup .timeline）─────────────────────────── */
+
+.writing-timeline {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  align-items: flex-start; /* 滚动面纪律：禁 unsafe-center（spec ui/layout-and-pages） */
+  width: 100%;
+  padding: var(--space-lg) var(--space-xl) var(--space-2xl);
+}
+
+.writing-timeline-idle {
+  margin: var(--space-md) 0 0;
+  font-size: var(--text-xs);
+  color: var(--on-surface-variant);
+  opacity: 0.75;
+}
+
+/* 段标题行（mockup .seg-head：名 + 水平线 + 说明）。 */
+.writing-seg {
+  width: 100%;
+}
+
+.writing-seg-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  margin: var(--space-lg) 0 var(--space-2xs);
+}
+
+.writing-seg:first-child .writing-seg-head {
+  margin-top: 0;
+}
+
+.writing-seg-name {
+  font-size: var(--text-2xs);
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  color: var(--on-surface-variant);
+  text-transform: uppercase;
+  flex-shrink: 0;
+}
+
+.writing-seg-line {
+  flex: 1;
+  height: 1px;
+  background: var(--border-subtle);
+}
+
+.writing-seg-info {
+  font-size: var(--text-3xs);
+  color: var(--on-surface-variant);
+  opacity: 0.8;
+  flex-shrink: 0;
+}
+
+/* 圈头（mockup .lap-head：tag + 水平线；历史圈折叠在 Fold summary 内）。 */
+.writing-lap-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  margin: var(--space-sm) 0 var(--space-3xs);
+  font-size: var(--text-2xs);
+  color: var(--on-surface-variant);
+}
+
+.writing-lap-tag {
+  background: var(--chip-bg);
+  padding: var(--space-3xs) var(--space-2xs);
+  border-radius: var(--radius-2xs);
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.writing-lap-tag--cur {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+.writing-lap-line {
+  flex: 1;
+  height: 1px;
+  background: var(--border-faint);
+}
+
+.writing-lap-history-summary {
+  color: var(--on-surface-variant);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 节点行（mockup .node：左侧 pip 竖线连接 + 行面 name/meta/右侧 chip+耗时）。 */
+.writing-node {
+  position: relative;
+  padding: var(--space-3xs) 0 var(--space-3xs) var(--space-xl);
+}
+
+.writing-node::before {
+  content: "";
+  position: absolute;
+  left: calc(var(--space-sm) + 1px);
+  top: 1.1rem;
+  bottom: -0.5rem;
+  width: 2px;
+  background: var(--border-subtle);
+}
+
+.writing-node:last-child::before {
+  display: none;
+}
+
+.writing-node-pip {
+  position: absolute;
+  left: var(--space-2xs);
+  top: 0.35rem;
+  width: 14px;
+  height: 14px;
+  border-radius: var(--radius-circle);
+  border: 2px solid var(--surface);
+  box-shadow: 0 0 0 1.5px var(--border-subtle);
+  background: var(--surface-container-high);
+  z-index: var(--z-base);
+  box-sizing: border-box;
+}
+
+.writing-node--done .writing-node-pip {
+  background: var(--accent);
+  box-shadow: 0 0 0 1.5px var(--accent);
+}
+
+.writing-node--error .writing-node-pip {
+  background: var(--error);
+  box-shadow: 0 0 0 1.5px var(--error);
+}
+
+.writing-node--running .writing-node-pip {
+  background: var(--accent);
+  box-shadow: 0 0 0 1.5px var(--accent);
+  animation: writing-node-breathe 1.6s var(--ease-standard) infinite;
+}
+
+.writing-node--pending {
+  opacity: 0.5;
+}
+
+@keyframes writing-node-breathe {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.45; transform: scale(0.85); }
+}
+
+.writing-node-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2xs);
+  min-height: 2rem;
+  padding: var(--space-3xs) var(--space-3xs);
+  border-radius: var(--radius-sm);
+}
+
+.writing-node-row:hover {
+  background: var(--hover-overlay);
+}
+
+.writing-node-icon {
+  font-size: var(--text-md);
+  color: var(--on-surface-variant);
+  flex-shrink: 0;
+}
+
+.writing-node-name {
+  font-size: var(--text-base);
+  font-weight: 500;
+  flex-shrink: 0;
+}
+
+.writing-node-meta {
+  font-size: var(--text-2xs);
+  color: var(--on-surface-variant);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.writing-node-right {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  flex-shrink: 0;
+  font-size: var(--text-2xs);
+  color: var(--on-surface-variant);
+  font-variant-numeric: tabular-nums;
+}
+
+.writing-node-time {
+  min-width: 2.2em;
+  text-align: right;
+}
+
+/* verdict chip（mockup .verdict：findings 计数 / route 判决）。 */
+.writing-verdict {
+  font-size: var(--text-3xs);
+  padding: var(--space-3xs) var(--space-2xs);
+  border-radius: var(--radius-2xs);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.writing-verdict--ok { background: var(--diff-add-bg); color: var(--success); }
+.writing-verdict--warn { background: var(--warning-bg); color: var(--warning); }
+.writing-verdict--err { background: var(--error-bg); color: var(--error); }
+.writing-verdict--loop { background: var(--info-bg); color: var(--info); }
+
+/* 折叠块（受控 Fold——summary 按钮 + 展开体）。 */
+.writing-fold {
+  margin: var(--space-3xs) 0 var(--space-2xs);
+}
+
+.writing-fold-summary {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2xs);
+  width: 100%;
+  border: none;
+  background: none;
+  padding: var(--space-3xs) var(--space-3xs);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-2xs);
+  color: var(--on-surface-variant);
+  cursor: pointer;
+  text-align: left;
+  font-family: inherit;
+}
+
+.writing-fold-summary:hover {
+  background: var(--hover-overlay);
+}
+
+.writing-fold-tw {
+  font-size: var(--text-3xs);
+  color: var(--on-surface-variant);
+  transition: transform var(--duration-fast) var(--ease-standard);
+  flex-shrink: 0;
+}
+
+.writing-fold[data-fold-open="true"] .writing-fold-tw {
+  transform: rotate(90deg);
+}
+
+.writing-fold-summary-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.writing-fold-parts {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2xs);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.writing-node-detail {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2xs);
+}
+
+.writing-sub-block {
+  margin: var(--space-3xs) 0 var(--space-2xs) var(--space-sm);
+  border-left: 2px solid var(--border-subtle);
+  padding: var(--space-3xs) 0 var(--space-3xs) var(--space-sm);
+}
+
+/* 思考流（mockup .think：层标签 + serif 预排体，max-height 滚动窗）。 */
+.writing-think {
+  font-size: var(--text-2xs);
+}
+
+.writing-think-head {
+  display: flex;
+  gap: var(--space-2xs);
+  align-items: center;
+  color: var(--on-surface-variant);
+  font-size: var(--text-2xs);
+  margin-bottom: var(--space-3xs);
+}
+
+.writing-think-k {
+  background: var(--chip-bg);
+  padding: var(--space-3xs) var(--space-2xs);
+  border-radius: var(--radius-2xs);
+  font-size: var(--text-3xs);
+}
+
+.writing-think-state {
+  font-size: var(--text-3xs);
+  opacity: 0.8;
+}
+
+.writing-think-body {
+  font-family: var(--font-display);
+  font-size: var(--text-sm);
+  color: var(--on-surface-variant);
+  line-height: 1.85;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 9.4rem;
+  overflow-y: auto;
+  background: var(--surface-container);
+  border-radius: var(--radius-sm);
+  padding: var(--space-sm) var(--space-md);
+}
+
+.writing-think-body--dim {
+  opacity: 0.72;
+}
+
+/* 调查工具行（mockup .tools .tool-row）。 */
+.writing-tool-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2xs);
+  font-size: var(--text-2xs);
+  padding: var(--space-3xs) var(--space-2xs);
+  border-radius: var(--radius-sm);
+  color: var(--on-surface-variant);
+  min-width: 0;
+}
+
+.writing-tool-row:hover {
+  background: var(--hover-overlay);
+}
+
+.writing-tool-tn {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: var(--text-2xs);
+  color: var(--accent-strong);
+  flex-shrink: 0;
+}
+
+.writing-tool-arg {
+  color: var(--on-surface-variant);
+  opacity: 0.8;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.writing-tool-ts {
+  font-size: var(--text-3xs);
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+.writing-tool-ts--ok { color: var(--success); }
+.writing-tool-ts--error { color: var(--error); }
+
+/* 正文流（mockup .prose-stream：卡片窗 + serif 排版 + 流式 caret 复用 agent-msg-md）。 */
+.writing-prose {
+  margin: var(--space-2xs) 0;
+  background: var(--card-bg);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: var(--space-md) var(--space-lg);
+}
+
+.writing-prose-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2xs);
+  font-size: var(--text-3xs);
+  color: var(--on-surface-variant);
+  margin-bottom: var(--space-2xs);
+}
+
+.writing-prose-words {
+  font-variant-numeric: tabular-nums;
+}
+
+.writing-prose .writing-prose-body {
+  font-family: var(--font-display);
+  font-size: var(--text-lg);
+  line-height: 2.05;
+  color: var(--on-surface);
+  max-height: 16rem;
+  overflow-y: auto;
+}
+
+.writing-prose-body--pending {
+  font-size: var(--text-2xs);
+  color: var(--on-surface-variant);
+  opacity: 0.75;
+}
+
+/* 产出卡（mockup .artifact-card：五 kind）。 */
+.writing-artifact {
+  background: var(--card-bg);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: var(--space-sm) var(--space-md);
+  margin: var(--space-3xs) 0 var(--space-2xs);
+}
+
+.writing-artifact-title {
+  font-size: var(--text-3xs);
+  letter-spacing: 0.08em;
+  color: var(--on-surface-variant);
+  text-transform: uppercase;
+  font-weight: 600;
+  margin-bottom: var(--space-2xs);
+  display: flex;
+  gap: var(--space-2xs);
+  align-items: center;
+}
+
+.writing-artifact-count {
+  background: var(--chip-bg);
+  padding: 0 var(--space-2xs);
+  border-radius: var(--radius-pill);
+  font-size: var(--text-3xs);
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.writing-artifact-note {
+  margin: 0;
+  font-size: var(--text-2xs);
+  color: var(--on-surface-variant);
+  line-height: 1.7;
+}
+
+.writing-artifact-verdict {
+  font-size: var(--text-2xs);
+  font-weight: 600;
+  color: var(--on-surface);
+  margin-bottom: var(--space-3xs);
+}
+
+.writing-artifact-line {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--on-surface);
+  line-height: 1.7;
+}
+
+.writing-artifact-items {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.writing-artifact-truncated {
+  margin-top: var(--space-3xs);
+  font-size: var(--text-3xs);
+  color: var(--on-surface-variant);
+  opacity: 0.8;
+}
+
+.writing-itemline {
+  font-size: var(--text-2xs);
+  color: var(--on-surface-variant);
+  padding: var(--space-3xs) 0;
+  border-top: 1px solid var(--border-faint);
+  line-height: 1.7;
+}
+
+.writing-itemline:first-child {
+  border-top: none;
+}
+
+/* brief-card 键值表（mockup .kv）。 */
+.writing-kv {
+  margin: 0;
+  display: grid;
+  grid-template-columns: minmax(5.5rem, auto) 1fr;
+  gap: var(--space-3xs) var(--space-md);
+  font-size: var(--text-2xs);
+}
+
+.writing-kv-row {
+  display: contents;
+}
+
+.writing-kv-k {
+  color: var(--on-surface-variant);
+  white-space: nowrap;
+}
+
+.writing-kv-v {
+  margin: 0;
+  color: var(--on-surface);
+  line-height: 1.7;
+  word-break: break-word;
+}
+
+/* findings 行（mockup .finding：severity 徽 + label/note/quote）。 */
+.writing-finding {
+  display: flex;
+  gap: var(--space-2xs);
+  align-items: flex-start;
+  padding: var(--space-3xs) 0;
+  border-top: 1px solid var(--border-faint);
+  font-size: var(--text-sm);
+}
+
+.writing-finding:first-of-type {
+  border-top: none;
+}
+
+.writing-finding-sev {
+  flex-shrink: 0;
+  font-size: var(--text-3xs);
+  font-weight: 700;
+  padding: var(--space-3xs) var(--space-2xs);
+  border-radius: var(--radius-2xs);
+  margin-top: 1px;
+}
+
+.writing-finding-sev--hard { background: var(--error-bg); color: var(--error); }
+.writing-finding-sev--soft { background: var(--warning-bg); color: var(--warning); }
+.writing-finding-sev--neutral { background: var(--chip-bg); color: var(--on-surface-variant); }
+
+.writing-finding-fx {
+  color: var(--on-surface-variant);
+  line-height: 1.7;
+  min-width: 0;
+}
+
+.writing-finding-fx b {
+  color: var(--on-surface);
+  font-weight: 600;
+}
+
+.writing-finding-quote {
+  display: block;
+  margin-top: var(--space-3xs);
+  font-family: var(--font-display);
+  font-size: var(--text-2xs);
+  color: var(--on-surface-variant);
+  opacity: 0.85;
+}
+
+/* route-decision 卡（mockup .route-decision）。 */
+.writing-route {
+  font-size: var(--text-sm);
+}
+
+.writing-route-d {
+  font-weight: 700;
+  color: var(--info);
+}
+
+.writing-route-why {
+  color: var(--on-surface-variant);
+  font-size: var(--text-2xs);
+  margin-top: var(--space-3xs);
+  line-height: 1.7;
+}
+
+/* ══ 09-13 子3 W5：审阅相位（design §1.3/§4 + mockup §2/§3）════════════════════
+ *
+ * 相位容器切换：run 相位沿用 .writing-phase 滚动面（时间线）；review 相位改 overflow:hidden——
+ * 审阅卡自管滚动（终稿卡 = 编辑区滚 + 动作条钉底；其余卡 = .writing-review-scroll 滚）。
+ * 类前缀 .writing-review-*（容器/顶条/抽屉）/.writing-final-*（终稿卡）/.writing-escalate-*
+ * （裁决卡）/.writing-stub-*（降级卡）；token 纪律同文件头。 */
+
+.writing-phase[data-writing-phase="review"] {
+  overflow: hidden;
+}
+
+.writing-review {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+}
+
+/* 顶条：暂停理由 pill + 章名 + 收敛信息 + 时间线开关 + 收起审阅。 */
+.writing-review-top {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  flex-shrink: 0;
+  padding: var(--space-sm) var(--space-lg);
+  border-bottom: 1px solid var(--border-faint);
+}
+
+.writing-review-pill {
+  flex-shrink: 0;
+  font-size: var(--text-3xs);
+  font-weight: 700;
+  padding: var(--space-3xs) var(--space-2xs);
+  border-radius: var(--radius-pill);
+}
+
+.writing-review-pill[data-review-kind="final"],
+.writing-review-pill[data-review-kind="suspension"] { color: var(--warning); background: var(--warning-bg); }
+.writing-review-pill[data-review-kind="escalate"] { color: var(--error); background: var(--error-bg); }
+.writing-review-pill[data-review-kind="brief"] { color: var(--info); background: var(--info-bg); }
+.writing-review-pill[data-review-kind="guard"] { color: var(--accent-strong); background: var(--accent-soft); }
+.writing-review-pill[data-review-kind="draft"],
+.writing-review-pill[data-review-kind="stub"] { color: var(--on-surface-variant); background: var(--chip-bg); }
+
+.writing-review-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--text-md);
+  font-weight: 600;
+  font-family: var(--font-display);
+  letter-spacing: 0.02em;
+}
+
+.writing-review-converge {
+  flex-shrink: 0;
+  font-size: var(--text-2xs);
+  color: var(--on-surface-variant);
+}
+
+.writing-review-converge b,
+.writing-final-summary-loops {
+  color: var(--accent-strong);
+  font-weight: 700;
+}
+
+.writing-review-tl-toggle,
+.writing-review-collapse {
+  flex-shrink: 0;
+  border: 1px solid var(--border-subtle);
+  background: var(--card-bg);
+  color: var(--on-surface-variant);
+  font-size: var(--text-2xs);
+  padding: var(--space-3xs) var(--space-xs);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.writing-review-tl-toggle:hover,
+.writing-review-collapse:hover {
+  background: var(--hover-overlay);
+  color: var(--on-surface);
+}
+
+/* 卡片区 + 滚动面（终稿卡自管滚动不进 scroll 层；其余卡滚）。 */
+.writing-review-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+.writing-review-card {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.writing-review-scroll {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--space-lg);
+}
+
+/* 时间线侧抽屉（mockup .tl-drawer：320px / surface-low / 可收起）。 */
+.writing-review-drawer {
+  width: 320px;
+  flex-shrink: 0;
+  border-left: 1px solid var(--border-faint);
+  background: var(--project-tree-bg);
+  overflow-y: auto;
+  padding: var(--space-md) var(--space-sm) var(--space-lg);
+}
+
+.writing-review-drawer-title {
+  font-size: var(--text-3xs);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--on-surface-variant);
+  font-weight: 700;
+  margin-bottom: var(--space-2xs);
+}
+
+/* ── 终稿卡（design §4.1：全幅编辑 + 自审摘要折叠 + 动作条钉底 backdrop-blur）── */
+
+.writing-final {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+.writing-final-summary {
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border-faint);
+}
+
+.writing-final-summary > summary {
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs);
+  padding: var(--space-2xs) var(--space-lg);
+  font-size: var(--text-2xs);
+  color: var(--on-surface-variant);
+  user-select: none;
+}
+
+.writing-final-summary > summary::-webkit-details-marker { display: none; }
+.writing-final-summary > summary:hover { background: var(--hover-overlay); }
+
+.writing-final-summary-line {
+  display: flex;
+  gap: var(--space-xs);
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.writing-final-summary-v {
+  font-weight: 700;
+  color: var(--success);
+}
+
+.writing-final-summary-missing {
+  opacity: 0.7;
+}
+
+.writing-final-summary-body {
+  padding: var(--space-3xs) var(--space-lg) var(--space-sm);
+  font-size: var(--text-2xs);
+  color: var(--on-surface-variant);
+  line-height: 1.9;
+}
+
+.writing-final-summary-body .k {
+  display: inline-block;
+  min-width: 3rem;
+  font-weight: 600;
+  color: var(--on-surface);
+}
+
+.writing-final-summary-body ul {
+  margin: var(--space-3xs) 0;
+  padding-left: var(--space-lg);
+}
+
+.writing-final-summary-loops-line {
+  margin-top: var(--space-3xs);
+}
+
+.writing-final-lint {
+  margin: var(--space-2xs) 0 0;
+  padding: var(--space-2xs) var(--space-xs);
+  background: var(--card-bg);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: var(--text-3xs);
+  color: var(--on-surface-variant);
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 12rem;
+  overflow-y: auto;
+}
+
+/* 编辑区：滚动口在 wrap（flex-start 对齐——滚动面 unsafe-center 反模式）；编辑器限宽 760 居中。 */
+.writing-final-editor-wrap {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--space-2xl) var(--space-lg) 7rem;
+}
+
+.writing-final-editor {
+  width: 100%;
+  max-width: 760px;
+  align-self: flex-start;
+  margin: 0 auto;
+}
+
+.writing-final-doc-title {
+  margin: 0 0 var(--space-3xs);
+  font-family: var(--font-display);
+  font-size: var(--text-lg);
+  font-weight: 600;
+  text-align: center;
+  letter-spacing: 0.05em;
+  color: var(--on-surface);
+}
+
+.writing-final-doc-sub {
+  margin: 0 0 var(--space-lg);
+  text-align: center;
+  font-size: var(--text-3xs);
+  color: var(--on-surface-variant);
+}
+
+/* 编辑器正文排版（复用 .tiptap 基座 + serif 稿件形态——FileEditor 同族观感）。 */
+.writing-final-editor .tiptap {
+  min-height: 40vh;
+  font-family: var(--font-display);
+  font-size: var(--text-md);
+  line-height: 2.1;
+  color: var(--on-surface);
+  outline: none;
+}
+
+.writing-final-editor .tiptap p {
+  margin: 0 0 1.1em;
+}
+
+.writing-final-editor .tiptap p.is-editor-empty:first-child::before {
+  content: attr(data-placeholder);
+  color: var(--on-surface-variant);
+  opacity: 0.6;
+  float: left;
+  height: 0;
+  pointer-events: none;
+}
+
+/* 选区浮层（sticky 钉编辑区滚动口底——选中即现）。 */
+.writing-final-sel-float {
+  position: sticky;
+  bottom: var(--space-sm);
+  margin: var(--space-2xs) auto 0;
+  width: max-content;
+  display: flex;
+  gap: 2px;
+  background: var(--on-surface);
+  border-radius: var(--radius-md);
+  padding: var(--space-3xs) var(--space-2xs);
+  box-shadow: var(--shadow-elevated);
+}
+
+.writing-final-sel-float button {
+  border: none;
+  background: transparent;
+  color: var(--background);
+  font-size: var(--text-2xs);
+  padding: var(--space-3xs) var(--space-xs);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.writing-final-sel-float button:hover { background: var(--hover-overlay); }
+
+.writing-final-sel-float .writing-final-sel-refine {
+  /* CR-14（09-18 CR 批 B）：pill 底色 = on-surface（亮主题近黑/暗主题近白的反相面），
+     accent 在亮主题深底上对比度 ~2:1 不可读——换 background（反相对应色）保强调靠字重。 */
+  color: var(--background);
+  font-weight: 700;
+}
+
+/* 钉底动作条（backdrop-blur）。 */
+.writing-final-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  flex-shrink: 0;
+  padding: var(--space-xs) var(--space-lg);
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  backdrop-filter: blur(10px);
+  border-top: 1px solid var(--border-subtle);
+}
+
+.writing-final-wc {
+  font-size: var(--text-2xs);
+  color: var(--on-surface-variant);
+  font-variant-numeric: tabular-nums;
+}
+
+.writing-final-resuming {
+  font-size: var(--text-2xs);
+  color: var(--accent);
+}
+
+.writing-final-dirty {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3xs);
+  font-size: var(--text-3xs);
+  color: var(--warning);
+}
+
+.writing-final-dirty::before {
+  content: '';
+  width: 7px;
+  height: 7px;
+  border-radius: var(--radius-circle);
+  background: var(--warning);
+  animation: writing-breathe 1.6s infinite;
+}
+
+.writing-final-dirty--invalid {
+  color: var(--error);
+}
+
+.writing-final-dirty--invalid::before {
+  background: var(--error);
+  animation: none;
+}
+
+@keyframes writing-breathe {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+.writing-final-grow {
+  flex: 1;
+}
+
+/* 按钮族（终稿/裁决/降级卡共用）。 */
+.writing-final-btn {
+  border: 1px solid var(--border-subtle);
+  background: var(--card-bg);
+  color: var(--on-surface);
+  font-size: var(--text-xs);
+  padding: var(--space-2xs) var(--space-md);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.writing-final-btn:hover { background: var(--hover-overlay); }
+.writing-final-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.writing-final-btn--primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+  font-weight: 600;
+}
+
+.writing-final-btn--primary:hover { background: var(--accent-strong); }
+
+.writing-final-btn--danger {
+  color: var(--error);
+  border-color: var(--error);
+}
+
+.writing-final-btn--danger:hover { background: var(--error-bg); }
+
+.writing-final-btn--ghost {
+  border-style: dashed;
+  color: var(--on-surface-variant);
+}
+
+/* 浮层族（指令卡/确认卡槽/打回面板/放弃确认——absolute 钉卡区底上方）。 */
+.writing-final-overlay {
+  position: absolute;
+  left: var(--space-sm);
+  right: var(--space-sm);
+  bottom: calc(var(--space-lg) + 3.25rem);
+  z-index: var(--z-sticky);
+  background: var(--card-bg);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-elevated);
+  padding: var(--space-sm) var(--space-md);
+}
+
+.writing-final-overlay-title {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: var(--text-2xs);
+  font-weight: 700;
+  color: var(--accent-strong);
+  margin-bottom: var(--space-2xs);
+}
+
+.writing-final-overlay-esc {
+  font-weight: 400;
+  color: var(--on-surface-variant);
+}
+
+.writing-final-overlay-actions {
+  display: flex;
+  gap: var(--space-2xs);
+  justify-content: flex-end;
+  margin-top: var(--space-2xs);
+}
+
+.writing-final-intent-quote {
+  margin: 0 0 var(--space-2xs);
+  font-family: var(--font-display);
+  font-size: var(--text-2xs);
+  color: var(--on-surface-variant);
+  background: var(--chip-bg);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-sm);
+  padding: var(--space-2xs) var(--space-xs);
+  line-height: 1.8;
+  max-height: 8rem;
+  overflow-y: auto;
+  white-space: pre-wrap;
+}
+
+.writing-final-intent-input,
+.writing-final-redo-input {
+  width: 100%;
+  min-height: 3.5rem;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--card-bg);
+  color: var(--on-surface);
+  font-size: var(--text-xs);
+  padding: var(--space-2xs) var(--space-xs);
+  font-family: inherit;
+  resize: vertical;
+}
+
+.writing-final-intent-error {
+  margin: var(--space-3xs) 0 0;
+  font-size: var(--text-3xs);
+  color: var(--error);
+}
+
+.writing-final-confirm-slot {
+  padding: 0;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  display: flex;
+  justify-content: center;
+  pointer-events: none;
+}
+
+.writing-final-confirm-slot > * {
+  pointer-events: auto;
+  width: min(680px, 100%);
+  max-height: 70%;
+  overflow-y: auto;
+}
+
+/* 打回面板（意见必填——chips 点填 + 空意见禁用提交由组件层）。 */
+.writing-final-redo-title {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2xs);
+  font-size: var(--text-2xs);
+  font-weight: 700;
+  margin-bottom: var(--space-2xs);
+}
+
+.writing-final-req {
+  color: var(--error);
+  font-size: var(--text-3xs);
+  background: var(--error-bg);
+  padding: 1px var(--space-2xs);
+  border-radius: var(--radius-pill);
+  font-weight: 600;
+}
+
+.writing-final-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3xs);
+  margin: var(--space-2xs) 0;
+}
+
+.writing-final-reason-chip {
+  font-size: var(--text-3xs);
+  color: var(--on-surface-variant);
+  border: 1px dashed var(--border-subtle);
+  background: transparent;
+  padding: var(--space-3xs) var(--space-2xs);
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+}
+
+.writing-final-reason-chip:hover {
+  border-style: solid;
+  border-color: var(--accent);
+  color: var(--accent-strong);
+}
+
+.writing-final-redo-foot {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2xs);
+  margin-top: var(--space-2xs);
+}
+
+.writing-final-redo-hint {
+  font-size: var(--text-3xs);
+  color: var(--on-surface-variant);
+}
+
+.writing-final-redo-hint--warn { color: var(--error); }
+
+/* 放弃确认弹层。 */
+.writing-final-abandon-title {
+  font-size: var(--text-sm);
+  font-weight: 700;
+  color: var(--error);
+  margin-bottom: var(--space-3xs);
+}
+
+.writing-final-abandon-body {
+  margin: 0;
+  font-size: var(--text-2xs);
+  color: var(--on-surface-variant);
+  line-height: 1.8;
+}
+
+/* ── escalate 裁决卡（design §4.2 / D-d）── */
+
+.writing-escalate {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2xs);
+  max-width: 860px;
+  width: 100%;
+  margin: 0 auto;
+}
+
+.writing-escalate-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2xs);
+}
+
+.writing-escalate-tag {
+  font-size: var(--text-3xs);
+  font-weight: 700;
+  padding: var(--space-3xs) var(--space-2xs);
+  border-radius: var(--radius-pill);
+  color: var(--error);
+  background: var(--error-bg);
+  letter-spacing: 0.06em;
+}
+
+.writing-escalate-title {
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+
+.writing-escalate-resuming {
+  margin-left: auto;
+  font-size: var(--text-2xs);
+  color: var(--accent);
+}
+
+.writing-escalate-hint {
+  margin: 0;
+  font-size: var(--text-2xs);
+  color: var(--on-surface-variant);
+  line-height: 1.8;
+}
+
+.writing-escalate-route {
+  margin: 0;
+  font-size: var(--text-3xs);
+  color: var(--on-surface-variant);
+  font-family: ui-monospace, Consolas, monospace;
+}
+
+.writing-escalate-items {
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--card-bg);
+  padding: var(--space-2xs) var(--space-xs);
+}
+
+.writing-escalate-items-title {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2xs);
+  font-size: var(--text-3xs);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--on-surface-variant);
+  font-weight: 600;
+  padding: var(--space-3xs) var(--space-3xs) var(--space-2xs);
+}
+
+.writing-escalate-count {
+  background: var(--chip-bg);
+  padding: 0 var(--space-2xs);
+  border-radius: var(--radius-pill);
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.writing-escalate-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.writing-escalate-pick {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2xs);
+  padding: var(--space-3xs);
+  border-radius: var(--radius-sm);
+}
+
+.writing-escalate-pick:hover { background: var(--hover-overlay); }
+
+.writing-escalate-fx {
+  min-width: 0;
+  flex: 1;
+  font-size: var(--text-2xs);
+  color: var(--on-surface-variant);
+  line-height: 1.8;
+}
+
+.writing-escalate-fx b { color: var(--on-surface); }
+
+.writing-escalate-loc {
+  display: block;
+  font-size: var(--text-3xs);
+  font-family: ui-monospace, Consolas, monospace;
+  opacity: 0.75;
+}
+
+/* 勾选钮组（接受/修订/忽略 三态互斥——is-on 高亮）。 */
+.writing-escalate-pc {
+  display: flex;
+  gap: var(--space-3xs);
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+.writing-escalate-pc-btn {
+  font-size: var(--text-3xs);
+  border: 1px solid var(--border-subtle);
+  background: var(--card-bg);
+  color: var(--on-surface-variant);
+  padding: 2px var(--space-2xs);
+  border-radius: var(--radius-2xs);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.writing-escalate-pc-btn--accept.is-on {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent-strong);
+  font-weight: 600;
+}
+
+.writing-escalate-pc-btn--revise.is-on {
+  background: var(--warning-bg);
+  border-color: var(--warning);
+  color: var(--warning);
+  font-weight: 600;
+}
+
+.writing-escalate-pc-btn--ignore.is-on {
+  background: var(--chip-bg);
+  color: var(--on-surface-variant);
+}
+
+.writing-escalate-supplement {
+  width: 100%;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--card-bg);
+  color: var(--on-surface);
+  font-size: var(--text-2xs);
+  padding: var(--space-2xs) var(--space-xs);
+  font-family: inherit;
+  resize: vertical;
+}
+
+.writing-escalate-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2xs);
+  margin-top: var(--space-2xs);
+}
+
+.writing-escalate-hint-note {
+  font-size: var(--text-3xs);
+  color: var(--error);
+}
+
+/* ── stub 链降级卡（design §1.3 dogfood 直跑链兜底）── */
+
+.writing-stub {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2xs);
+  max-width: 560px;
+  margin: var(--space-xl) auto 0;
+  padding: var(--space-lg);
+  background: var(--card-bg);
+  border: 1px dashed var(--border-subtle);
+  border-radius: var(--radius-lg);
+}
+
+.writing-stub-title {
+  margin: 0;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--on-surface);
+}
+
+.writing-stub-body {
+  margin: 0;
+  font-size: var(--text-2xs);
+  color: var(--on-surface-variant);
+  line-height: 1.8;
+}
+
+.writing-stub-actions {
+  display: flex;
+  gap: var(--space-2xs);
+  margin-top: var(--space-2xs);
+}
+
+/* ══ 09-13 子3 W6：终态产物区（design §6.2 + mockup .final-zone/.fail-zone）═══════════
+ *
+ * 钉在运行相位时间线底部（.writing-phase 滚动面内）：completed 落盘清单 / error 失败卡 /
+ * aborted 中断卡三态；--pending 变体 = 链仍在跑窗口的 children 槽（chapter_candidate 待落盘
+ * 审阅——W4 挂载位迁此）。行内落盘清单 = 图标 + 名 + 计数/预渲染行 + 跳转链接。 */
+.writing-outcome {
+  width: 100%;
+  margin: var(--space-lg) 0 var(--space-sm);
+  padding: var(--space-md) var(--space-lg);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  background: var(--card-bg);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2xs);
+}
+
+.writing-outcome--pending {
+  border-style: dashed;
+  background: transparent;
+}
+
+.writing-outcome-title {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2xs);
+  margin: 0;
+  font-size: var(--text-sm);
+  font-weight: 700;
+  color: var(--on-surface);
+}
+
+.writing-outcome-ic {
+  color: var(--success);
+}
+
+.writing-outcome-ic--error {
+  color: var(--error);
+}
+
+.writing-outcome-ic--muted {
+  color: var(--on-surface-variant);
+}
+
+.writing-outcome-dur {
+  margin-left: var(--space-2xs);
+  font-size: var(--text-2xs);
+  font-weight: 400;
+  color: var(--on-surface-variant);
+  font-variant-numeric: tabular-nums;
+}
+
+.writing-outcome-sub {
+  margin: 0;
+  font-size: var(--text-2xs);
+  line-height: 1.8;
+  color: var(--on-surface-variant);
+}
+
+.writing-outcome-sub b {
+  color: var(--error);
+  font-weight: 700;
+}
+
+.writing-outcome-hint {
+  margin: 0;
+  font-size: var(--text-3xs);
+  line-height: 1.8;
+  color: var(--on-surface-variant);
+  opacity: 0.85;
+}
+
+.writing-outcome-norows {
+  margin: 0;
+  font-size: var(--text-2xs);
+  color: var(--on-surface-variant);
+  opacity: 0.75;
+}
+
+.writing-disk-list {
+  margin: var(--space-2xs) 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+}
+
+.writing-disk-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2xs);
+  padding: var(--space-3xs) 0;
+  border-top: 1px solid var(--border-faint);
+  font-size: var(--text-2xs);
+  color: var(--on-surface);
+  min-width: 0;
+}
+
+.writing-disk-item:first-child {
+  border-top: none;
+}
+
+.writing-disk-ic {
+  flex-shrink: 0;
+  font-size: var(--text-xs);
+}
+
+.writing-disk-name {
+  flex-shrink: 0;
+  color: var(--on-surface-variant);
+}
+
+.writing-disk-item--note .writing-disk-note-line {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--on-surface-variant);
+}
+
+.writing-disk-grow {
+  flex: 1;
+}
+
+.writing-disk-cnt {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2xs);
+  color: var(--on-surface-variant);
+  white-space: nowrap;
+}
+
+.writing-disk-cnt b {
+  color: var(--on-surface);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.writing-disk-link {
+  flex-shrink: 0;
+  border: none;
+  background: none;
+  padding: 0;
+  color: var(--accent-strong);
+  font-size: var(--text-3xs);
+  cursor: pointer;
+  font-family: inherit;
+  white-space: nowrap;
+}
+
+.writing-disk-link:hover {
+  text-decoration: underline;
+}
+
+.writing-outcome-errors {
+  margin: var(--space-2xs) 0 0;
+  padding: var(--space-2xs) var(--space-xs);
+  list-style: none;
+  background: var(--error-bg);
+  border-radius: var(--radius-sm);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.writing-outcome-errline {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: var(--text-3xs);
+  color: var(--error);
+  word-break: break-all;
+  line-height: 1.7;
+}
+
+.writing-outcome-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2xs);
+  margin-top: var(--space-2xs);
+}

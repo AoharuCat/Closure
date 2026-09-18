@@ -7,11 +7,11 @@ import {
 import { runChain, summarizeRunSnapshot } from '../src/runtime/chainRunner';
 import {
   createChapterChainNodes,
-  CHAPTER_CHAIN_REVISION_LOOP,
+  CHAPTER_CHAIN_LOOPS,
 } from '../src/nodes/chapter-chain';
 import type { GenerateFn } from '../src/nodes/llm-node';
 import type { SessionState } from '../src/types';
-import type { RunSnapshot } from '../src/contracts/run';
+import type { ChainLoopConfig, RunSnapshot } from '../src/contracts/run';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Story 4.0 §4 / implement.md 7.1：写章战术链段端到端集成测（4.0 dogfooding gate 的 mock-LLM 版）。
@@ -153,6 +153,24 @@ const REVIEW_RESULT = {
   reasons: ['主角动机铺垫不足', 'L1 cliché hotspot 已回应（句1，降级 info）'],
 };
 
+/** brief-reviewer fixture（A2 规划审核——六维全过，规划环 pass 直通写手）。 */
+const PLAN_REVIEW_PASS = {
+  verdict: 'pass',
+  summary: '任务卡可写，无硬维度缺陷',
+  findings: [],
+};
+
+/**
+ * revision-optimizer fixture（C1 环回圈编译产物——anchorless：optimizer yaml 契约「不产 scope」，
+ * 选区锚点由系统构造；A-trigger 编译的意图是整章 directive 形态，写手走带指令的整章重写）。
+ */
+const OPTIMIZER_INTENT = {
+  change: { summary: '补强主角动机（据 Reader-Audit findings 编译）', details: ['进城决策加铺垫'] },
+  lockedItems: [{ field: '角色性格', authority: 'hard', evidence: '坚韧少年' }],
+  rationale: { source: 'user-directive', note: 'auto_revise A-trigger 编译（source 由节点机械盖戳）' },
+  provenance: { rawUserInstruction: '据 Reader-Audit 审核发现修订本章明确缺陷（auto_revise route decision）', compilerNote: '环内 C1 编译' },
+};
+
 interface GenerateOverrides {
   /** route 决策序列（按调用次序；超出长度时复用最后一项）。默认 ['auto_revise','accept_as_truth']。 */
   routeDecisions?: string[];
@@ -161,23 +179,27 @@ interface GenerateOverrides {
 }
 
 /**
- * mock generate：按 yaml system 段标记区分节点返 fixture JSON。
+ * mock generate：按 yaml system 段标记区分节点返 fixture。
+ * - system 含「规划审核」→ brief-reviewer-node（A2），返 PLAN_REVIEW_PASS（规划环 pass）。
  * - system 含「路由判决」→ route-agent，按 routeDecisions 序列返（计数器）。
- * - system 含「修订编辑」→ targeted-revision-agent，返 REVISED_DRAFT。
- * - system 含「Reader-Audit」/「审核」/「多维度」→ Reader-Audit（multi-review-agent 节点），返 REVIEW_RESULT。
- * - 其余（含「故事写作者」）→ draft-writer-agent，返 INITIAL_DRAFT。
- *
- * system 标记对齐 prompts/*.yaml（route-agent.yaml「路由判决」/ targeted-revision「修订编辑」/
- * multi-review-agent.yaml「Reader-Audit 双层审核员」/ draft-writer「故事写作者」）。Story 4.2：multi-review
- * 节点换为 Reader-Audit composite（L1→L2），yaml system 段 rework 为「Reader-Audit 双层审核员」——
- * matcher 加 'Reader-Audit' 关键字（'审核' 仍在 yaml，向后兼容旧 fixture）。
+ * - system 含「改稿意图编译器」→ revision-optimizer-node（C1 环回圈编译），返 OPTIMIZER_INTENT。
+ * - system 含「完整性审核」→ completeness-verify L2（须在 generic「审核」前匹配）。
+ * - system 含「Reader-Audit」/「审核」/「多维度」→ Reader-Audit（multi-review-agent），返 REVIEW_RESULT。
+ * - system 含「状态提取」→ world-extractor（5 轴）。
+ * - system 含「story-sync-agent」→ story-sync 提取节点（空 patches）。
+ * - 其余（含「故事写作者」）→ draft-writer-agent：**首跑返 INITIAL_DRAFT（整章首写），后续返
+ *   REVISED_DRAFT（环回圈带 revision_intent 的改稿轮）**——W1d 单位置写手 B/C2 双形态。
  */
 function makeE2eGenerate(overrides: GenerateOverrides = {}) {
   const routeDecisions = overrides.routeDecisions ?? ['auto_revise', 'accept_as_truth'];
   const routeReason = overrides.routeReason ?? 'mock route reason';
   let routeIdx = 0;
+  let writerRound = 0;
   return vi.fn<GenerateFn>(async (_msgs, sys) => {
     const s = sys ?? '';
+    if (s.includes('规划审核')) {
+      return { content: JSON.stringify(PLAN_REVIEW_PASS), finishReason: 'stop' };
+    }
     if (s.includes('路由判决')) {
       const decision = routeDecisions[Math.min(routeIdx, routeDecisions.length - 1)];
       routeIdx += 1;
@@ -186,8 +208,8 @@ function makeE2eGenerate(overrides: GenerateOverrides = {}) {
         finishReason: 'stop',
       };
     }
-    if (s.includes('修订编辑')) {
-      return { content: JSON.stringify(REVISED_DRAFT), finishReason: 'stop' };
+    if (s.includes('改稿意图编译器')) {
+      return { content: JSON.stringify(OPTIMIZER_INTENT), finishReason: 'stop' };
     }
     // completeness-verify L2（「完整性审核」——须在 generic「审核」前匹配）
     if (s.includes('完整性审核')) {
@@ -207,8 +229,23 @@ function makeE2eGenerate(overrides: GenerateOverrides = {}) {
     if (s.includes('story-sync-agent')) {
       return { content: JSON.stringify({ runId: 'r', chapterId: 'ep1', patches: [], summary: '无可提取' }), finishReason: 'stop' };
     }
-    // draft-writer（默认分支）
-    return { content: JSON.stringify(INITIAL_DRAFT), finishReason: 'stop' };
+    // draft-writer（默认分支）：首跑整章初稿 / 环回圈改稿轮（revision_intent directive 在 prompt 里）。
+    // CR-1 断路器对照：改稿轮 ≥3 在正文尾携轮次标记——每圈草稿真实变化，确定性空转断路器不触发
+    //（cap 耗尽语义在下方 cap=3 用例独立锚定；空转短路行为在 chainRunner.test.ts CR-1 组专测）。
+    writerRound += 1;
+    if (writerRound >= 3) {
+      return {
+        content: JSON.stringify({
+          ...REVISED_DRAFT,
+          text: `${REVISED_DRAFT.text}（修订第${writerRound}轮）`,
+        }),
+        finishReason: 'stop',
+      };
+    }
+    return {
+      content: JSON.stringify(writerRound === 1 ? INITIAL_DRAFT : REVISED_DRAFT),
+      finishReason: 'stop',
+    };
   });
 }
 
@@ -229,10 +266,10 @@ function makeSession(): SessionState {
   };
 }
 
-/** 用真 6 节点 + mock generate 跑 runChain 全链（design §4.1 数据流）。 */
+/** 用真节点 + mock generate 跑 runChain 全链（design §4.1 数据流）。loops 缺省 = 生产双环（W1d 装配）。 */
 async function runChainE2E(
   generate: ReturnType<typeof vi.fn<GenerateFn>>,
-  revisionLoop: { from: string; through: string; cap: number } = CHAPTER_CHAIN_REVISION_LOOP,
+  auditLoopOverrides: Partial<ChainLoopConfig> = {},
 ): Promise<RunSnapshot> {
   const session = makeSession();
   return runChain(
@@ -240,7 +277,9 @@ async function runChainE2E(
       chain: createChapterChainNodes(generate, undefined, session),
       initialArtifacts: makeInitialArtifacts(),
       requirement: '',
-      revisionLoop,
+      loops: CHAPTER_CHAIN_LOOPS.map((loop) =>
+        loop.from === 'revision-optimizer-node' ? { ...loop, ...auditLoopOverrides } : loop,
+      ),
     },
     {
       generate,
@@ -259,74 +298,73 @@ function collectUserPrompts(generate: ReturnType<typeof vi.fn<GenerateFn>>): str
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// 1. revision 闭环主场景（Story 7.4：auto_revise → break 交 leader 驱动 redo）— 7 断言全验
+// 1. 链内回环主场景（链流程重排 W1d：auto_revise → 环体 7 节点重跑 → 二判 accept 终态）— 7 断言全验
+//    环内改稿执行者 = 单位置写手（optimizer 紧后）：首圈整章首写（INITIAL_DRAFT），环回圈带 C1 编译的
+//    anchorless revision_intent 走 directive 整章重写（REVISED_DRAFT）；targeted-revision 已退役。
 // ════════════════════════════════════════════════════════════════════════════
 
-describe('chain-e2e — Story 7.4 auto_revise break（交 leader 驱动 redo）', () => {
-  it('全链跑通：draft 产出 + review verdict + auto_revise break + draft 未裸改 + yaml 渲染 + brief #6 + summary isolation', async () => {
-    const generate = makeE2eGenerate(); // route: auto_revise → accept_as_truth（7.4：首次 auto_revise 即 break）
+describe('chain-e2e — 链内回环（W1d：auto_revise 环内收敛，写手单位置改稿）', () => {
+  it('全链跑通：规划环 pass + draft 产出 + auto_revise 回环重跑（optimizer→writer）+ 修订稿落定 + 提取段对终稿一次 + yaml 渲染 + brief #6 + summary isolation', async () => {
+    const generate = makeE2eGenerate(); // route: auto_revise → accept_as_truth（回环一次后收敛）
     const snapshot = await runChainE2E(generate);
 
     // ── 断言 1：chapter draft 产出（draft.initial 含 title/text/wordCount，非空）──
     const draft = snapshot.artifacts['draft.initial'] as Record<string, unknown>;
     expect(draft).toBeDefined();
     expect(typeof draft.title).toBe('string');
-    expect(draft.title).not.toBe('');
     expect(typeof draft.text).toBe('string');
-    expect(draft.text).not.toBe('');
     expect(typeof draft.wordCount).toBe('number');
-    expect(draft.wordCount).toBeGreaterThan(0);
 
-    // ── 断言 2：review.verdict 产出（review.latest 含 verdict + dimensions）──
+    // ── 断言 2：review.verdict 产出（review.latest 含 verdict + dimensions）+ plan_review pass
+    //    （规划环 A2 独立审核过卡）+ revision_intent 编译产物（source 机械盖戳 audit-finding）──
     const review = snapshot.artifacts['review.latest'] as Record<string, unknown>;
     expect(review).toBeDefined();
     expect(review.verdict).toBe('revise');
     expect(Array.isArray(review.dimensions)).toBe(true);
-    expect((review.dimensions as unknown[]).length).toBeGreaterThan(0);
+    expect((snapshot.artifacts['plan_review'] as { verdict: string }).verdict).toBe('pass');
+    expect(snapshot.artifacts['revision_intent']).toMatchObject({
+      rationale: { source: 'audit-finding' },
+    });
 
-    // ── 断言 3：route_decision = 'auto_revise'（Story 7.4：break 不 loop，交 leader 驱动 redo）──
+    // ── 断言 3：route 终态 = accept_as_truth（回环一次收敛后二判）+ status completed（无 auto_revise_pending）──
     const routeDecision = snapshot.artifacts['route_decision'] as { decision: string; reason: string };
-    expect(routeDecision.decision).toBe('auto_revise');
+    expect(routeDecision.decision).toBe('accept_as_truth');
     expect(typeof routeDecision.reason).toBe('string');
-    // status = auto_revise_pending（break 出主循环，非 completed）
-    expect(snapshot.status).toBe('auto_revise_pending');
+    expect(snapshot.status).toBe('completed');
 
-    // ── 断言 4：Story 7.4 auto_revise break（无 loop 重跑，draft.initial 未被 targeted-revision 覆盖）──
-    // 调用计数：draft-writer(1) + 5 轴 world-extractor(5) + targeted-revision 首跑 skip(0) + multi-review(1)
-    // + completeness-verify(1) + route(1) + story-sync(1，2.2 WP-E 激活 LLM 提取) = 10。
-    // 不再闭环重跑（auto_revise break 非 loop，targeted-revision 裸改稿路径不走）。
-    expect(generate.mock.calls.length).toBe(10);
-    // draft.initial 未被 overwrite（仍是 INITIAL_DRAFT，非 REVISED_DRAFT——无 loop 裸改稿）
-    expect(draft.text).toContain('INITIAL_DRAFT_MARKER');
-    expect(draft.text).not.toContain('REVISED_DRAFT_MARKER');
-    expect(draft.title).toBe(INITIAL_DRAFT.title);
+    // ── 断言 4：链内回环（环体 7 节点重跑一次，LLM 面 5 节点）：首轮 11（brief-reviewer + draft-writer
+    //    + 5 轴 world-extractor + multi-review + completeness + route + story-sync）+ 回环 5（revision-
+    //    optimizer + draft-writer 改稿轮 + multi-review + completeness + route）= 16。提取段（world×5 +
+    //    story-sync）在环外零重跑（AC5 环瘦身）。draft.initial 被环内改稿落定为修订稿（REVISED_DRAFT）。──
+    expect(generate.mock.calls.length).toBe(16);
+    expect(draft.text).toContain('REVISED_DRAFT_MARKER');
+    expect(draft.title).toBe(REVISED_DRAFT.title);
 
     // ── 断言 5：yaml `{{var}}` 渲染（mock generate 收到的 userPrompt 不含字面 `{{...}}` 模板标记）──
-    // 证 renderTemplate 把 yaml user 段的 {{verdict}}/{{reasons}}/{{chapterBrief}}/{{draft}}/
-    // {{chapterTask}}/{{storyPlan}}/{{projectContext}}/{{draftText}}/{{reviewResult}} 全替换为值。
-    //
-    // 精确匹配 mustache 标记 `{{...}}`（非裸 `}}`）：buildPrompt 把 chapterTask/storyPlan 等结构化 artifact
-    // JSON.stringify 注入 yaml，JSON 嵌套对象闭合会产合法 `}}`（如 `{"emotionTarget":{...}}`），不能误判。
-    // JSON.stringify 不产 `{{`（外内两层 `{` 间必有 key 名隔开）→ 模板标记 = 唯一 `{{` 来源。
     const userPrompts = collectUserPrompts(generate);
-    expect(userPrompts.length).toBe(10); // 每个 generate 调用都有 user prompt（CR-002：completeness-verify 可达 9；2.2 WP-E story-sync 激活 10）
+    expect(userPrompts.length).toBe(16);
     for (const content of userPrompts) {
       expect(content).not.toMatch(/\{\{[^{}]*\}\}/); // 无残留 `{{key}}` 模板标记
       expect(content).not.toContain('{{'); // JSON 不产 `{{` → 见到就是未渲染模板
     }
-    // 额定：验具体 var 真的注入了（非空替换）—— draft-writer user prompt 含 chapter_brief goal + settings
-    const draftCall = generate.mock.calls.find(([_msgs, sys]) => {
+    // AC5 环瘦身（调用计数维度）：写手恰 2 次（首写 + 环回改稿轮）；world 提取器恰 5 次（环外零重跑）。
+    const writerCalls = generate.mock.calls.filter(([, sys]) => {
       const s = sys ?? '';
       return (
+        !s.includes('规划审核') &&
         !s.includes('路由判决') &&
+        !s.includes('改稿意图编译器') &&
         !s.includes('Reader-Audit') &&
         !s.includes('多维度') &&
         !s.includes('审核') &&
-        !s.includes('完整性审核') &&
-        !s.includes('修订编辑') &&
-        !s.includes('状态提取')
+        !s.includes('状态提取') &&
+        !s.includes('story-sync-agent')
       );
     });
+    expect(writerCalls.length).toBe(2);
+    expect(generate.mock.calls.filter(([, sys]) => (sys ?? '').includes('状态提取')).length).toBe(5);
+    // 额定：验具体 var 真的注入了（非空替换）—— draft-writer user prompt 含 chapter_brief goal + settings
+    const draftCall = writerCalls[0];
     expect(draftCall).toBeDefined();
     const draftUserContent = (draftCall![0] as Array<{ content?: string }>)[0]?.content ?? '';
     expect(draftUserContent).toContain('主角抵达 B 城'); // chapter_brief.goal 经 brief-compiler 透传
@@ -354,21 +392,17 @@ describe('chain-e2e — Story 7.4 auto_revise break（交 leader 驱动 redo）'
       steer: '窒息感再松一口气',
     });
 
-    // ── 断言 7：summarizeRunSnapshot 返回 summary（不含内部 trace）──
+    // ── 断言 7：summarizeRunSnapshot 返回 summary（不含内部 trace；autoReviseFindings 已随 W1a 退役）──
     const summary = summarizeRunSnapshot(snapshot);
-    expect(summary.status).toBe('auto_revise_pending');
+    expect(summary.status).toBe('completed');
     expect(summary.routeDecision).toEqual({
-      decision: 'auto_revise',
-      reason: expect.stringContaining('auto_revise'),
+      decision: 'accept_as_truth',
+      reason: expect.stringContaining('accept_as_truth'),
     });
     expect(summary.reviewVerdict).toBe('revise');
-    expect(summary.draftTitle).toBe(INITIAL_DRAFT.title); // 初稿标题（未被修订覆盖）
-    expect(summary.draftWordCount).toBe(INITIAL_DRAFT.wordCount);
+    expect(summary.draftTitle).toBe(REVISED_DRAFT.title); // 修订稿标题（环内改稿落定后）
     expect(Array.isArray(summary.errors)).toBe(true);
-    // Story 7.4：auto_revise 时 autoReviseFindings 抽取（block/warn drop info，grounding 硬要求）
-    expect(summary.autoReviseFindings).toBeDefined();
-    expect(summary.autoReviseFindings!.length).toBe(1); // 1 warn finding（info 被过滤）
-    expect(summary.autoReviseFindings![0].severity).toBe('warn');
+    expect(summary.autoReviseFindings).toBeUndefined(); // W1a：leader redo 编排退役，字段删除
     // context isolation：summary 不含内部 trace / 全量 artifacts
     const summaryKeys = Object.keys(summary);
     expect(summaryKeys).not.toContain('artifacts');
@@ -383,24 +417,28 @@ describe('chain-e2e — Story 7.4 auto_revise break（交 leader 驱动 redo）'
 // 2. happy-path（accept 首判，无闭环）
 // ════════════════════════════════════════════════════════════════════════════
 
-describe('chain-e2e — happy-path（accept 首判，无 revision 闭环）', () => {
-  it('route 首判 accept_as_truth → 链段结束（10 generate 调用，无闭环）', async () => {
+describe('chain-e2e — happy-path（accept 首判，无回环）', () => {
+  it('route 首判 accept_as_truth → 提取段跑完链完成（11 generate 调用，无回环）', async () => {
     const generate = makeE2eGenerate({
       routeDecisions: ['accept_as_truth'],
       routeReason: '正文达标',
     });
     const snapshot = await runChainE2E(generate);
 
-    // route 首判 accept → 链段结束
+    // route 首判 accept → onAccept + verdict checkpoint 后自然前进提取段 → 链完成
     const routeDecision = snapshot.artifacts['route_decision'] as { decision: string };
     expect(routeDecision.decision).toBe('accept_as_truth');
     expect(snapshot.status).toBe('completed');
 
-    // 无闭环：generate 调用 = draft-writer(1) + 5 轴 world-extractor(5) + targeted-revision 首跑 skip(0)
-    // + multi-review(1) + completeness-verify(1) + route(1) + story-sync(1，2.2 WP-E) = 10
-    expect(generate.mock.calls.length).toBe(10);
+    // 无回环：generate 调用 = brief-reviewer(1) + draft-writer(1) + 5 轴 world-extractor(5)
+    // + multi-review(1) + completeness-verify(1) + route(1) + story-sync(1，2.2 WP-E) = 11
+    //（revision-optimizer 首圈 no-op 不调 LLM——无 review.latest）
+    expect(generate.mock.calls.length).toBe(11);
+    // E 段可达（提取后移：route accept 后自然前进）
+    expect(snapshot.completedNodes).toContain('world-merge-node');
+    expect(snapshot.completedNodes).toContain('feedback-ledger-node');
 
-    // draft.initial = 初稿（未被 overwrite，因 targeted-revision 首跑 skip）
+    // draft.initial = 初稿（无回环无改稿轮）
     const draft = snapshot.artifacts['draft.initial'] as { text: string };
     expect(draft.text).toContain('INITIAL_DRAFT_MARKER');
 
@@ -415,85 +453,93 @@ describe('chain-e2e — happy-path（accept 首判，无 revision 闭环）', ()
 // 3. escalate 路径（route 返 escalate_user → 链段立即结束）
 // ════════════════════════════════════════════════════════════════════════════
 
-describe('chain-e2e — escalate 路径（route 返 escalate_user）', () => {
-  it('route 首判 escalate_user → 链段结束（10 generate 调用，无闭环）', async () => {
+describe('chain-e2e — escalate 路径（route 返 escalate_user → escalate-pause）', () => {
+  it('route 首判 escalate_user → escalate-pause（11 generate 调用，无回环；提取段不可达）', async () => {
     const generate = makeE2eGenerate({
       routeDecisions: ['escalate_user'],
       routeReason: 'OOC 边界难断，需作者拍板',
     });
     const snapshot = await runChainE2E(generate);
 
-    // route 首判 escalate_user → 链段结束（上发 leader）
+    // route 首判 escalate_user → escalate-pause（W1a R4b：灰区链内暂停形态，裁决驱动 resume）
     const routeDecision = snapshot.artifacts['route_decision'] as { decision: string; reason: string };
     expect(routeDecision.decision).toBe('escalate_user');
-    expect(snapshot.status).toBe('completed');
+    expect(snapshot.status).toBe('paused');
+    expect(snapshot.escalatePause).toBe(true);
+    expect(snapshot.currentNodeId).toBe('route-agent'); // 停 through 节点
 
-    // 无闭环：generate 调用 = draft(1) + 5 轮 world-extractor(5) + multi-review(1) + completeness-verify(1)
-    // + route(1) + story-sync(1，2.2 WP-E) = 10
-    expect(generate.mock.calls.length).toBe(10);
+    // 无回环：generate 调用 = brief-reviewer(1) + draft(1) + 5 轮 world-extractor... 提取段在 route 后
+    // ——escalate-pause break 时 E 段未跑：brief-reviewer(1) + draft(1) + multi-review(1) +
+    // completeness(1) + route(1) = 5（story-sync/world 不跑——提取后移）。
+    expect(generate.mock.calls.length).toBe(5);
+    expect(snapshot.completedNodes).not.toContain('world-merge-node');
 
-    // summary 透传 escalate（leader 据此决定 ask_user）
+    // summary 透传 escalate + escalatePause 标记（入口层据此派裁决器 + resume 分派）
     const summary = summarizeRunSnapshot(snapshot);
     expect(summary.routeDecision?.decision).toBe('escalate_user');
-    expect(summary.status).toBe('completed');
+    expect(summary.status).toBe('paused');
+    expect(summary.escalatePause).toBe(true);
   });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
-// 4. Story 7.4 cap=0 → auto_revise 立即 escalate（cap 防御路径；正常 redo 循环 cap 在 leader）
+// 4. W1a：环 cap 超限 → 强制 escalate-pause（链内 cap 防御；leader 侧 AUTO_REVISE 兜底计数已退役）
 // ════════════════════════════════════════════════════════════════════════════
 
-describe('chain-e2e — Story 7.4 cap=0 auto_revise 立即 escalate', () => {
-  it('cap=0：route auto_revise → 立即 escalate（cap 防御路径，无 loop 重跑）', async () => {
-    // Story 7.4：cap=0 → revisionCount=0 < 0 = false → 立即 escalate（单 runChain 内 cap 防御；
-    // 正常 redo 循环 cap 在 leader writeChapterTool 兜底计数）。
+describe('chain-e2e — W1a 环 cap 超限强制 escalate-pause', () => {
+  it('cap=0：route auto_revise → 立即强制 escalate-pause（无回环重跑）', async () => {
+    // W1a：cap=0 → count(0) < cap(0) = false → 立即强制 escalate → escalate-pause（链内 cap 防御）。
     const generate = makeE2eGenerate({
       routeDecisions: ['auto_revise'], // 永远 auto_revise
       routeReason: '仍有缺陷',
     });
-    const snapshot = await runChainE2E(generate, {
-      ...CHAPTER_CHAIN_REVISION_LOOP,
-      cap: 0,
-    });
+    const snapshot = await runChainE2E(generate, { cap: 0 });
 
     // cap=0 → 强制 escalate_user（runChain 覆写 route_decision）
     const routeDecision = snapshot.artifacts['route_decision'] as { decision: string; reason: string };
     expect(routeDecision.decision).toBe('escalate_user');
     expect(routeDecision.reason).toContain('cap');
 
-    // status completed + errors 记 cap 超限
-    expect(snapshot.status).toBe('completed');
+    // W1a：escalate-pause（status=paused + escalatePause 标记）+ errors 记 cap 超限
+    expect(snapshot.status).toBe('paused');
+    expect(snapshot.escalatePause).toBe(true);
     expect(snapshot.errors?.some((e) => e.includes('cap'))).toBe(true);
 
-    // generate 调用：首轮 10（draft-writer + 5 轮 world-extractor + multi-review + completeness-verify
-    // + route + story-sync（2.2 WP-E）），cap=0 无 loop 重跑
-    expect(generate.mock.calls.length).toBe(10);
+    // generate 调用：cap=0 在 route 首判即 escalate-pause——提取段（route 后）未跑：
+    // brief-reviewer(1) + draft-writer(1) + multi-review(1) + completeness(1) + route(1) = 5
+    expect(generate.mock.calls.length).toBe(5);
+    expect(snapshot.completedNodes).not.toContain('world-merge-node');
 
-    // draft.initial 未被 overwrite（cap=0 无 loop，targeted-revision 不跑）
+    // draft.initial 未被 overwrite（cap=0 无回环改稿轮）
     const draft = snapshot.artifacts['draft.initial'] as { text: string };
     expect(draft.text).toContain('INITIAL_DRAFT_MARKER');
 
-    // summary 透传强制 escalate
+    // summary 透传强制 escalate + escalatePause 标记（入口层据此分派裁决 resume）
     const summary = summarizeRunSnapshot(snapshot);
     expect(summary.routeDecision?.decision).toBe('escalate_user');
+    expect(summary.escalatePause).toBe(true);
+    expect(summary.pausedStage).toBeUndefined(); // 非 stage 审阅卡形态
   });
 
-  it('cap=0 默认行为一致（cap=3 时 auto_revise → break 非 escalate；cap 在 leader 循环兜底）', async () => {
-    // 对照：cap=3（生产配置）时 auto_revise → break（status=auto_revise_pending），不在 chainRunner 内 escalate。
-    // leader writeChapterTool 跨 redo 循环 cap=3 兜底（本 e2e 测 chain 段行为，不验 leader 循环）。
+  it('cap=3：持续 auto_revise → 3 次回环后 cap 耗尽 → 强制 escalate-pause（不再 break 交 leader）', async () => {
+    // 对照（W1a 语义）：cap=3（生产配置）时 auto_revise 链内回环 3 次（环体重跑），第 4 判仍
+    // auto_revise → cap 耗尽强制 escalate-pause——环内收敛失败信号直达入口层（裁决分派），
+    // leader AUTO_REVISE 兜底循环已退役。
     const generate = makeE2eGenerate({
       routeDecisions: ['auto_revise'],
       routeReason: '仍有缺陷',
     });
-    const snapshot = await runChainE2E(generate); // 默认 CHAPTER_CHAIN_REVISION_LOOP cap=3
+    const snapshot = await runChainE2E(generate); // 默认自审环 cap=3
 
-    // cap=3 → auto_revise break（status=auto_revise_pending），routeDecision 仍 auto_revise（未 escalate）
+    // cap=3 → 3 次回环后强制 escalate → escalate-pause（routeDecision 已被覆写 escalate_user）
     const routeDecision = snapshot.artifacts['route_decision'] as { decision: string };
-    expect(routeDecision.decision).toBe('auto_revise');
-    expect(snapshot.status).toBe('auto_revise_pending');
+    expect(routeDecision.decision).toBe('escalate_user');
+    expect(snapshot.status).toBe('paused');
+    expect(snapshot.escalatePause).toBe(true);
 
-    // generate 调用：首轮 10（draft + 5 轮 world-extractor + multi-review + completeness-verify + route
-    // + story-sync（2.2 WP-E）），无 loop 重跑
-    expect(generate.mock.calls.length).toBe(10);
+    // generate 调用：cap 耗尽在 route 第 4 判 escalate-pause——提取段未跑：首轮 5（brief-reviewer +
+    // draft + multi-review + completeness + route）+ 3 次回环 × 环体 LLM 5 节点（optimizer + writer
+    // 改稿轮 + multi-review + completeness + route）= 5 + 15 = 20（提取段在环外零重跑——AC5 环瘦身）
+    expect(generate.mock.calls.length).toBe(20);
   });
 });

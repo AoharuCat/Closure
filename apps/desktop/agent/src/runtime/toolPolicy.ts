@@ -28,9 +28,11 @@ const WRITE_TOOLS = new Set([
   // Story 8.7 BMad CR-002（2026-08-19）：mention 账两链内写工具显式归写类。它们无 field_patch
   // envelope（不产人审卡）且 record 是 per-episode 全量替换语义——缺省 classifyTool='read' 时
   // readonly 档 LLM 可直调，一次误调即覆写真实账 + json_set 直写章梗概。归 'write'（readonly/suggest
-  // 拦，auto 放行）而非 'diff'：无 patch 人审面，suggest 放行没有审卡兜底。链内 mention-ledger-node /
-  // targeted-revision 降档包装走 registry.execute 直调不经 filterToolsForPolicy，照旧可达（调用来源
-  // 判据，mirror 8.1 materialize_chapter_summary 注释——该工具至今未收录是遗留差异，本条只管 8.7 新面）。
+  // 拦，auto 放行）而非 'diff'：无 patch 人审面，suggest 放行没有审卡兜底。链内 mention-ledger-node
+  // 走 registry.execute 直调不经 filterToolsForPolicy，照旧可达（调用来源判据，mirror 8.1
+  // materialize_chapter_summary 注释——该工具至今未收录是遗留差异，本条只管 8.7 新面）。
+  // 链流程重排 W1d：targeted-revision 降档包装退役后 degrade 的链内直调方不在——工具本体保留
+  // 注册，未来消费方 = W4 re-extract-chapter / 保守化通道（同样 registry 直调形态）。
   // PermissionService（skill-VM 路径）无匹配规则 → external/ask fallback（用户可见门，非静默直通）。
   'record_episode_mentions',
   'degrade_episode_mentions',
@@ -79,6 +81,13 @@ const DIFF_TOOLS = new Set([
   // agentDiffSlice.WRITE_TOOLS 归 Step 6——author_profile 走专用分流不进 WRITE_TOOLS）。
   'creative_brief_update',
   'creative_preferences_update',
+  // 09-12 子4 W6 遗留②（Tier 2 桥面，design §7）：信息释放地图与承诺台账两写工具——
+  // 产 field_patch envelope（field info_release_map / promise_registry）走 PatchReview 人审
+  // （mirror growth_curve_update diff 语义）；autoApply=true（auto 档）直落。此前缺省 'read'
+  // 让 readonly 档可直调 + autoApply 自审闸门/档位强制双不覆盖（闸只拦 diff 家族）。B01
+  // 三处同步第 2 处（shell handler 既有；UI agentDiffSlice.WRITE_TOOLS 已同批补齐）。
+  'info_release_map_update',
+  'promise_ledger_update',
   'author_profile_update',
   // 风格卡片 MVP（task 08-28-style-card-mvp A 路）：文风分析派发工具——本体派发无工具分析子
   // agent（纯判断），返回的卡草案以专用 setting_md_patch envelope（settingId='style'）走既有

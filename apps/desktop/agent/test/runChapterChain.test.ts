@@ -18,7 +18,7 @@ vi.mock('../src/skill/discovery', () => ({
 // Story 6.6 Phase C1/C2：5 轴 world-extractor 提取器（physical/cognitive/emotional/relational/factional），
 // 各轴 yaml system 段含「<轴>状态提取专家」——共同子串「状态提取」路由到同一 extractor fixture（空 patches）。
 function makeChainGenerate(
-  overrides: Partial<{ draft: object; review: object; route: object; extractor: object; completeness: object; storySync: object }> = {},
+  overrides: Partial<{ draft: object; review: object; route: object; extractor: object; completeness: object; storySync: object; planReview: object }> = {},
 ): ReturnType<typeof vi.fn<GenerateFn>> {
   const draft = overrides.draft ?? { title: '第二章 B 城', text: '黄昏的荒野上，主角深吸一口气。', wordCount: 2800, chapterId: 'ep1' };
   const review = overrides.review ?? { verdict: 'pass', summary: '节奏合理', dimensions: [], reasons: [] };
@@ -31,8 +31,11 @@ function makeChainGenerate(
   // Story 2.2 WP-E：story-sync 真跑 LLM 提取（system 首句「你是 story-sync-agent」）。默认空 patches
   // （NovelStorySyncPayload 形态；parseStorySyncResponse 强制 runId/chapterId）。
   const storySync = overrides.storySync ?? { runId: 'r', chapterId: 'ep1', patches: [], summary: '无可提取' };
+  // 链流程重排 W1d：brief-reviewer（A2 规划审核，system「规划审核」）——pass 直通（规划环零回环）。
+  const planReview = overrides.planReview ?? { verdict: 'pass', summary: '卡可写', findings: [] };
   return vi.fn<GenerateFn>(async (_msgs, sys) => {
     const s = sys ?? '';
+    if (s.includes('规划审核')) return { content: JSON.stringify(planReview), finishReason: 'stop' };
     if (s.includes('路由判决')) return { content: JSON.stringify(route), finishReason: 'stop' };
     // completeness-verify L2（「完整性审核」——须在 generic「审核」前匹配）
     if (s.includes('完整性审核')) return { content: JSON.stringify(completeness), finishReason: 'stop' };
@@ -49,11 +52,13 @@ function makeChainGenerate(
 function isDraftSystem(sys: unknown): boolean {
   const s = typeof sys === 'string' ? sys : '';
   return (
+    !s.includes('规划审核') &&
     !s.includes('路由判决') &&
     !s.includes('Reader-Audit') &&
     !s.includes('多维度') &&
     !s.includes('审核') &&
     !s.includes('完整性审核') &&
+    !s.includes('改稿意图编译器') &&
     !s.includes('修订编辑') &&
     !s.includes('状态提取') &&
     !s.includes('story-sync-agent')
@@ -200,24 +205,32 @@ describe('WorkflowRuntime.runChapterChain（Story 4.0 §4.7）', () => {
   });
 
   // ════════════════════════════════════════════════════════════════════════════
-  // 5. revision 闭环端到端（auto_revise → targeted-revision 改稿 → accept 终止）
+  // 5. 链内回环端到端（W1a：auto_revise → 环体重跑 → 二判 accept 终态——不 break 交 leader）
   // ════════════════════════════════════════════════════════════════════════════
 
-  it('Story 7.4：auto_revise → break（status=auto_revise_pending）交 leader 驱动 redo（不 chainRunner loop 裸改稿）', async () => {
-    // route 第 1 次返 auto_revise（chainRunner break，不再 loop 到第 2 次 route 调用）
+  it('W1d：auto_revise → 链内回环（C1 编译 + 写手改稿轮重跑）→ route 二判 accept 终态（经 runChapterChain 包装层）', async () => {
+    // route 第 1 次返 auto_revise（链内回环重跑环体），第 2 次返 accept（收敛终态）
     let routeCallIdx = 0;
+    let writerRound = 0;
     const generate = vi.fn<GenerateFn>(async (_msgs, sys) => {
       const s = sys ?? '';
+      if (s.includes('规划审核')) {
+        return { content: JSON.stringify({ verdict: 'pass', summary: '卡可写', findings: [] }), finishReason: 'stop' };
+      }
       if (s.includes('路由判决')) {
         routeCallIdx += 1;
         const decision = routeCallIdx === 1 ? 'auto_revise' : 'accept_as_truth';
         return { content: JSON.stringify({ decision, reason: `mock ${decision}` }), finishReason: 'stop' };
       }
-      // targeted-revision（system 含「修订编辑」——须在「审核」前匹配，因 Reader-Audit 与 targeted-revision
-      // system 都可能含「审核」字样）
-      if (s.includes('修订编辑')) {
+      // C1 revision-optimizer 环回圈编译（system「改稿意图编译器」）——anchorless intent
+      if (s.includes('改稿意图编译器')) {
         return {
-          content: JSON.stringify({ title: '章', text: '修订正文', wordCount: 120, chapterId: 'ep1', revisionNotes: ['补动机'] }),
+          content: JSON.stringify({
+            change: { summary: '补动机' },
+            lockedItems: [],
+            rationale: { source: 'audit-finding', note: 'A-trigger' },
+            provenance: { rawUserInstruction: '据 Reader-Audit 审核发现修订', compilerNote: 'C1' },
+          }),
           finishReason: 'stop',
         };
       }
@@ -232,22 +245,32 @@ describe('WorkflowRuntime.runChapterChain（Story 4.0 §4.7）', () => {
       if (s.includes('状态提取')) {
         return { content: JSON.stringify({ storyTime: 5, title: '状态切面', subjects: [], patches: [] }), finishReason: 'stop' };
       }
-      // draft-writer
-      return { content: JSON.stringify({ title: '章', text: '正文', wordCount: 100, chapterId: 'ep1' }), finishReason: 'stop' };
+      // story-sync（WP-E）——须在默认分支前
+      if (s.includes('story-sync-agent')) {
+        return { content: JSON.stringify({ runId: 'r', chapterId: 'ep1', patches: [], summary: '无可提取' }), finishReason: 'stop' };
+      }
+      // draft-writer（默认分支）：首圈整章首写 / 环回圈带 revision_intent 的改稿轮（写手单位置 B/C2）
+      writerRound += 1;
+      const draft = writerRound === 1
+        ? { title: '章', text: '正文', wordCount: 100, chapterId: 'ep1' }
+        : { title: '章', text: '修订正文', wordCount: 120, chapterId: 'ep1' };
+      return { content: JSON.stringify(draft), finishReason: 'stop' };
     });
     const runtime = await makeRuntime(generate);
     const parent = await makeParent(runtime);
 
     const summary = await runtime.runChapterChain(parent.id, makeInitialArtifacts());
 
-    // Story 7.4：auto_revise → break（status=auto_revise_pending），不再 chainRunner loop 重跑到 accept。
-    // leader（writeChapterTool）驱动 redo 循环（本 runChapterChain 测只验 chain 段行为，不验 leader 循环）。
-    expect(summary.status).toBe('auto_revise_pending');
-    expect(summary.routeDecision?.decision).toBe('auto_revise');
-    // 调用计数：draft-writer(1) + 5 轴 world-extractor(5) + targeted-revision 首跑 skip(0) + multi-review(1)
-    // + completeness-verify(1) + route(1) + story-sync(1，2.2 WP-E 激活 LLM 提取) = 10。
-    // 不再闭环重跑（auto_revise break 非 loop）。
-    expect(generate.mock.calls.length).toBe(10);
+    // W1a+W1d：auto_revise 链内回环——环体（C1 编译 + 写手改稿轮 + 审读 + 完整性 + 路由）重跑后
+    // route 二判 accept → completed（无 auto_revise_pending）。
+    expect(summary.status).toBe('completed');
+    expect(summary.routeDecision?.decision).toBe('accept_as_truth');
+    // 调用计数：首轮 5（brief-reviewer + draft-writer + multi-review + completeness-verify + route）+
+    // 回环 5（revision-optimizer 编译 + 写手改稿轮 + multi-review + completeness-verify + route）+
+    // 提取段 6（5 轴 world-extractor + story-sync，route accept 后一次）= 16。
+    expect(generate.mock.calls.length).toBe(16);
+    // 修订稿落定（环内写手带 directive 改稿轮 overwrite draft.initial——targeted-revision 已退役）
+    expect(summary.draftText).toBe('修订正文');
   });
 
   // ════════════════════════════════════════════════════════════════════════════
@@ -255,15 +278,17 @@ describe('WorkflowRuntime.runChapterChain（Story 4.0 §4.7）', () => {
   //    预设 chainSnapshot（completedNodes=brief+draft）→ runChapterChain({resume}) → runChain 跳过已完成节点。
   // ════════════════════════════════════════════════════════════════════════════
 
-  /** 构造 chainSnapshot（RunSnapshot）——mirror runChain 产出的形态，供 resume 读回。 */
+  /** 构造 chainSnapshot（RunSnapshot）——mirror runChain 产出的形态，供 resume 读回。
+   * W1d 新链序：draft checkpoint 停点的真实 completed 前缀 = [brief-compiler, brief-reviewer,
+   * revision-optimizer, draft-writer]（A1→A2→C1 no-op→B 后停在写手位）。 */
   function makeChainSnapshot(overrides: Partial<RunSnapshot> = {}): RunSnapshot {
     return {
       runId: 'run-resume-1',
       status: 'paused',
       currentNodeId: 'draft-writer-agent',
       projectPath,
-      completedNodes: ['brief-compiler-node', 'draft-writer-agent'],
-      pendingNodes: ['story-sync-agent', 'targeted-revision-agent', 'multi-review-agent', 'route-agent'],
+      completedNodes: ['brief-compiler-node', 'brief-reviewer-node', 'revision-optimizer-node', 'draft-writer-agent'],
+      pendingNodes: ['revision-guard-agent', 'lint-node', 'multi-review-agent', 'completeness-verify-node', 'route-agent', 'story-sync-agent', 'feedback-ledger-node'],
       artifacts: {
         ...makeInitialArtifacts(),
         chapter_brief: { goal: 'REACH_B_CITY_GOAL', tone: '紧张', episodeId: 'ep1' },
@@ -324,15 +349,17 @@ describe('WorkflowRuntime.runChapterChain（Story 4.0 §4.7）', () => {
     });
     expect(summary.status).toBe('completed');
 
-    // 重放前缀在事件流最前（runChain 首节点事件之前）：snapshot completedNodes 链序。
+    // 重放前缀在事件流最前（runChain 首节点事件之前）：snapshot completedNodes 链序
+    //（W1d 新链前缀：brief-compiler → brief-reviewer → revision-optimizer → draft-writer）。
     expect(events[0]).toEqual({ type: 'chain-node-done', data: { nodeId: 'brief-compiler-node', status: 'done' } });
-    expect(events[1]).toEqual({ type: 'chain-node-done', data: { nodeId: 'draft-writer-agent', status: 'done' } });
+    expect(events[1]).toEqual({ type: 'chain-node-done', data: { nodeId: 'brief-reviewer-node', status: 'done' } });
+    expect(events[2]).toEqual({ type: 'chain-node-done', data: { nodeId: 'revision-optimizer-node', status: 'done' } });
+    expect(events[3]).toEqual({ type: 'chain-node-done', data: { nodeId: 'draft-writer-agent', status: 'done' } });
     // 之后是真跑的新节点步进 + 哨兵终态帧（重放不吞新事件）。
     const dones = events.filter((e) => e.type === 'chain-node-done').map((e) => e.data);
     expect(dones[dones.length - 1]).toEqual({ nodeId: '__chain_run__', status: 'completed' });
-    const newNodes = dones.filter(
-      (d) => d.nodeId !== 'brief-compiler-node' && d.nodeId !== 'draft-writer-agent' && d.nodeId !== '__chain_run__',
-    );
+    const prefixIds = ['brief-compiler-node', 'brief-reviewer-node', 'revision-optimizer-node', 'draft-writer-agent'];
+    const newNodes = dones.filter((d) => !prefixIds.includes(d.nodeId as string) && d.nodeId !== '__chain_run__');
     expect(newNodes.length).toBeGreaterThan(0);
   });
 
@@ -349,9 +376,9 @@ describe('WorkflowRuntime.runChapterChain（Story 4.0 §4.7）', () => {
     });
 
     expect(summary.status).toBe('completed');
-    // 从头跑 → draft-writer 调 → generate 10 次（draft + 5 轴 world-extractor + multi-review +
-    // completeness-verify + route + story-sync（2.2 WP-E））
-    expect(generate.mock.calls.length).toBe(10);
+    // 从头跑 → generate 11 次（brief-reviewer + draft-writer + 5 轴 world-extractor + multi-review +
+    // completeness-verify + route + story-sync（2.2 WP-E）；C1 首圈 no-op 零调用）
+    expect(generate.mock.calls.length).toBe(11);
     const hasDraftCall = generate.mock.calls.some(([_msgs, sys]: any) => isDraftSystem(sys));
     expect(hasDraftCall).toBe(true);
   });
@@ -374,7 +401,7 @@ describe('WorkflowRuntime.runChapterChain（Story 4.0 §4.7）', () => {
     expect(getChainSpy).not.toHaveBeenCalled();
     // 从头跑 → draft 调（generate 10 次：draft + 5 轮 world-extractor + multi-review + completeness-verify
     // + route + story-sync（2.2 WP-E））
-    expect(generate.mock.calls.length).toBe(10);
+    expect(generate.mock.calls.length).toBe(11); // W1d：+brief-reviewer（规划审核 LLM）——C1 首圈 no-op 零调用
   });
 
   // ════════════════════════════════════════════════════════════════════════════
@@ -456,13 +483,12 @@ describe('WorkflowRuntime.runChapterChain（Story 4.0 §4.7）', () => {
     expect(summary.draftContent).toBe('黄昏的荒野上，主角深吸一口气。');
     // draft checkpoint 后 pause → route 未跑（routeDecision 缺省，链段未到 verdict）
     expect(summary.routeDecision).toBeUndefined();
-    // brief checkpoint 通过（continue，不在 pauseStages）→ brief-compiler + draft-writer 跑了；
-    // generate 调 1 次（draft-writer；story-sync 在 draft 后但 draft checkpoint pause 先 break 未达；
-    // multi-review/route 未到）
-    expect(generate.mock.calls.length).toBe(1);
+    // brief checkpoint 通过（continue，不在 pauseStages）→ brief-compiler + brief-reviewer + draft-writer
+    // 跑了；generate 调 2 次（brief-reviewer + draft-writer；提取段在 route 后未达；multi-review 未到）
+    expect(generate.mock.calls.length).toBe(2);
   });
 
-  it('mode = deriveCheckpointPolicy("suggest")：同 pauseStages=["draft"]（半自动模式真实映射）', async () => {
+  it('mode = deriveCheckpointPolicy("suggest")：pauseStages=["final"]（链流程重排 W2——终稿人审一次，route accept 后停）', async () => {
     const generate = makeChainGenerate();
     const runtime = await makeRuntime(generate);
     const parent = await makeParent(runtime);
@@ -472,8 +498,12 @@ describe('WorkflowRuntime.runChapterChain（Story 4.0 §4.7）', () => {
     });
 
     expect(summary.status).toBe('paused');
-    expect(summary.pausedStage).toBe('draft');
+    expect(summary.pausedStage).toBe('final');
+    // draftContent = 终稿正文（终稿卡可编辑源，豁免 context isolation）
     expect(summary.draftContent).toBe('黄昏的荒野上，主角深吸一口气。');
+    // route accept 终态已处理（final pause 在终态后 fire）——onAccept 未调（W2 移 E 段完成后）
+    expect(summary.routeDecision?.decision).toBe('accept_as_truth');
+    expect(summary.chapter_accept).toBeUndefined();
   });
 
   // ════════════════════════════════════════════════════════════════════════════
@@ -495,7 +525,9 @@ describe('WorkflowRuntime.runChapterChain（Story 4.0 §4.7）', () => {
     const parent = await makeParent(runtime);
 
     const summary = await runtime.runChapterChain(parent.id, makeInitialArtifacts(), {
-      mode: deriveCheckpointPolicy('suggest'),
+      // W2：draft 已退出 deriveCheckpointPolicy 停点集——显式 draft policy 钉原场景（归档行为挂
+      // draft checkpoint fire，与档位映射解耦）。
+      mode: { pauseStages: ['draft'], escalateMode: 'ask' },
     });
 
     expect(summary.status).toBe('paused');
@@ -624,7 +656,7 @@ describe('WorkflowRuntime.runChapterChain（Story 4.0 §4.7）', () => {
     expect(summary.routeDecision?.decision).toBe('accept_as_truth');
     // 全跑：draft + 5 轮 world-extractor + multi-review + completeness-verify + route + story-sync（2.2 WP-E）
     // = 10 次 generate
-    expect(generate.mock.calls.length).toBe(10);
+    expect(generate.mock.calls.length).toBe(11); // W1d：+brief-reviewer（规划审核 LLM）——C1 首圈 no-op 零调用
   });
 
   it('mode = deriveCheckpointPolicy("readonly")：brief checkpoint 首停（pauseStages=["brief","draft","verdict"]）', async () => {
@@ -642,8 +674,9 @@ describe('WorkflowRuntime.runChapterChain（Story 4.0 §4.7）', () => {
     // brief checkpoint 时 draft 未产 → draftContent 缺省；briefContent 抽 chapter_brief artifact
     expect(summary.draftContent).toBeUndefined();
     expect(summary.briefContent).toBeDefined();
-    // brief-compiler 纯代码 + draft-writer 未到 → generate 未调
-    expect(generate).not.toHaveBeenCalled();
+    // W1d：brief 停点挪 A2（brief-reviewer）后——A1 纯代码 + A2 LLM 已跑 → generate 恰 1 次
+    //（brief-reviewer 规划审核；写手/提取段未到）
+    expect(generate).toHaveBeenCalledTimes(1);
   });
 
   // ════════════════════════════════════════════════════════════════════════════
@@ -772,7 +805,7 @@ describe('WorkflowRuntime.runChapterChain（Story 4.0 §4.7）', () => {
     expect(summary.status).toBe('completed');
     // 从头跑：draft + 5 轮 world-extractor + multi-review + completeness-verify + route + story-sync（2.2 WP-E）
     // = 10 次 generate
-    expect(generate.mock.calls.length).toBe(10);
+    expect(generate.mock.calls.length).toBe(11); // W1d：+brief-reviewer（规划审核 LLM）——C1 首圈 no-op 零调用
     // feedback 仍注入到 draft-writer prompt
     const draftCall = generate.mock.calls.find(([_msgs, sys]: any) => isDraftSystem(sys));
     const userContent = (draftCall![0] as any)[0]?.content ?? '';
@@ -786,7 +819,7 @@ describe('WorkflowRuntime.runChapterChain（Story 4.0 §4.7）', () => {
   //     用 pauseStages=['verdict'] 隔离 verdict 行为（跳过 brief/draft 让链段跑到 route 终态）。
   // ════════════════════════════════════════════════════════════════════════════
 
-  it('CR-001 accept：route=accept + verdict pause → onAccept 先产 chapter_accept（verdict pause 不再抢断终态处理）', async () => {
+  it('CR-001 accept（链流程重排 W2）：route=accept + final pause → 终稿 checkpoint 在终态处理后 fire；onAccept 不在 pause 前（移 E 段完成后——pause 时刻无候选，防 silent data loss 由完成腿兜底）', async () => {
     const generate = makeChainGenerate();
     const runtime = await makeRuntime(generate);
     const parent = await makeParent(runtime);
@@ -796,21 +829,22 @@ describe('WorkflowRuntime.runChapterChain（Story 4.0 §4.7）', () => {
       runId: snap.runId,
     }));
 
-    // 只在 verdict pause（brief/draft 通过 → 链段跑到 route 终态）
+    // 只在 final pause（brief/draft 通过 → 链段跑到 route 终态）
     const summary = await runtime.runChapterChain(parent.id, makeInitialArtifacts(), {
-      mode: { pauseStages: ['verdict'], escalateMode: 'ask' },
+      mode: { pauseStages: ['final'], escalateMode: 'ask' },
       onAccept,
     });
 
-    // verdict pause 在 route accept 终态处理后——onAccept 已产 chapter_accept（修前：pause 抢断，onAccept 不调）
+    // final pause 在 route accept 终态处理后（route_decision 已产）；W2 F1b：onAccept 移 E 段完成后
+    // ——pause 时刻无 chapter_accept（候选须含人改后正文）。
     expect(summary.status).toBe('paused');
-    expect(summary.pausedStage).toBe('verdict');
+    expect(summary.pausedStage).toBe('final');
     expect(summary.routeDecision?.decision).toBe('accept_as_truth');
-    expect(onAccept).toHaveBeenCalledTimes(1);
-    expect(summary.chapter_accept).toMatchObject({ chapterId: 'ep1' });
+    expect(onAccept).not.toHaveBeenCalled();
+    expect(summary.chapter_accept).toBeUndefined();
   });
 
-  it('CR-001 accept resume：verdict pause（chapter_accept 已产 + 持久 chainSnapshot）→ resume-continue → 候选在 summary（无 silent drop）', async () => {
+  it('CR-001 accept resume（W2 落盘拆两步）：final pause（无候选 + 持久 chainSnapshot）→ resume-continue → E 段跑完 → 完成时 onAccept 补产候选（无 silent drop——plan-review L7 锚）', async () => {
     const { RunStateStore } = await import('../src/runtime/runState');
     const runState = new RunStateStore();
     const generate = makeChainGenerate();
@@ -822,42 +856,50 @@ describe('WorkflowRuntime.runChapterChain（Story 4.0 §4.7）', () => {
       runId: snap.runId,
     }));
 
-    // Turn 1：跑到 verdict pause（chapter_accept 已产 + persist chainSnapshot）
+    // Turn 1：跑到 final pause（W2：无 chapter_accept + persist chainSnapshot）
     const paused = await runtime.runChapterChain(parent.id, makeInitialArtifacts(), {
-      mode: { pauseStages: ['verdict'], escalateMode: 'ask' },
+      mode: { pauseStages: ['final'], escalateMode: 'ask' },
       onAccept,
     });
     expect(paused.status).toBe('paused');
-    expect(paused.chapter_accept).toMatchObject({ chapterId: 'ep1' });
-    // chainSnapshot 持久含 chapter_accept + route-agent 在 completedNodes（resume 续跑依据）
+    expect(paused.chapter_accept).toBeUndefined();
+    // chainSnapshot 持久含 route accept + route-agent 在 completedNodes（resume 续跑依据）
     const snap = runState.getChainSnapshot(parent.id);
-    expect(snap?.artifacts['chapter_accept']).toBeDefined();
+    expect((snap?.artifacts['route_decision'] as { decision?: string })?.decision).toBe('accept_as_truth');
     expect(snap?.completedNodes).toContain('route-agent');
 
-    // Turn 2：resume-continue → route 在 completedNodes 前缀跳过 → 链段无剩节点 → complete
+    // Turn 2：resume-continue → route 在 completedNodes 前缀跳过 → E 段（提取段）跑完 → complete
     const resumed = await runtime.runChapterChain(parent.id, makeInitialArtifacts(), {
       resume: { fromSnapshot: true },
       onAccept,
     });
     expect(resumed.status).toBe('completed');
-    // chapter_accept 从 chainSnapshot 恢复 → summary 有候选（无 silent drop）
+    // W2 F1b：完成时 onAccept 补产 chapter_accept → summary 有候选（无 silent drop）
     expect(resumed.chapter_accept).toMatchObject({ chapterId: 'ep1' });
-    // onAccept 不再被调（route skip，终态处理在 Turn 1 verdict pause 前已跑）
     expect(onAccept).toHaveBeenCalledTimes(1);
   });
 
-  it('Story 7.4 CR-001：route=auto_revise + verdict pause → break（auto_revise 非终态不 pause；persist-only verdict 调用）', async () => {
+  it('W1d CR-001：route=auto_revise + verdict pause → 链内回环（回环中不 pause）；二判 accept 终态后 verdict pause', async () => {
     let routeCallIdx = 0;
+    let writerRound = 0;
     const generate = vi.fn<GenerateFn>(async (_msgs, sys) => {
       const s = sys ?? '';
+      if (s.includes('规划审核')) {
+        return { content: JSON.stringify({ verdict: 'pass', summary: '卡可写', findings: [] }), finishReason: 'stop' };
+      }
       if (s.includes('路由判决')) {
         routeCallIdx += 1;
         const decision = routeCallIdx === 1 ? 'auto_revise' : 'accept_as_truth';
         return { content: JSON.stringify({ decision, reason: `mock ${decision}` }), finishReason: 'stop' };
       }
-      if (s.includes('修订编辑')) {
+      if (s.includes('改稿意图编译器')) {
         return {
-          content: JSON.stringify({ title: '章', text: '修订正文', wordCount: 120, chapterId: 'ep1', revisionNotes: ['补'] }),
+          content: JSON.stringify({
+            change: { summary: '补' },
+            lockedItems: [],
+            rationale: { source: 'audit-finding', note: 'A-trigger' },
+            provenance: { rawUserInstruction: '据 Reader-Audit 审核发现修订', compilerNote: 'C1' },
+          }),
           finishReason: 'stop',
         };
       }
@@ -872,29 +914,36 @@ describe('WorkflowRuntime.runChapterChain（Story 4.0 §4.7）', () => {
       if (s.includes('状态提取')) {
         return { content: JSON.stringify({ storyTime: 5, title: '状态切面', subjects: [], patches: [] }), finishReason: 'stop' };
       }
-      return { content: JSON.stringify({ title: '章', text: '正文', wordCount: 100, chapterId: 'ep1' }), finishReason: 'stop' };
+      if (s.includes('story-sync-agent')) {
+        return { content: JSON.stringify({ runId: 'r', chapterId: 'ep1', patches: [], summary: '无可提取' }), finishReason: 'stop' };
+      }
+      writerRound += 1;
+      const draft = writerRound === 1
+        ? { title: '章', text: '正文', wordCount: 100, chapterId: 'ep1' }
+        : { title: '章', text: '修订正文', wordCount: 120, chapterId: 'ep1' };
+      return { content: JSON.stringify(draft), finishReason: 'stop' };
     });
     const runtime = await makeRuntime(generate);
     const parent = await makeParent(runtime);
     const onAccept = vi.fn((snap: RunSnapshot) => ({ chapterId: 'ep1', candidate: { content: 'x' }, runId: snap.runId }));
 
     const summary = await runtime.runChapterChain(parent.id, makeInitialArtifacts(), {
-      mode: { pauseStages: ['verdict'], escalateMode: 'ask' },
+      mode: { pauseStages: ['final'], escalateMode: 'ask' },
       onAccept,
     });
 
-    // Story 7.4：auto_revise → break（status=auto_revise_pending），不 loop 到 accept。verdict pause 决策
-    // 被忽略（auto_revise 非终态，break 给 leader；persist-only verdict 调用保 snapshot 为 redo resume）。
-    expect(summary.status).toBe('auto_revise_pending');
-    expect(summary.routeDecision?.decision).toBe('auto_revise');
-    // 不 loop 重跑：draft(1) + 5 轴 world-extractor(5) + multi-review(1) + completeness-verify(1) + route(1)
-    // + story-sync(1，2.2 WP-E 激活) = 10（targeted-revision 首跑 skip）
-    expect(generate.mock.calls.length).toBe(10);
-    // auto_revise 非终态 → onAccept 不调（leader redo 循环内 accept 时才调）
+    // W1a：auto_revise 链内回环（final pauseStages 不打断回环——回环非暂停形态）→ 二判 accept →
+    // final checkpoint 在终态处理后 fire → pause 抢断 complete（W2：onAccept 移 E 段完成后，pause 时不调）。
+    expect(summary.status).toBe('paused');
+    expect(summary.pausedStage).toBe('final');
+    expect(summary.routeDecision?.decision).toBe('accept_as_truth');
     expect(onAccept).not.toHaveBeenCalled();
+    // W1d 回环重跑：首轮 5（brief-reviewer + draft + multi-review + completeness + route）+ 回环 5
+    //（C1 编译 + 写手改稿轮 + multi-review + completeness + route）= 10（final pause 抢断——提取段未跑）
+    expect(generate.mock.calls.length).toBe(10);
   });
 
-  it('CR-001 escalate：route=escalate_user + verdict pause → onAccept 对称调（D4）+ escalateFindings 在 summary（终态处理完整）', async () => {
+  it('W1a R4b：route=escalate_user → escalate-pause（status=paused + escalatePause，非 verdict stage 暂停）+ onAccept 对称调（D4）+ escalateFindings 在 summary', async () => {
     const generate = makeChainGenerate({
       review: {
         verdict: 'escalate',
@@ -920,14 +969,17 @@ describe('WorkflowRuntime.runChapterChain（Story 4.0 §4.7）', () => {
       onAccept,
     });
 
+    // W1a：escalate → escalate-pause（与 verdict stage 暂停同 paused 形态但带 escalatePause 标记、
+    // 不产 pausedStage——入口层据标记走裁决 resume 分派而非 ChapterReviewPanel 三动作）。
     expect(summary.status).toBe('paused');
-    expect(summary.pausedStage).toBe('verdict');
+    expect(summary.escalatePause).toBe(true);
+    expect(summary.pausedStage).toBeUndefined();
     expect(summary.routeDecision?.decision).toBe('escalate_user');
-    // escalate findings 在 summary（verdict pause 在 escalate 处理后，findings 已抽）
+    // escalate findings 在 summary（裁决器初审 + 用户裁决数据源）
     expect(summary.escalateFindings).toEqual([
       { severity: 'block', quote: '硬气', location: '段1句2', explanation: 'OOC 嫌疑', subClass: 'Characterization.memory' },
     ]);
-    // D4 v2：escalate 也调 onAccept（候选给 PatchReview 裁决），在 verdict pause 前（修前：pause 抢断，不调）
+    // D4 v2：escalate 也调 onAccept（候选给裁决流程），在 escalate-pause 前（修前：pause 抢断，不调）
     expect(onAccept).toHaveBeenCalledTimes(1);
     expect(summary.chapter_accept).toMatchObject({ chapterId: 'ep1' });
   });
@@ -980,6 +1032,8 @@ describe('WorkflowRuntime.runChapterChain（Story 4.0 §4.7）', () => {
       let verifierCall = 0;
       return vi.fn<GenerateFn>(async (_msgs, sys) => {
         const s = sys ?? '';
+        // W1d：brief-reviewer（A2 规划审核）——pass 直通（挂起场景与规划环无关）
+        if (s.includes('规划审核')) return { content: JSON.stringify({ verdict: 'pass', summary: '卡可写', findings: [] }), finishReason: 'stop' };
         if (s.includes('出发核查员')) {
           verifierCall += 1;
           const verdict = verifierCall === 1 ? ESCALATE_VERDICT : PASS_VERDICT;
@@ -1124,6 +1178,8 @@ describe('WorkflowRuntime.runChapterChain（Story 4.0 §4.7）', () => {
     it('CR-002：stale suspended + 段落级 intent → legacy 直写清 suspended → 不再 pause 且成环新稿', async () => {
       const generate = vi.fn<GenerateFn>(async (_msgs, sys) => {
         const s = sys ?? '';
+        // W1d：brief-reviewer（A2 规划审核）——pass 直通
+        if (s.includes('规划审核')) return { content: JSON.stringify({ verdict: 'pass', summary: '卡可写', findings: [] }), finishReason: 'stop' };
         // revision-guard L2（system「改稿保义裁判员」——须在 generic「审核」前匹配）→ clean 放行 splice。
         if (s.includes('改稿保义裁判员')) {
           return { content: JSON.stringify({ verdict: 'clean', findings: [], summary: '保义通过' }), finishReason: 'stop' };
@@ -1145,7 +1201,7 @@ describe('WorkflowRuntime.runChapterChain（Story 4.0 §4.7）', () => {
         return { content: JSON.stringify(DRAFT), finishReason: 'stop' };
       });
       const { runChain } = await import('../src/runtime/chainRunner');
-      const { createChapterChainNodes, CHAPTER_CHAIN_REVISION_LOOP } = await import('../src/nodes/chapter-chain');
+      const { createChapterChainNodes, CHAPTER_CHAIN_LOOPS } = await import('../src/nodes/chapter-chain');
       const { decideCheckpointPause } = await import('../src/contracts/run');
       const session = {
         id: 'sess-cr002', agentName: 'chapter-chain', projectPath, status: 'idle' as const,
@@ -1180,7 +1236,7 @@ describe('WorkflowRuntime.runChapterChain（Story 4.0 §4.7）', () => {
           },
           // redo 语义：brief-compiler 已完成、draft-writer 重跑。
           resumedCompletedNodes: ['brief-compiler-node'],
-          revisionLoop: CHAPTER_CHAIN_REVISION_LOOP,
+          loops: CHAPTER_CHAIN_LOOPS,
           onCheckpoint: async (stage, snap) => decideCheckpointPause(stage, snap, deriveCheckpointPolicy('auto')),
         },
         { generate, sessionContext: session, signal: new AbortController().signal },
@@ -1280,6 +1336,200 @@ describe('WorkflowRuntime.runChapterChain（Story 4.0 §4.7）', () => {
       expect(next.status).toBe('completed');
     });
   });
+  describe('W2 resume.editedDraft（终稿手改覆写单源）', () => {
+    it('final pause → resume-continue + editedDraft → E 段跑完 + summary 载改后正文与重算 wordCount', async () => {
+      const { RunStateStore } = await import('../src/runtime/runState');
+      const runState = new RunStateStore();
+      const generate = makeChainGenerate();
+      const runtime = await makeRuntime(generate, runState);
+      const parent = await makeParent(runtime);
+
+      // Turn 1：suggest 档（=['final']）跑到终稿 pause。
+      const paused = await runtime.runChapterChain(parent.id, makeInitialArtifacts(), {
+        mode: deriveCheckpointPolicy('suggest'),
+      });
+      expect(paused.status).toBe('paused');
+      expect(paused.pausedStage).toBe('final');
+      expect(paused.draftText).toBe('黄昏的荒野上，主角深吸一口气。');
+
+      // Turn 2：终稿 accept 携手改全文 → resume 续跑 E 段。
+      const EDITED = '黄昏的荒野上，主角缓缓吐出一口气。（手改：删掉「深吸」改为「缓缓吐出」）';
+      const resumed = await runtime.runChapterChain(parent.id, makeInitialArtifacts(), {
+        resume: { fromSnapshot: true, editedDraft: EDITED },
+      });
+      expect(resumed.status).toBe('completed');
+      // E 段对改后正文提取：summary.draftText = 改后全文（wordCount 机械重算——LLM 自报值被覆盖）。
+      expect(resumed.draftText).toBe(EDITED);
+      expect(resumed.draftWordCount).toBe(EDITED.replace(/\s+/g, '').length);
+    });
+
+    it('resume-continue 无 editedDraft → 正文原样（零回归）', async () => {
+      const { RunStateStore } = await import('../src/runtime/runState');
+      const runState = new RunStateStore();
+      const generate = makeChainGenerate();
+      const runtime = await makeRuntime(generate, runState);
+      const parent = await makeParent(runtime);
+
+      await runtime.runChapterChain(parent.id, makeInitialArtifacts(), {
+        mode: deriveCheckpointPolicy('suggest'),
+      });
+      const resumed = await runtime.runChapterChain(parent.id, makeInitialArtifacts(), {
+        resume: { fromSnapshot: true },
+      });
+      expect(resumed.status).toBe('completed');
+      expect(resumed.draftText).toBe('黄昏的荒野上，主角深吸一口气。');
+    });
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // CR 批（09-13 review findings）：redo 清理集补 optimizer_failed（CR-7）/
+  // resume.redoFrom 跨簇契约 / escalate-accept 续跑补发终稿 checkpoint（CR-3a）。
+  // ══════════════════════════════════════════════════════════════════════════
+
+  /** route 终态过的快照基底（redo / resume 消费）。 */
+  function makeRouteDoneSnapshot(over: Partial<RunSnapshot> = {}): RunSnapshot {
+    return {
+      runId: 'run-route-done',
+      status: 'paused',
+      currentNodeId: 'route-agent',
+      projectPath,
+      completedNodes: [
+        'brief-compiler-node',
+        'brief-reviewer-node',
+        'revision-optimizer-node',
+        'draft-writer-agent',
+        'revision-guard-agent',
+        'lint-node',
+        'multi-review-agent',
+        'completeness-verify-node',
+        'route-agent',
+      ],
+      pendingNodes: [],
+      artifacts: {
+        ...makeInitialArtifacts(),
+        chapter_brief: { goal: 'REACH_B_CITY_GOAL', tone: '紧张', episodeId: 'ep1' },
+        'draft.initial': { title: '第二章 B 城', text: '黄昏的荒野上，主角深吸一口气。', wordCount: 2800, chapterId: 'ep1' },
+        'review.latest': { verdict: 'revise', summary: '需改', dimensions: [], reasons: [] },
+        route_decision: { decision: 'escalate_user', reason: '灰区' },
+      },
+      review: null,
+      archive: null,
+      delivery: null,
+      feedback: null,
+      errors: [],
+      ...over,
+    };
+  }
+
+  it('CR-7：redo 边界不含 C1（multi-review 起点）+ 陈旧 optimizer_failed 残留 → redo 清理集清除，route 重判 accept 正常终态（修前 stale 信号每圈强制 escalate 死环）', async () => {
+    const { RunStateStore } = await import('../src/runtime/runState');
+    const runState = new RunStateStore();
+    const generate = makeChainGenerate();
+    const runtime = await makeRuntime(generate, runState);
+    const parent = await makeParent(runtime);
+
+    const base = makeRouteDoneSnapshot();
+    runState.setChainSnapshot(parent.id, {
+      ...base,
+      artifacts: {
+        ...base.artifacts,
+        optimizer_failed: { optimizer_failed: true, nodeId: 'revision-optimizer-node', message: '上圈编译失败（stale 残留）' },
+      },
+    });
+
+    const summary = await runtime.runChapterChain(parent.id, makeInitialArtifacts(), {
+      resume: { fromSnapshot: true },
+      // redo 边界在 C1 之后（multi-review idx6）→ 前缀跳过 C1（圈作用域清理不触发）——修前唯一
+      // 清理入口失效，route 读 stale 信号强制 escalate（裁决 revise 再 redo → 又拦 = 永久死环）。
+      redo: { nodeId: 'multi-review-agent' },
+    });
+
+    // CR-7：redo 清理集清掉 stale optimizer_failed → multi-review/completeness/route 重跑后 route
+    // 判 accept（mock 默认）→ E 段续跑 completed。
+    expect(summary.status).toBe('completed');
+    expect(summary.routeDecision?.decision).toBe('accept_as_truth');
+    expect(summary.escalatePause).toBeUndefined();
+    expect(summary.errors ?? []).toEqual([]);
+  });
+
+  it('resume.redoFrom（跨簇契约）：plan pause 裁决 revise → redoFrom=brief-compiler-node → 规划环整环重跑（brief-reviewer 重审）', async () => {
+    const { RunStateStore } = await import('../src/runtime/runState');
+    const runState = new RunStateStore();
+    const generate = makeChainGenerate();
+    const runtime = await makeRuntime(generate, runState);
+    const parent = await makeParent(runtime);
+
+    runState.setChainSnapshot(parent.id, {
+      runId: 'run-plan-pause',
+      status: 'paused',
+      currentNodeId: 'brief-reviewer-node',
+      projectPath,
+      completedNodes: ['brief-compiler-node', 'brief-reviewer-node'],
+      pendingNodes: [],
+      artifacts: {
+        ...makeInitialArtifacts(),
+        chapter_brief: { goal: 'REACH_B_CITY_GOAL', tone: '紧张', episodeId: 'ep1' },
+        plan_review: {
+          verdict: 'escalate',
+          summary: '灰区',
+          findings: [{ dimension: 'red-line', severity: 'hard', grounding: 'brief.goal', note: '红线冲突' }],
+        },
+      },
+      review: null,
+      archive: null,
+      delivery: null,
+      feedback: null,
+      errors: [],
+      escalatePause: true,
+    });
+
+    const summary = await runtime.runChapterChain(parent.id, makeInitialArtifacts(), {
+      resume: { fromSnapshot: true, redoFrom: 'brief-compiler-node' },
+    });
+
+    // redoFrom 移除 brief-compiler → 前缀断在 idx0 → A1 重编 → A2 重审（pass）→ B → 环 → route accept → completed。
+    expect(summary.status).toBe('completed');
+    expect(summary.routeDecision?.decision).toBe('accept_as_truth');
+    // 规划环重跑证据：brief-reviewer 的 generate（规划审核 system）在本次 resume run 被调。
+    const hasPlanReview = generate.mock.calls.some(
+      ([_m, sys]: any) => typeof sys === 'string' && sys.includes('规划审核'),
+    );
+    expect(hasPlanReview).toBe(true);
+  });
+
+  it('CR-3a：escalate-pause → 裁决 accept resume（suggest 档）→ 补发终稿 checkpoint pause（AC2b「C7 的进 D」）→ 终稿 accept 再 resume → E 段跑完 completed', async () => {
+    const { RunStateStore } = await import('../src/runtime/runState');
+    const runState = new RunStateStore();
+    const generate = makeChainGenerate({ route: { decision: 'escalate_user', reason: '灰区' } });
+    const runtime = await makeRuntime(generate, runState);
+    const parent = await makeParent(runtime);
+
+    // 第一腿：route 判 escalate → escalate-pause（route 已进 completedNodes）。
+    const first = await runtime.runChapterChain(parent.id, makeInitialArtifacts(), {
+      mode: deriveCheckpointPolicy('suggest'),
+    });
+    expect(first.status).toBe('paused');
+    expect(first.escalatePause).toBe(true);
+
+    // 第二腿：裁决 accept → resume 续跑 → CR-3a 补发终稿 checkpoint（suggest=['final'] → pause，
+    // 不补发则 route 被 completed 前缀跳过、终稿卡结构性不可达）。
+    const second = await runtime.runChapterChain(parent.id, makeInitialArtifacts(), {
+      resume: { fromSnapshot: true },
+      mode: deriveCheckpointPolicy('suggest'),
+    });
+    expect(second.status).toBe('paused');
+    expect(second.escalatePause).toBeUndefined(); // 新 run 非 escalate-pause 形态（终稿审阅卡路由）
+    expect(second.pausedStage).toBe('final');
+    expect(second.draftContent).toBe('黄昏的荒野上，主角深吸一口气。');
+
+    // 第三腿：终稿卡 accept（continue）→ 补发标记在（不再补发）→ E 段跑完 → completed。
+    const third = await runtime.runChapterChain(parent.id, makeInitialArtifacts(), {
+      resume: { fromSnapshot: true },
+      mode: deriveCheckpointPolicy('suggest'),
+    });
+    expect(third.status).toBe('completed');
+    expect(third.routeDecision?.decision).toBe('escalate_user'); // 裁决采信的终态决策保留
+  });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1309,3 +1559,10 @@ describe('RunStateStore.clearChainSnapshot（Story 4.3 Step 3 resume abort）', 
     expect(store.clearChainSnapshot(sessionId)).toBe(false);
   });
 });
+
+
+// ════════════════════════════════════════════════════════════════════════════
+// 链流程重排 W2（R3 终稿手改通道 / R4c 落盘拆两步）：resume.editedDraft——终稿 checkpoint
+// 人审手改正文全文，resume 读回经 applyEditedDraft 单源覆写 draft.initial（text + wordCount
+// 机械重算 + 申报类 stale 清理），E 段（随后的续跑腿）对改后正文提取。
+// ════════════════════════════════════════════════════════════════════════════

@@ -66,11 +66,18 @@ export const generationMessageSchema = z.discriminatedUnion('role', [
 
 /**
  * Normalized usage counters across providers.
+ *
+ * thinkingTokens / cacheReadTokens (09-12 agy provider, design §2): surfaced
+ * by providers that report them (the Antigravity CLI event stream — per-turn
+ * thinking + cache_read are signals even the HTTP paths do not return).
+ * Purely additive optional fields; responses without them parse unchanged.
  */
 export const generationUsageSchema = z.object({
   promptTokens: z.number().int().nonnegative().optional(),
   completionTokens: z.number().int().nonnegative().optional(),
   totalTokens: z.number().int().nonnegative().optional(),
+  thinkingTokens: z.number().int().nonnegative().optional(),
+  cacheReadTokens: z.number().int().nonnegative().optional(),
 }).partial();
 
 export const generationFinishReasonSchema = z.enum([
@@ -132,6 +139,12 @@ export const thinkingControlSchema = z.object({
 export const generationLaneSchema = z.enum(['dialogue', 'background']);
 export type GenerationLane = z.infer<typeof generationLaneSchema>;
 
+/** {keyId, modelId} pointer to a configured key + model. */
+export const modelRefSchema = z.object({
+  keyId: z.string().min(1),
+  modelId: z.string().min(1),
+});
+
 export const textGenerationRequestSchema = z.object({
   model: z.string().min(1),
   messages: z.array(generationMessageSchema).min(1),
@@ -145,6 +158,57 @@ export const textGenerationRequestSchema = z.object({
   // Dispatch lane (dogfood R2 #7): see generationLaneSchema. Purely additive
   // optional field — payloads without it parse unchanged.
   lane: generationLaneSchema.optional(),
+  /**
+   * Session key (09-12 agy provider, design §2): identifies the LOGICAL
+   * conversation this call belongs to, so session-capable providers (the
+   * Antigravity CLI resident-session driver) can reuse a warm process and
+   * send incremental turns instead of resending the full history. Absent
+   * = single-shot cold path — per-call spawn, no resident state.
+   * CR-13 (09-12 agy provider review batch): two-state discipline — '' is
+   * normalized to ABSENT at parse (an assembly point leaking an empty string
+   * must not be hard-rejected by min(1); same absent semantics as
+   * lane/thinking above). Purely additive; payloads without it parse
+   * unchanged.
+   */
+  sessionKey: z
+    .string()
+    .optional()
+    .transform((v) => (v === undefined || v.length === 0 ? undefined : v)),
+  /**
+   * Task-model slot / pipeline label (09-12 usage-panel): which logical lane
+   * this call belongs to for usage aggregation ('writer-draft' / 'decon' /
+   * 'vision-relay' / 'doc-summary'…). Free value — no enum (the vocabulary
+   * evolves with call sites; the ledger's task_type column is CHECK-free for
+   * the same reason). Two-state discipline mirrors sessionKey (CR-13): '' from
+   * a hand-built body normalizes to ABSENT, never hard-rejected. Purely
+   * additive; payloads without it parse unchanged.
+   */
+  taskType: z
+    .string()
+    .optional()
+    .transform((v) => (v === undefined || v.length === 0 ? undefined : v)),
+  /**
+   * Prompt-cache breakpoint flag (09-12 system stabilization, C batch / C3.4):
+   * request-level directive for the protocol layer to attach explicit
+   * Anthropic-style `cache_control: {type:'ephemeral'}` breakpoints — the
+   * system tail block + the conversation-tail block (2 ≤ the official cap of
+   * 4). Named same-root with the wire field (`cache_control`). Purely
+   * additive optional boolean: absent/false keeps the wire body
+   * byte-identical (zero regression). The OpenAI-compatible path reads it but
+   * never acts (implicit prefix caching has no protocol field) and the
+   * Antigravity CLI path carries its own mirror-based caching (flag inert
+   * there).
+   */
+  cacheControl: z.boolean().optional(),
+});
+
+/**
+ * ONE fallback-trace record (09-12 子2 fallback chains, design §4): the model a
+ * failed attempt targeted plus the classified failure reason. Carried on
+ * responses ONLY when a fallback actually happened (two-state `.min(1)`).
+ */
+export const fallbackTraceEntrySchema = modelRefSchema.extend({
+  reason: z.string(),
 });
 
 export const textGenerationResponseSchema = z.object({
@@ -163,6 +227,20 @@ export const textGenerationResponseSchema = z.object({
   finishReason: generationFinishReasonSchema.optional(),
   usage: generationUsageSchema.optional(),
   toolCalls: z.array(toolCallResultSchema).optional(),
+  /**
+   * The model that actually served this response (09-12 子2 fallback chains):
+   * the gateway annotates the RESOLVED identity ({keyId, modelId} of whichever
+   * chain entry succeeded — never the request ref, which is the {default,
+   * default} sentinel under auto-pick), so the terminal state can label the
+   * real model after a fallback switch. ABSENT = no fallback machinery ran.
+   */
+  modelRef: modelRefSchema.optional(),
+  /**
+   * Per-failed-attempt records, present ONLY when at least one fallback switch
+   * happened (two-state `.min(1)` — an empty array is rejected). Purely
+   * additive: responses without it parse unchanged.
+   */
+  fallbackTrace: z.array(fallbackTraceEntrySchema).min(1).optional(),
 });
 
 export const imageGenerationRequestSchema = z.object({
@@ -188,15 +266,57 @@ export const imageGenerationResponseSchema = z.object({
   })),
 });
 
-/** {keyId, modelId} pointer to a configured key + model. */
-export const modelRefSchema = z.object({
-  keyId: z.string().min(1),
-  modelId: z.string().min(1),
+/**
+ * ONE wire-form fallback entry (09-12 子2 fallback chains, design §4): the
+ * next chain candidate as `{ref, thinking}` — `thinking` here is the
+ * NORMALIZED ThinkingControl (the agent-side assignmentThinkingControl
+ * projection of the slot entry's thinking/thinkingCustom pair), not the raw
+ * slot fields. Single source for the gateway loop's per-attempt model/thinking
+ * overwrite.
+ */
+export const generateFallbackEntrySchema = z.object({
+  ref: modelRefSchema,
+  thinking: thinkingControlSchema.optional(),
 });
+
+/**
+ * ONE model switch on a fallback chain (09-12 子2 fallback chains, design §7;
+ * CR-15 形态单源). The gateway loop surfaces this via onFallback every time the
+ * chain advances off a failed attempt; agent assembly points turn it into the
+ * additive 'model-fallback' runtime / child / chain events (agent-side
+ * `ModelFallbackEventData` extends this with the chain-lane nodeId/role), and
+ * the gateway always mirrors a logger.warn (shell direct-call faces with no
+ * onFallback rely on the log line). `reason` carries the SAME string the
+ * terminal fallbackTrace records: a `kind: detail` summary from
+ * classifyGenerationFailure, or a `config:` / `image:` prefixed pre-flight
+ * failure summary.
+ */
+export interface ModelFallbackSwitchEvent {
+  /**
+   * The model that failed. Resolved identity when resolution succeeded; the
+   * requested entry ref when it did not (config: failures — under auto-pick
+   * this may be the {default,default} sentinel).
+   */
+  from: { keyId: string; modelId: string };
+  /** The chain entry taking over (its configured ref). */
+  to: { keyId: string; modelId: string };
+  /** Classified failure summary (`kind: detail` / `config: …` / `image: …`). */
+  reason: string;
+  /** 1-based index of the FAILED attempt. */
+  attempt: number;
+}
 
 export const generateTextPayloadSchema = z.object({
   ref: modelRefSchema,
   request: textGenerationRequestSchema,
+  /**
+   * Ordered fallback chain behind `ref` (09-12 子2): zero default — ABSENT
+   * means the gateway's single-model fast path runs byte-identical to the
+   * pre-fallback behavior; length ≥ 1 means the gateway loop advances through
+   * these entries when the primary model fails with a fallback-eligible
+   * error. Two-state contract: empty `[]` is rejected (`.min(1)`).
+   */
+  fallbacks: z.array(generateFallbackEntrySchema).min(1).optional(),
 });
 
 export const generateImagePayloadSchema = z.object({
@@ -256,6 +376,8 @@ export type EmbeddingRequest = z.infer<typeof embeddingRequestSchema>;
 export type EmbeddingResponse = z.infer<typeof embeddingResponseSchema>;
 export type ToolFunction = z.infer<typeof toolFunctionSchema>;
 export type ToolCallResult = z.infer<typeof toolCallResultSchema>;
+export type GenerateFallbackEntry = z.infer<typeof generateFallbackEntrySchema>;
+export type FallbackTraceEntry = z.infer<typeof fallbackTraceEntrySchema>;
 export type ThinkingLevel = z.infer<typeof thinkingLevelSchema>;
 export type ThinkingControl = z.infer<typeof thinkingControlSchema>;
 /**

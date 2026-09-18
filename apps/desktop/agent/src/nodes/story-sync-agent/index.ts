@@ -13,6 +13,7 @@ import {
 import type { AgentNode, NodeResult, NodeRunInput } from '../../contracts/run';
 import { deriveStorySyncByRules } from './rules';
 import { isAbortError, type GenerateFn } from '../llm-node';
+import type { GenerationDelta } from '../../provider/ipc-provider';
 import { logger } from '../../logger';
 
 // ── Story 2.2 WP-E（design §5.5.1）：story-sync 节点真跑 LLM 提取（激活空转件）──
@@ -33,14 +34,16 @@ import { logger } from '../../logger';
 //   draft.initial.llmPatches defensive 透传（4.0 链段无上游产出但保留）+ rules 兜底。
 // - **CR-E7 belt（防线双保险）**：promise_registry patches 在节点层机械过滤（prompt 规则 7 禁提取 +
 //   parser 白名单含 promise_registry 不拦——此处兜底丢弃，mirror 6.5 track-conflation 防线）。
-// - 产出 story.sync artifact 形态不变（patches + summary，multi-review 连续性记忆用途不变，链内消费零回归）；
-//   终态反哺消费经 summarizeRunSnapshot deliverable 豁免（chainRunner，Story 2.2 WP-E）。
+// - 产出 story.sync artifact 形态不变（patches + summary）。链流程重排 W3：本节点挂 E9（终稿后一次
+//   提取），multi-review 不再消费（continuityMemory var 已删）——唯一消费 = 终态反哺经
+//   summarizeRunSnapshot deliverable 豁免（chainRunner，Story 2.2 WP-E）。
 //
 // 范式判据（ADR-3）：提取 = 语义判断（哪些结构性设定在正文出现）归 LLM；组装/prompt 构建/安全过滤 =
 // 纯代码机械。状态变化禁提取（归 6.6 五轴）在 prompt 规则 8 编码（track-conflation 防线）。
 //
 // expected_downstream_consumers:
-// - Story 2.2 WP-E applier（write-chapter.ts）：route 终态读 summary.storySync patches 转 story_sync_apply。
+// - Story 2.2 WP-E applier（write-chapter.ts）：终态读 summary.storySync patches 转 story_sync_apply
+//   （链流程重排 W3：收尾时序 = E9 提取段完成后）。
 
 const CREATIVE_SET = new Set<string>(creativeFieldKeys);
 
@@ -73,7 +76,17 @@ export interface StorySyncNodeDeps {
     generate: GenerateFn;
     modelRef?: { keyId: string; modelId: string };
     thinking?: ThinkingControl;
+    /** 09-12 子2 fallback chains（H2 透传面）：extraction 档回退链（chapter-chain llmDepsFor 注入）。 */
+    fallbacks?: import('@orison/shared-contracts').GenerateFallbackEntry[];
+    /** 09-12 usage-panel：任务档位/流程标签（chapter-chain llmDepsFor 注入 'extraction'）。 */
+    taskType?: string;
     signal?: AbortSignal;
+    /**
+     * 09-13 子2 W2b（思考流，design §1）：节点流回调——generate opts 透传 provider onDelta（单发
+     * 无重试环：messageId 一次预分配；tool 通道滤除——防御性，本节点无工具）。装配侧由 chapter-chain
+     * `withNodeStreaming` 注入（补 nodeId/role → workflow onNodeDelta）。缺省不开（零回归）。
+     */
+    onDelta?: (d: { messageId: string; channel: 'text' | 'reasoning'; delta: string }) => void;
   };
   /**
    * 项目路径（chapter-chain.ts 装配传 session.projectPath）——loadStorySyncContext 读 project.yaml 组
@@ -265,15 +278,30 @@ async function runLlmExtraction(
       .filter((m) => m.role !== 'system')
       .map((m) => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content)))
       .join('\n');
+    // 09-13 子2 W2b（思考流）：onDelta 透传（单发无重试环：messageId 一次预分配；tool 通道滤除
+    //——防御性，本节点无工具）。缺省不占位（非流式路径零回归）。
+    const attemptMessageId = randomUUID();
     const result = await llm.generate(
       [{ id: randomUUID(), role: 'user', content: userContent, createdAt: Date.now() }],
       SYSTEM_PROMPT,
       [],
       llm.signal ?? new AbortController().signal,
-      llm.modelRef || llm.thinking
+      llm.modelRef || llm.thinking || llm.fallbacks?.length || llm.taskType || llm.onDelta
         ? {
             ...(llm.modelRef ? { modelRef: llm.modelRef } : {}),
             ...(llm.thinking ? { thinking: llm.thinking } : {}),
+            // 09-12 子2（H2）：fallbacks 透传（空链不占位）。
+            ...(llm.fallbacks?.length ? { fallbacks: llm.fallbacks } : {}),
+            // 09-12 usage-panel：taskType 透传（未标注不占位）。
+            ...(llm.taskType ? { taskType: llm.taskType } : {}),
+            ...(llm.onDelta
+              ? {
+                  onDelta: (d: GenerationDelta) => {
+                    if (d.type === 'tool') return;
+                    llm.onDelta!({ messageId: attemptMessageId, channel: d.type, delta: d.delta });
+                  },
+                }
+              : {}),
           }
         : undefined,
     );

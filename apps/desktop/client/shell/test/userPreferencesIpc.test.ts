@@ -1,6 +1,6 @@
 import path from 'node:path';
 import os from 'node:os';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { rmBestEffort } from './rmBestEffort';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { UserPreferencesConfig } from '@orison/shared-contracts';
@@ -67,6 +67,8 @@ describe('user preferences IPC round-trip', () => {
       wallpaperFrostBlur: 20,
       // R8 全局界面缩放。
       interfaceScale: 1.15,
+      // 09-12 usage-panel R5 用量保留窗 roundtrip。
+      usageRetentionDays: 30,
     };
 
     await save({}, written);
@@ -92,6 +94,8 @@ describe('user preferences IPC round-trip', () => {
     expect(read.wallpaperFrostBlur).toBe(20);
     // R8 界面缩放 roundtrip。
     expect(read.interfaceScale).toBe(1.15);
+    // 09-12 usage-panel R5 用量保留窗 roundtrip。
+    expect(read.usageRetentionDays).toBe(30);
   });
 
   it('wallpaper round-trip: clamps opacity into 0.1–1 and drops the url on clear', async () => {
@@ -158,6 +162,41 @@ describe('user preferences IPC round-trip', () => {
       interfaceScale: Number.NaN,
     });
     expect(((await load({})) as UserPreferencesConfig).interfaceScale).toBe(1);
+  });
+
+  it('09-12 usage-panel R5 用量保留窗：写侧钳回 [7,730] 落盘；手改盘文件读侧归位；缺键回默认 90', async () => {
+    const { save, load } = getHandlers();
+
+    // 写侧 clamp-before-persist（防垃圾值入库）：越界值钳到边界后落盘，读回即边界值。
+    await save({}, {
+      theme: 'system',
+      locale: 'system',
+      usageRetentionDays: 6,
+    } as UserPreferencesConfig);
+    expect(((await load({})) as UserPreferencesConfig).usageRetentionDays).toBe(7);
+
+    await save({}, {
+      theme: 'system',
+      locale: 'system',
+      usageRetentionDays: 731,
+    } as UserPreferencesConfig);
+    expect(((await load({})) as UserPreferencesConfig).usageRetentionDays).toBe(730);
+
+    // 读侧 lenient（flat YAML 可手改，interfaceScale 同款）：手写盘文件越界 → 读路径归位。
+    mkdirSync(path.join(TEST_HOME, '.orison', 'user'), { recursive: true });
+    writeFileSync(
+      path.join(TEST_HOME, '.orison', 'user', 'preferences.yaml'),
+      'theme: system\nlocale: system\nusageRetentionDays: 6\n',
+      'utf-8',
+    );
+    expect(((await load({})) as UserPreferencesConfig).usageRetentionDays).toBe(7);
+
+    // 缺键（存量文件零迁移）→ 默认 90。
+    await save({}, {
+      theme: 'system',
+      locale: 'system',
+    } as UserPreferencesConfig);
+    expect(((await load({})) as UserPreferencesConfig).usageRetentionDays).toBe(90);
   });
 
   it('R8：保存偏好即时对发起方 webContents 施加界面缩放；非法值不施加也不抛', async () => {
