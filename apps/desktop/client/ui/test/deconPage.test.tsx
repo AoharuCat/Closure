@@ -1026,6 +1026,13 @@ describe('新建向导（F-12 过滤 + 深度档预填 + 预估卡）', () => {
     await waitFor(() => {
       expect(query('[data-decon-wizard]')).toBeTruthy();
     });
+    // 材料列表异步装载：选项未渲染前 change 落空（select.value 恒 ''→ materialId 空
+    // → canCreate 假 → 无 toast 无 create，表现为 budgetInvalid 断言扑空）。
+    await waitFor(() => {
+      expect(
+        document.querySelector('[data-decon-field="material"] option[value="mat-aaaaaaaaaaaa"]'),
+      ).toBeTruthy();
+    });
     fireEvent.change(query('[data-decon-field="material"]'), { target: { value: 'mat-aaaaaaaaaaaa' } });
     fireEvent.click(query('[data-decon-tier="deep"]'));
     // 非正数预算 → budgetInvalid 提示 + 不 create（NaN 分支同 showToast 路径——deconView
