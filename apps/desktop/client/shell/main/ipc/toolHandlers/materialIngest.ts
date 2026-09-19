@@ -70,6 +70,7 @@ import type {
   MaterialFormat,
 } from '@orison/shared-contracts';
 import { atomicWriteFileSync } from '@orison/shared-contracts/fs/atomicWrite';
+import { sanitizeDiskName } from '@orison/shared-contracts/fs/naming';
 import {
   extractHeadingCandidates,
   joinSubtitleCues,
@@ -289,7 +290,13 @@ const FORMAT_BY_EXTENSION: Readonly<Record<string, MaterialFormat>> = {
 /** 派生 .md 相对路径（F-08 relPath 镜像：materials/sub/foo.txt → .derived/sub/foo.md）。 */
 export function derivedRelPathFor(relInMaterials: string): string {
   const dir = path.posix.dirname(relInMaterials);
-  const stem = path.posix.basename(relInMaterials, path.posix.extname(relInMaterials));
+  const rawStem = path.posix.basename(relInMaterials, path.posix.extname(relInMaterials));
+  // stem 过命名单源（W2 R1 / FS#14）：POSIX 源文件名可含 Windows 非法字符/保留名（源已在
+  // 盘上合法），镜像派生名不加防护会在 Windows 落盘失败——非法/控制字符 → '-'、保留名
+  // '-doc' 后缀、80 帽。清成空串（纯点/空格 stem）退 'untitled'。帽内既有 Windows 合法
+  // stem 输出逐字节不变；超 80 帽的存量 stem 截断后派生路径变位——派生 .md 是可重建缓存，
+  // 读写两侧一律经本函数重算（无持久化派生路径），变位一致、缺失侧按 re-derive 自愈。
+  const stem = sanitizeDiskName(rawStem) || 'untitled';
   // ⚠ 已知边界：同目录同 stem 异扩展（foo.txt + foo.md）镜像到同一派生路径——批量导入面
   // （Wave D）按需拒收同名冲突；本模块维持 design 钉死的镜像形态。
   return dir === '.' ? `.derived/${stem}.md` : `.derived/${dir}/${stem}.md`;

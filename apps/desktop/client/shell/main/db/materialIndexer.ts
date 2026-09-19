@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
-import { app } from 'electron';
+import { homedir } from 'node:os';
 import type { ResolvedModel } from '@orison/shared-contracts';
 import {
   MATERIAL_CHUNK_STRATEGIES,
@@ -125,7 +125,7 @@ export const MATERIAL_CHUNK_SOURCE_KIND = 'material_chunk';
 
 /** 全局车道材料根目录（~/.orison/materials/——craft-kb 同级惯例，机器级非项目内）。 */
 export function getGlobalMaterialsRoot(): string {
-  return path.join(app.getPath('home'), '.orison', 'materials');
+  return path.join(homedir(), '.orison', 'materials');
 }
 
 /** embed 批量尺寸（design §3.2：32 chunks/调用——事务外 best-effort）。 */

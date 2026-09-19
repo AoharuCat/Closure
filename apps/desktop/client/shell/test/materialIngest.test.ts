@@ -151,6 +151,18 @@ describe('常量与路径/身份 helpers', () => {
     expect(derivedRelPathFor('a/b/c.md')).toBe('.derived/a/b/c.md');
   });
 
+  it('derivedRelPathFor：stem 过命名单源（W2 R1/FS#14）——Windows 非法字符替换、保留名后缀、合法 stem 逐字节不变', () => {
+    // POSIX 源名可含 Windows 非法字符（源已在盘上合法），镜像派生名清洗后可在 Windows 落盘。
+    expect(derivedRelPathFor('报告:卷一.txt')).toBe('.derived/报告-卷一.md');
+    expect(derivedRelPathFor('a?b<c>.md')).toBe('.derived/a-b-c-.md');
+    // 保留名主名段 → '-doc' 后缀（插首点前）。
+    expect(derivedRelPathFor('sub/con.txt')).toBe('.derived/sub/con-doc.md');
+    // Windows 合法 stem 零漂移（存量项目派生路径不变）。
+    expect(derivedRelPathFor('第一章 风起.txt')).toBe('.derived/第一章 风起.md');
+    // 纯点 stem 清成空串 → 'untitled' 回退。
+    expect(derivedRelPathFor('....txt')).toBe('.derived/untitled.md');
+  });
+
   it('normalizeMaterialText：BOM strip + CRLF/CR→LF', () => {
     expect(normalizeMaterialText('﻿正文')).toBe('正文');
     expect(normalizeMaterialText('a\r\nb\rc')).toBe('a\nb\nc');

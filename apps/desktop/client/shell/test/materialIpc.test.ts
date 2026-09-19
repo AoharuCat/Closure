@@ -39,10 +39,16 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const TEST_HOME = path.join(process.cwd(), 'test-tmp-material-ipc');
+const TEST_HOME = vi.hoisted(() => process.cwd() + (process.platform === 'win32' ? '\\' : '/') + 'test-tmp-material-ipc');
 const PROJECT_DIR = path.join(TEST_HOME, 'my-project');
 const SOURCES_DIR = path.join(TEST_HOME, 'sources');
 
+// home 单源 = os.homedir()：与 electron getPath mock 同一 TEST_HOME——真 ~/.orison 零触碰。
+vi.mock('node:os', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:os')>();
+  const withHome = { ...actual, homedir: () => TEST_HOME };
+  return { ...withHome, default: withHome };
+});
 vi.mock('electron', () => ({
   app: {
     getPath: (_: string) => TEST_HOME,

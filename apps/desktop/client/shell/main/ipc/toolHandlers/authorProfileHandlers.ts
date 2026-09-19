@@ -16,9 +16,10 @@
  *   accept 走专用 IPC `author-profile:apply`（authorProfileIpc.ts）**重新追加当前 note**
  *   （永不落盘 stale after 快照——档案在提议与采纳之间可能被作者手改，重放 note 不会覆写）。
  *
- * Path（mirror craft-kb 目录处理，craftKbPaths.ts）：`app.getPath('home')`（非 os.homedir，
- * 与 db/index.ts getDbPath 同源；tests mock electron.app.getPath 到 throwaway home 或用
- * _setAuthorProfilePathForTest override，真 ~/.orison 永不被测试触碰）。目录不存在则 mkdir。
+ * Path（mirror craft-kb 目录处理，craftKbPaths.ts）：`os.homedir()`（home 单源，与
+ * db/index.ts getDbPath 及 agent / local-bff 侧一致；tests mock node:os 的 homedir 到
+ * throwaway home 或用 _setAuthorProfilePathForTest override，真 ~/.orison 永不被测试触碰）。
+ * 目录不存在则 mkdir。
  * 路径由 home 派生非 LLM 输入——无穿越面（LLM 只控制 note 文本内容）。
  *
  * autoApply 自审闸门在 agent runLoop（toolPolicy），本 handler 不校验 selfReviewConfirmed
@@ -26,7 +27,7 @@
  */
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
-import { app } from 'electron';
+import { homedir } from 'node:os';
 import { atomicWriteFileSync } from '@orison/shared-contracts/fs/atomicWrite';
 import { getLogger } from '../../logger';
 import type { ToolHandler } from './types';
@@ -38,10 +39,10 @@ export function _setAuthorProfilePathForTest(filePath: string | null): void {
   authorProfilePathOverride = filePath;
 }
 
-/** 作者档案文件：`~/.orison/author_profile.md`（app.getPath('home') 派生，见文件头）。 */
+/** 作者档案文件：`~/.orison/author_profile.md`（os.homedir() 派生，见文件头）。 */
 export function getAuthorProfilePath(): string {
   return (
-    authorProfilePathOverride ?? path.join(app.getPath('home'), '.orison', 'author_profile.md')
+    authorProfilePathOverride ?? path.join(homedir(), '.orison', 'author_profile.md')
   );
 }
 

@@ -1,4 +1,7 @@
 * text=auto eol=lf
+# cmd.exe 对 LF-only 批处理的 goto/label 有历史边角案例——bat 强制 CRLF 入库
+#（属性只管未来 checkout，存量 blob 不 renormalize，避免全仓 churn）。
+*.bat text eol=crlf
 *.png binary
 *.jpg binary
 *.ico binary

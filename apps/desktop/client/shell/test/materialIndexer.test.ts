@@ -28,9 +28,15 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 import type { ResolvedModel } from '@orison/shared-contracts';
 import { materialSchema } from '@orison/shared-contracts';
 
-const TEST_HOME = path.join(process.cwd(), 'test-tmp-material-indexer');
+const TEST_HOME = vi.hoisted(() => process.cwd() + (process.platform === 'win32' ? '\\' : '/') + 'test-tmp-material-indexer');
 const PROJECT_DIR = path.join(TEST_HOME, 'my-project');
 
+// home 单源 = os.homedir()：与 electron getPath mock 同一 TEST_HOME——真 ~/.orison 零触碰。
+vi.mock('node:os', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:os')>();
+  const withHome = { ...actual, homedir: () => TEST_HOME };
+  return { ...withHome, default: withHome };
+});
 vi.mock('electron', () => ({
   app: {
     getPath: (_: string) => TEST_HOME,
@@ -139,7 +145,7 @@ function writeProjectSource(rel: string, content: string): void {
   writeFileSync(full, content, 'utf-8');
 }
 
-/** 全局车道根 = ~/.orison/materials（design §4.4——craft-kb 同级；app.getPath mock → TEST_HOME/.orison/materials）。 */
+/** 全局车道根 = ~/.orison/materials（design §4.4——craft-kb 同级；home mock（os.homedir）→ TEST_HOME/.orison/materials）。 */
 const GLOBAL_MATERIALS = path.join(TEST_HOME, '.orison', 'materials');
 
 function writeGlobalSource(rel: string, content: string): void {

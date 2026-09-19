@@ -538,7 +538,9 @@ function listenPromise(server: Server, port: number): Promise<void> {
       }
     };
     server.on('error', onError);
-    server.listen(port, () => {
+    // Bind loopback only: the drive server is a local harness; binding all
+    // interfaces triggers the Windows firewall prompt for no benefit.
+    server.listen(port, '127.0.0.1', () => {
       server.off('error', onError);
       resolve();
     });

@@ -1,5 +1,4 @@
 import { createHash } from 'node:crypto';
-import path from 'node:path';
 import { rmBestEffort } from './rmBestEffort';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DeconCanonEntry, DeconChapterFacts, DeconEntity, DeconFacts, DeconSpan, Material } from '@orison/shared-contracts';
@@ -9,8 +8,14 @@ import type { DeconCanonEntry, DeconChapterFacts, DeconEntity, DeconFacts, Decon
 // conflict 两档分开/P1c 门/per-domain 断点 skip/LLM 不可用挂起）。
 // ABI 门控 + throwaway home（mirror deconP1Aggregate.test.ts）。
 
-const TEST_HOME = path.join(process.cwd(), 'test-tmp-decon-p2');
+const TEST_HOME = vi.hoisted(() => process.cwd() + (process.platform === 'win32' ? '\\' : '/') + 'test-tmp-decon-p2');
 
+// home 单源 = os.homedir()：与 electron getPath mock 同一 TEST_HOME——真 ~/.orison 零触碰。
+vi.mock('node:os', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:os')>();
+  const withHome = { ...actual, homedir: () => TEST_HOME };
+  return { ...withHome, default: withHome };
+});
 vi.mock('electron', () => ({
   app: {
     getPath: (_: string) => TEST_HOME,

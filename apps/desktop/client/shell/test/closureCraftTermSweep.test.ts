@@ -7,8 +7,14 @@ import type { ResolvedModel, CraftCard, CraftTerm } from '@orison/shared-contrac
 // E10.2b Wave 2（W2.4）：词目种子 + 归并迁移（category 跟随 + entry 重写）+ 模型切换卡向量
 // sweep（挂 reindexAllCraft 同点位）+ F-01 orphan 谓词值域（文档扫描跳过 card: 行）。
 
-const TEST_HOME = path.join(process.cwd(), 'test-tmp-craft-term-sweep');
+const TEST_HOME = vi.hoisted(() => process.cwd() + (process.platform === 'win32' ? '\\' : '/') + 'test-tmp-craft-term-sweep');
 
+// home 单源 = os.homedir()：与 electron getPath mock 同一 TEST_HOME——真 ~/.orison 零触碰。
+vi.mock('node:os', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:os')>();
+  const withHome = { ...actual, homedir: () => TEST_HOME };
+  return { ...withHome, default: withHome };
+});
 vi.mock('electron', () => ({
   app: {
     getPath: (_: string) => TEST_HOME,

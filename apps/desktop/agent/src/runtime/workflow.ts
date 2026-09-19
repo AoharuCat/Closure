@@ -42,6 +42,7 @@ import type { SessionPermissionMode } from './toolPolicy';
 import type { AgentBehaviorMode, ArcProgressionGap, ArcTimingAxis, AssetCard, BalancedAskCategory, CharacterDepthAxis, ChapterChainProjectInput, CreativeFieldKey, CreativePreferences, EpisodeOutline, MentionSignal, NovelStorySyncPayload, OutlineDepthAxis, ParticipationGear, PipelineStageFacts, PinnedPrefixItem, ReExtractChapterResult, SceneGraphIssue, SettingCoverageGap, SettingPrefixInput, StoryDecision, WorldDepthAxis, WriteWorldStateRequest } from '@orison/shared-contracts';
 import { BALANCED_ASK_CATEGORIES_DEFAULT, assembleChapterChainArtifacts, assetCardsSchema, balancedAskCategorySchema, collectRelevantDecisions, compileSettingPrefix, computePipelineStage, countCharacterCards, creativeBriefSchema, creativeFieldKeys, creativePreferencesSchema, describeMentionSignal, episodeOutlinesSchema, findArcCoverageGaps, findSettingCoverageGaps, findUnanchoredCharacterProgressions, novelSchema, readGrowthCurveSkipCount, resolveChapterIdForEpisode, resolveEpisodeIdForChapter, sceneGraphSchema, storyDecisionSchema, stripChapterFrontmatter, validateSceneGraph } from '@orison/shared-contracts';
 import type { BatchRunState } from '@orison/shared-contracts';
+import { decodeFileToUtf8 } from '@orison/shared-contracts/fs/decodeText';
 import { stampBatchOnMessage, syncActiveBatchStamp } from '../tool/batch-state';
 import yaml from 'js-yaml';
 import { createSubagentRuntime, type SubagentRuntime, type SubagentDispatchInput, type SubagentDispatchOutput } from './subagent';
@@ -1890,7 +1891,10 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions = {}): Wor
 
         let prose: string;
         try {
-          prose = await readFile(resolvedContentPath, 'utf8');
+          // 读侧归一单源（多 OS R3 / FS#15 同类点，check 批补）：runBackfill 章 prose 与
+          // reExtractChapter 同走 decodeFileToUtf8——外部 CRLF/GBK 存盘不把 `\r`/乱码带进
+          // 提取 prompt；app 恒写 LF 的常态路径字节不变（strict UTF-8 + LF 归一 = 恒等）。
+          prose = decodeFileToUtf8(await readFile(resolvedContentPath));
         } catch {
           // prose 文件不在磁盘（已删 / 未生成）→ 跳过该 episode（不崩）。
           logger.warn({ projectPath, episodeId: ep.id, contentFile }, 'runBackfill: chapter prose unreadable → skip episode');
@@ -2129,7 +2133,10 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions = {}): Wor
       }
       let fileRaw: string;
       try {
-        fileRaw = await readFile(resolvedContentPath, 'utf8');
+        // 读侧归一单源（多 OS task R3 / FS#15）：buffer → decodeFileToUtf8（BOM/UTF-16/GBK 检测 +
+        // CRLF/单 CR 归一 LF）。frontmatter 解析面本就容忍 CRLF，此处归一读侧消 `\r` 残留进 prose；
+        // app 恒写 LF 的常态路径字节不变。
+        fileRaw = decodeFileToUtf8(await readFile(resolvedContentPath));
       } catch (err) {
         logger.warn({ err: err instanceof Error ? err.message : String(err), projectPath, contentFile, chapterId }, 'reExtractChapter: chapter prose unreadable');
         return { ok: false, reason: `章正文文件不可读（${contentFile}）`, chapterId, episodeId };

@@ -9,6 +9,7 @@ import { snapshotToLocalHistory } from '../../fs/localHistory';
 import type { ToolHandler } from './types';
 import type { ProjectSearchResult } from '@orison/shared-contracts';
 import { atomicWriteFileSync } from '@orison/shared-contracts/fs/atomicWrite';
+import { decodeFileToUtf8 } from '@orison/shared-contracts/fs/decodeText';
 import { assertNotManagedProjectDocument } from '../managedProjectDocument';
 import { chapterIdOfChapterFilePath, degradeMentionLedgerForChapterFile } from '../../db/mentionLedgerDegrade';
 
@@ -18,7 +19,10 @@ export const readFileHandler: ToolHandler = async ({ params, projectDir }) => {
   assertWithinProject(projectDir, fullPath);
   if (!existsSync(fullPath)) throw new Error(`未找到文件：${filePath}`);
 
-  const content = readFileSync(fullPath, 'utf-8');
+  // 读侧归一单源（多 OS task R3 / FS#3）：buffer → decodeFileToUtf8（BOM/UTF-16 sniff/GBK 检测 +
+  // CRLF/单 CR 归一 LF）。Windows GBK .txt 不再以乱码进 prompt，CRLF 不再把 \r 带给模型
+  //（模型按原文写回易产混合行尾）。与编辑器读面（decodeText）同一检测序。
+  const content = decodeFileToUtf8(readFileSync(fullPath));
   const lines = content.split('\n');
   const sliced = limit ? lines.slice(offset, offset + limit) : lines.slice(offset);
   const numbered = sliced.map((l, i) => `${offset + i + 1}\t${l}`).join('\n');

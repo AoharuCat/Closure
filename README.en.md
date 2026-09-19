@@ -177,9 +177,17 @@ Download installers from [GitHub Releases](../../releases):
 
 | Platform | Format |
 |----------|--------|
-| Windows | `.exe` installer / portable `.zip` |
-| macOS | `.dmg` disk image (experimental; uploads coming in batches) |
-| Linux | `.AppImage` portable executable (experimental; uploads coming in batches) |
+| Windows | `.exe` installer (combined x64 + arm64) / portable `.zip` (x64) |
+| macOS | `.dmg` disk image + `.zip` (Apple Silicon and Intel) |
+| Linux | `.AppImage` portable executable (x64 and arm64) |
+
+### Known Limitations
+
+- **macOS builds are unsigned**: the Alpha has no Apple developer certificate, so Gatekeeper blocks the first launch — right-click the app and choose "Open", or run `xattr -cr /Applications/Closure.app` on the extracted/mounted `Closure.app` before launching.
+- **macOS auto-update is unavailable**: in-app auto-update on macOS requires signed builds (electron-updater refuses to install unsigned ones) — until code signing lands, please download the new installer manually to upgrade.
+- **arm64 builds are not verified on real hardware**: the Windows / macOS / Linux arm64 packages are theoretically usable (arm64 prebuilds for all native modules are in place), but we have no arm64 machines on hand — if something breaks, please [open an issue](../../issues) with your platform and device model.
+- **AppImage is the preferred Linux format**: no installation, no distro package-manager coupling; deb/rpm are not provided yet.
+- **CI mechanically covers all three platforms**: the full test suite and a startup smoke test (Electron launch through first frame) run per-platform on Windows / macOS / Linux CI; hands-on daily-use testing still focuses on Windows — for platform-specific issues, please [open an issue](../../issues).
 
 ## User Guide
 
@@ -209,10 +217,6 @@ Download installers from [GitHub Releases](../../releases):
 - [x] Book-deconstruction engine (universal ingestion, experience distillation, novel teardown)
 - [x] Antigravity CLI access (direct Gemini + dialog tool bridge)
 - [x] Usage panel and automatic model fallback
-
-### In Progress
-
-- [ ] Full-pipeline field testing in real creative work (second round of realistic chapters wrapping up)
 
 ### Planned
 

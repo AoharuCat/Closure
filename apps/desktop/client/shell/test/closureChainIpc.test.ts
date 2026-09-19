@@ -11,7 +11,7 @@ import { allowPath } from '../main/ipc/pathGuard';
 // CR-7（IPC 入口 Zod 校验）/ CR-10（assertSafePath 路径守卫）：handler 入口先 safeParse 再 assertSafePath，
 // 故测试 allowPath(TEST_DIR) 授权测试目录（mirror pathGuard.test.ts 模式），并加 Zod reject + 路径越界用例。
 
-const TEST_DIR = path.join(process.cwd(), 'test-tmp-closure-chain-ipc');
+const TEST_DIR = vi.hoisted(() => process.cwd() + (process.platform === 'win32' ? '\\' : '/') + 'test-tmp-closure-chain-ipc');
 
 const { handle, runChapterChain, runAgentWithExplicitSystem, createSession, loadProject, acceptChapterCandidate, onFieldEdited, clearChainSnapshot, getChainSnapshot, getSession, acquireProjectRun, releaseProjectRun, releaseLease, error: logError, info: logInfo, warn: logWarn, notifyLeaderChainCompleted, chapterWriteHandler, reExtractChapter, deleteSession, listChapterSummaries, runtimeShape } = vi.hoisted(() => ({
   handle: vi.fn(),
@@ -49,6 +49,14 @@ const { handle, runChapterChain, runAgentWithExplicitSystem, createSession, load
   // runAgentWithExplicitSystem（测「旧 runtime 无此方法」的 optimizer 不可用分因；默认 false 零影响）。
   runtimeShape: { noExplicitSystem: false },
 }));
+
+// home 单源 = os.homedir()：与 electron getPath mock 同一 TEST_DIR（worldStateRepository /
+// projectRepository 保真实现直碰真 db，路径须留在 throwaway home）——真 ~/.orison 零触碰。
+vi.mock('node:os', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:os')>();
+  const withHome = { ...actual, homedir: () => TEST_DIR };
+  return { ...withHome, default: withHome };
+});
 
 vi.mock('electron', () => ({
   app: { getPath: (_: string) => TEST_DIR, isPackaged: false },

@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
-import { app } from 'electron';
+import { homedir } from 'node:os';
 import { deriveCraftId, parseCraftMd } from './craftMd';
 import { getLogger } from '../logger';
 
@@ -16,9 +16,8 @@ import { getLogger } from '../logger';
  * content (curation deferred to a later user-owned story); tests use fixture md
  * docs under a temp user dir.
  *
- * `app.getPath('home')` is used (not `os.homedir()`) to match `db/index.ts`'s
- * `getDbPath` - tests mock `electron.app.getPath` to a throwaway home so the real
- * `~/.orison` is never touched.
+ * Home 单源 = `os.homedir()`（与 `db/index.ts` `getDbPath` 及 agent / local-bff 侧一致）；
+ * tests mock `node:os` 的 `homedir` 到 throwaway home，真 `~/.orison` 永不被触碰。
  */
 
 let userDirOverride: string | null = null;
@@ -30,7 +29,7 @@ export function _setCraftKbUserDirForTest(dir: string | null): void {
 
 /** Writable user craft KB dir: `~/.orison/craft-kb/`. */
 export function getCraftKbUserDir(): string {
-  return userDirOverride ?? path.join(app.getPath('home'), '.orison', 'craft-kb');
+  return userDirOverride ?? path.join(homedir(), '.orison', 'craft-kb');
 }
 
 /**

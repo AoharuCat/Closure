@@ -16,6 +16,16 @@
       "import": "./src/fs/atomicWrite.ts",
       "default": "./src/fs/atomicWrite.ts"
     },
+    "./fs/decodeText": {
+      "types": "./src/fs/decodeText.ts",
+      "import": "./src/fs/decodeText.ts",
+      "default": "./src/fs/decodeText.ts"
+    },
+    "./fs/naming": {
+      "types": "./src/fs/naming.ts",
+      "import": "./src/fs/naming.ts",
+      "default": "./src/fs/naming.ts"
+    },
     "./contracts/channels": {
       "types": "./src/contracts/channels.ts",
       "import": "./src/contracts/channels.ts",

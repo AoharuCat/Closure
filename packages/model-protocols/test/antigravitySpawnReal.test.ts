@@ -140,6 +140,8 @@ describe('spawnRealCli 适配层（行分帧 / 退出排空）', () => {
         expect(mockedExecFile).toHaveBeenCalledWith(
           'taskkill',
           expect.arrayContaining(['/PID', '4242', '/T', '/F']),
+          // windowsHide 选项形态钉面（多 OS R5）：GUI 主进程 spawn taskkill 不闪 console 窗。
+          { windowsHide: true },
           expect.anything(),
         );
         expect(killSpy).not.toHaveBeenCalled();
@@ -176,7 +178,8 @@ describe('spawnRealCli 适配层（行分帧 / 退出排空）', () => {
     try {
       child.kill();
       expect(mockedExecFile).toHaveBeenCalledTimes(1);
-      const callback = vi.mocked(mockedExecFile).mock.calls[0]![2] as (
+      // 形参序（file, args, opts, callback)——windowsHide 选项落在 [2]，回调随之位移到 [3]。
+      const callback = vi.mocked(mockedExecFile).mock.calls[0]![3] as (
         err: Error | null,
       ) => void;
       expect(fake.kill).not.toHaveBeenCalled(); // 成功路径零回落

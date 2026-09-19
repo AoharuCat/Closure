@@ -737,6 +737,56 @@ describe('local project repository helpers', () => {
     expect(updated.novel!.chapters[0].title).toBe('新章');
   });
 
+  it('#107 check 批：外编 CRLF 旧章 → 回拼落盘纯 LF（读侧归一，\\r 零残留）', () => {
+    const project = createEmptyProjectDocument('FM Preserve CRLF');
+    const withNovel = {
+      ...project,
+      novel: {
+        chapters: [
+          {
+            id: '第01章-旧章',
+            title: '旧章',
+            sort_order: 0,
+            sections: [{ id: 's1', sort_order: 0, content_file: 'chapters/第01章-旧章.md' }],
+            status: 'draft',
+          },
+        ],
+      },
+    };
+    saveProject(TEST_PROJECT_DIR, withNovel as any);
+    const mdDir = path.join(TEST_PROJECT_DIR, 'chapters');
+    if (!existsSync(mdDir)) mkdirSync(mdDir, { recursive: true });
+    writeFileSync(
+      path.join(mdDir, '第01章-旧章.md'),
+      '---\r\norder: 0\r\n---\r\n\r\n# 旧章\r\n\r\n旧正文。',
+      'utf8',
+    );
+
+    const chapterPatch = {
+      runId: 'run_fm_crlf',
+      createdAt: new Date().toISOString(),
+      patches: [
+        {
+          field: 'chapter_candidate' as any,
+          action: 'set' as const,
+          data: {
+            chapterId: '第01章-旧章',
+            runId: 'run_fm_crlf',
+            candidate: { title: '新章', content: '# 新标题\n\n新正文。' },
+          },
+          fieldVersion: 1,
+          generatedBy: 'draft-writer-agent',
+        },
+      ],
+    };
+
+    applyFieldPatches(TEST_PROJECT_DIR, chapterPatch);
+
+    const md = readFileSync(path.join(TEST_PROJECT_DIR, 'chapters/第01章-旧章.md'), 'utf8');
+    expect(md).toBe('---\norder: 0\n---\n# 新标题\n\n新正文。');
+    expect(md.includes('\r')).toBe(false);
+  });
+
   it('4.1 Step 4：chapter_candidate 补丁带 storyDecisions → 追加到 novel.story_decisions（经 core）', () => {
     const project = createEmptyProjectDocument('Chapter Candidate StoryDecisions');
     const withNovel = {

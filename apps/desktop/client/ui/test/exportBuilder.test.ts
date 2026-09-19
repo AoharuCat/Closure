@@ -59,7 +59,11 @@ describe('exportBuilder', () => {
 
   it('uses project name and current date for export filenames', () => {
     vi.setSystemTime(new Date('2026-07-09T12:00:00Z'));
-    expect(exportFilename('我的:项目', 'txt')).toBe('我的_项目-2026-07-09.txt');
+    expect(exportFilename('我的:项目', 'txt')).toBe('我的-项目-2026-07-09.txt');
+    // 命名单源（W2 R1/FS#7）：保留名 '-doc' 后缀、结尾点空格剔除、空名回退 'export'。
+    expect(exportFilename('CON', 'md')).toBe('CON-doc-2026-07-09.md');
+    expect(exportFilename('尾点... ', 'txt')).toBe('尾点-2026-07-09.txt');
+    expect(exportFilename(undefined, 'md')).toBe('export-2026-07-09.md');
     vi.useRealTimers();
   });
 });

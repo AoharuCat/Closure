@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { loadProject, saveProject } from './localProjectRepository';
 import { atomicWriteFileSync } from '@orison/shared-contracts/fs/atomicWrite';
+import { decodeFileToUtf8 } from '@orison/shared-contracts/fs/decodeText';
 import {
   acceptChapterCandidateCore,
   preserveChapterFrontmatter,
@@ -32,11 +33,15 @@ export function loadChapterMetadata(projectPath: string, chapterId: string): Rec
 /**
  * 读取单个章节第一节的 markdown 正文。
  * 文件不存在返回 null。
+ *
+ * 读侧归一单源（多 OS task R3 / FS#15）：buffer → decodeFileToUtf8（BOM/UTF-16/GBK 检测 +
+ * CRLF/单 CR 归一 LF）——外部编辑器 CRLF 存盘不再把 `\r` 带进同步链；app 恒写 LF 的
+ * 常态路径字节不变。
  */
 export function loadChapterMarkdown(projectPath: string, contentFile: string): string | null {
   const filePath = path.join(projectPath, contentFile);
   if (!existsSync(filePath)) return null;
-  return readFileSync(filePath, 'utf8');
+  return decodeFileToUtf8(readFileSync(filePath));
 }
 
 // ── 候选内容接收 ──
@@ -92,7 +97,7 @@ export function acceptChapterCandidate(
   // 已注册章文件的 frontmatter `order:`（登记载体）物理抹掉 → 派生重排错位。旧文件有
   // frontmatter 且新内容无 → 原样回拼（body-only 旧文件零行为变化）。规则单源见
   // shared-contracts preserveChapterFrontmatter。
-  const existingMd = existsSync(mdPath) ? readFileSync(mdPath, 'utf-8') : null;
+  const existingMd = existsSync(mdPath) ? decodeFileToUtf8(readFileSync(mdPath)) : null;
   atomicWriteFileSync(mdPath, preserveChapterFrontmatter(existingMd, result.mdContent), 'utf8');
 
   // 持久化 project.yaml（章节元数据 + story_decisions 已由 core mutate；调用方 bump meta 版本）。

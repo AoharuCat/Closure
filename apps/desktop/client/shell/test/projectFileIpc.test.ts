@@ -10,7 +10,7 @@
  * 同形态）；initRepo mock 掉（本文件不触 git，防真 isomorphic-git 负载，
  * projectCreateGitInit.test.ts 同款）。
  */
-import { closeSync, existsSync, ftruncateSync, mkdirSync, openSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, ftruncateSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { rmBestEffort } from './rmBestEffort';
@@ -338,5 +338,258 @@ describe('project:save-base64-image — inbox/images 白名单 + additive notify
         fileName: 'evil.png',
       }),
     ).rejects.toThrow('Invalid image directory');
+  });
+});
+
+// ── W2 多系统支持（R1/R2）：命名单源拒绝面 + move-file 守卫 + rename-entry 大小写放行 ──
+
+function handlerFor(channel: string): (event: unknown, ...args: unknown[]) => Promise<unknown> {
+  const call = handle.mock.calls.find((c) => c[0] === channel);
+  if (!call) throw new Error(`${channel} handler not registered`);
+  return call[1] as (event: unknown, ...args: unknown[]) => Promise<unknown>;
+}
+
+describe('project:create-directory — 命名单源拒绝面（R1/FS#1/#10）', () => {
+  beforeEach(() => {
+    handle.mockReset();
+    send.mockReset();
+    initRepo.mockReset();
+    initRepo.mockResolvedValue({ initialized: true });
+    rmBestEffort(BASE_TMP);
+    initProjectsRoot(BASE_TMP);
+    mkdirSync(PROJECT_DIR, { recursive: true });
+    registerProjectFileIpc();
+  });
+
+  afterEach(() => {
+    rmBestEffort(BASE_TMP);
+  });
+
+  it('Windows 保留名拒绝：报错带违规原因，盘上零残留', async () => {
+    const handler = handlerFor('project:create-directory');
+
+    await expect(handler({}, PROJECT_DIR, 'con')).rejects.toThrow('reserved');
+    await expect(handler({}, PROJECT_DIR, 'NUL.md')).rejects.toThrow('reserved');
+    expect(existsSync(path.join(PROJECT_DIR, 'con'))).toBe(false);
+  });
+
+  it('非法字符拒绝（含穿越分隔符）：报错带违规原因', async () => {
+    const handler = handlerFor('project:create-directory');
+
+    await expect(handler({}, PROJECT_DIR, '报告:卷一')).rejects.toThrow('illegal-char');
+    await expect(handler({}, PROJECT_DIR, 'a/b')).rejects.toThrow('illegal-char');
+    await expect(handler({}, PROJECT_DIR, 'a\\b')).rejects.toThrow('illegal-char');
+  });
+
+  // CR-7：`..` 在命名单源 assert 之前显式早拒——否则落进 trailing-dot-space 的
+  // 巧合归类，穿越意图的报错文案误导；空名/纯空白名单源按设计返 null（空名判定
+  // 属调用方），本通道早拒防 join 结果静默变父目录（旧缺陷 = 对空名假成功返回
+  // 父路径，不落新盘面——rejects 断言即完整证明）。
+  it('空名 / 纯空白名 / `..` 早拒：报错文案明确（CR-7）', async () => {
+    const handler = handlerFor('project:create-directory');
+
+    await expect(handler({}, PROJECT_DIR, '')).rejects.toThrow('项目名称为空');
+    await expect(handler({}, PROJECT_DIR, '   ')).rejects.toThrow('项目名称为空');
+    await expect(handler({}, PROJECT_DIR, '..')).rejects.toThrow('相对路径段');
+  });
+
+  it('项目名超长拒绝（帽 60）：报错带 too-long', async () => {
+    const handler = handlerFor('project:create-directory');
+
+    await expect(handler({}, PROJECT_DIR, '长'.repeat(61))).rejects.toThrow('too-long');
+  });
+
+  it('合法中文名放行：目录落盘 + 返回绝对路径（既有主链零变化回归）', async () => {
+    const handler = handlerFor('project:create-directory');
+
+    const result = (await handler({}, PROJECT_DIR, '无法告白')) as string;
+
+    expect(result).toBe(path.resolve(path.join(PROJECT_DIR, '无法告白')));
+    expect(existsSync(path.join(PROJECT_DIR, '无法告白'))).toBe(true);
+  });
+
+  it('恰 60 字符项目名在帽内放行（边界不误伤）', async () => {
+    const handler = handlerFor('project:create-directory');
+
+    const name = '书'.repeat(60);
+    await handler({}, PROJECT_DIR, name);
+    expect(existsSync(path.join(PROJECT_DIR, name))).toBe(true);
+  });
+});
+
+describe('project:create-entry — 命名单源拒绝面（R1/FS#2，boolean 契约）', () => {
+  beforeEach(() => {
+    handle.mockReset();
+    send.mockReset();
+    initRepo.mockReset();
+    initRepo.mockResolvedValue({ initialized: true });
+    rmBestEffort(BASE_TMP);
+    initProjectsRoot(BASE_TMP);
+    mkdirSync(PROJECT_DIR, { recursive: true });
+    registerProjectFileIpc();
+  });
+
+  afterEach(() => {
+    rmBestEffort(BASE_TMP);
+  });
+
+  it('保留名 / 非法字符 / 超长 → false，盘上零残留', async () => {
+    const handler = handlerFor('project:create-entry');
+
+    expect(await handler({}, path.join(PROJECT_DIR, 'con'), false)).toBe(false);
+    expect(await handler({}, path.join(PROJECT_DIR, 'a:b.md'), true)).toBe(false);
+    expect(await handler({}, path.join(PROJECT_DIR, `${'长'.repeat(81)}.md`), false)).toBe(false);
+    expect(existsSync(path.join(PROJECT_DIR, 'con'))).toBe(false);
+    expect(existsSync(path.join(PROJECT_DIR, 'a:b.md'))).toBe(false);
+  });
+
+  it('合法中文名放行：文件落盘返回 true（既有主链零变化回归）', async () => {
+    const handler = handlerFor('project:create-entry');
+
+    expect(await handler({}, path.join(PROJECT_DIR, '第一章.md'), false)).toBe(true);
+    expect(existsSync(path.join(PROJECT_DIR, '第一章.md'))).toBe(true);
+  });
+});
+
+describe('project:move-file — 目标已存在守卫（R2/FS#4，mirror rename-entry）', () => {
+  beforeEach(() => {
+    handle.mockReset();
+    send.mockReset();
+    initRepo.mockReset();
+    initRepo.mockResolvedValue({ initialized: true });
+    rmBestEffort(BASE_TMP);
+    initProjectsRoot(BASE_TMP);
+    mkdirSync(PROJECT_DIR, { recursive: true });
+    registerProjectFileIpc();
+  });
+
+  afterEach(() => {
+    rmBestEffort(BASE_TMP);
+  });
+
+  it('目标已存在 → 报错拒移：源文件不被吞（POSIX 静默覆盖面关闭）', async () => {
+    const handler = handlerFor('project:move-file');
+    const tempFile = path.join(PROJECT_DIR, 'temp', 'x.png');
+    const assetFile = path.join(PROJECT_DIR, 'assets', 'images', 'y.png');
+    mkdirSync(path.dirname(tempFile), { recursive: true });
+    mkdirSync(path.dirname(assetFile), { recursive: true });
+    writeFileSync(tempFile, 'source-bytes', 'utf-8');
+    writeFileSync(assetFile, 'asset-bytes', 'utf-8');
+
+    await expect(handler({}, PROJECT_DIR, '/temp/x.png', '/assets/images/y.png')).rejects.toThrow(
+      'Move target already exists',
+    );
+    // 数据零损：源原样在位，目标内容未被覆盖。
+    expect(readFileSync(tempFile, 'utf-8')).toBe('source-bytes');
+    expect(readFileSync(assetFile, 'utf-8')).toBe('asset-bytes');
+  });
+
+  it('目标不存在 → 照常移动并返回目标路径（既有主链零变化回归）', async () => {
+    const handler = handlerFor('project:move-file');
+    const tempFile = path.join(PROJECT_DIR, 'temp', 'x.png');
+    mkdirSync(path.dirname(tempFile), { recursive: true });
+    writeFileSync(tempFile, 'img-bytes', 'utf-8');
+
+    const result = (await handler({}, PROJECT_DIR, '/temp/x.png', '/assets/images/y.png')) as string;
+
+    expect(result).toBe(path.join(PROJECT_DIR, 'assets', 'images', 'y.png'));
+    expect(existsSync(path.join(PROJECT_DIR, 'assets', 'images', 'y.png'))).toBe(true);
+    expect(existsSync(tempFile)).toBe(false);
+  });
+
+  // CR-3（mirror rename-entry）：大小写不敏感 fs（win32/mac）上 existsSync 会命中
+  // 源自身——`x.png` 移到 `X.png` 被误拒。守卫对大小写等价形态放行（门 = 非
+  // linux）；linux 上目标本就不存在、同测试经既有守卫直过，三平台同断言成立。
+  it('纯大小写移动（x.png → X.png）放行：不被大小写不敏感 existsSync 误拒（CR-3）', async () => {
+    const handler = handlerFor('project:move-file');
+    const tempFile = path.join(PROJECT_DIR, 'temp', 'x.png');
+    mkdirSync(path.dirname(tempFile), { recursive: true });
+    writeFileSync(tempFile, 'img-bytes', 'utf-8');
+
+    const result = (await handler({}, PROJECT_DIR, '/temp/x.png', '/temp/X.png')) as string;
+
+    expect(result).toBe(path.join(PROJECT_DIR, 'temp', 'X.png'));
+    // 新大小写形态可访问（不反向断言旧形态消失——大小写不敏感 fs 上 x.png 与
+    // X.png 同指一个文件，mirror rename-entry 测试形态）。
+    expect(existsSync(path.join(PROJECT_DIR, 'temp', 'X.png'))).toBe(true);
+  });
+});
+
+// CR-4/CR-3 联动钉面：大小写等价放行门 = 非 linux（win32 NTFS + macOS APFS 默认
+// 都不区分大小写）；linux 大小写敏感语义不随修复漂移——异名大小写在 linux 是真实
+// 兄弟，守卫必须不放行（两个 rename 通道各钉一条）。
+describe.skipIf(process.platform !== 'linux')('linux 门——大小写异名是真实兄弟，守卫不放行（CR-3/CR-4）', () => {
+  beforeEach(() => {
+    handle.mockReset();
+    send.mockReset();
+    initRepo.mockReset();
+    initRepo.mockResolvedValue({ initialized: true });
+    rmBestEffort(BASE_TMP);
+    initProjectsRoot(BASE_TMP);
+    mkdirSync(PROJECT_DIR, { recursive: true });
+    registerProjectFileIpc();
+  });
+
+  afterEach(() => {
+    rmBestEffort(BASE_TMP);
+  });
+
+  it('project:rename-entry：a.md → A.md 且 A.md 真实存在 → false（A.md 不被覆盖）', async () => {
+    const handler = handlerFor('project:rename-entry');
+    writeFileSync(path.join(PROJECT_DIR, 'a.md'), '甲', 'utf-8');
+    writeFileSync(path.join(PROJECT_DIR, 'A.md'), '甲大写', 'utf-8');
+
+    expect(await handler({}, path.join(PROJECT_DIR, 'a.md'), path.join(PROJECT_DIR, 'A.md'))).toBe(false);
+    expect(readFileSync(path.join(PROJECT_DIR, 'A.md'), 'utf-8')).toBe('甲大写');
+  });
+
+  it('project:move-file：temp/x.png → temp/X.png 且 X.png 真实存在 → 报错拒移', async () => {
+    const handler = handlerFor('project:move-file');
+    mkdirSync(path.join(PROJECT_DIR, 'temp'), { recursive: true });
+    writeFileSync(path.join(PROJECT_DIR, 'temp', 'x.png'), 'lower-bytes', 'utf-8');
+    writeFileSync(path.join(PROJECT_DIR, 'temp', 'X.png'), 'upper-bytes', 'utf-8');
+
+    await expect(handler({}, PROJECT_DIR, '/temp/x.png', '/temp/X.png')).rejects.toThrow(
+      'Move target already exists',
+    );
+    expect(readFileSync(path.join(PROJECT_DIR, 'temp', 'X.png'), 'utf-8')).toBe('upper-bytes');
+    expect(readFileSync(path.join(PROJECT_DIR, 'temp', 'x.png'), 'utf-8')).toBe('lower-bytes');
+  });
+});
+
+describe('project:rename-entry — 纯大小写改名放行（R2/CR-4，大小写不敏感 fs 修复）', () => {
+  beforeEach(() => {
+    handle.mockReset();
+    send.mockReset();
+    initRepo.mockReset();
+    initRepo.mockResolvedValue({ initialized: true });
+    rmBestEffort(BASE_TMP);
+    initProjectsRoot(BASE_TMP);
+    mkdirSync(PROJECT_DIR, { recursive: true });
+    registerProjectFileIpc();
+  });
+
+  afterEach(() => {
+    rmBestEffort(BASE_TMP);
+  });
+
+  it('纯大小写改名（第一章.md → 第一章.MD）放行：不被大小写不敏感 existsSync 误拒', async () => {
+    const handler = handlerFor('project:rename-entry');
+    const file = path.join(PROJECT_DIR, '第一章.md');
+    writeFileSync(file, '正文', 'utf-8');
+
+    expect(await handler({}, file, path.join(PROJECT_DIR, '第一章.MD'))).toBe(true);
+    // 改名后以新大小写形态可访问（POSIX 大小写敏感 fs 上本就直接走既有守卫放行）。
+    expect(existsSync(path.join(PROJECT_DIR, '第一章.MD'))).toBe(true);
+    expect(readFileSync(path.join(PROJECT_DIR, '第一章.MD'), 'utf-8')).toBe('正文');
+  });
+
+  it('真实异名目标已存在仍拒改（守卫沿用，防 POSIX 静默覆盖）', async () => {
+    const handler = handlerFor('project:rename-entry');
+    writeFileSync(path.join(PROJECT_DIR, 'a.md'), '甲', 'utf-8');
+    writeFileSync(path.join(PROJECT_DIR, 'b.md'), '乙', 'utf-8');
+
+    expect(await handler({}, path.join(PROJECT_DIR, 'a.md'), path.join(PROJECT_DIR, 'b.md'))).toBe(false);
+    expect(readFileSync(path.join(PROJECT_DIR, 'b.md'), 'utf-8')).toBe('乙');
   });
 });

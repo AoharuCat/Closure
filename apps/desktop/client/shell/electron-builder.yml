@@ -50,10 +50,15 @@ buildDependenciesFromSource: false
 
 win:
   icon: resources/icon.ico
+  # arch 单源在 config：release.yml 用裸 `--win`（CLI 显式 target/arch 列表会整体
+  # 覆盖 config per-target arch——targetFactory.computeArchToTargetNamesMap 对带
+  # targetNames 的 raw 原样返回）。arm64 产物为理论级（无真机验证，README 已知
+  # 限制明示；better-sqlite3 electron-v136 / sqlite-vec / jieba 的 arm64 预编译均在位）。
   target:
     - target: nsis
       arch:
         - x64
+        - arm64
   artifactName: "${productName}-Setup-${version}.${ext}"
 
 nsis:
@@ -69,7 +74,11 @@ nsis:
 # （electron-builder 26 已移除 electronDifferentialDownload 根级开关。）
 generateUpdatesFilesForAllChannels: false
 
-# macOS 同时出 arm64(Apple Silicon) 与 x64(Intel) 两份 dmg。
+# macOS 同时出 arm64(Apple Silicon) 与 x64(Intel) 两份 dmg + zip。
+# zip 备妥 electron-updater mac 更新所需的 feed 形态（latest-mac.yml 引 zip；早期
+# dmg-only 缺该形态）。⚠️ 但未签名构建（identity: null）会被 electron-updater 拒绝
+# 安装——mac 更新链在代码签名落地前整体不可用，zip 只是必要非充分条件，升级目前
+# 须手动下载。两 target 各双 arch，单次构建产出单份 latest-mac.yml（签名落地即用）。
 mac:
   # 单张高分辨率 PNG 即可，electron-builder 在 macOS 构建机上自动转 .icns。
   icon: resources/icon.png
@@ -81,12 +90,20 @@ mac:
       arch:
         - arm64
         - x64
+    - target: zip
+      arch:
+        - arm64
+        - x64
 
 linux:
   icon: resources/icon.png
   category: Office
   target:
     - target: AppImage # 跨发行版的免安装可执行格式
+      # arm64 为理论级（预编译原料在位，无真机验证）；x64 为主分发面。
+      arch:
+        - x64
+        - arm64
 
 # GitHub Releases 直传（本地构建 --publish always 走 GH_TOKEN；CI release.yml 同源）。
 # releaseType: release = 上传到既有正式 release（默认 draft 在「同 tag 已有 published

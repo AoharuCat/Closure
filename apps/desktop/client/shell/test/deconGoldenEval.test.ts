@@ -7,9 +7,15 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 // 纯函数面（yaml 容错解析 / 实体与场景断言判别）无 db；全链面跑 fine job 后对产物断言
 // （合成 fixtures——真金标 dogfood 回填注记见 runner 头注）。ABI 门控 + throwaway home。
 
-const TEST_HOME = path.join(process.cwd(), 'test-tmp-decon-golden');
+const TEST_HOME = vi.hoisted(() => process.cwd() + (process.platform === 'win32' ? '\\' : '/') + 'test-tmp-decon-golden');
 const EVAL_DIR = path.join(TEST_HOME, 'evals', 'decon');
 
+// home 单源 = os.homedir()：与 electron getPath mock 同一 TEST_HOME——真 ~/.orison 零触碰。
+vi.mock('node:os', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:os')>();
+  const withHome = { ...actual, homedir: () => TEST_HOME };
+  return { ...withHome, default: withHome };
+});
 vi.mock('electron', () => ({
   app: {
     getPath: (_: string) => TEST_HOME,

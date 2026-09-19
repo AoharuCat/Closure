@@ -120,9 +120,30 @@ describe('model CLI discovery IPC（09-12 agy provider W4）', () => {
       expect(defaultAgyExecutableCandidates('win32', {})).toEqual([expected, 'agy.exe']);
     });
 
-    it('non-Windows: bare agy on PATH', () => {
-      expect(defaultAgyExecutableCandidates('darwin', {})).toEqual(['agy']);
-      expect(defaultAgyExecutableCandidates('linux', {})).toEqual(['agy']);
+    // 多 OS R4 / CR-8：Linux GUI 菜单启动的桌面会话 PATH 同样极简（用户级
+    // `~/.local/bin` 与系统级 `/usr/local/bin` 安装位不在其中）——先枚举两个惯例
+    // 安装位绝对路径再落 PATH 裸名兜底。
+    it('Linux: user/system bin dirs first, bare agy on PATH last (multi-OS R4 / CR-8)', () => {
+      expect(defaultAgyExecutableCandidates('linux', {})).toEqual([
+        path.join(os.homedir(), '.local', 'bin', 'agy'),
+        '/usr/local/bin/agy',
+        'agy',
+      ]);
+    });
+
+    it('other platforms keep the bare agy on PATH as the only candidate', () => {
+      expect(defaultAgyExecutableCandidates('freebsd', {})).toEqual(['agy']);
+    });
+
+    // 多 OS R4：darwin 打包 app（Finder 启动）继承极简 PATH——先枚举常见 bin 目录
+    // 绝对路径再落 PATH 裸名兜底（终端开发场景）。
+    it('macOS: homebrew/user bin dirs first, bare agy on PATH last (multi-OS R4)', () => {
+      expect(defaultAgyExecutableCandidates('darwin', {})).toEqual([
+        '/opt/homebrew/bin/agy',
+        '/usr/local/bin/agy',
+        path.join(os.homedir(), '.local', 'bin', 'agy'),
+        'agy',
+      ]);
     });
   });
 
@@ -205,6 +226,43 @@ describe('model CLI discovery IPC（09-12 agy provider W4）', () => {
         expect(result.models).toHaveLength(1);
       }
       expect(execFileMock).toHaveBeenCalledTimes(2);
+    });
+
+    // 多 OS R4：darwin 打包 app 场景——前三候选（homebrew ×2 / 用户 bin）全 ENOENT，
+    // PATH 裸名兜底命中；resolvedExecutable 回填链路不变。
+    it('macOS: walks the enumerated bin dirs to the PATH fallback, backfill unchanged (multi-OS R4)', async () => {
+      const candidates = defaultAgyExecutableCandidates('darwin', {});
+      fakeExecFile([
+        { executable: candidates[0]!, err: enoent(candidates[0]!) },
+        { executable: candidates[1]!, err: enoent(candidates[1]!) },
+        { executable: candidates[2]!, err: enoent(candidates[2]!) },
+        { executable: 'agy', stdout: 'gemini-3.8-pro-high\tGemini 3.8 Pro (High)' },
+      ]);
+      const result = await discoverCliModels('', { platform: 'darwin', env: {} });
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.resolvedExecutable).toBe('agy');
+        expect(result.models).toHaveLength(1);
+      }
+      expect(execFileMock).toHaveBeenCalledTimes(4);
+    });
+
+    // CR-8：Linux 候选序步行——两个 bin 目录候选全 ENOENT 后 PATH 裸名兜底命中
+    //（序 = 用户级 → 系统级 → PATH，回填链路与 mac 同型）。
+    it('Linux: walks the enumerated bin dirs to the PATH fallback, backfill unchanged (CR-8)', async () => {
+      const candidates = defaultAgyExecutableCandidates('linux', {});
+      fakeExecFile([
+        { executable: candidates[0]!, err: enoent(candidates[0]!) },
+        { executable: candidates[1]!, err: enoent(candidates[1]!) },
+        { executable: 'agy', stdout: 'gemini-3.8-pro-high\tGemini 3.8 Pro (High)' },
+      ]);
+      const result = await discoverCliModels('', { platform: 'linux', env: {} });
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.resolvedExecutable).toBe('agy');
+        expect(result.models).toHaveLength(1);
+      }
+      expect(execFileMock).toHaveBeenCalledTimes(3);
     });
 
     it('stderr authentication failure maps to typed not-logged-in (no throw)', async () => {

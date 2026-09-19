@@ -455,4 +455,36 @@ describe('WorkflowRuntime.runBackfill（Story 3.4 C-A1 backfill 接线）', () =
     expect(Object.keys(result)).not.toContain('summariesMaterialized');
     expect(Object.keys(result)).not.toContain('summaryFailed');
   });
+
+  // ── 15. CRLF 章文读侧归一（多 OS R3 / FS#15 同类点）：外部编辑器 CRLF 存盘 → \r 不进 extractor prompt ──
+  it('CRLF 章文 → \\r 不进 extractor prompt（读侧归一，提取照常落表）', async () => {
+    const generate = makeBackfillGenerate(5);
+    const runtime = await makeRuntime(generate);
+    const parent = await makeParent(runtime);
+
+    mockTool = { execute: vi.fn().mockResolvedValue(undefined) };
+
+    writeProject({
+      episodes: [{ id: 'ep1', index: 0 }],
+      chapters: [
+        {
+          id: 'ch1',
+          sort_order: 0,
+          contentFile: 'chapters/ch1.md',
+          prose: '艾莉娜走进酒馆。BACKFILL_PROSE_MARKER\r\n第二段。\r\n',
+        },
+      ],
+    });
+
+    const result = await runtime.runBackfill(parent.id);
+
+    expect(result.ok).toBe(true);
+    expect(result.episodesWritten).toBe(1);
+    // 全部 generate 调用的全部消息零 \r（prose 已归一 LF），marker 证实 prose 确实进了 prompt。
+    const allContent = generate.mock.calls
+      .flatMap((call) => (call[0] as Array<{ content: string }>).map((m) => m.content))
+      .join('\n');
+    expect(allContent).toContain('BACKFILL_PROSE_MARKER');
+    expect(allContent).not.toContain('\r');
+  });
 });

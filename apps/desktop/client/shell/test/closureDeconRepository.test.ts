@@ -1,4 +1,3 @@
-import path from 'node:path';
 import { rmBestEffort } from './rmBestEffort';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import type {
@@ -19,8 +18,14 @@ import { deconMaterialRef, parseDeconMaterialRef } from '@orison/shared-contract
 // E10.3b W1：+ child B 三表（product/report/review）往返 + 写侧 zod 门 + 级联三处
 // （deleteDeconJobCascade / materials:delete / resetDeconRerunState——stale→rerun 复位语义）。
 
-const TEST_HOME = path.join(process.cwd(), 'test-tmp-decon-repo');
+const TEST_HOME = vi.hoisted(() => process.cwd() + (process.platform === 'win32' ? '\\' : '/') + 'test-tmp-decon-repo');
 
+// home 单源 = os.homedir()：与 electron getPath mock 同一 TEST_HOME——真 ~/.orison 零触碰。
+vi.mock('node:os', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:os')>();
+  const withHome = { ...actual, homedir: () => TEST_HOME };
+  return { ...withHome, default: withHome };
+});
 vi.mock('electron', () => ({
   app: {
     getPath: (_: string) => TEST_HOME,

@@ -352,7 +352,9 @@ export async function probeAgyCliVersion(
   executable: string,
   run: (executable: string, args: string[]) => Promise<string> = (exe, args) =>
     new Promise<string>((resolve, reject) => {
-      execFile(exe, args, { timeout: 10_000 }, (err, stdout) => {
+      // windowsHide 与其余 spawn 点对齐（多 OS R5）：GUI 主进程 spawn 控制台程序
+      //（agy --version）时 Windows 理论上闪现 console 窗。
+      execFile(exe, args, { timeout: 10_000, windowsHide: true }, (err, stdout) => {
         if (err !== null && err !== undefined) reject(err);
         else resolve(stdout);
       });

@@ -15,9 +15,15 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 //     ./node_modules/vitest/vitest.mjs run test/chapterChunkIndexerFailLoud.test.ts
 // ─────────────────────────────────────────────────────────────────────────────
 
-const TEST_HOME = path.join(process.cwd(), 'test-tmp-chapter-chunk-fail-loud');
+const TEST_HOME = vi.hoisted(() => process.cwd() + (process.platform === 'win32' ? '\\' : '/') + 'test-tmp-chapter-chunk-fail-loud');
 const PROJECT_DIR = path.join(TEST_HOME, 'my-project');
 
+// home 单源 = os.homedir()：与 electron getPath mock 同一 TEST_HOME——真 ~/.orison 零触碰。
+vi.mock('node:os', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:os')>();
+  const withHome = { ...actual, homedir: () => TEST_HOME };
+  return { ...withHome, default: withHome };
+});
 vi.mock('electron', () => ({
   app: {
     getPath: (_: string) => TEST_HOME,

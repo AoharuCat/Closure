@@ -11,7 +11,7 @@ import type { GenerationCallRecord } from '@orison/model-protocols';
 // 可控——¥ 矩阵的取数面）；repository 部分包装（clearLedger 可注入失败）。
 // ─────────────────────────────────────────────────────────────────────────────
 
-const TEST_HOME = path.join(process.cwd(), 'test-tmp-usage-ipc');
+const TEST_HOME = vi.hoisted(() => process.cwd() + (process.platform === 'win32' ? '\\' : '/') + 'test-tmp-usage-ipc');
 
 const { handle } = vi.hoisted(() => ({ handle: vi.fn() }));
 const configMocks = vi.hoisted(() => ({
@@ -20,6 +20,12 @@ const configMocks = vi.hoisted(() => ({
   clearShouldThrow: false,
 }));
 
+// home 单源 = os.homedir()：与 electron getPath mock 同一 TEST_HOME——真 ~/.orison 零触碰。
+vi.mock('node:os', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:os')>();
+  const withHome = { ...actual, homedir: () => TEST_HOME };
+  return { ...withHome, default: withHome };
+});
 vi.mock('electron', () => ({
   ipcMain: { handle },
   app: { getPath: (_: string) => TEST_HOME, isPackaged: false },

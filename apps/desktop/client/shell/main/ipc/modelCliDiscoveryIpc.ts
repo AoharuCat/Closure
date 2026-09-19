@@ -89,13 +89,33 @@ export function parseAgyModelsTsv(stdout: string): RemoteModel[] {
 
 /**
  * 空请求时的默认可执行候选（探测序）：Windows 先试独立安装目录
- * `%LOCALAPPDATA%\agy\bin\agy.exe`（装机实证路径）再试 PATH 上的 `agy.exe`；
- * 其他平台直接 PATH 上的 `agy`。纯函数——platform/env 由调用方传入供单测。
+ * `%LOCALAPPDATA%\agy\bin\agy.exe`（装机实证路径）再试 PATH 上的 `agy.exe`；macOS
+ * 先枚举常见 bin 目录（多 OS R4：打包 app 经 Finder/launchpad 启动继承极简 PATH——
+ * homebrew / 用户级安装目录不在其中，裸名探测必 ENOENT）再落 PATH 裸名兜底（终端
+ * 开发场景）；Linux 同病同修（CR-8：GUI 菜单启动的桌面会话 PATH 同样极简，用户级
+ * `~/.local/bin` 与系统级 `/usr/local/bin` 安装位不在其中）——先用户级安装惯例位、
+ * 再系统级手动安装惯例位，最后 PATH 裸名兜底；其余平台直接 PATH 上的 `agy`。
+ * 纯函数——platform/env 由调用方传入供单测。
  */
 export function defaultAgyExecutableCandidates(
   platform: NodeJS.Platform,
   env: NodeJS.ProcessEnv,
 ): string[] {
+  if (platform === 'darwin') {
+    return [
+      '/opt/homebrew/bin/agy',
+      '/usr/local/bin/agy',
+      path.join(os.homedir(), '.local', 'bin', 'agy'),
+      'agy',
+    ];
+  }
+  if (platform === 'linux') {
+    return [
+      path.join(os.homedir(), '.local', 'bin', 'agy'),
+      '/usr/local/bin/agy',
+      'agy',
+    ];
+  }
   if (platform !== 'win32') return ['agy'];
   const localAppData = env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
   return [path.join(localAppData, 'agy', 'bin', 'agy.exe'), 'agy.exe'];

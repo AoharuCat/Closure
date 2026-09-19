@@ -47,3 +47,33 @@ jobs:
 
       - name: Test
         run: pnpm test
+
+      # ── 启动冒烟（三平台各一次；R8 / design D4）───────────────────────────
+      # 前置 test 步把 better-sqlite3 重建成了 Node ABI（vitest 用）——Electron 主进程
+      # 直接加载会 ABI 断裂（NODE_MODULE_VERSION 不匹配，db 打开即挂）。冒烟前必须
+      # 翻回 Electron ABI：rebuild:native = electron-rebuild，prebuild 优先下载
+      # electron-ABI 预编译，三平台 runner 均无需 C++ 工具链。
+      - name: Rebuild native modules (Electron ABI, for smoke)
+        run: pnpm rebuild:native
+
+      - name: Build shell (renderer + main)
+        run: pnpm --filter @orison/desktop-shell build
+
+      # 真主进程拉起到 ready-to-show 即退（ORISON_SMOKE=1 通道，marker + exit 0 判定，
+      # 脚本内 120s 自杀兜底）。win/mac runner 自带桌面会话直跑；
+      # ubuntu runner 无显示会话而 BrowserWindow 需要 X——xvfb 装配 + xvfb-run 包裹。
+      - name: Startup smoke (Electron main to ready)
+        if: matrix.os != 'ubuntu-latest'
+        working-directory: apps/desktop/client/shell
+        run: node scripts/ci-smoke.mjs
+        timeout-minutes: 5
+
+      - name: Startup smoke (Electron main to ready, xvfb)
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+          cd apps/desktop/client/shell
+          xvfb-run -a node scripts/ci-smoke.mjs
+        timeout-minutes: 5

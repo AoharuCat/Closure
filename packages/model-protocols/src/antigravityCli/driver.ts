@@ -433,7 +433,9 @@ export function spawnRealCli(
         platform: process.platform,
         pid: proc.pid,
         taskkill: (pid) => {
-          execFile('taskkill', ['/PID', String(pid), '/T', '/F'], (err) => {
+          // windowsHide 与其余 spawn 点对齐（多 OS R5）：GUI 主进程 spawn 控制台程序
+          //（taskkill）时 Windows 理论上闪现 console 窗。
+          execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true }, (err) => {
             if (err === null || err === undefined) return;
             proc.kill();
           });

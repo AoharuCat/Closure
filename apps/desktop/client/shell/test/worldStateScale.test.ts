@@ -75,8 +75,14 @@ import {
 
 // Point the SQLite registry at a throwaway home so the real ~/.orison db is
 // never touched (mirror worldStateCheckpoint.test.ts / worldStateBackfillSummary.test.ts).
-const TEST_HOME = path.join(process.cwd(), 'test-tmp-world-state-scale');
+const TEST_HOME = vi.hoisted(() => process.cwd() + (process.platform === 'win32' ? '\\' : '/') + 'test-tmp-world-state-scale');
 
+// home 单源 = os.homedir()：与 electron getPath mock 同一 TEST_HOME——真 ~/.orison 零触碰。
+vi.mock('node:os', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:os')>();
+  const withHome = { ...actual, homedir: () => TEST_HOME };
+  return { ...withHome, default: withHome };
+});
 vi.mock('electron', () => ({
   app: {
     getPath: (_: string) => TEST_HOME,

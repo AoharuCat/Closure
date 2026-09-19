@@ -123,7 +123,7 @@ settings:
   cliExecutablePlaceholder: '%LOCALAPPDATA%\agy\bin\agy.exe'
   cliExecutableHint: 'Leave empty to auto-detect the default install location (Windows: %LOCALAPPDATA%\agy\bin\agy.exe, or agy.exe on PATH).'
   cliExecutableMissing: "Fill in the agy executable path (or fetch the model list first to auto-detect it)."
-  cliExecutableNotFound: "agy executable not found — confirm Antigravity CLI is installed, or check the path above."
+  cliExecutableNotFound: "agy executable not found — confirm Antigravity CLI is installed, or check the path above; on Windows, npm-global shims (.cmd) cannot be launched directly — fill in the absolute path of the standalone-installed agy.exe."
   cliDiscoveryFailed: "Failed to fetch the model list"
   cliLoginHint: "Not logged in: run agy in a terminal to complete the login, then come back and fetch again."
   # ToS gray-zone risk note (user decision 2026-09-12; single copy source — the

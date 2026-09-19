@@ -608,6 +608,17 @@ describe('sanitizeChapterStemSegment — 章标题文件名安全段', () => {
     expect(sanitizeChapterStemSegment('标'.repeat(50))).toHaveLength(40);
   });
 
+  it('保留名加 -doc 后缀（W2 R1/FS#6 单源；后缀插首点前，40 帽仍收尾）', () => {
+    // 标题恰为 Windows 保留设备名 → stem 段加 '-doc'（naming.ts insertReservedSuffix 同语义）。
+    expect(sanitizeChapterStemSegment('NUL')).toBe('NUL-doc');
+    expect(sanitizeChapterStemSegment('com1')).toBe('com1-doc');
+    // 带内部点的保留主名段：后缀插在首点前（CON.x → CON-doc.x），产物整体不再是保留名。
+    expect(sanitizeChapterStemSegment('CON.x')).toBe('CON-doc.x');
+    // 非保留名带点不受影响；既有清洗语义不回退（中文/删除式清洗原样）。
+    expect(sanitizeChapterStemSegment('第1.5章 伏笔')).toBe('第1.5章 伏笔');
+    expect(sanitizeChapterStemSegment('a<b>c:"d/e\\f|g?h*i')).toBe('abcdefghi');
+  });
+
   it('全非法/空 → 空串（调用方退化为纯「第N章」）', () => {
     expect(sanitizeChapterStemSegment('???')).toBe('');
     expect(sanitizeChapterStemSegment('')).toBe('');

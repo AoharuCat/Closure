@@ -10,8 +10,14 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 // 参数正确、hook 抛错不阻摘要落盘」——vi.mock 索引器模块捕获调用（wiring 测试）。
 // ─────────────────────────────────────────────────────────────────────────────
 
-const TEST_HOME = path.join(process.cwd(), 'test-tmp-chapter-summary-hook-wiring');
+const TEST_HOME = vi.hoisted(() => process.cwd() + (process.platform === 'win32' ? '\\' : '/') + 'test-tmp-chapter-summary-hook-wiring');
 
+// home 单源 = os.homedir()：与 electron getPath mock 同一 TEST_HOME——真 ~/.orison 零触碰。
+vi.mock('node:os', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:os')>();
+  const withHome = { ...actual, homedir: () => TEST_HOME };
+  return { ...withHome, default: withHome };
+});
 vi.mock('electron', () => ({
   app: {
     getPath: (_: string) => TEST_HOME,

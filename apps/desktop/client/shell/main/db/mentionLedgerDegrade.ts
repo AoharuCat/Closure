@@ -91,7 +91,14 @@ export function chapterIdOfChapterFilePath(fullPath: string, projectRoot: string
   const normalized = fullPath.replace(/\\/g, '/');
   const root = projectRoot.replace(/\\/g, '/').replace(/\/+$/, '');
   const marker = `${root}/chapters/`;
-  if (!normalized.startsWith(marker)) return undefined;
+  // 大小写不敏感 fs（CR-5 / FS#9，门 = 非 linux）：win32 NTFS 与 macOS APFS（默认）
+  // 都不区分大小写——目录段大小写漂移（用户在资源管理器/Finder 把 chapters 改成
+  // Chapters）不该让判据静默失配——前缀比较按 pathGuard.normalizeForCompare 同款仅在
+  // 非 linux 平台归一大小写；stem 仍从原大小写切片（chapterId 与盘上文件名 stem /
+  // yaml 注册 id 的精确匹配依赖原大小写，不能随比较归一被小写化）。
+  const compareForOs = (value: string): string =>
+    process.platform !== 'linux' ? value.toLowerCase() : value;
+  if (!compareForOs(normalized).startsWith(compareForOs(marker))) return undefined;
   const rest = normalized.slice(marker.length);
   if (rest.length === 0 || rest.includes('/')) return undefined; // 子目录非章文件形态
   if (!rest.endsWith('.md')) return undefined;

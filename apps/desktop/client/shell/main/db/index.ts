@@ -1,7 +1,7 @@
 import Database from 'better-sqlite3';
 import { existsSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
-import { app } from 'electron';
+import { homedir } from 'node:os';
 import {
   isSqliteVecAvailable,
   loadSqliteVec,
@@ -12,8 +12,10 @@ import { getLogger } from '../logger';
 
 let db: Database.Database;
 
+// Home 单源 = os.homedir()（与 agent / local-bff 侧及 craftKbPaths / materialIndexer /
+// authorProfileHandlers 一致；tests mock node:os 的 homedir 到 throwaway home）。
 function getDbPath(): string {
-  const dataDir = path.join(app.getPath('home'), '.orison', 'data');
+  const dataDir = path.join(homedir(), '.orison', 'data');
   if (!existsSync(dataDir)) mkdirSync(dataDir, { recursive: true });
   return path.join(dataDir, 'projects.db');
 }

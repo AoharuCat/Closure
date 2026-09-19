@@ -9,9 +9,15 @@ import type { DeconStylePayload, Material } from '@orison/shared-contracts';
 // 无卡标准 14 节新建/fenced 节选不误切/坏形防御）+ decon:export-style IPC handler 面（落盘/
 // style-payload-missing/project-not-found/stale 拒绝/路径门）。ABI 门控 + throwaway home。
 
-const TEST_HOME = path.join(process.cwd(), 'test-tmp-decon-style-export');
+const TEST_HOME = vi.hoisted(() => process.cwd() + (process.platform === 'win32' ? '\\' : '/') + 'test-tmp-decon-style-export');
 const PROJECT_DIR = path.join(TEST_HOME, 'proj-style-target');
 
+// home 单源 = os.homedir()：与 electron getPath mock 同一 TEST_HOME——真 ~/.orison 零触碰。
+vi.mock('node:os', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:os')>();
+  const withHome = { ...actual, homedir: () => TEST_HOME };
+  return { ...withHome, default: withHome };
+});
 vi.mock('electron', () => ({
   app: {
     getPath: (_: string) => TEST_HOME,

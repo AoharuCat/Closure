@@ -489,7 +489,7 @@ describe('model config IPC', () => {
         }],
       }],
     } satisfies ModelConfig);
-    let seeded = (await loadCall![1]({})) as ModelConfig;
+    const seeded = (await loadCall![1]({})) as ModelConfig;
     expect(seeded.keys[0]?.customHeaders).toEqual({ 'X-Route-Tag': 'closure' });
 
     // clear：同键保存但子3 字段全部缺席（UI 清空后投影的二态空侧）。

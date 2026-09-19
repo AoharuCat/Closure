@@ -5,6 +5,11 @@ import path from 'node:path';
 import os from 'node:os';
 import type { SaveBase64ImageInput } from '@orison/shared-contracts';
 import { atomicWriteFileSync } from '@orison/shared-contracts/fs/atomicWrite';
+import {
+  PROJECT_NAME_MAX_LENGTH,
+  assertSafeDiskName,
+  findDiskNameViolation,
+} from '@orison/shared-contracts/fs/naming';
 import { allowPath, assertSafePath, assertWithinProject, resolveCreateParent } from './pathGuard';
 import { decodeFileToUtf8 } from '../fs/decodeText';
 import { findProjectRootFor, snapshotToLocalHistory, snapshotTreeToLocalHistory } from '../fs/localHistory';
@@ -72,9 +77,6 @@ function isImportableSourcePath(src: string): boolean {
   if (!path.isAbsolute(trimmed)) return false;
   // Reject Windows device paths / alternate data stream tricks.
   if (trimmed.includes('\0')) return false;
-  if (/^[a-zA-Z]:/.test(trimmed) === false && process.platform === 'win32' && !trimmed.startsWith('\\\\')) {
-    // On Windows, absolute paths are drive-letter or UNC.
-  }
   const resolved = path.resolve(trimmed);
   if (isSensitiveImportSource(resolved)) return false;
   return true;
@@ -114,10 +116,22 @@ export function registerProjectFileIpc(): void {
     if (!parent.ok) throw new Error(parent.reason);
     const safeParentDir = parent.dir;
     assertSafePath(safeParentDir);
-    // Reject names with path separators to prevent traversal via name
-    if (name.includes('/') || name.includes('\\') || name.includes('..')) {
-      throw new Error('Invalid project name');
+    // 命名单源拒绝面（W2 R1 / FS#1/#10）：穿越分隔符、Windows 保留设备名、非法字符
+    // （<>:"/\|?*）、结尾点/空格、控制字符、超长（项目名帽 60 保深路径 MAX_PATH 余量——
+    // 项目目录是盘上最深路径前缀）。拒绝不改写用户输入；DiskNameViolationError 带
+    // reason，NewProjectDialog 的 catch 直接把 message 透成失败 toast（用户可见原因）。
+    // 空名/纯空白名早拒（CR-7a）：命名单源对 '' 按设计返 null（空名判定属调用方——
+    // 自动派生链各有 'untitled' 型回退），本通道无回退语义——不拒会把 join 结果静默
+    // 变成父目录本身。`..` 早拒（CR-7b）：create-entry 侧在命名单源 assert 前有显式
+    // `..` 拦截，本通道此前没有——'..' 会落进 trailing-dot-space 的巧合归类，穿越
+    // 意图的报错文案不该误导。
+    if (typeof name !== 'string' || name.trim() === '') {
+      throw new Error('项目名称为空');
     }
+    if (name.trim() === '..') {
+      throw new Error('项目名称不能是相对路径段（..）');
+    }
+    assertSafeDiskName(name, { maxLength: PROJECT_NAME_MAX_LENGTH });
     const projectDir = path.join(safeParentDir, name);
     assertSafePath(projectDir);
     if (!existsSync(projectDir)) {
@@ -285,7 +299,16 @@ export function registerProjectFileIpc(): void {
     // silently replace the target (data loss); on Windows it throws. Guard
     // explicitly so the behaviour is consistent and the UI can warn the user.
     // Allow a pure case/spacing change where the resolved target IS the source.
-    if (path.resolve(newPath) !== path.resolve(oldPath) && existsSync(newPath)) {
+    // Case-only rename gate `!== 'linux'` (CR-4): win32 NTFS and macOS APFS
+    // (default) are both case-insensitive — existsSync hits the source itself,
+    // which falsely rejected `第一章.md` → `第一章.MD`. Skip the guard when the
+    // paths differ only by case. Linux keeps the guard — there a case-variant
+    // is a real, distinct sibling that must not be clobbered.
+    const resolvedOld = path.resolve(oldPath);
+    const resolvedNew = path.resolve(newPath);
+    const isCaseOnlyRename =
+      process.platform !== 'linux' && resolvedOld.toLowerCase() === resolvedNew.toLowerCase();
+    if (resolvedNew !== resolvedOld && existsSync(newPath) && !isCaseOnlyRename) {
       return false;
     }
     try {
@@ -305,6 +328,10 @@ export function registerProjectFileIpc(): void {
     if (!baseName || baseName === '.' || baseName === '..' || baseName.includes('..')) {
       return false;
     }
+    // 命名单源拒绝面（W2 R1 / FS#2）：Windows 保留名 / 非法字符 / 结尾点空格 / 控制字符 /
+    // 超长（默认帽 80）。本通道契约是 boolean——违规按既有失败形态返 false（文件树
+    // ProjectTree/ChapterListPanel 两消费方按 false 分支出 toast），不抛错改契约。
+    if (findDiskNameViolation(baseName)) return false;
     // Never overwrite an existing file/dir: a blind atomicWrite('') here would
     // truncate a real manuscript to empty. Refuse and let the UI report it.
     if (existsSync(fullPath)) return false;
@@ -428,6 +455,24 @@ export function registerProjectFileIpc(): void {
     const destination = buildProjectPath(projectDir, toRelativePath);
     assertNotManagedProjectDocument(source);
     assertNotManagedProjectDocument(destination);
+    // Reject moving onto an existing entry. On POSIX renameSync would silently
+    // replace the target (data loss); on Windows it throws. Guard explicitly so
+    // the behaviour is consistent (mirrors project:rename-entry; this was the
+    // one rename site missing the guard). Allow a no-op where the resolved
+    // target IS the source, and a case-only move on case-insensitive filesystems
+    // (CR-3, gate mirrors rename-entry): the case-insensitive fs makes
+    // existsSync hit the source itself, which would falsely reject
+    // `x.png` → `X.png`. win32 NTFS and macOS APFS (default) are both
+    // case-insensitive; Linux keeps the guard — there a case-variant is a real,
+    // distinct sibling that must not be clobbered. Errors throw — this
+    // channel's failure form.
+    const resolvedSource = path.resolve(source);
+    const resolvedDestination = path.resolve(destination);
+    const isCaseOnlyMove =
+      process.platform !== 'linux' && resolvedSource.toLowerCase() === resolvedDestination.toLowerCase();
+    if (resolvedDestination !== resolvedSource && existsSync(destination) && !isCaseOnlyMove) {
+      throw new Error(`Move target already exists: ${destination}`);
+    }
     const dir = path.dirname(destination);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
     renameSync(source, destination);

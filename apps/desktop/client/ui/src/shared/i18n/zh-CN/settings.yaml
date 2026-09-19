@@ -122,7 +122,7 @@ settings:
   cliExecutablePlaceholder: '%LOCALAPPDATA%\agy\bin\agy.exe'
   cliExecutableHint: '留空则自动探测默认安装位置（Windows：%LOCALAPPDATA%\agy\bin\agy.exe，或 PATH 上的 agy.exe）。'
   cliExecutableMissing: "请填写 agy 可执行路径（或先拉取模型列表自动探测）。"
-  cliExecutableNotFound: "未找到 agy 可执行文件——请确认已安装 Antigravity CLI，或检查上方路径。"
+  cliExecutableNotFound: "未找到可用的 agy 可执行文件——请确认已安装 Antigravity CLI，或检查上方路径；Windows 上 npm 全局安装的 shim（.cmd）无法直接调用，请填写独立安装的 agy.exe 绝对路径。"
   cliDiscoveryFailed: "拉取模型列表失败"
   cliLoginHint: "尚未登录：请先在终端运行 agy 完成登录，再回来拉取模型。"
   # ToS 灰区风险备注（用户 2026-09-12 拍板；文案单源——共享组件 AgyTosRiskNote 渲染本键）

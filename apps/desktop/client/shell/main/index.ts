@@ -31,6 +31,10 @@ import {
   setProductionAgyBridgeRuntime,
   sweepStaleBridgeHomes,
 } from './ipc/agyBridge';
+// W5 R9（design D6）+ CR-6 加固批：os.tmpdir()/agy-* 启动清扫（实现与判定谓词在
+// main/fs/agyTempSweep.ts——名形精确匹配 mkdtemp('agy-') 产物、非目录条目跳过、
+// 陈旧判据取目录 + 直接子项最大 mtime）。
+import { sweepStaleAgyTempSessionDirs } from './fs/agyTempSweep';
 import { registerAgyBridgeIpc, wasAgyBridgeUsed } from './ipc/agyBridgeIpc';
 // 09-12 usage-panel（子5 W3）：应用内用量面两通道（usage:overview / usage:clear）+
 // 计量 sink 生产装配（installUsageMeteringProduction——协议层 wrapper → closure_llm_log
@@ -101,6 +105,17 @@ import { stopChapterChunkWatcher } from './db/chapterChunkWatcher';
  * 下文 renderer 加载分支仍读该 env——那是取 URL 值，不是判态。
  */
 const isDev = !app.isPackaged;
+
+/**
+ * CI 启动冒烟通道（W5 R8 / design D4）：ORISON_SMOKE=1 时走**正常全量 init 路径**
+ * （db 打开、协议注册、IPC 注册、主窗口创建、ready-to-show）——冒烟的价值在真实启动
+ * 路径，不走捷径分支。ready-to-show 后打 `ORISON_SMOKE_READY` marker → `app.exit(0)`。
+ * 差异仅一处无人值守适配：注册库初始化失败的原生弹窗改 console.error（CI 无人可点，
+ * 弹窗 = 挂死——#101② 先例的 CI 形态），退出码语义不变（exit(1)）。无网络依赖
+ * （更新器本就 not-configured，且冒烟在 ready-to-show 即退、走不到 did-finish-load）。
+ */
+const smokeMode = process.env.ORISON_SMOKE === '1';
+const SMOKE_READY_MARKER = 'ORISON_SMOKE_READY';
 
 /**
  * CR-15（09-12 agy provider CR 批）：CLI 池退出等待窗口 = 池内 belt 硬杀时限
@@ -286,6 +301,10 @@ function createWindow() {
     y: savedWindowState?.y,
     minWidth: 1100,
     minHeight: 720,
+    // CI 冒烟（ORISON_SMOKE=1）：藏窗创建。ready-to-show（首帧渲染信号）只在隐藏
+    // 窗上可靠发射——show:true 即显即绘不保证该事件（本机实测 120s 不发）；CI 也
+    // 无需真实显示窗口。非冒烟态 true = 默认行为不变。
+    show: !smokeMode,
     icon: isMac ? undefined : resolveAppIcon(),
     frame: isMac,                          // Windows/Linux 隐藏原生标题栏
     titleBarStyle: isMac ? 'hidden' : undefined, // macOS 保留红绿灯
@@ -373,6 +392,18 @@ function createWindow() {
     void win.loadFile(path.join(__dirname, '../renderer/index.html'));
   }
 
+  // CI 启动冒烟（W5 R8 / design D4）：真实启动路径全量走到 renderer 首帧
+  //（ready-to-show——BrowserWindow 级事件，非 webContents），打 marker 后强退
+  //（app.exit 不走 will-quit——冒烟进程无在途状态需要善后，db 为 WAL 短连接、
+  // 进程死即恢复）。stdout 接管道时 write 异步缓冲——flush 回调里再退防 marker
+  // 被强退截杀；2s belt 防回调失联挂死（脚本侧另有 120s 超时兜底红）。
+  if (smokeMode) {
+    win.once('ready-to-show', () => {
+      process.stdout.write(`${SMOKE_READY_MARKER}\n`, () => app.exit(0));
+      setTimeout(() => app.exit(0), 2_000);
+    });
+  }
+
   // Silent update check on startup (packaged builds only). The renderer
   // surfaces a guided prompt only if a newer version is found. Delay so the
   // window/renderer is ready to receive the `update:event` stream.
@@ -404,7 +435,14 @@ export function initProjectRegistryOrExit(
     exit: (code: number) => void;
   } = {
     getDb,
-    showErrorBox: (title, content) => dialog.showErrorBox(title, content),
+    // 冒烟态（ORISON_SMOKE=1）：CI 无人可点原生弹窗——改 console.error 承载同一份
+    // 可诊断文案，exit(1) 语义不变。默认 deps 每调用现构造，注入测试（registryInitFailure
+    // 显式传 deps）不受此分支影响。
+    showErrorBox: smokeMode
+      ? (title, content) => {
+          console.error(`${title}\n${content}`);
+        }
+      : (title, content) => dialog.showErrorBox(title, content),
     exit: (code) => app.exit(code),
   },
 ): boolean {
@@ -528,6 +566,10 @@ app.whenReady().then(() => {
       'agy-bridge: startup sweep of stale bridge homes failed (non-fatal)',
     );
   });
+  // W5 R9（design D6）：纯文本 lane 的 agy 临时 cwd 同族清扫（桥假宿清扫只覆盖
+  // ~/.orison/agy-bridge/home/*，os.tmpdir()/agy-* 归本函数）。同步执行——tmpdir
+  // 扫描 + 少量 rm 为毫秒级，且就位在 marker 之前使冒烟路径也覆盖它。
+  sweepStaleAgyTempSessionDirs();
   // Story 2.1: scan the global craft KB (~/.orison/craft-kb/ + bundled seeds) and
   // incrementally reindex new/changed docs into closure_craft_* on startup. Fire-
   // and-forget: craft reindex does async embeds (slow), must not block app launch.

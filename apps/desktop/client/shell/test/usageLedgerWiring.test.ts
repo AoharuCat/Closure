@@ -17,7 +17,7 @@ import { generateText, generateTextStream, setGenerationUsageSink } from '@oriso
 // - configIpc 真跑（不 mock——throwaway home 的空配置面 → ¥ ABSENT 路径）。
 // ─────────────────────────────────────────────────────────────────────────────
 
-const TEST_HOME = path.join(process.cwd(), 'test-tmp-usage-ledger-wiring');
+const TEST_HOME = vi.hoisted(() => process.cwd() + (process.platform === 'win32' ? '\\' : '/') + 'test-tmp-usage-ledger-wiring');
 
 const { handle, safeStorage } = vi.hoisted(() => ({
   handle: vi.fn(),
@@ -28,6 +28,12 @@ const { handle, safeStorage } = vi.hoisted(() => ({
   },
 }));
 
+// home 单源 = os.homedir()：与 electron getPath mock 同一 TEST_HOME——真 ~/.orison 零触碰。
+vi.mock('node:os', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:os')>();
+  const withHome = { ...actual, homedir: () => TEST_HOME };
+  return { ...withHome, default: withHome };
+});
 vi.mock('electron', () => ({
   ipcMain: { handle },
   safeStorage,

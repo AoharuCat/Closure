@@ -1,5 +1,4 @@
 import { createHash } from 'node:crypto';
-import path from 'node:path';
 import { rmBestEffort } from './rmBestEffort';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DeconChapterLabels, DeconFacts, DeconSpan, Material } from '@orison/shared-contracts';
@@ -12,8 +11,14 @@ import { DECON_CRAFT_DIMENSION_IDS } from '@orison/shared-contracts';
 // 两形态 + 渲染对拍零序号算术 + 回查纯函数）+ C3 截断升帽重试两径 + C4 材料读点重试。
 // ABI 门控 + throwaway home（mirror deconP3Label.test.ts）。
 
-const TEST_HOME = path.join(process.cwd(), 'test-tmp-decon-p5');
+const TEST_HOME = vi.hoisted(() => process.cwd() + (process.platform === 'win32' ? '\\' : '/') + 'test-tmp-decon-p5');
 
+// home 单源 = os.homedir()：与 electron getPath mock 同一 TEST_HOME——真 ~/.orison 零触碰。
+vi.mock('node:os', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:os')>();
+  const withHome = { ...actual, homedir: () => TEST_HOME };
+  return { ...withHome, default: withHome };
+});
 vi.mock('electron', () => ({
   app: {
     getPath: (_: string) => TEST_HOME,

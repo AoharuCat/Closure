@@ -216,6 +216,25 @@ describe('WorkflowRuntime.reExtractChapter（链流程重排 W4 / R6 链外重�
     expect(userContent).not.toContain('order: 0');
   });
 
+  // ── 3b. CRLF 章文读侧归一（多 OS R3 / FS#15）：外部编辑器 CRLF 存盘 → \r 不进提取 prompt ──
+  it('CRLF 章文 → \r 不进 extractor prompt（读侧归一，链照常跑通）', async () => {
+    const generate = makeReExtractGenerate(5);
+    const runtime = await makeRuntime(generate);
+    const parent = await makeParent(runtime);
+    mockWriteWorld = { execute: vi.fn().mockResolvedValue(undefined) };
+    writeProject({
+      prose: '---\r\norder: 0\r\n---\r\n\r\n# 第一章\r\n\r\n艾莉娜走进酒馆。RE_EXTRACT_PROSE_MARKER\r\n',
+    });
+
+    const result = await runtime.reExtractChapter(parent.id, { chapterId: 'ch1' });
+
+    expect(result.ok).toBe(true);
+    const firstCall = generate.mock.calls[0];
+    const userContent = (firstCall?.[0]?.[0]?.content as string) ?? '';
+    expect(userContent).toContain('RE_EXTRACT_PROSE_MARKER');
+    expect(userContent).not.toContain('\r');
+  });
+
   // ── 4. graceful：章不存在 ──
   it('章未注册 → {ok:false, reason}（不崩，明确报错）', async () => {
     const generate = makeReExtractGenerate();

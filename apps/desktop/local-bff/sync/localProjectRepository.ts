@@ -4,6 +4,7 @@ import type { z } from 'zod';
 import { patchOperationSchema, projectDocumentSchema, transformForeshadowToPromise, markStaleFields } from '@orison/shared-contracts';
 import type { ProjectFieldPatch, CreativeFieldKey, ForeshadowMigrationInput } from '@orison/shared-contracts';
 import { acceptChapterCandidateCore, preserveChapterFrontmatter, type ChapterIntegrationProject } from '@orison/shared-contracts';
+import { decodeFileToUtf8 } from '@orison/shared-contracts/fs/decodeText';
 import {
   applyDecisionActions,
   storyDecisionActionSchema,
@@ -607,7 +608,7 @@ export function applyFieldPatchesWithSkipped(
           // 族）。旧文件有 frontmatter 且新内容无 → 原样回拼（body-only 旧文件零行为变化）。
           // 规则单源见 shared-contracts preserveChapterFrontmatter（mirror novelProjectRepository
           // acceptChapterCandidate 同款）。
-          const existingMd = existsSync(mdPath) ? readFileSync(mdPath, 'utf-8') : null;
+          const existingMd = existsSync(mdPath) ? decodeFileToUtf8(readFileSync(mdPath)) : null;
           atomicWriteFileSync(mdPath, preserveChapterFrontmatter(existingMd, result.mdContent), 'utf8');
 
           // core structuredClone 了 next 并 mutate；把 novel（含 chapter meta + story_decisions）投回 working doc。

@@ -15,13 +15,19 @@ import type {
 // E10.2b W3.5：蒸馏管线全链测试（全 mock generateText/embed——mirror materialLLMWiring 形态）。
 // ABI 门控 + throwaway home（mirror closureCraftCardRepository.test.ts）。
 
-const TEST_HOME = path.join(process.cwd(), 'test-tmp-craft-distill');
+const TEST_HOME = vi.hoisted(() => process.cwd() + (process.platform === 'win32' ? '\\' : '/') + 'test-tmp-craft-distill');
 const MATERIALS_ROOT = path.join(TEST_HOME, '.orison', 'materials');
 
 const state = vi.hoisted(() => ({
   embedModel: null as ResolvedModel | null,
 }));
 
+// home 单源 = os.homedir()：与 electron getPath mock 同一 TEST_HOME——真 ~/.orison 零触碰。
+vi.mock('node:os', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:os')>();
+  const withHome = { ...actual, homedir: () => TEST_HOME };
+  return { ...withHome, default: withHome };
+});
 vi.mock('electron', () => ({
   app: {
     getPath: (_: string) => TEST_HOME,

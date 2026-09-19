@@ -45,14 +45,18 @@ jobs:
       - name: Build renderer + main
         run: pnpm --filter @orison/desktop-shell build
 
-      # NSIS installer + latest.yml + blockmap, published straight to the
-      # GitHub Release (electron-updater feed). Release must NOT be a draft,
-      # or latest.yml is invisible to the updater.
+      # NSIS installer (x64 + arm64, arch single-sourced in electron-builder.yml)
+      # + latest.yml + blockmap, published straight to the GitHub Release
+      # (electron-updater feed). Release must NOT be a draft, or latest.yml is
+      # invisible to the updater. Bare `--win` is load-bearing: an explicit CLI
+      # target/arch list (the old `--win nsis --x64`) makes electron-builder
+      # return the raw CLI map as-is and IGNORE the per-target arch in the
+      # config, silently dropping arm64.
       - name: Build & publish NSIS installer
         working-directory: apps/desktop/client/shell
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: pnpm exec electron-builder --config electron-builder.yml --win nsis --x64 --publish always
+        run: pnpm exec electron-builder --config electron-builder.yml --win --publish always
 
       # Portable (green) build — secondary artifact, no self-update.
       - name: Build portable package
@@ -75,8 +79,11 @@ jobs:
           draft: false
           generate_release_notes: true
 
-  # macOS 在单一 runner 上一次性打包 arm64 + x64 的 dmg + zip。
-  # 两架构同一次构建产出单份 latest-mac.yml，electron-updater 自动选架构。
+  # macOS 在单一 runner 上一次性打包 arm64 + x64 的 dmg + zip（zip 备妥 electron-updater
+  # mac 更新所需 feed 形态，latest-mac.yml 引用；target/arch 单源在 electron-builder.yml）。
+  # 产物未签名（identity: null + 下方 CSC 自动发现关闭）——electron-updater 在 macOS
+  # 拒绝安装未签名构建，mac 更新链在签名落地前不可用（升级须手动下载），zip 只是
+  # feed 形态的必要非充分条件。两架构同次构建产出单份 latest-mac.yml。
   release-macos:
     runs-on: macos-latest
     steps:
@@ -118,7 +125,8 @@ jobs:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: pnpm exec electron-builder --config electron-builder.yml --mac --publish always
 
-  # Linux 在 x64 runner 上打包 AppImage（跨发行版免安装格式）。
+  # Linux 在 x64 runner 上打包 AppImage（跨发行版免安装格式；x64 + arm64 单源在
+  # electron-builder.yml，arm64 产物为理论级——预编译原料在位、无真机验证）。
   release-linux:
     runs-on: ubuntu-latest
     steps:

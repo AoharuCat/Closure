@@ -7,6 +7,10 @@ import { onFieldEdited, toggleFieldLock } from '../sync/fieldSyncBridge';
 
 const TEST_PROJECT_DIR = path.join(process.cwd(), 'test-tmp-field-sync');
 
+// 判腐隔离根钉进测试目录：quarantineRootDir 的 env 缺省回落真机 ~/.orison/quarantine，
+// 不设则每次判腐用例都在真实 home 落 project.yaml.corrupt-* 备份（测试污染）。
+process.env.ORISON_QUARANTINE_ROOT = path.join(TEST_PROJECT_DIR, 'quarantine');
+
 describe('fieldSyncBridge', () => {
   afterEach(() => {
     if (existsSync(TEST_PROJECT_DIR)) {
@@ -302,7 +306,14 @@ describe('fieldSyncBridge', () => {
 
       expect(result.quarantined).not.toBeNull();
       expect(result.quarantined!.recovered).toBe(false);
+      // CR-10：备份落点必须钉在本测试目录的隔离根内——文件顶部 ORISON_QUARANTINE_ROOT
+      // env seam 真实生效的判据（quarantineRootDir 调用时读 env），真机
+      // ~/.orison/quarantine 零触碰才有本断言。backupPath 类型含 null（隔离失败面），
+      // `?.` 使 null/前缀不符双双落到断言失败。
       expect(result.quarantined!.backupPath).toMatch(/project\.yaml\.corrupt-/);
+      expect(
+        result.quarantined!.backupPath?.startsWith(path.join(TEST_PROJECT_DIR, 'quarantine')),
+      ).toBe(true);
       expect(typeof result.quarantined!.reason).toBe('string');
       // 落盘语义不变：bootstrap 兜底重建后本字段照常写入（行为与改造前一致）。
       const loaded = loadProject(TEST_PROJECT_DIR)!;

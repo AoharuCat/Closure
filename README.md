@@ -177,9 +177,17 @@ docs/               — 架构与设计文档
 
 | 平台 | 格式 |
 |------|------|
-| Windows | `.exe` 安装包 / 免安装 `.zip` |
-| macOS | `.dmg` 磁盘映像（实验性，将陆续补传） |
-| Linux | `.AppImage` 免安装可执行（实验性，将陆续补传） |
+| Windows | `.exe` 安装包（x64 与 arm64 合一）/ 免安装 `.zip`（x64） |
+| macOS | `.dmg` 磁盘映像 + `.zip`（Apple Silicon 与 Intel） |
+| Linux | `.AppImage` 免安装可执行（x64 与 arm64） |
+
+### 已知限制
+
+- **macOS 包未签名**：Alpha 阶段无 Apple 开发者证书，首次启动会被 Gatekeeper 拦截——右键 App 选「打开」，或对解压/挂载出的 `Closure.app` 执行 `xattr -cr /Applications/Closure.app` 后再启动。
+- **macOS 自动更新不可用**：应用内自动更新在 macOS 要求构建经过签名（electron-updater 拒绝安装未签名构建）——签名落地前升级请手动下载新版安装包覆盖。
+- **arm64 产物未做真机验证**：Windows / macOS / Linux 的 arm64 包为理论可用（原生模块的 arm64 预编译均已在位），但我们手上没有 arm64 实机——遇到问题请[提 Issue](../../issues) 附平台与机型信息。
+- **Linux 首选 AppImage**：免安装、无发行版包管理器耦合；deb/rpm 等格式暂未提供。
+- **CI 已覆盖三平台机械验证**：全仓测试与启动冒烟（Electron 拉起到首帧）在 Windows / macOS / Linux CI 逐平台运行；日常使用的功能实测重心仍在 Windows——其他平台遇到平台相关问题请[提 Issue](../../issues)。
 
 ## 使用指南
 
@@ -209,10 +217,6 @@ docs/               — 架构与设计文档
 - [x] 拆书引擎（通用摄取、经验蒸馏、小说拆解）
 - [x] Antigravity CLI 接入（Gemini 直连 + 对话工具桥）
 - [x] 用量面板与模型自动回退链
-
-### 进行中
-
-- [ ] 真实创作全流程实测（写实章第二轮收尾）
 
 ### 规划中
 

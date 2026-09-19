@@ -1,5 +1,4 @@
 import { createHash } from 'node:crypto';
-import path from 'node:path';
 import { rmBestEffort } from './rmBestEffort';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Material } from '@orison/shared-contracts';
@@ -15,8 +14,14 @@ import type { DeconProgressEvent } from '@orison/shared-contracts';
 // 三 checkpoint 到点暂停→approve-review 续跑零重付 + craft 闸门前置（coarse 不空停）+
 // 维度×档位序列矩阵（buildDeconPhaseSteps 纯函数）。ABI 门控 + throwaway home。
 
-const TEST_HOME = path.join(process.cwd(), 'test-tmp-decon-ipc');
+const TEST_HOME = vi.hoisted(() => process.cwd() + (process.platform === 'win32' ? '\\' : '/') + 'test-tmp-decon-ipc');
 
+// home 单源 = os.homedir()：与 electron getPath mock 同一 TEST_HOME——真 ~/.orison 零触碰。
+vi.mock('node:os', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:os')>();
+  const withHome = { ...actual, homedir: () => TEST_HOME };
+  return { ...withHome, default: withHome };
+});
 vi.mock('electron', () => ({
   app: {
     getPath: (_: string) => TEST_HOME,

@@ -93,6 +93,28 @@ describe('novel project repository', () => {
     expect(content).toBeNull();
   });
 
+  it('loadChapterMarkdown CRLF 章文读出 LF（外部编辑器行尾归一，多 OS R3）', () => {
+    const project = createEmptyProjectDocument('CRLF Test');
+    const withNovel = {
+      ...project,
+      novel: {
+        chapters: [
+          { id: 'ch_001', title: '第1章', sort_order: 0, sections: [{ id: 'ch_001_s1', sort_order: 0, content_file: 'chapters/ch_001.md' }] },
+        ],
+      },
+    };
+    saveProject(TEST_PROJECT_DIR, withNovel as any);
+
+    const mdDir = path.join(TEST_PROJECT_DIR, 'chapters');
+    mkdirSync(mdDir, { recursive: true });
+    // 外部编辑器（Windows 记事本系）CRLF 存盘形态——归一后 \r 不进同步链。
+    writeFileSync(path.join(mdDir, 'ch_001.md'), '第一段\r\n第二段\r\n', 'utf8');
+
+    const content = loadChapterMarkdown(TEST_PROJECT_DIR, 'chapters/ch_001.md');
+
+    expect(content).toBe('第一段\n第二段\n');
+  });
+
   it('acceptChapterCandidate 写入 markdown 并更新 chapter 元数据', () => {
     const project = createEmptyProjectDocument('Accept Test');
     const withNovel = {
@@ -265,5 +287,15 @@ describe('acceptChapterCandidate 覆写保序（#107 check 批）', () => {
     });
     const md = readFileSync(path.join(TEST_PROJECT_DIR, 'chapters/第01章-旧章.md'), 'utf8');
     expect(md).toBe('# 新标题\n\n新正文。');
+  });
+
+  it('外编 CRLF 旧章 → 回拼落盘纯 LF（读侧归一，\\r 零残留）', () => {
+    seedProjectWithChapterFile('---\r\norder: 0\r\n---\r\n\r\n# 旧章\r\n\r\n旧正文。');
+    acceptChapterCandidate(TEST_PROJECT_DIR, '第01章-旧章', 'run_fm4', {
+      content: '# 新标题\n\n新正文。',
+    });
+    const md = readFileSync(path.join(TEST_PROJECT_DIR, 'chapters/第01章-旧章.md'), 'utf8');
+    expect(md).toBe('---\norder: 0\n---\n# 新标题\n\n新正文。');
+    expect(md.includes('\r')).toBe(false);
   });
 });

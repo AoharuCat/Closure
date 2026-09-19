@@ -6,8 +6,14 @@ import type { ChapterStateSummary } from '@orison/shared-contracts';
 
 // Point the SQLite registry at a throwaway home so the real ~/.orison db is
 // never touched (mirror mentionLedgerRepository.test.ts).
-const TEST_HOME = path.join(process.cwd(), 'test-tmp-mention-degrade');
+const TEST_HOME = vi.hoisted(() => process.cwd() + (process.platform === 'win32' ? '\\' : '/') + 'test-tmp-mention-degrade');
 
+// home 单源 = os.homedir()：与 electron getPath mock 同一 TEST_HOME——真 ~/.orison 零触碰。
+vi.mock('node:os', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:os')>();
+  const withHome = { ...actual, homedir: () => TEST_HOME };
+  return { ...withHome, default: withHome };
+});
 vi.mock('electron', () => ({
   app: {
     getPath: (_: string) => TEST_HOME,
@@ -192,5 +198,29 @@ describe('chapterIdOfChapterFilePath（chapters/ 目录路径检测）', () => {
     expect(chapterIdOfChapterFilePath(path.join(root, 'chapters', 'notes.txt'), root)).toBeUndefined();
     expect(chapterIdOfChapterFilePath(path.join('/other', 'chapters', 'a.md'), root)).toBeUndefined();
     expect(chapterIdOfChapterFilePath(path.join(root, 'chapters'), root)).toBeUndefined();
+  });
+});
+
+// ── chapterIdOfChapterFilePath — 前缀比较大小写归一（CR-5/FS#9；范式 pathGuard）──
+// 判据按平台分叉：门 = 非 linux（win32 NTFS + macOS APFS 默认都不区分大小写），
+// 非 linux 门测试在 Windows 本机/win CI 与 mac CI 跑；linux 门测试在 ubuntu CI 跑，
+// 两侧合起来钉死「非 linux 归一 / linux 敏感」的完整语义。
+
+describe.skipIf(process.platform === 'linux')('chapterIdOfChapterFilePath — 非 linux（win32/APFS）大小写归一比较', () => {
+  it('chapters 目录大小写漂移（Chapters）仍命中，降档不再静默跳过', () => {
+    const root = 'C:\\proj';
+    expect(chapterIdOfChapterFilePath('C:\\proj\\Chapters\\ch_001.md', root)).toBe('ch_001');
+  });
+
+  it('projectRoot 大小写漂移（c:\\PROJ）同样命中；stem 保持原大小写（不随比较归一小写化）', () => {
+    expect(chapterIdOfChapterFilePath('C:\\proj\\chapters\\Ch_001.md', 'c:\\PROJ')).toBe('Ch_001');
+  });
+});
+
+describe.skipIf(process.platform !== 'linux')('chapterIdOfChapterFilePath — linux 保持大小写敏感', () => {
+  it('Chapters ≠ chapters（大小写敏感语义不随非 linux 修复漂移）', () => {
+    const root = path.join('/', 'p', 'proj');
+    expect(chapterIdOfChapterFilePath(path.join(root, 'Chapters', 'ch_001.md'), root)).toBeUndefined();
+    expect(chapterIdOfChapterFilePath(path.join(root, 'chapters', 'ch_001.md'), root)).toBe('ch_001');
   });
 });

@@ -1,6 +1,7 @@
 import { readdirSync } from 'node:fs';
 import path from 'node:path';
 import type { SaveBase64ImageInput } from '@orison/shared-contracts';
+import { sanitizeDiskName } from '@orison/shared-contracts/fs/naming';
 import { assertWithinProject } from './pathGuard';
 
 export type FileEntry = {
@@ -82,8 +83,9 @@ export function buildProjectPath(projectDir: string, relativePath: string): stri
 }
 
 function sanitizeFileName(value: string): string {
-  // eslint-disable-next-line no-control-regex
-  const sanitized = value.replace(/[<>:"/\\|?*\x00-\x1F]/g, '-').replace(/\s+/g, '-').slice(0, 80);
+  // 空白折叠保留（图片名观感惯例，既有行为）；非法/控制字符、结尾点空格、保留名
+  // （'-doc' 后缀）、80 长度帽统一走命名单源（W2 R1 / FS#8——显式传名 `con` 不再落 con.png）。
+  const sanitized = sanitizeDiskName(value.replace(/\s+/g, '-'));
   return sanitized || 'image';
 }
 

@@ -20,11 +20,17 @@ import type {
 // 全部 fixture 自制样文（AC11 版权红线）。
 // ─────────────────────────────────────────────────────────────────────────────
 
-const TEST_HOME = path.join(process.cwd(), 'test-tmp-craft-subtitle-e2e');
+const TEST_HOME = vi.hoisted(() => process.cwd() + (process.platform === 'win32' ? '\\' : '/') + 'test-tmp-craft-subtitle-e2e');
 const MATERIALS_ROOT = path.join(TEST_HOME, '.orison', 'materials');
 
 const state = vi.hoisted(() => ({ embedModel: null as ResolvedModel | null }));
 
+// home 单源 = os.homedir()：与 electron getPath mock 同一 TEST_HOME——真 ~/.orison 零触碰。
+vi.mock('node:os', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:os')>();
+  const withHome = { ...actual, homedir: () => TEST_HOME };
+  return { ...withHome, default: withHome };
+});
 vi.mock('electron', () => ({
   app: {
     getPath: (_: string) => TEST_HOME,

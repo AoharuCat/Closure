@@ -20,6 +20,8 @@ describe('preload security surface', () => {
       'applyAgentFieldPatch',
       'applyAuthorProfileNote',
       'canaryProbeVision',
+      // 拆书链：章标派生状态读 + 失败章重取（closureChain 两 invoke）。
+      'chapterDerivationStatus',
       'checkForUpdate',
       'clearWallpaper',
       'close',
@@ -155,6 +157,7 @@ describe('preload security surface', () => {
       'pickProjectDirectory',
       'platform',
       'probeResearchDocParser',
+      'reExtractChapter',
       'readDirectory',
       'readFile',
       'readFileBinary',

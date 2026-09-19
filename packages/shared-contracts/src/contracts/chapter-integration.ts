@@ -1,5 +1,6 @@
 import type { StoryDecision } from './story-decision';
 import { wouldChapterLandAtOrder, type ChapterOrderingEntry } from './chapter-ordering';
+import { sanitizeDiskName } from '../fs/naming';
 
 // ── Story 4.1 Step 4：chapter-integration 持久化（CR-15b）共享纯函数 ──
 //
@@ -291,17 +292,22 @@ export function countChaptersAtSortOrder(
 
 /** 章标题 → 文件名安全段（Windows 非法字符清洗；中文标题友好——ASCII 白名单折叠会毁掉整题）。 */
 export function sanitizeChapterStemSegment(title: string): string {
-  return title
-    // Windows 文件名非法字符（<>:"/\|?*）+ 控制字符 + 换行 → 剔除（不替换占位符：中文标题可读性优先；
-    // 对照 writer-node archiveDirName 的 `[^a-zA-Z0-9_-]` 折叠——那里的输入是 ASCII episodeId，此处是章节标题）。
-    .replace(/[<>:"/\\|?*\x00-\x1f]/g, '')
-    // 连续空白折叠 + 去首尾（标题内换行/多空格不应变成文件名里的怪形态）。
-    .replace(/\s+/g, ' ')
-    .trim()
-    // Windows 不允许文件名以点/空格结尾。
-    .replace(/[. ]+$/, '')
-    // 长度上限：深项目路径 + 长标题会顶 Windows MAX_PATH（260）；40 字符对章节标题绰绰有余。
-    .slice(0, 40);
+  return sanitizeDiskName(
+    title
+      // Windows 文件名非法字符（<>:"/\|?*）+ 控制字符 + 换行 → 剔除（不替换占位符：中文标题可读性优先；
+      // 对照 writer-node archiveDirName 的 `[^a-zA-Z0-9_-]` 折叠——那里的输入是 ASCII episodeId，此处是章节标题）。
+      .replace(/[<>:"/\\|?*\x00-\x1f]/g, '')
+      // 连续空白折叠 + 去首尾（标题内换行/多空格不应变成文件名里的怪形态）。
+      .replace(/\s+/g, ' ')
+      .trim()
+      // Windows 不允许文件名以点/空格结尾。
+      .replace(/[. ]+$/, ''),
+    // 命名单源收尾（W2 R1 / FS#6）：保留名 '-doc' 后缀（插首点前，CON → CON-doc、CON.x →
+    // CON-doc.x——与 sanitizeDiskName 同语义）+ 40 长度帽（MAX_PATH 理由不变，**帽保持 40 不换
+    // 默认 80**）+ 截断后尾点/空格复修。入串经上方清洗已无非法/控制字符，单源的替换面对它
+    // 是 no-op——只叠加保留名与帽语义，既有删除式清洗语义与全部既有用例不变。
+    { maxLength: 40 },
+  );
 }
 
 /** planAutoCreateChapter 判定输入（入口层各自从已加载 project 数据 + summary 组装）。 */

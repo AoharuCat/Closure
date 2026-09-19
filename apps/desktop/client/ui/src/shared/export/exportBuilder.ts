@@ -1,3 +1,5 @@
+import { sanitizeDiskName } from '@orison/shared-contracts/fs/naming';
+
 export type ChapterManuscript = {
   title: string;
   body: string;
@@ -7,7 +9,10 @@ const FRONTMATTER_RE = /^---\s*\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/;
 const LEADING_HEADING_RE = /^#\s+(.+?)\s*#*\s*(?:\r?\n|$)/;
 
 export function exportFilename(projectName: string | undefined, ext: string): string {
-  const base = (projectName ?? 'export').replace(/[\\/:*?"<>|]/g, '_').trim() || 'export';
+  // 命名单源（W2 R1 / FS#7）：非法/控制字符 → '-'、结尾点空格剔除、保留名 '-doc' 后缀
+  // （`con` → `con-doc-<date>.txt`）、80 长度帽——此前只挡非法字符（占位 '_'）且未挡
+  // 保留名/控制字符。入串先 trim（sanitize 只修结尾，不吃前导空白）；清成空退 'export'。
+  const base = sanitizeDiskName((projectName ?? 'export').trim()).trim() || 'export';
   const date = new Date().toISOString().slice(0, 10);
   return `${base}-${date}.${ext}`;
 }
