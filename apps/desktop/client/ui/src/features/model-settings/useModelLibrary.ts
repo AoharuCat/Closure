@@ -6,6 +6,7 @@ import type {
 } from '@orison/shared-contracts';
 import { discoverCliModels, loadRemoteModels } from '../../shared/api/generation';
 import { useAppStore } from '../../shared/store/appStore';
+import { useToastStore } from '../../shared/store/toastStore';
 import {
   draftCustomHeadersRecord,
   draftToKey,
@@ -58,6 +59,7 @@ type Args = {
 
 export function useModelLibrary({ modelConfig, setModelConfig, t }: Args): ModelLibraryState & ModelLibraryActions {
   const appendOutputEntry = useAppStore((s) => s.appendOutputEntry);
+  const showToast = useToastStore((s) => s.showToast);
   const [draft, setDraft] = useState<KeyDraft>(emptyKeyDraft());
   const [remoteModels, setRemoteModels] = useState<RemoteModel[]>([]);
   const [refreshing, setRefreshing] = useState(false);
@@ -121,7 +123,7 @@ export function useModelLibrary({ modelConfig, setModelConfig, t }: Args): Model
 
     // CLI 形态的判别载荷守卫（schema min(1) 的 UI 前置——空路径的键保存必被拒）。
     if (draft.protocol === 'antigravity-cli' && !draft.cliExecutable.trim()) {
-      setNotice(t('settings.cliExecutableMissing'));
+      rejectApply(t('settings.cliExecutableMissing'));
       return;
     }
 
@@ -129,14 +131,14 @@ export function useModelLibrary({ modelConfig, setModelConfig, t }: Args): Model
     //（silent no-op），必须响亮拦截（本地化文案带字段/模型名）。
     const issue = findKeyDraftIssue(draft);
     if (issue) {
-      setNotice(t(issue.key, issue.vars));
+      rejectApply(t(issue.key, issue.vars));
       return;
     }
 
     const newKey = draftToKey(draft, id);
 
     if (newKey.models.length === 0) {
-      setNotice(t('settings.noModelsWarning'));
+      rejectApply(t('settings.noModelsWarning'));
       return;
     }
 
@@ -152,6 +154,7 @@ export function useModelLibrary({ modelConfig, setModelConfig, t }: Args): Model
     //（config:save-model 面 modelConfigSaveSchema.parse：header 名域/blocklist/数值域/
     // CLI 形态互斥）未处理 = unhandled promise rejection，用户看不到任何反馈。现在落
     // notice（本地化兜底文案）+ 输出日志（原始 zod detail 可诊断）。
+    // R10：同走 rejectApply——壳侧 schema 拒收与本地前置校验同属「应用被拒」，都要可见。
     try {
       await setModelConfig({ ...modelConfig, keys: updatedKeys });
     } catch (error) {
@@ -162,7 +165,7 @@ export function useModelLibrary({ modelConfig, setModelConfig, t }: Args): Model
         message: 'Model config save rejected',
         detail: message,
       });
-      setNotice(t('settings.modelSaveRejected'));
+      rejectApply(t('settings.modelSaveRejected'));
       return;
     }
     setDraft(keyToDraft(newKey));
@@ -333,6 +336,18 @@ export function useModelLibrary({ modelConfig, setModelConfig, t }: Args): Model
 
   function dismissNotice() {
     setNotice(null);
+  }
+
+  /**
+   * R10（dogfood F14）：保存被拒必须「看得见」。既有通道只有 notice 条——它渲染在编辑器
+   * 顶部，而「应用」钮在编辑器底部：编辑器比视口长时，提示条落在视口外，用户看到的就是
+   * 「点了应用什么也没发生」（真机：温度越界被拦下、文件未变、零提示），无法区分「值非法」
+   * 与「保存坏了」。notice 保留（持久、可关闭、可回看），另经 toast 通道（本页
+   * AgyBridgeSection 的失败提示同款）给即时可见反馈——两处同文案，同一拒绝事实。
+   */
+  function rejectApply(message: string): void {
+    setNotice(message);
+    showToast(message, 'error');
   }
 
   return {

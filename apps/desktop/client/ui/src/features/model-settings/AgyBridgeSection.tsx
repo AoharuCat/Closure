@@ -14,12 +14,23 @@ import { fetchAgyBridgeStatus, revokeAgyBridge, setAgyBridgeConsent } from '../.
  * - 「立即授权」：设置面自含披露摘要（副标题 + 各态提示行），点击直写同意；declined
  *   态文案说明纯文本降级后果 + 「重新授权」翻转（design §4.3：设置页可翻转重询）。
  * - 「关闭工具桥」（仅 ok 态）：confirm（danger）→ revoke——活动桥会话存在 →
- *   'active-sessions' 提示先结束会话；成功 = 状态翻回未配置（真实全局零写入，无条目
- *   移除面）。挂载即拉状态（shell 每次现读，用户手改 agy settings 即时反映）。
+ *   'active-sessions' 提示如实说明释放条件（会话闲置超时后自动回收，见
+ *   BRIDGE_SESSION_IDLE_TTL_MINUTES；R11：不再给「先结束对话」这一做不到的指引）；
+ *   成功 = 状态翻回未配置（真实全局零写入，无条目移除面）。挂载即拉状态（shell 每次
+ *   现读，用户手改 agy settings 即时反映）。
  *
  * 独立组件本地 state（mirror UsageSettingsPage 形态：machine 级瞬态读面，不建 slice）。
  */
 type Props = { t: (key: string, vars?: Record<string, string | number>) => string };
+
+/**
+ * 桥会话 idle 回收阈值（分钟）——shell 侧常量 `BRIDGE_SESSION_IDLE_TTL_MS`
+ *（`apps/desktop/client/shell/main/ipc/agyBridge.ts`，默认 30min，60s 清扫一次）的 UI 镜像：
+ *「关闭工具桥」被活动会话拦下时，提示必须如实说出真正的释放条件（闲置超时自动回收），
+ * 所以这个数只能跟着 TTL 走——改 TTL 时两处同步校准（对称 AgyBridgeConsentDialog 的
+ * AGY_GEMINI_COPY_SIZE_HINT_MB 同注同源先例），不在文案里手抄数字。
+ */
+export const BRIDGE_SESSION_IDLE_TTL_MINUTES = 30;
 
 const STATE_CHIP_CLASS: Record<AgyBridgeConsentState, string> = {
   ok: 'is-ok',
@@ -101,7 +112,15 @@ export function AgyBridgeSection({ t }: Props) {
         return;
       }
       if (!result.ok && result.error === 'active-sessions') {
-        showToast(t('agyBridge.revokeActiveSessions', { n: result.activeSessions.length }), 'warning');
+        // R11（dogfood F15）：释放条件是 idle TTL（会话闲置超时自动回收），不是「对话结束」——
+        // 旧文案指引用户「先结束相关对话」，照做仍关不掉（真机复现）。文案如实说释放条件。
+        showToast(
+          t('agyBridge.revokeActiveSessions', {
+            n: result.activeSessions.length,
+            minutes: BRIDGE_SESSION_IDLE_TTL_MINUTES,
+          }),
+          'warning',
+        );
         return;
       }
       if (!result.ok && result.error === 'operation-failed') {

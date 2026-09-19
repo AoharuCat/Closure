@@ -139,7 +139,7 @@ export function registerBuiltinTools() {
   // route + revision loop) via ctx.skillExecutor.runChapterChain. Mirrors
   // spawn_agent's local-tool-with-runtime pattern. PermissionService DEFAULT_RULES
   // `^write_` → 'ask' (user confirms before generation). Story 4.1 Step 5 wires
-  // the leader interactive trigger (DEFAULT_ORISON_PROMPT write_chapter guidance +
+  // the leader interactive trigger (DEFAULT_CLOSURE_PROMPT write_chapter guidance +
   // ChapterListPanel「生成」button → sendAgentMessage → leader runLoop); E3 will
   // build the full workbench horizontal surface (校验议题进 chat / chat-fatigue).
   registry.register(writeChapterTool);
@@ -984,7 +984,7 @@ export function registerBuiltinTools() {
       author: z.object({
         name: z.string(),
         email: z.string(),
-      }).optional().describe('Commit author (defaults to Orison Agent)'),
+      }).optional().describe('Commit author (defaults to Closure Agent)'),
     }),
   }));
 
@@ -1107,7 +1107,7 @@ export function registerBuiltinTools() {
   // shell createWorkflowRuntime() 空参无 externalSkillRoots（agentIpc.ts:69），.orison/agents/
   // 是项目级用户目录——无 app 级 agents root 可挂 → prompts/researcher-agent.yaml（ADR-4 单契约源）
   // + runAgentWithExplicitSystem allowedTools 白名单（研究只读工具，无写权限）。
-  // 快查（单点事实）leader 直调 wiki_*/web_* 工具，不经此 tool（DEFAULT_ORISON_PROMPT Research 段）。
+  // 快查（单点事实）leader 直调 wiki_*/web_* 工具，不经此 tool（DEFAULT_CLOSURE_PROMPT Research 段）。
   registry.register(dispatchResearcherTool);
 
   // ── Story 8.6 R7（design D10/D11）：冷启动规划派发两工具（local tool）──

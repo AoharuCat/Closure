@@ -901,6 +901,17 @@ describe('system prompt（立场段前置共用 + 各 kind 输出骨架）', () 
     expect(DECON_P5_BOOK_GROUP_SYSTEM_PROMPT).toContain('照抄输入章标对照表里的章标原词');
   });
 
+  it('反工具硬化行随立场段覆盖三 kind 与分组骨架', () => {
+    for (const p of [
+      DECON_P5_BOOK_SYSTEM_PROMPT,
+      DECON_P5_CHAPTER_SYSTEM_PROMPT,
+      DECON_P5_SCENE_SYSTEM_PROMPT,
+      DECON_P5_BOOK_GROUP_SYSTEM_PROMPT,
+    ]) {
+      expect(p).toContain('不要使用任何工具（联网搜索、命令执行、浏览器等）');
+    }
+  });
+
   it('网文语境 grep 守卫（零古典例零学院名号零反向禁令——feedback-webnovel-framing-no-classical）', () => {
     const bookUser = buildDeconBookReadingUserPrompt({
       bookTitle: '输出测试小说',

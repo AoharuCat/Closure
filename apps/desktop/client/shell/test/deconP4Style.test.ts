@@ -464,6 +464,8 @@ describe('DECON_P4_STYLE_SYSTEM_PROMPT（网文语境 + 三代码节不进 LLM �
       expect(DECON_P4_STYLE_SYSTEM_PROMPT).toContain(key);
     }
     expect(DECON_P4_STYLE_SYSTEM_PROMPT).toContain('机械统计、节选、附录三节由系统生成');
+    // 反工具硬化行：纯文本车道调内置工具会被无头权限拒收，整回合拖成空响应。
+    expect(DECON_P4_STYLE_SYSTEM_PROMPT).toContain('不要使用任何工具（联网搜索、命令执行、浏览器等）');
     // 网文语境 grep 守卫（feedback-webnovel-framing-no-classical）——标题声明的守卫实体化：
     // 零古典例零学院名号零反向禁令（mirror deconP5Output.test 的 corpus 守卫）。
     expect(DECON_P4_STYLE_SYSTEM_PROMPT).not.toMatch(

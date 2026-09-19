@@ -35,6 +35,7 @@ import {
   reindexCraftDelete,
   reindexAllCraft,
   scanAndReindexCraftKb,
+  getCurrentCraftVecDim,
   EMBED_DIM,
 } from '../main/db/closureCraftIndexer';
 import { floatArrayToBuffer } from '../main/db/closureIndexer';
@@ -575,6 +576,94 @@ describe.skipIf(!sqliteUsable)('closureCraftIndexer Story 8.7 S4 (summary layer 
     expect(
       (db.prepare('SELECT COUNT(*) AS n FROM closure_craft_vec WHERE craft_id=?').get('s7del') as { n: number }).n,
     ).toBe(0);
+  });
+});
+
+// ── dogfood R4 F1：reindexAllCraft 结构维度自愈（无文件无卡也先修表再早退）──
+// 事故形态：craft KB 零文档零卡，closure_craft_entry 里只有全局材料车道共栖的
+// material_chunk 行；旧模型遗留维度（initSchema 缺省 float[1024]）遇上 4096 新模型——
+// 旧实现的空库早退跳过整段结构重建，材料行重嵌永被维度门拒收，降级横幅常驻。
+describe.skipIf(!sqliteUsable)('reindexAllCraft structural dim repair (dogfood R4 F1)', () => {
+  beforeAll(clean);
+  afterAll(clean);
+
+  const MAT_CRAFT_ID = 'mat:mat-f067201a6b6a.ch0#c0';
+
+  function vecOf(dim: number, slot = 0): number[] {
+    const v = new Array(dim).fill(0);
+    v[slot] = 1;
+    return v;
+  }
+
+  /** 造一行「旧模型时代已落向量」的材料 chunk 行（model + content_hash 齐——清 hash UPDATE 的靶子）。 */
+  function seedMaterialChunkRow(db: ReturnType<typeof getDb>): void {
+    db.prepare(
+      `INSERT INTO closure_craft_entry
+         (craft_id, craft_type, source_kind, name, body_text, content_hash, model, dim)
+       VALUES (?,?,?,?,?,?,?,?)`,
+    ).run(MAT_CRAFT_ID, 'uncategorized', 'material_chunk', '材料 chunk', '正文样例', 'a'.repeat(64), 'old-embed-1024', 1024);
+  }
+
+  function craftVecTableSql(db: ReturnType<typeof getDb>): string | undefined {
+    return (
+      db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='closure_craft_vec'").get() as
+        | { sql: string }
+        | undefined
+    )?.sql;
+  }
+
+  it('无文件无卡 + 表维度不符 → 先重建表到探测维度再早退；清 hash UPDATE 连带材料 chunk 行', async () => {
+    if (!isSqliteVecAvailable()) return; // vec0 gate
+    const db = getDb();
+    // 前置：craft KB 真空（bundled seeds 不存在的环境事实，显式钉住）；表在旧维度。
+    expect(listCraftMdFiles()).toHaveLength(0);
+    expect(getCurrentCraftVecDim(db)).toBe(1024);
+    seedMaterialChunkRow(db);
+
+    const result = await reindexAllCraft({
+      resolveModel: () => stubModel(),
+      embed: async () => vecOf(4096),
+    });
+
+    // 结构事件如实回报；reindexed 恒 0（无 craft 文档可枚举）。
+    expect(result).toEqual({ reindexed: 0, dimChanged: true, newDim: 4096, cardsReembedded: 0 });
+    // 表重建到探测维度 + 多向量 DDL 形态（内嵌 CREATE 与 initSchema 三处同步纪律）。
+    const sql = craftVecTableSql(db)!;
+    expect(sql).toContain('float[4096]');
+    expect(sql).toContain('vector_id TEXT PRIMARY KEY');
+    expect(sql).toContain('vector_kind');
+    // 清 hash UPDATE 连带材料行：旧模型时代落过向量的行回到 pending（重嵌补回语义）。
+    const row = db
+      .prepare('SELECT content_hash, model FROM closure_craft_entry WHERE craft_id=?')
+      .get(MAT_CRAFT_ID) as { content_hash: string | null; model: string };
+    expect(row.content_hash).toBeNull();
+    expect(row.model).toBe('old-embed-1024'); // 只清 hash，不动记账列
+  });
+
+  it('维度一致且表在 → 不重建零写零清（空库不空轮 DROP，历史返回形态原样）', async () => {
+    if (!isSqliteVecAvailable()) return; // vec0 gate
+    const db = getDb();
+    expect(getCurrentCraftVecDim(db)).toBe(1024);
+    seedMaterialChunkRow(db);
+    const sqlBefore = craftVecTableSql(db);
+
+    let embedCalls = 0;
+    const result = await reindexAllCraft({
+      resolveModel: () => stubModel(),
+      embed: async () => {
+        embedCalls++;
+        return vecOf(1024);
+      },
+    });
+
+    expect(result).toEqual({ reindexed: 0, dimChanged: false, newDim: null, cardsReembedded: 0 });
+    // 探测照跑（维度一致性只能实测）——但表零重建、行零清。
+    expect(embedCalls).toBe(1);
+    expect(craftVecTableSql(db)).toBe(sqlBefore);
+    const row = db
+      .prepare('SELECT content_hash FROM closure_craft_entry WHERE craft_id=?')
+      .get(MAT_CRAFT_ID) as { content_hash: string | null };
+    expect(row.content_hash).toHaveLength(64);
   });
 });
 

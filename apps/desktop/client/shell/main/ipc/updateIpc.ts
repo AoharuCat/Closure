@@ -16,9 +16,9 @@ function getAutoUpdater(): AutoUpdater {
   return cachedAutoUpdater;
 }
 
-// 更新源（08-28 快速发布回填）：GitHub 公仓 chillison/Closure Releases。检查/下载/
+// 更新源（08-28 快速发布回填）：GitHub 公仓 AoharuCat/Closure Releases。检查/下载/
 // releases 页跳转链路自此恢复；electron-builder.yml 的 publish 段已同步回填。
-const UPDATE_REPO: { owner: string; repo: string } = { owner: 'chillison', repo: 'Closure' };
+const UPDATE_REPO: { owner: string; repo: string } = { owner: 'AoharuCat', repo: 'Closure' };
 
 function releasesPage(): string {
   return UPDATE_REPO ? `https://github.com/${UPDATE_REPO.owner}/${UPDATE_REPO.repo}/releases/latest` : '';

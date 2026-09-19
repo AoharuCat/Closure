@@ -17,6 +17,10 @@ describe('preload security surface', () => {
       'agyBridgeRevoke',
       'agyBridgeSetConsent',
       'agyBridgeStatus',
+      // 09-19 CLI 白名单（W3）：Closure 文本 Agent 状态面三通道。
+      'agyTextAgentDisable',
+      'agyTextAgentEnable',
+      'agyTextAgentStatus',
       'applyAgentFieldPatch',
       'applyAuthorProfileNote',
       'canaryProbeVision',
@@ -24,6 +28,9 @@ describe('preload security surface', () => {
       'chapterDerivationStatus',
       'checkForUpdate',
       'clearWallpaper',
+      // 09-19 dogfood R4：CLI 凭据探针两通道（读最近结果 / 手动重测）。
+      'cliProbeRun',
+      'cliProbeStatus',
       'close',
       'compactAgentSession',
       'compileRevisionIntent',

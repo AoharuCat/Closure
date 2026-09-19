@@ -74,7 +74,7 @@ if (git('status', '--porcelain') !== '') die('工作树不干净——先 commit
 
 // public remote 已配置（CR-08-29-005：未配置时给可操作指引而非裸堆栈）
 if (!git('remote').split('\n').map((r) => r.trim()).includes(PUBLIC_REMOTE)) {
-  die(`remote "${PUBLIC_REMOTE}" 未配置——先 git remote add ${PUBLIC_REMOTE} https://github.com/chillison/Closure.git`);
+  die(`remote "${PUBLIC_REMOTE}" 未配置——先 git remote add ${PUBLIC_REMOTE} https://github.com/AoharuCat/Closure.git`);
 }
 
 // 交互确认可读（CR-08-29-005：非 TTY 无 --yes 会挂在 readFileSync(0)）

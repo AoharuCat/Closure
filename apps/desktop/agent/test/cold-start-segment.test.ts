@@ -11,18 +11,18 @@ vi.mock('../src/skill/discovery', () => ({
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Story 8.6 Step 4：创作管线能力段〔九要点静态段〕+ 流程雷达三态段 + 偏好分档行 +
-// 8.5 弧段 arc_timing 分档 + 作者档案行三态 + DEFAULT_ORISON_PROMPT 订正（D12）。
+// 8.5 弧段 arc_timing 分档 + 作者档案行三态 + DEFAULT_CLOSURE_PROMPT 订正（D12）。
 //
 // 测试方法：loader / 快照构建函数非 exported → 经 sendMessage end-to-end 验。system 稳定化
 // （09-12）+ CR-D1 拆分（09-13）后：静态能力段（管线九要点 / 风格卡 / 弧段 timing 双态行 /
 // autonomy 契约）回 system 恒定区尾（buildMainRunConfig 拼 `---` 块——capabilityOnly 隔离断言）；
 // 注记（kind='session_state_note'，user-role，`<session_state readonly="true">` 包裹）= 纯动态
 // 状态快照（雷达 / 偏好分档行 / 弧段档位真值行 / 档案行）。generate mock 2 参回调：
-// (system, note) 双面断言。DEFAULT_ORISON_PROMPT 静态文本仍断 system。档案路径经
+// (system, note) 双面断言。DEFAULT_CLOSURE_PROMPT 静态文本仍断 system。档案路径经
 // _setAuthorProfilePathForTest 钉到临时目录（真 ~/.orison 永不被测试触碰 + 断言确定性）。
 //
 // ⚠ runLoop 会把工具描述追加进 generate 收到的 system（appendToolDescriptions '# Available Tools'
-// 段）。DEFAULT_ORISON_PROMPT 的否定断言（not.toContain）仍在 prompt+segments 隔离段
+// 段）。DEFAULT_CLOSURE_PROMPT 的否定断言（not.toContain）仍在 prompt+segments 隔离段
 //（split '# Available Tools'）上做，防工具描述误报；注记消息不含工具描述，否定断言直接上
 // note.content。
 // ─────────────────────────────────────────────────────────────────────────────
@@ -84,14 +84,14 @@ describe('Story 8.6 — 创作管线能力段 + 流程雷达三态 + 弧段 arc_
 
   /**
    * 静态能力段隔离（CR-D1 拆分）：capability 段 = system 尾 `---` 块（buildMainRunConfig 拼），
-   * 剥 DEFAULT_ORISON_PROMPT / path 行 / skills 与 runLoop 追加的工具描述——能力段断言打在此段。
+   * 剥 DEFAULT_CLOSURE_PROMPT / path 行 / skills 与 runLoop 追加的工具描述——能力段断言打在此段。
    */
   function capabilityOnly(system: string): string {
     return promptOnly(system).split('\n\n---\n').pop() ?? '';
   }
 
   /**
-   * 跑一轮对话，generate mock 断言。1 参 system = 恒定区（DEFAULT_ORISON_PROMPT / path 行 /
+   * 跑一轮对话，generate mock 断言。1 参 system = 恒定区（DEFAULT_CLOSURE_PROMPT / path 行 /
    * 引导行 / skills / 静态能力段〔CR-D1 拆分回system〕/ 工具描述），2 参 note = session_state_note
    * 注记（纯动态状态快照：雷达 / 偏好行 / 档案行；turn 开始 hash 门追加——首轮必发一条）。
    * 档案路径默认钉到临时项目目录（缺文件 = 合法空档案）；configure 可改写 override（degraded /
@@ -511,10 +511,10 @@ describe('Story 8.6 — 创作管线能力段 + 流程雷达三态 + 弧段 arc_
     });
   });
 
-  // ── DEFAULT_ORISON_PROMPT 订正（D12：Project Structure 换 Closure 实际；relay 句扩指管线段）──
-  // 本组断言面在 system 恒定区（DEFAULT_ORISON_PROMPT 静态文本）——不随状态注记迁移。
+  // ── DEFAULT_CLOSURE_PROMPT 订正（D12：Project Structure 换 Closure 实际；relay 句扩指管线段）──
+  // 本组断言面在 system 恒定区（DEFAULT_CLOSURE_PROMPT 静态文本）——不随状态注记迁移。
 
-  it('DEFAULT_ORISON_PROMPT：story-memory.yaml 零残留 + Closure 实际结构三行 + relay 句扩指管线段', async () => {
+  it('DEFAULT_CLOSURE_PROMPT：story-memory.yaml 零残留 + Closure 实际结构三行 + relay 句扩指管线段', async () => {
     writeProjectYaml({ name: 'Test' });
     await runTurn((system) => {
       const prompt = promptOnly(system);

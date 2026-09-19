@@ -43,6 +43,8 @@
 @import "../../features/usage/usage.css";
 @import "../../features/agent-panel/agy-bridge-consent.css";
 @import "../../features/model-settings/agy-bridge.css";
+@import "../../features/model-settings/agy-probe.css";
+@import "../../features/model-settings/agy-text-agent.css";
 
 /* ── Reset ── */
 #root {

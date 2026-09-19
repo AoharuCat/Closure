@@ -342,6 +342,8 @@ describe('DECON_P3A_SYSTEM_PROMPT（正典枚举注入）', () => {
     }
     expect(DECON_P3A_SYSTEM_PROMPT).toContain('paraRange');
     expect(DECON_P3A_SYSTEM_PROMPT).toContain('quote');
+    // 反工具硬化行：纯文本车道调内置工具会被无头权限拒收，整回合拖成空响应。
+    expect(DECON_P3A_SYSTEM_PROMPT).toContain('不要使用任何工具（联网搜索、命令执行、浏览器等）');
   });
 });
 

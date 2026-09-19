@@ -89,6 +89,13 @@ notifications:
   quarantineBodyEmpty: "原文件已备份至：{backup}（备份文件与工程同目录，可人工恢复），已以空工程打开。"
   quarantineBodyRecovered: "原文件已备份至：{backup}（备份文件与工程同目录，可人工恢复），已从可抢救数据重建打开。"
   quarantineBodyNoBackup: "工程文件被判为无法解析，但自动备份未成功（文件可能被占用），原文件仍保留在工程目录。原因：{reason}"
+  # CLI 凭据探针判死 toast（09-19 dogfood R4；shell 只在状态转变为 auth-dead 时推一次。
+  # {keyName} = 失效 key 名——启动扫多 key 同判死时 shell 合并成单条事件，名单顿号连接）
+  cliAuthDead: "CLI 登录已失效（{keyName}）——切换账号或在终端运行 agy 重新登录"
+  # 文本 Agent 降级 toast（09-19 CLI 白名单 W4；shell 进程级只推一次。降级已自愈——
+  # 本 turn 已用无 agent 车道重跑，提示词硬化仍兜底。文案按 F12 实证纠正：不再断言
+  # 「Agent 未生效」——工具 step 不等于 agent 未加载，只如实说观察到什么 + 做了什么）
+  cliTextAgentFallback: "Closure 文本 Agent 本轮调用了 agy 内置工具，已自动回退标准模式重跑本回合。"
 common:
   cancel: "取消"
   confirm: "确认"

@@ -7,7 +7,7 @@ import { logger } from '../logger';
 // leader 深研究（多源 / 多跳 / 需综合）经此派发 researcher 子 agent：隔离上下文里自主调研究
 // 工具查证 → 蒸馏报告（简要理解开头 + 来源分层 + 交叉验证 + canon 冲突列候选）回传 leader，
 // 不灌 leader 对话史（context isolation，ADR-17）。快查（单点事实：某词条/某页面）leader 直调
-// wiki_*/web_* 工具，不经此 tool（判据在 DEFAULT_ORISON_PROMPT Research 段）。
+// wiki_*/web_* 工具，不经此 tool（判据在 DEFAULT_CLOSURE_PROMPT Research 段）。
 //
 // 🔑 挂载路线 = b（design D12 fallback，mirror 3.4 diagnose_impacts）：shell 侧
 // `createWorkflowRuntime()` 空参调用（agentIpc.ts:69）无 externalSkillRoots，且
@@ -27,7 +27,7 @@ import { logger } from '../logger';
 // 空报告 → 友善降级（告知 leader 可改直调研究工具），绝不假报告。
 //
 // expected_downstream_consumers:
-// - DEFAULT_ORISON_PROMPT Research 段（WP8.2）：直查 vs 派发判据 + 五段 brief 模板。
+// - DEFAULT_CLOSURE_PROMPT Research 段（WP8.2）：直查 vs 派发判据 + 五段 brief 模板。
 // - 多轮派发常态（leader 持线 child 无状态，R4）——每轮独立 brief，无 mid-run 双向（不建通道）。
 
 /**

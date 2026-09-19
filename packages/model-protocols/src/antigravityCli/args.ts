@@ -5,7 +5,7 @@ import type { GenerationLane, ThinkingControl } from '@orison/shared-contracts';
 // 形态（装机实测 agy 1.2.2）：
 //   agy --input-format stream-json --output-format stream-json
 //       --disable-slash-commands --model <slug> --print-timeout <lane 映射>
-//       [--effort low|medium|high]
+//       [--effort low|medium|high] [--agent <声明式 agent 激活值>]
 //
 // ⚠️ 不传 `-p`：stream-json 输入模式下 -p 传入的 prompt 被丢弃（官方文档 + 装机实
 // 测），且 Go flag 解析坑——`-p` 会把后续 flag 名当 prompt 值吞掉（实测报错实证）。
@@ -67,6 +67,11 @@ export interface CliArgsInput {
   thinking?: ThinkingControl;
   /** 覆盖 print-timeout（桥 turn 传 BRIDGE_PRINT_TIMEOUT）；缺省 = lane 映射。 */
   printTimeout?: { arg: string; ms: number };
+  /**
+   * 声明式 agent 激活值（09-19 白名单 W1；取 agents.ts 布局常量 `agentName`）。缺省/
+   * 空串 = 不挂 agent（现状路径，γ 反工具硬化兜底）——条件展开统一 truthy 纪律。
+   */
+  agentName?: string;
 }
 
 /** 组装 spawn 参数数组（纯函数；无 `-p` 形态——见文件头）。 */
@@ -82,6 +87,9 @@ export function buildCliArgs(input: CliArgsInput): string[] {
   const effort = effortArgForThinking(input.thinking);
   if (effort !== undefined) {
     args.push('--effort', effort);
+  }
+  if (input.agentName) {
+    args.push('--agent', input.agentName);
   }
   return args;
 }

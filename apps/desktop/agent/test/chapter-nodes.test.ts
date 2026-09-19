@@ -1537,7 +1537,7 @@ describe('route 节点', () => {
     expect(systemArg).toContain('auto_revise');
     expect(systemArg).toContain('accept_as_truth');
     expect(systemArg).toContain('escalate_user');
-    expect(systemArg).not.toContain('You are Orison');
+    expect(systemArg).not.toContain('You are Closure');
   });
 
   it('CR-8：route decision 别名归一（中文/连字符/缩写 → canonical 三档）', async () => {

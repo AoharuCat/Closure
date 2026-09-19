@@ -14,6 +14,7 @@ const {
   reindexAllForChangedModel,
   ensureEntryVecDim,
   getCurrentVecDim,
+  getCurrentCraftVecDim,
   generateEmbeddings,
   warn,
   info,
@@ -24,12 +25,14 @@ const {
   reindexAllForChangedModel: vi.fn(),
   ensureEntryVecDim: vi.fn(),
   getCurrentVecDim: vi.fn(),
+  getCurrentCraftVecDim: vi.fn(),
   generateEmbeddings: vi.fn(),
   warn: vi.fn(),
   info: vi.fn(),
 }));
 
 vi.mock('../main/db/closureIndexer', () => ({ ensureEntryVecDim, getCurrentVecDim }));
+vi.mock('../main/db/craftVecDim', () => ({ getCurrentCraftVecDim }));
 vi.mock('../main/db/index', () => ({ getDb }));
 vi.mock('../main/db/sqliteVecLoader', () => ({ isSqliteVecAvailable }));
 vi.mock('../main/ipc/modelGatewayIpc', () => ({ resolveEmbeddingModel }));
@@ -73,11 +76,12 @@ function vecOf(dim: number): number[] {
 describe('reconcileEmbeddingIndexOnStartup (dogfood #39 T2 C1)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    // 健康基线：vec 扩展可用、配置了 embed-m、全库无 pending、存量模型一致、维度 4096。
+    // 健康基线：vec 扩展可用、配置了 embed-m、全库无 pending、存量模型一致、两张向量表实测维度一致（4096）。
     isSqliteVecAvailable.mockReturnValue(true);
     resolveEmbeddingModel.mockReturnValue({ modelId: 'embed-m' });
     getDb.mockReturnValue(dbMock({ storyModels: ['embed-m'], craftModels: ['embed-m'] }));
     getCurrentVecDim.mockReturnValue(4096);
+    getCurrentCraftVecDim.mockReturnValue(4096);
     generateEmbeddings.mockResolvedValue({ embeddings: [vecOf(4096)] });
     ensureEntryVecDim.mockReturnValue(false);
     reindexAllForChangedModel.mockResolvedValue(undefined);
@@ -138,6 +142,24 @@ describe('reconcileEmbeddingIndexOnStartup (dogfood #39 T2 C1)', () => {
     await reconcileEmbeddingIndexOnStartup();
 
     expect(reindexAllForChangedModel).toHaveBeenCalledWith({ force: false, configuredModelId: 'embed-m' });
+  });
+
+  it('F2：行面信号全健康但两表实测维度矛盾 → 仍触发迁移扫（维度定谳以实测表 DDL 为准）', async () => {
+    // 事故形态：entry_vec 已迁 4096、closure_craft_vec 残留旧维度 1024，pending/model 两信号
+    // 全干净——单看一张表（或任何记账值）当维度定谳会漏掉另一张的残留。实测维度互相矛盾
+    // 即按维度变化语义走迁移扫（扫内 reindexAllCraft 自带探测 + 按探测维度重建）。
+    getDb.mockReturnValue(dbMock({ storyModels: ['embed-m'], craftModels: ['embed-m'] }));
+    getCurrentVecDim.mockReturnValue(4096);
+    getCurrentCraftVecDim.mockReturnValue(1024);
+
+    await reconcileEmbeddingIndexOnStartup();
+
+    expect(reindexAllForChangedModel).toHaveBeenCalledWith({ force: false, configuredModelId: 'embed-m' });
+    // 迁移原因可观测：warn 载荷带两表实测维度 + 漂移旗标。
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ previousDim: 4096, craftVecDim: 1024, craftDimDrifted: true }),
+      expect.stringContaining('stale vector index'),
+    );
   });
 
   it('dim probe 失败（端点断/key 坏）→ warn 放弃本次，不空跑重建扫（下次启动再试）', async () => {

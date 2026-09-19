@@ -23,7 +23,7 @@
  *     the image to `<project>/.orison/research-media/` + copied it to the
  *     clipboard; this handler renders the relay package (image path +
  *     suggestedPrompt) so the leader can relay it to the author verbatim
- *     (DEFAULT_ORISON_PROMPT Research 段 manual 视觉转告协议 — the leader
+ *     (DEFAULT_CLOSURE_PROMPT Research 段 manual 视觉转告协议 — the leader
  *     NEVER fabricates image content, red line).
  *
  * NEVER throws outside the path-escape invariant (mirror fetchHandlers /

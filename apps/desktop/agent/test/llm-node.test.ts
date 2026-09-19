@@ -8,7 +8,7 @@ import type { GenerateResult } from '../src/provider/ipc-provider';
 // Story 4.0 §4.2 / implement.md 2.3：createLlmNode 工厂。
 // mock generate（返 fixture JSON）→ loadAgentPrompt 读真实 yaml（role=draft-writer-agent）→
 // renderTemplate 渲染 user 段 → parseOutput（JSON.parse + Zod）→ NodeResult。
-// 核心：generate 收到的是 yaml system 段（非 Orison 默认 systemPrompt "You are Orison"）。
+// 核心：generate 收到的是 yaml system 段（非运行时默认 systemPrompt "You are Closure"）。
 // ─────────────────────────────────────────────────────────────────────────────
 
 function makeRun(artifacts: Record<string, unknown> = {}): RunSnapshot {
@@ -88,8 +88,8 @@ describe('createLlmNode — happy path', () => {
   });
 });
 
-describe('createLlmNode — yaml 契约（核心：generate 收 yaml system 非 Orison 默认）', () => {
-  it('generate 收到的 system = yaml system 段（含 "专业的故事写作者"，不含 "You are Orison"）', async () => {
+describe('createLlmNode — yaml 契约（核心：generate 收 yaml system 非运行时默认）', () => {
+  it('generate 收到的 system = yaml system 段（含 "专业的故事写作者"，不含 "You are Closure"）', async () => {
     const generateMock = vi.fn<GenerateFn>(async () => makeOkResult(VALID_DRAFT));
     const node = createLlmNode(draftWriterConfig, { generate: generateMock });
 
@@ -98,7 +98,7 @@ describe('createLlmNode — yaml 契约（核心：generate 收 yaml system 非 
     expect(generateMock).toHaveBeenCalledTimes(1);
     const systemArg = generateMock.mock.calls[0][1];
     expect(systemArg).toContain('专业的故事写作者');
-    expect(systemArg).not.toContain('You are Orison');
+    expect(systemArg).not.toContain('You are Closure');
   });
 
   it('generate 收到的 user prompt 已渲染（含 chapterTask 值，不含字面 {{chapterTask}}）', async () => {

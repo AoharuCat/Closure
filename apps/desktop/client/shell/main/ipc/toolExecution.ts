@@ -319,7 +319,7 @@ register('parse_document', parseDocumentHandler);
 // 或 imageUrl（SSRF 守卫 + netFetch 二进制下载 10MB cap + 重定向逐跳复验，mirror web_fetch）
 // 二选一 → runVisionAnalysis（WP1 vision seam 三层分派内核）：visionModel 已配 → 直接视觉
 // 分析返回文本；未配 → manual 导出协议（图存 <project>/.orison/research-media/ + 复制剪贴板
-// + suggestedPrompt——leader 按 DEFAULT_ORISON_PROMPT Research 段转告协议原样转给用户手动
+// + suggestedPrompt——leader 按 DEFAULT_CLOSURE_PROMPT Research 段转告协议原样转给用户手动
 // 分析，结果贴回对话续跑；绝不编造图片内容）。declared mimeType 按扩展名/Content-Type，
 // 内核魔数嗅探纠正（D3 字节严格匹配）。never-throws（R8）；classifyTool 默认 'read'。
 register('analyze_image', analyzeImageHandler);

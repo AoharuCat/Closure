@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, readdirSync, statSync, utimesSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync, symlinkSync, utimesSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -8,6 +8,10 @@ import {
   __getAgyBridgeCoreForTest,
   uninstallAgyBridgeCoreForTest,
   BRIDGE_MCP_SERVER_NAME,
+  AGY_GLOBAL_AGENTS_ROOT_SEGMENTS,
+  CLOSURE_BRIDGE_AGENT,
+  CLOSURE_BRIDGE_AGENT_LAYOUT,
+  renderAgentMarkdown,
 } from '@orison/model-protocols';
 
 const { handleToolExecuteMock } = vi.hoisted(() => ({
@@ -64,6 +68,21 @@ const FACE: BridgeToolFaceEntry[] = [
   { name: 'outline_update', description: '修订大纲。', inputSchema: { type: 'object' } },
 ];
 
+// ── 09-19 白名单 W2：桥声明式 agent 文件断言素材（内容/路径均取协议层单源——布局常量
+// 可能被装机探针定谳翻转为扁平形态，测试从常量拼预期路径，不钉字面量）。 ──
+
+const BRIDGE_AGENT_MD = renderAgentMarkdown(CLOSURE_BRIDGE_AGENT);
+
+/** 假宿内桥 agent 文件预期路径（与 prepareBridgeHome 同一套常量拼接）。 */
+function bridgeAgentFilePath(homeDir: string): string {
+  return path.join(
+    homeDir,
+    ...AGY_GLOBAL_AGENTS_ROOT_SEGMENTS,
+    ...CLOSURE_BRIDGE_AGENT_LAYOUT.dirSegments,
+    'agent.md',
+  );
+}
+
 // ── 假宿四件套 + marker + 真实 ~/.gemini 零触碰 ──
 
 /** 递归快照（相对路径 + size + mtimeMs + isDir）——零触碰对拍用。 */
@@ -95,8 +114,8 @@ function buildRealHomeFixture(home: string): void {
   writeFileSync(path.join(home, '.gemini', 'antigravity-cli', 'brain', 'conv-1.json'), '{"k":1}', 'utf8');
 }
 
-describe('agyBridge：prepareBridgeHome（四件套 + marker + 真实目录零触碰）', () => {
-  it('四件套内容断言 + 真实 home 快照零变化（红线对拍）', async () => {
+describe('agyBridge：prepareBridgeHome（四件套 + 桥 agent 文件 + marker + 真实目录零触碰）', () => {
+  it('四件套 + 桥 agent 文件内容断言 + 真实 home 快照零变化（红线对拍）', async () => {
     const realHome = tempDir('agy-bridge-realhome-');
     buildRealHomeFixture(realHome);
     const homeRoot = tempDir('agy-bridge-root-');
@@ -111,6 +130,7 @@ describe('agyBridge：prepareBridgeHome（四件套 + marker + 真实目录零�
       pipeName: '\\\\.\\pipe\\test-pipe',
       token: 'tok-1',
       tools: FACE,
+      agentMarkdown: BRIDGE_AGENT_MD,
       mcpServerPath: '/assets/mcpServer.mjs',
       execPath: '/electron/exe',
       pid: 4242,
@@ -143,7 +163,10 @@ describe('agyBridge：prepareBridgeHome（四件套 + marker + 真实目录零�
     expect(settingsCopy.permissions.deny).toEqual(['run_command(rm *)']);
     // ④ tools.json。
     expect(JSON.parse(readFileSync(path.join(homeDir, 'bridge', 'tools.json'), 'utf8'))).toEqual(FACE);
-    // ⑤ marker。
+    // ⑤ 桥声明式 agent 文件（09-19 白名单 W2）：内容 = 生成器输出逐字节一致（零内置
+    //    工具 + system prompt 通道的落盘面；--agent 激活值对应 agents.ts 布局常量）。
+    expect(readFileSync(bridgeAgentFilePath(homeDir), 'utf8')).toBe(BRIDGE_AGENT_MD);
+    // ⑥ marker。
     const marker = JSON.parse(readFileSync(path.join(homeDir, 'marker.json'), 'utf8')) as { pid: number; sessionId: string };
     expect(marker).toMatchObject({ pid: 4242, sessionId: 'session-1' });
 
@@ -162,7 +185,7 @@ describe('agyBridge：prepareBridgeHome（四件套 + marker + 真实目录零�
       homeRoot,
       realHome: corruptHome,
       serverName: BRIDGE_MCP_SERVER_NAME,
-      pipeName: 'p', token: 't', tools: [], mcpServerPath: 'm', execPath: 'e', pid: 1, sessionId: 'c1',
+      pipeName: 'p', token: 't', tools: [], agentMarkdown: BRIDGE_AGENT_MD, mcpServerPath: 'm', execPath: 'e', pid: 1, sessionId: 'c1',
     })).rejects.toThrow(AgyBridgeHomeError);
     // CR-3：corrupt 预检先于一切拷贝——零字节已写假宿（半成品凭据副本不留盘）。
     expect(existsSync(corruptHomeDir)).toBe(false);
@@ -172,7 +195,7 @@ describe('agyBridge：prepareBridgeHome（四件套 + marker + 真实目录零�
     const homeDir = path.join(homeRoot, 'c2');
     await prepareBridgeHome({
       homeDir, homeRoot, realHome: noSettingsHome,
-      serverName: BRIDGE_MCP_SERVER_NAME, pipeName: 'p', token: 't', tools: [], mcpServerPath: 'm', execPath: 'e', pid: 1, sessionId: 'c2',
+      serverName: BRIDGE_MCP_SERVER_NAME, pipeName: 'p', token: 't', tools: [], agentMarkdown: BRIDGE_AGENT_MD, mcpServerPath: 'm', execPath: 'e', pid: 1, sessionId: 'c2',
     });
     const settingsCopy = JSON.parse(readFileSync(path.join(homeDir, '.gemini', 'antigravity-cli', 'settings.json'), 'utf8')) as { permissions: { allow: string[] } };
     expect(settingsCopy.permissions.allow).toEqual([`mcp(${BRIDGE_MCP_SERVER_NAME}/*)`]);
@@ -188,7 +211,7 @@ describe('agyBridge：prepareBridgeHome（四件套 + marker + 真实目录零�
     writeFileSync(path.join(homeDir, '.gemini'), 'not-a-dir', 'utf8');
     await expect(prepareBridgeHome({
       homeDir, homeRoot, realHome,
-      serverName: BRIDGE_MCP_SERVER_NAME, pipeName: 'p', token: 't', tools: [], mcpServerPath: 'm', execPath: 'e', pid: 1, sessionId: 'c3',
+      serverName: BRIDGE_MCP_SERVER_NAME, pipeName: 'p', token: 't', tools: [], agentMarkdown: BRIDGE_AGENT_MD, mcpServerPath: 'm', execPath: 'e', pid: 1, sessionId: 'c3',
     })).rejects.toThrow();
     // 失败路径清理——整个半成品假宿（含预置残骸）删除，凭据副本零滞留。
     expect(existsSync(homeDir)).toBe(false);
@@ -203,25 +226,116 @@ describe('agyBridge：prepareBridgeHome（四件套 + marker + 真实目录零�
     writeFileSync(path.join(homeDir, 'marker.json'), JSON.stringify({ pid: 1234, sessionId: 'someone-else' }), 'utf8');
     await expect(prepareBridgeHome({
       homeDir, homeRoot, realHome,
-      serverName: BRIDGE_MCP_SERVER_NAME, pipeName: 'p', token: 't', tools: [], mcpServerPath: 'm', execPath: 'e', pid: 1, sessionId: 'mine',
+      serverName: BRIDGE_MCP_SERVER_NAME, pipeName: 'p', token: 't', tools: [], agentMarkdown: BRIDGE_AGENT_MD, mcpServerPath: 'm', execPath: 'e', pid: 1, sessionId: 'mine',
     })).rejects.toThrow(AgyBridgeHomeError);
     expect(existsSync(path.join(homeDir, 'marker.json'))).toBe(true); // 他人假宿原样保留
     // 同 sessionId marker（清理失败的残留）→ force 覆盖照常准备。
     await prepareBridgeHome({
       homeDir, homeRoot, realHome,
-      serverName: BRIDGE_MCP_SERVER_NAME, pipeName: 'p', token: 't', tools: [], mcpServerPath: 'm', execPath: 'e', pid: 1, sessionId: 'someone-else',
+      serverName: BRIDGE_MCP_SERVER_NAME, pipeName: 'p', token: 't', tools: [], agentMarkdown: BRIDGE_AGENT_MD, mcpServerPath: 'm', execPath: 'e', pid: 1, sessionId: 'someone-else',
     });
     expect(existsSync(path.join(homeDir, '.gemini', 'config', 'mcp_config.json'))).toBe(true);
   });
 
-  it('路径守卫：假宿越出 homeRoot / 与真实目录重叠 → 阻断', () => {
+  it('CR-2：假宿拷贝树内同名 agent（bridge/text 任一名）→ 遮蔽闸 typed 阻断 + 半成品假宿不留盘', async () => {
+    const homeRoot = tempDir('agy-bridge-root-');
+    const realHome = tempDir('agy-bridge-realhome-');
+    buildRealHomeFixture(realHome);
+    // 用户真实全局 agents 里的同名文件（bridge 名）——随整拷进入假宿。
+    const shadowDir = path.join(realHome, '.gemini', 'config', 'agents', 'user-copy');
+    mkdirSync(shadowDir, { recursive: true });
+    const shadowFile = path.join(shadowDir, 'agent.md');
+    writeFileSync(shadowFile, '---\nname: closure-bridge\n---\n用户自建同名 agent\n', 'utf8');
+    const homeDir = path.join(homeRoot, 'shadowed');
+    await expect(prepareBridgeHome({
+      homeDir, homeRoot, realHome,
+      serverName: BRIDGE_MCP_SERVER_NAME, pipeName: 'p', token: 't', tools: [], agentMarkdown: BRIDGE_AGENT_MD, mcpServerPath: 'm', execPath: 'e', pid: 1, sessionId: 'shadowed',
+    })).rejects.toThrow(AgyBridgeHomeError);
+    // typed 报错点名遮蔽路径（用户可定位处理）；失败路径清理——凭据副本零滞留。
+    await expect(prepareBridgeHome({
+      homeDir, homeRoot, realHome,
+      serverName: BRIDGE_MCP_SERVER_NAME, pipeName: 'p', token: 't', tools: [], agentMarkdown: BRIDGE_AGENT_MD, mcpServerPath: 'm', execPath: 'e', pid: 1, sessionId: 'shadowed',
+    })).rejects.toThrow(/user-copy/);
+    expect(existsSync(homeDir)).toBe(false);
+
+    // text 名同样在闸内（双名检测）：改名为 closure-text → 照阻断。
+    writeFileSync(shadowFile, '---\nname: closure-text\n---\n用户自建同名 agent\n', 'utf8');
+    await expect(prepareBridgeHome({
+      homeDir, homeRoot, realHome,
+      serverName: BRIDGE_MCP_SERVER_NAME, pipeName: 'p', token: 't', tools: [], agentMarkdown: BRIDGE_AGENT_MD, mcpServerPath: 'm', execPath: 'e', pid: 1, sessionId: 'shadowed',
+    })).rejects.toThrow(AgyBridgeHomeError);
+
+    // 异名外来 agent（无害）→ 照常准备成功。
+    writeFileSync(shadowFile, '---\nname: my-own-agent\n---\n正文\n', 'utf8');
+    await prepareBridgeHome({
+      homeDir, homeRoot, realHome,
+      serverName: BRIDGE_MCP_SERVER_NAME, pipeName: 'p', token: 't', tools: [], agentMarkdown: BRIDGE_AGENT_MD, mcpServerPath: 'm', execPath: 'e', pid: 1, sessionId: 'shadowed',
+    });
+    expect(readFileSync(bridgeAgentFilePath(homeDir), 'utf8')).toBe(BRIDGE_AGENT_MD);
+  });
+
+  it('CR-2 symlink 目录：假宿 agents 根内符号链接指入同名 agent → 照阻断（statSync 跟进）', async () => {
+    const homeRoot = tempDir('agy-bridge-root-');
+    const realHome = tempDir('agy-bridge-realhome-');
+    buildRealHomeFixture(realHome);
+    // 真目录在 agents 根外，agents 根内以符号链接指入——dirent.isDirectory()=false 形态。
+    const outside = path.join(realHome, '.gemini', 'config', 'outside-agents');
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(path.join(outside, 'agent.md'), '---\nname: closure-bridge\n---\n正文\n', 'utf8');
+    const link = path.join(realHome, '.gemini', 'config', 'agents', 'linked');
+    mkdirSync(path.dirname(link), { recursive: true });
+    try {
+      symlinkSync(outside, link, process.platform === 'win32' ? 'junction' : 'dir');
+    } catch {
+      return; // 无特权环境无法布景（mirror 既有 junction 先例）——机制面为纯 statSync 跟进
+    }
+    const homeDir = path.join(homeRoot, 'shadowed-link');
+    await expect(prepareBridgeHome({
+      homeDir, homeRoot, realHome,
+      serverName: BRIDGE_MCP_SERVER_NAME, pipeName: 'p', token: 't', tools: [], agentMarkdown: BRIDGE_AGENT_MD, mcpServerPath: 'm', execPath: 'e', pid: 1, sessionId: 'shadowed-link',
+    })).rejects.toThrow(AgyBridgeHomeError);
+  });
+
+  it('路径守卫第一道：假宿必须严格位于 homeRoot 之内 → 越出即阻断', () => {
     const homeRoot = tempDir('agy-bridge-root-');
     const realHome = tempDir('agy-bridge-realhome-');
     expect(() => assertFakeHomePath(tempDir('agy-elsewhere-'), homeRoot, realHome)).toThrow(AgyBridgeHomeError);
     expect(() => assertFakeHomePath(homeRoot, homeRoot, realHome)).toThrow(AgyBridgeHomeError);
-    expect(() => assertFakeHomePath(path.join(homeRoot, 'x'), homeRoot, homeRoot)).toThrow(AgyBridgeHomeError);
-    expect(() => assertFakeHomePath(path.join(homeRoot, 'x'), homeRoot, realHome)).not.toThrow();
     expect(defaultAgyBridgeHomeRoot('/home/u')).toBe(path.join('/home/u', '.orison', 'agy-bridge', 'home'));
+  });
+
+  it('路径守卫放行面：假宿位于真实用户目录的数据子树内是合法落点（生产嵌套拓扑）', () => {
+    const realHome = tempDir('agy-real-');
+    const homeRoot = path.join(realHome, '.orison', 'agy-bridge', 'home');
+    const home = path.join(homeRoot, '647fefd2-session');
+    expect(() => assertFakeHomePath(home, homeRoot, realHome)).not.toThrow();
+    // homeRoot 与 realHome 分离、互不嵌套：照常放行。
+    const separateRoot = tempDir('agy-bridge-root-');
+    expect(() => assertFakeHomePath(path.join(separateRoot, 'x'), separateRoot, realHome)).not.toThrow();
+    // homeRoot 恰与 realHome 重合：home 仍属「位于真实目录内」的合法族。
+    expect(() => assertFakeHomePath(path.join(homeRoot, 'x'), homeRoot, homeRoot)).not.toThrow();
+  });
+
+  it('路径守卫禁令面：假宿不得等于/包含真实目录，不得触及真实 .gemini 凭据树', () => {
+    const base = tempDir('agy-guard-');
+    // 禁令①：home === real（入参须先过第一道 homeRoot 检查，故 real 取在 homeRoot 之内）。
+    const root1 = path.join(base, 'root1');
+    expect(() => assertFakeHomePath(path.join(root1, 's1'), root1, path.join(root1, 's1'))).toThrow(
+      /真实用户目录/,
+    );
+    // 禁令②：home 包含 real（真实目录整个落进假宿树——灾难形态）。
+    const root2 = path.join(base, 'root2');
+    expect(() => assertFakeHomePath(path.join(root2, 's1'), root2, path.join(root2, 's1', 'realuser'))).toThrow(
+      /真实用户目录/,
+    );
+    // 禁令③：home === realGemini（假宿指到真实凭据目录上）。
+    const root3 = path.join(base, 'root3');
+    const real3 = path.join(root3, 'realuser');
+    expect(() => assertFakeHomePath(path.join(real3, '.gemini'), root3, real3)).toThrow(/agy 凭据目录/);
+    // 禁令④：home 位于 realGemini 之内（假宿落进真实凭据树）。
+    const real4 = path.join(base, 'real4');
+    const root4 = path.join(real4, '.gemini', 'bridge-home');
+    expect(() => assertFakeHomePath(path.join(root4, 's1'), root4, real4)).toThrow(/凭据目录之内/);
   });
 });
 
@@ -706,6 +820,9 @@ describe('agyBridge：installShellAgyBridgeCore wiring（model-protocols 内核�
     const core = __getAgyBridgeCoreForTest();
     expect(core).toBeDefined();
     expect(core!.homeRoot).toBe(homeRoot);
+    // 09-19 白名单 W2：装配处填 renderAgentMarkdown(CLOSURE_BRIDGE_AGENT)（内容单源 =
+    // 协议层 agents.ts，shell 零内容编写）。
+    expect(core!.bridgeAgentMarkdown).toBe(renderAgentMarkdown(CLOSURE_BRIDGE_AGENT));
     // 内核 writeHomePayload → shell prepareBridgeHome 真实现（漏装配 = 生产全量降级而无红的对偶：装配了但没接到实现也在此红）。
     const homeDir = path.join(homeRoot, 'session-w');
     await core!.writeHomePayload({
@@ -715,10 +832,13 @@ describe('agyBridge：installShellAgyBridgeCore wiring（model-protocols 内核�
       pipeName: 'p-w',
       token: 't-w',
       tools: FACE,
+      agentMarkdown: core!.bridgeAgentMarkdown,
     });
     const mcpConfig = JSON.parse(readFileSync(path.join(homeDir, '.gemini', 'config', 'mcp_config.json'), 'utf8')) as { mcpServers: Record<string, unknown> };
     expect(Object.keys(mcpConfig.mcpServers)).toEqual([BRIDGE_MCP_SERVER_NAME]);
     expect(JSON.parse(readFileSync(path.join(homeDir, 'marker.json'), 'utf8'))).toMatchObject({ sessionId: 'session-w' });
+    // 桥 agent 文件落盘且内容 = 生成器输出（spawn --agent 激活值的假宿落盘面——W2 主链）。
+    expect(readFileSync(bridgeAgentFilePath(homeDir), 'utf8')).toBe(renderAgentMarkdown(CLOSURE_BRIDGE_AGENT));
     // openBridgeSession → 注册表。
     const opened = await core!.openBridgeSession({ sessionId: 'session-o', projectDir: os.tmpdir(), permissionMode: 'auto', face: FACE });
     expect(registry.getSession('session-o')?.token).toBe(opened.token);

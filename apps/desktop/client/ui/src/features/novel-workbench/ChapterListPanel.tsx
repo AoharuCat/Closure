@@ -18,7 +18,7 @@ import type { NovelChapterMeta } from '../../shared/store/novelChapterSlice';
  * 绕过映射推断（design §3.3 directChapterId 优先）。
  *
  * 最小形态（不建 E3 横切工作面）：章列表每行加「生成」按钮 → sendAgentMessage（自然语言
- * + episodeId/chapterId 上下文）→ leader runLoop 凭 DEFAULT_ORISON_PROMPT 的 write_chapter
+ * + episodeId/chapterId 上下文）→ leader runLoop 凭 DEFAULT_CLOSURE_PROMPT 的 write_chapter
  * 引导调工具。leader 决定何时调 / 传什么 brief（design §3.4）。
  */
 function findEpisodeForChapter(

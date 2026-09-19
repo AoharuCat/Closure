@@ -15,6 +15,7 @@ import {
   StreamInterruptedError,
 } from '../src/errors';
 import { generateTextStream } from '../src';
+import { classifyCliError } from '../src/antigravityCli/driver';
 
 // ── 09-12 子2 W2：classifyGenerationFailure 分类矩阵（design §3 表逐行）──
 //
@@ -29,6 +30,42 @@ describe('classifyGenerationFailure (fallback chain, design §3)', () => {
       .toMatchObject({ eligible: true, kind: 'auth' });
     expect(classifyGenerationFailure(new ProtocolHttpError('Forbidden', 403)))
       .toMatchObject({ eligible: true, kind: 'auth' });
+  });
+
+  it('auth: CLI 车道认证错误（classifyCliError 产出）→ eligible（跨形态判据统一）', () => {
+    // 空响应守卫文案 + stderr 认证信号 → 401 认证错误——链上换模型照常可行。
+    const err = classifyCliError(
+      'antigravity-cli turn ended with SUCCESS but produced no response text (empty response and zero text deltas)',
+      'error: authentication failed or timed out',
+    );
+    expect(err).toBeInstanceOf(ProtocolHttpError);
+    expect(classifyGenerationFailure(err)).toMatchObject({ eligible: true, kind: 'auth' });
+  });
+
+  it('other: CLI 内置工具 headless 自动拒（classifyCliError 产出）→ ineligible（形态内禀，链不烧）', () => {
+    // 内置工具在无头形态拿不到授权，换模型大概率同死——指令修复才是出路，不烧链。
+    const err = classifyCliError(
+      'antigravity-cli turn ended with SUCCESS but produced no response text (empty response and zero text deltas)',
+      'jetski: no output produced — a tool required the "command" permission that headless mode cannot prompt for, so it was auto-denied.',
+    );
+    expect(err).toBeInstanceOf(ProtocolHttpError);
+    expect((err as ProtocolHttpError).status).toBe(412);
+    expect(classifyGenerationFailure(err)).toMatchObject({ eligible: false, kind: 'other' });
+  });
+
+  it('other: CLI MCP 预授权软拒（classifyCliError 产出）→ ineligible（会话授权事实，链不烧）', () => {
+    // MCP 主体软拒与模型无关（同一条桥、同一套预授权，换模型撞同一堵墙——烧链纯浪费）
+    // → 与内置工具行同用合成 412 落 other/eligible=false；文案指向预授权出路（F9 反向的
+    // 独立分支，与内置工具行各说各话）。
+    const err = classifyCliError(
+      'antigravity-cli turn ended with SUCCESS but produced no response text (empty response and zero text deltas)',
+      'jetski: no output produced — a tool required the "mcp" permission that headless mode cannot prompt for, so it was auto-denied.',
+    );
+    expect(err).toBeInstanceOf(ProtocolHttpError);
+    expect((err as ProtocolHttpError).status).toBe(412);
+    expect((err as ProtocolHttpError).message).toContain('pre-authorization');
+    expect((err as ProtocolHttpError).message).not.toContain('built-in agy tool');
+    expect(classifyGenerationFailure(err)).toMatchObject({ eligible: false, kind: 'other' });
   });
 
   it('quota: ProtocolHttpError 429/402 → eligible', () => {

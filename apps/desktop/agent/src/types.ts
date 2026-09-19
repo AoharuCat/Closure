@@ -219,12 +219,21 @@ export interface StreamDeltaData {
 }
 
 /**
- * 子4 W4（09-12 agy MCP 工具桥）：桥车道运行期通知载荷。`soft-denied` = MCP 工具软拒
+ * 子4 W4（09-12 agy MCP 工具桥）：桥车道运行期通知载荷。`soft-denied` = **MCP 主体**软拒
  * 三形态任一信号命中（预授权缺失——W0 §2 matcher）；`sendback` / `sendback-missed` =
  * present_result 打回一次 / 二次未调接受（§5.3）。
+ *
+ * 09-19 工具面修复批 R5：新增 `builtin-tool-started`——模型发起 agy **内置**工具调用
+ * （非桥工具族；`toolName` 携被调工具名）。纯观测相位：只报告「模型离开了桥工具族」，
+ * 不断言该调用失败（内置步可成功也可被 headless 权限软拒——research f8 §5.4）。
+ * R6（F13）：新增 `builtin-tool-denied`——该内置调用被 headless 权限系统拦下（软拒的
+ * 内置工具主体侧；与 `soft-denied` 的 MCP 预授权语义分开）。
  */
 export interface AgyBridgeNoticeData {
-  notice: 'sendback' | 'sendback-missed' | 'soft-denied';
+  notice: 'sendback' | 'sendback-missed' | 'soft-denied' | 'builtin-tool-started' | 'builtin-tool-denied';
+  /** `builtin-tool-started` / `builtin-tool-denied`：模型调用的内置工具名（其余信号缺席；
+   *  denied 形态由 stderr 兜底信号检出时可缺席——缺席即不带键）。 */
+  toolName?: string;
 }
 
 /**

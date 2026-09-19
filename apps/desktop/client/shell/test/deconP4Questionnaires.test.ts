@@ -158,6 +158,12 @@ describe('共用立场段（design §3.2 四条）', () => {
   it('书内人物对照组只作呼应证据（不当失败样本）', () => {
     expect(DECON_P4_STANCE_PROMPT).toContain('不当失败样本');
   });
+
+  it('环境约束行在场：纯文本作答、禁用任何工具（P4/P5 全量 system 随前缀覆盖）', () => {
+    expect(DECON_P4_STANCE_PROMPT).toContain('不要使用任何工具（联网搜索、命令执行、浏览器等）');
+    // 立场段是全部 P4/P5 system 前缀——抽查一路构建产物确认硬化行随装配在场。
+    expect(build('qidaigan', 'chapter')).toContain('不要使用任何工具（联网搜索、命令执行、浏览器等）');
+  });
 });
 
 describe('词形单源（契约枚举 zip——不复制词形）', () => {

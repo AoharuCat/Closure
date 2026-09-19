@@ -229,6 +229,7 @@ const DECON_P2_RECALL_DESCRIPTORS: Record<'world' | 'rule' | 'tone', { goal: str
 
 export const DECON_P2_RECALL_SYSTEM_PROMPT = [
   '你是小说设定档案整理器。下面给你从原文召回的候选段落（带段落号），从候选段落中归纳设定条目。',
+  '仅基于提供的文本作答；不要使用任何工具（联网搜索、命令执行、浏览器等）——本环境不提供工具，调用工具会导致失败。',
   '每条输出 {"name":"条目名","summary":"一两句概括","paraRanges":[{"start":段号,"end":段号}],"quote":"支撑原文摘录"}；',
   '- paraRanges 是半开区间，只能引用候选列表中实际出现的段落号——引用候选外段落号会被整体拒收；',
   '- quote 是 paraRanges 范围内的原文逐字摘录（不得改写、不得拼接不同位置），给出 quote 的条目视为直接引用，没有原文可引就不要给 quote（纯归纳条目合法）；',
@@ -396,6 +397,7 @@ export function buildDeconRecallEntries(
 
 export const DECON_P2_PORTRAIT_SYSTEM_PROMPT = [
   '你是小说角色档案整理器。根据给出的角色在原文中的出场摘录，为每个角色归纳画像（供同人写作保真参照）。',
+  '仅基于提供的文本作答；不要使用任何工具（联网搜索、命令执行、浏览器等）——本环境不提供工具，调用工具会导致失败。',
   '输出字段（全部依据摘录归纳——摘录支撑不了的写 null，禁止编造）：',
   '- identity：一句话身份概括；',
   '- speechPattern：语言风格/口癖；',
@@ -496,6 +498,7 @@ export function buildDeconPortraitUserPrompt(
 
 export const DECON_P2_TIMELINE_SYSTEM_PROMPT = [
   '你是小说时间线标注器。下面按阅读顺序给出全书事件，为每个事件标注故事内时间：',
+  '仅基于提供的文本作答；不要使用任何工具（联网搜索、命令执行、浏览器等）——本环境不提供工具，调用工具会导致失败。',
   '- storyTimeLabel：故事时间标签（如「第一日清晨」「十年前」——事件在故事世界中的时刻）；',
   '- timeOrder：故事时间序数（整数，按故事世界内先后编号——阅读序正常时该值应当递增或不降；同一时刻可同号；「十年前」这类回溯事件的序数应小于当前叙事位）；',
   '- device：若该事件是倒叙/插叙/预叙等**刻意打乱时序的叙事装置**，标 "flashback"（倒叙/插叙/回忆）或 "flashforward"（预叙/铺垫未来）；正常顺序事件省略该字段。',
@@ -504,6 +507,7 @@ export const DECON_P2_TIMELINE_SYSTEM_PROMPT = [
 
 export const DECON_P2_TIMELINE_REVIEW_SYSTEM_PROMPT = [
   '你是小说时间线矛盾复核裁判。下面的事件按阅读顺序排列，其故事时间序数相对前文出现了回退，且标注了叙事装置（倒叙/插叙/预叙）。',
+  '仅基于提供的文本作答；不要使用任何工具（联网搜索、命令执行、浏览器等）——本环境不提供工具，调用工具会导致失败。',
   '判断每一处回退是作者**有意**的时序装置（倒叙回忆、预叙铺垫——章节文本有「回忆/当年/十年前/后来」等回溯语汇支撑）还是**失误**（时间线自相矛盾——正文按当下叙事写但时间对不上）。',
   '每条输出 {"id":"编号","intentional":true 或 false}。只能对给出的编号作答，禁止自创编号。输出纯 JSON 数组，不要解释。',
 ].join('\n');

@@ -20,6 +20,11 @@ export class FakeAgyProcess implements CliChild {
   stdinEnded = false;
   exited = false;
   exitCode: number | null = null;
+  /**
+   * 注入式写失败次数（0 = 恒成功）：置 1 即下一次写入失败并消耗掉（此后写入恢复成功）。
+   * 覆盖面 = 「纠正在途写失败」这类一次性故障（失败即作废会话，不存在重试面）。
+   */
+  writeFailureBudget = 0;
   /** writeLine 的模拟延迟（背压观测用；默认 0 = 立即）。 */
   writeDelayMs = 0;
   /** 每条写入行的响应钩子（测试脚本化事件流——按写入回放 stdout）。 */
@@ -49,6 +54,10 @@ export class FakeAgyProcess implements CliChild {
     }
     if (this.exited) {
       throw new Error('write EPIPE (fake: process already exited)');
+    }
+    if (this.writeFailureBudget > 0) {
+      this.writeFailureBudget -= 1;
+      throw new Error('write EPIPE (fake: injected write failure)');
     }
     this.writtenLines.push(line);
     if (this.responder !== undefined) {
@@ -127,6 +136,8 @@ export interface FakePoolEnv {
   warns: string[];
   /** deps.info 收集的观测消息。 */
   infos: string[];
+  /** commitSeenHashes 实收序列（镜像记账断言面——R7 纠正行记账用；副本取存防后续覆写）。 */
+  commitCalls: string[][];
   nowValue: number;
   advanceNow(ms: number): void;
   /** 触发全部未清定时器（按创建序；新定时器照常追加，可再次触发）。 */
@@ -141,6 +152,7 @@ export function fakePoolEnv(spawnImpl?: (proc: FakeAgyProcess) => void): FakePoo
   const timers: FakeTimer[] = [];
   const warns: string[] = [];
   const infos: string[] = [];
+  const commitCalls: string[][] = [];
   let nowValue = 1_000_000;
 
   const deps: AgyPoolDeps = {
@@ -182,6 +194,9 @@ export function fakePoolEnv(spawnImpl?: (proc: FakeAgyProcess) => void): FakePoo
     info: (message) => {
       infos.push(message);
     },
+    onCommitSeenHashes: (hashes) => {
+      commitCalls.push([...hashes]);
+    },
   };
 
   const fireTimers = (): void => {
@@ -198,6 +213,7 @@ export function fakePoolEnv(spawnImpl?: (proc: FakeAgyProcess) => void): FakePoo
     timers,
     warns,
     infos,
+    commitCalls,
     get nowValue() {
       return nowValue;
     },

@@ -1,9 +1,9 @@
 import logoUrl from '../../../assets/logo.png';
 
-// 08-28 快速发布回填：GitHub 公仓 chillison/Closure 上线，外部链接恢复跳转。
-const HOMEPAGE_URL = 'https://github.com/chillison/Closure';
-const DEVELOPER_URL = 'https://github.com/chillison';
-const FEEDBACK_URL = 'https://github.com/chillison/Closure/issues';
+// 08-28 快速发布回填：GitHub 公仓 AoharuCat/Closure 上线，外部链接恢复跳转。
+const HOMEPAGE_URL = 'https://github.com/AoharuCat/Closure';
+const DEVELOPER_URL = 'https://github.com/AoharuCat';
+const FEEDBACK_URL = 'https://github.com/AoharuCat/Closure/issues';
 const QQ_GROUP = '1106823246';
 
 type Props = {

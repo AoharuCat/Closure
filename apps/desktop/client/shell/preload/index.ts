@@ -8,6 +8,10 @@ import type {
   AgyBridgeConsentValue,
   AgyBridgeRevokeResult,
   AgyBridgeStatusView,
+  // 09-19 CLI 白名单（W3）：Closure 文本 Agent 状态面三通道契约类型（type-only）。
+  AgyTextAgentDisableResult,
+  AgyTextAgentEnableResult,
+  AgyTextAgentStatusView,
   CraftRebuildResult,
   GenerateEmbeddingPayload,
   GenerateImagePayload,
@@ -21,6 +25,9 @@ import type {
   ListRemoteModelsRequest,
   ListCliModelsRequest,
   CliModelDiscoveryResult,
+  // 09-19 dogfood R4：CLI 凭据探针两通道契约类型（type-only，sandbox 纪律见下方
+  // WORLD_CHANGED_CHANNEL 注释）。
+  CliProbeSnapshot,
   DocParserProbeResult,
   ModelConfig,
   ModelRef,
@@ -253,6 +260,12 @@ export const exposedDesktopApi = {
   // Typed result — `not-logged-in` drives the settings-page login guidance.
   listCliModels: (request: ListCliModelsRequest) =>
     ipcRenderer.invoke('model:list-cli-models', request) as Promise<CliModelDiscoveryResult>,
+  // ── 09-19 dogfood R4：CLI 凭据探针两通道（读最近结果 / 手动重测；无推送面——
+  // auth-dead 转变通知走 tool:event 既有通道的 cli:auth-dead 事件）。──
+  cliProbeStatus: () =>
+    ipcRenderer.invoke('model:cli-probe-status') as Promise<Record<string, CliProbeSnapshot>>,
+  cliProbeRun: (input: { keyId: string }) =>
+    ipcRenderer.invoke('model:cli-probe-run', input) as Promise<CliProbeSnapshot>,
   // 模型生成（desktop main 直连 provider）
   generateText: (payload: GenerateTextPayload) =>
     ipcRenderer.invoke('model:generate-text', payload) as Promise<TextGenerationResponse>,
@@ -275,6 +288,13 @@ export const exposedDesktopApi = {
     ipcRenderer.invoke('agy-bridge:consent', input) as Promise<AgyBridgeConsentResult>,
   agyBridgeRevoke: () =>
     ipcRenderer.invoke('agy-bridge:revoke') as Promise<AgyBridgeRevokeResult>,
+  // ── 09-19 CLI 白名单（W3）：Closure 文本 Agent 状态面三通道（machine 级读写，无推送面）。──
+  agyTextAgentStatus: () =>
+    ipcRenderer.invoke('agy-text-agent:status') as Promise<AgyTextAgentStatusView>,
+  agyTextAgentEnable: () =>
+    ipcRenderer.invoke('agy-text-agent:enable') as Promise<AgyTextAgentEnableResult>,
+  agyTextAgentDisable: () =>
+    ipcRenderer.invoke('agy-text-agent:disable') as Promise<AgyTextAgentDisableResult>,
   // Story 2.1 CR-craft-kb-011: manual full rebuild of the global craft KB index.
   // No 2.1 UI calls it (agent-facing story); the IPC surface is the deliverable
   // for Epic 3's settings/command-bar "Rebuild craft KB" action.

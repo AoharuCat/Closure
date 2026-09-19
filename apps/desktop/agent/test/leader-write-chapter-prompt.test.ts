@@ -5,7 +5,7 @@
  * capability-only → 4.1 exercised）。验证方式：mock generate() 捕获 system prompt，
  * 断言含 write_chapter 引导文字（grep-able）。
  *
- * `DEFAULT_ORISON_PROMPT`（workflow.ts 内部 const，非 export）经 buildRuntimeSystemPrompt
+ * `DEFAULT_CLOSURE_PROMPT`（workflow.ts 内部 const，非 export）经 buildRuntimeSystemPrompt
  * 组装进 leader system prompt（runLoop 调 generate 时传 sys 参）。本测试走 runtime.sendMessage
  * 真实路径捕获——不读源文件（抗重构）。
  */

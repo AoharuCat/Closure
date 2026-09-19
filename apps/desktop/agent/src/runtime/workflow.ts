@@ -688,7 +688,7 @@ export interface WorkflowRuntime {
 // UTF-8 BOM——project.yaml / 章节 md 读入统一前置剥（runBackfill / reExtractChapter 等多读入点共用单常量）。
 const YAML_BOM = 0xfeff;
 
-const DEFAULT_ORISON_PROMPT = `You are Orison, an AI writing assistant embedded in a creative fiction IDE.
+const DEFAULT_CLOSURE_PROMPT = `You are Closure (可露希尔), an AI writing companion embedded in the Closure creative fiction IDE (Closure 创作工作台).
 
 ## Guidelines
 - Respond in the same language the user writes in.
@@ -4002,7 +4002,7 @@ async function buildMainRunConfig(
   });
   const baseSystemPrompt = await buildRuntimeSystemPrompt(session, extraSkillRoots);
   // system 稳定化（09-12，design §1）：system = 恒定区终态——[leader yaml systemPrompt] + `---` +
-  // [DEFAULT_ORISON_PROMPT + path 行/引导行 + skills]；十三路 interaction 信号（loader 九连调）
+  // [DEFAULT_CLOSURE_PROMPT + path 行/引导行 + skills]；十三路 interaction 信号（loader 九连调）
   // 迁出至 appendSessionStateNote（user-role 状态注记，追加在消息尾）。child agent 不走此函数
   //（leader 专属——child 走 buildRuntimeSystemPrompt 直调，无 interaction 段）。
   // 09-13 CR-D1（拍板 B）：interaction 静态能力段进 system 恒定区尾（tools 段经
@@ -4640,7 +4640,7 @@ async function buildRuntimeSystemPrompt(session: SessionState, extraSkillRoots: 
   } catch { /* no project.yaml */ }
 
   return buildSystemPrompt({
-    orisonPrompt: DEFAULT_ORISON_PROMPT,
+    basePrompt: DEFAULT_CLOSURE_PROMPT,
     projectMeta,
     skillsSummary,
   });

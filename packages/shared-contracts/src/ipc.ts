@@ -158,6 +158,11 @@ export const desktopIpcSchema = z.object({
     'agy-bridge:status',
     'agy-bridge:consent',
     'agy-bridge:revoke',
+    // 09-19 CLI 内置工具白名单（W3）：Closure 文本 Agent 状态面三通道（machine 级读写，
+    // 无窗口面无 pathGuard 面；store 仅记显式 declined——无记录 = 默认开启，prd R4）。
+    'agy-text-agent:status',
+    'agy-text-agent:enable',
+    'agy-text-agent:disable',
     'closure:rebuild-craft-kb',
     'closure:index-status',
     'closure:rebuild-story-index',
@@ -389,6 +394,31 @@ export type CliModelDiscoveryResult =
   | { ok: true; resolvedExecutable: string; models: RemoteModel[] }
   | { ok: false; error: CliModelDiscoveryErrorCode; detail?: string };
 
+/* ── CLI-form provider credential probe（09-19 dogfood R4）── */
+
+/**
+ * Probe verdict for one CLI-form key. `agy models` does NOT verify the login
+ * (an unauthenticated run still lists models), so the probe runs a tiny real
+ * generation (`<cliExecutable> -p "hi"`) and classifies the outcome:
+ *   - `ok`: exit 0, non-empty stdout, no auth signal.
+ *   - `auth-dead`: output hit the shared auth-signal word list (model-protocols
+ *     `isAuthError` — same single source as the driver's error classifier and
+ *     the `agy models` discovery path).
+ *   - `error`: everything else (timeout / crash / empty output); `detail`
+ *     carries a raw excerpt for the settings-page tooltip.
+ */
+export type CliProbeStatus = 'ok' | 'auth-dead' | 'error';
+
+/** One stored probe outcome (per keyId, in shell memory only — never persisted). */
+export type CliProbeSnapshot = {
+  keyId: string;
+  status: CliProbeStatus;
+  /** ISO timestamp of when this probe ran. */
+  probedAt: string;
+  /** Raw failure excerpt (error verdicts only) — tooltip face, not a log face. */
+  detail?: string;
+};
+
 /* ── agy MCP 工具桥（09-12-agy-mcp-tool-bridge 子4 W4）── */
 
 /** 同意值：allowed = 已同意（假宿副本可写预授权）；declined = 已拒绝（记住，降级纯文本）。 */
@@ -420,13 +450,60 @@ export type AgyBridgeConsentResult =
 
 /**
  * agy-bridge:revoke 结果（关闭回收 = 状态翻转回未配置；用户真实全局零写入——无条目
- * 移除面）。活动桥会话存在 → 'active-sessions'（附会话 id——UI 提示先结束会话）；
+ * 移除面）。活动桥会话存在 → 'active-sessions'（附会话 id——UI 如实说明释放条件：桥会话
+ * 闲置超时后自动回收，与对话是否结束无关）；
  * 存储错误 → 'operation-failed'（warn 记原文不上抛——与 consent 通道同语义，不伪装
  * 成活动会话占用）。
  */
 export type AgyBridgeRevokeResult =
   | { ok: true }
   | { ok: false; error: 'active-sessions'; activeSessions: string[] }
+  | { ok: false; error: 'operation-failed' };
+
+/* ── Closure 文本 Agent（09-19-cli-builtin-tool-whitelist W3）── */
+
+/**
+ * 真实全局 agent.md 文件四态（design §1.2）：current（Closure 尾标记 + hash 一致）/
+ * stale（有标记但 hash ≠ 当前生成器输出——启动对账即修）/ foreign（存在但无标记——
+ * 外来文件，绝不覆盖/误删）/ missing（启动对账即修）。
+ */
+export type AgyTextAgentFileState = 'current' | 'stale' | 'foreign' | 'missing';
+
+/**
+ * 文本 Agent 状态读面（agy-text-agent:status / enable / disable 写后回显）：
+ * - enabled = 开关维（无 declined 记录 = 默认开启，prd R4）；cliKeyPresent = 启用前提
+ *   第二半（存在任一 antigravity-cli provider key）——两者齐备才实际挂 agent。
+ * - shadowedBy ≠ 空 = 同 frontmatter `name` 遮蔽警示（agy 对同名零警告静默竞速——装机
+ *   探针定谳；路径级 foreign 检测罩不住，一层扫描外来路径呈报，宁误报不漏报，不代删；
+ *   不阻断我方文件维护）。
+ */
+export type AgyTextAgentStatusView = {
+  enabled: boolean;
+  cliKeyPresent: boolean;
+  fileState: AgyTextAgentFileState;
+  /** 同 frontmatter `name` 遮蔽我方的外来 agent.md 绝对路径（空 = 无遮蔽）。 */
+  shadowedBy: string[];
+  /** 真实全局 agent.md 绝对路径（卡片披露 + 冲突态展示）。 */
+  agentFilePath: string;
+  /** 同意状态文件路径（仅记显式 declined）。 */
+  consentFilePath: string;
+};
+
+/**
+ * agy-text-agent:enable 模式 A 结果：foreign-conflict = 外来同名文件压住我方路径（拒写
+ * 不覆盖——路径经 status 的 agentFilePath 呈现，不代删）；operation-failed = 写失败
+ * （warn 记日志不上抛）。成功附写后状态视图。
+ */
+export type AgyTextAgentEnableResult =
+  | { ok: true; view: AgyTextAgentStatusView }
+  | { ok: false; error: 'foreign-conflict' | 'operation-failed' };
+
+/**
+ * agy-text-agent:disable 模式 A 结果：declined 记住 + 自有文件回收（验 Closure 尾标记
+ * 才删——外来文件绝不动）。
+ */
+export type AgyTextAgentDisableResult =
+  | { ok: true; view: AgyTextAgentStatusView }
   | { ok: false; error: 'operation-failed' };
 
 /* ── Generation IPC payloads ── */
@@ -1163,6 +1240,20 @@ export type OrisonDesktopApi = {
    * `not-logged-in` drives the inline login guidance on the settings page.
    */
   listCliModels(request: ListCliModelsRequest): Promise<CliModelDiscoveryResult>;
+  /**
+   * 09-19 dogfood R4: read the latest CLI credential-probe snapshots (per
+   * keyId, shell memory only). Keys with no stored result are absent — the
+   * renderer renders them as「未探测」. Snapshots for deleted keys are filtered
+   * against the on-disk config at read time.
+   */
+  cliProbeStatus(): Promise<Record<string, CliProbeSnapshot>>;
+  /**
+   * 09-19 dogfood R4: run a credential probe for one saved CLI-form key right
+   * now (settings-page「测试连接」button) and return the fresh snapshot. A tiny
+   * real generation (`<cliExecutable> -p "hi"`, 30s cap) — 模式 A, never throws
+   * for an expected failure (an unresolvable key yields an `error` snapshot).
+   */
+  cliProbeRun(input: { keyId: string }): Promise<CliProbeSnapshot>;
   generateText(payload: GenerateTextPayload): Promise<TextGenerationResponse>;
   generateImage(payload: GenerateImagePayload): Promise<ImageGenerationResponse>;
   generateEmbedding(payload: GenerateEmbeddingPayload): Promise<EmbeddingResponse>;
@@ -1447,6 +1538,19 @@ export type OrisonDesktopApi = {
    * 假宿残留由启动清扫守卫覆盖）。
    */
   agyBridgeRevoke(): Promise<AgyBridgeRevokeResult>;
+  // ── 09-19 CLI 白名单（W3）：Closure 文本 Agent 状态面三通道 ──
+  /**
+   * 文本 Agent 状态读面（开关维 + CLI key 前提 + 文件四态 + name 遮蔽警示 + 路径）。
+   * 每次现读（文件被手删/外来覆盖即时反映——不信缓存）。
+   */
+  agyTextAgentStatus(): Promise<AgyTextAgentStatusView>;
+  /**
+   * 开启（清 declined 记录 + 立即写入最新 agent 文件；外来同名文件压住 → foreign-conflict
+   * 拒写不覆盖）。成功附写后状态视图。
+   */
+  agyTextAgentEnable(): Promise<AgyTextAgentEnableResult>;
+  /** 关闭（记 declined + 删除自有 agent 文件——验标记才删，外来文件绝不动）。 */
+  agyTextAgentDisable(): Promise<AgyTextAgentDisableResult>;
   /** 拆解进度订阅（mirror onCraftDistillProgress 形态，返回退订函数只移除本监听器）。 */
   onDeconProgress(callback: (event: DeconProgressEvent) => void): () => void;
   runStorySync(payload: RunStorySyncPayload): Promise<RunStorySyncResult>;

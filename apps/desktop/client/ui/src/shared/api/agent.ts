@@ -198,10 +198,21 @@ export type AgentStreamEvent =
   | { type: 'context-usage'; data: { usedTokens: number; windowTokens: number | null; redlinePercent: number } }
   /**
    * 09-12 子4 W4（design §8）：桥车道运行期通知——`sendback`（present_result 打回重跑
-   * 一次）/ `sendback-missed`（二次未调接受 + 警告）/ `soft-denied`（MCP 工具软拒三形态
-   * 任一信号命中 = 预授权缺失，AC7 诊断入口）。additive：旧消费者忽略。
+   * 一次）/ `sendback-missed`（二次未调接受 + 警告）/ `soft-denied`（**MCP 主体**工具软拒
+   * 三形态任一信号命中 = 预授权缺失，AC7 诊断入口）。additive：旧消费者忽略。
+   * 09-19 工具面修复批 R5：增 `builtin-tool-started`——模型发起 agy 内置工具调用（离开桥
+   * 工具族），`toolName` 携被调工具名；纯观测相位（不断言该调用失败）。
+   * R6（F13）：增 `builtin-tool-denied`——该内置调用被 headless 权限拦下（软拒的内置工具
+   * 主体侧，与 `soft-denied` 的 MCP 预授权语义分开）。载荷单源 mirror = agent 包 types.ts
+   * 的 AgyBridgeNoticeData。
    */
-  | { type: 'bridge-notice'; data: { notice: 'sendback' | 'sendback-missed' | 'soft-denied' } };
+  | {
+      type: 'bridge-notice';
+      data: {
+        notice: 'sendback' | 'sendback-missed' | 'soft-denied' | 'builtin-tool-started' | 'builtin-tool-denied';
+        toolName?: string;
+      };
+    };
 
 export type AgentSkillInfo = {
   name: string;

@@ -71,7 +71,6 @@
 }
 
 .agy-bridge-fact-value {
-  font-family: var(--font-mono, monospace);
   font-size: var(--text-xs);
   overflow-wrap: anywhere;
   color: var(--on-surface-variant);

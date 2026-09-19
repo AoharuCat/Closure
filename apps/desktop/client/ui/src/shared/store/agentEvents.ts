@@ -89,14 +89,23 @@ export const MODEL_FALLBACK_NOTICE_CAP = 5;
 /**
  * 09-12 子4 W6（design §8）：桥车道运行期通知（bridge-notice 事件的 per-session 记录，
  * cap BRIDGE_NOTICE_CAP；每次 send 重置——「本次 run 的通知」，随会话 forget 链清，
- * mirror ModelFallbackNotice 全套生命周期）。三信号：sendback / sendback-missed /
- * soft-denied（软拒 = 预授权缺失诊断入口，AC7）。
+ * mirror ModelFallbackNotice 全套生命周期）。四信号：sendback / sendback-missed /
+ * soft-denied（**MCP 主体**软拒 = 预授权缺失诊断入口，AC7）+ builtin-tool-started
+ * （R5：模型发起 agy 内置工具调用 = 离开了桥工具族——纯观测相位，不断言该调用失败）
+ * + builtin-tool-denied（R6/F13：该内置调用被 headless 权限拦下）。
  */
-export type BridgeNoticeKind = 'sendback' | 'sendback-missed' | 'soft-denied';
+export type BridgeNoticeKind =
+  | 'sendback'
+  | 'sendback-missed'
+  | 'soft-denied'
+  | 'builtin-tool-started'
+  | 'builtin-tool-denied';
 
 export type BridgeNotice = {
   id: string;
   notice: BridgeNoticeKind;
+  /** `builtin-tool-started` / `builtin-tool-denied`：模型调用的内置工具名（其余信号缺席）。 */
+  toolName?: string;
   at: number;
 };
 
@@ -757,9 +766,15 @@ export function handleAgentStreamEvent<S extends AgentDispatchState>(store: Agen
     case 'bridge-notice': {
       // 子4 W6（design §8）：桥车道运行期通知（打回 / 二次未调 / 软拒）——运行阶段可见性
       // 纪律：不静默。后台会话照写（键控槽，切回可见，mirror 回退通知）；最小测试 store
-      // 缺省字段不炸。
+      // 缺省字段不炸。R5 起含内置工具步信号、R6 起含内置工具被拒信号（toolName 条件展开
+      // ——缺席即不带键，防 undefined 混进渲染面）。
       if (store.getState().bridgeNoticesBySession === undefined) return;
-      const notice: BridgeNotice = { id: randomUUID(), notice: event.data.notice, at: Date.now() };
+      const notice: BridgeNotice = {
+        id: randomUUID(),
+        notice: event.data.notice,
+        ...(event.data.toolName !== undefined ? { toolName: event.data.toolName } : {}),
+        at: Date.now(),
+      };
       writeState(store, (s) => ({
         bridgeNoticesBySession: {
           ...(s.bridgeNoticesBySession ?? {}),

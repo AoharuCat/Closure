@@ -3,6 +3,7 @@ import { isVectorArmDegraded, type ResolvedModel } from '@orison/shared-contract
 import { getDb } from './index';
 import { isSqliteVecAvailable } from './sqliteVecLoader';
 import { ensureEntryVecDim, getCurrentVecDim } from './closureIndexer';
+import { getCurrentCraftVecDim } from './craftVecDim';
 import { resolveEmbeddingModel } from '../ipc/modelGatewayIpc';
 import { reindexAllForChangedModel } from '../ipc/configIpc';
 import { runWithEmbeddingSweepGate, isEmbeddingSweepInflight } from './embeddingSweepGate';
@@ -41,6 +42,11 @@ export { isEmbeddingSweepInflight };
  * - **force 分档**：存量含其他模型 → force 全量重嵌（授权迁移语义）；仅 pending 积压、
  *   模型一致 → force=false，健康行 hash-skip 零成本只重试待补行（dim 修正刚清过 hash
  *   的行自然全部成为待补行，收敛性不受影响）。
+ *
+ * F1 增补：降级判定纳入**实测表维度对账**——entry_vec / closure_craft_vec 两张向量表服务
+ * 同一配置模型，但各自独立迁移，实测维度（CREATE DDL 里的 float[N]）互相矛盾 = 至少一侧
+ * 没跟上模型迁移，行面 pending/model 信号可以全干净。维度定谳以实测表 DDL 为准，记账/meta
+ * 值与实际表维度可能漂移，单看一张表（或任何记录值）当定谳会漏掉另一张的残留。
  *
  * 防重复触发/启动风暴（dispatch 注意事项）：主进程 `app.whenReady()` 只跑一次（无
  * React StrictMode 双调面——那是渲染层效应），fire-and-forget 不阻启动；每启动至多一扫；
@@ -136,6 +142,13 @@ export async function reconcileEmbeddingIndexOnStartup(): Promise<void> {
     log.info('embedding reconcile: derived tables unavailable — nothing indexed yet');
     return;
   }
+  // F1：实测表维度对账（纯 db 读，零网络——健康态不引入探测成本）。两张向量表的 float[N]
+  // 互相矛盾即视为维度漂移，按维度变化语义走迁移扫（迁移扫内 reindexAllCraft 自带探测 +
+  // 按探测维度重建——结构修复点在那边）。
+  const db = getDb();
+  const previousDim = getCurrentVecDim(db);
+  const craftVecDim = getCurrentCraftVecDim(db);
+  const craftDimDrifted = previousDim !== null && craftVecDim !== null && craftVecDim !== previousDim;
   const storyDegraded = isVectorArmDegraded({
     configuredModelId: model.modelId,
     pending: signals.storyPending,
@@ -146,7 +159,7 @@ export async function reconcileEmbeddingIndexOnStartup(): Promise<void> {
     pending: signals.craftPending,
     storedModels: signals.craftModels,
   });
-  if (!storyDegraded && !craftDegraded) {
+  if (!storyDegraded && !craftDegraded && !craftDimDrifted) {
     log.info(
       {
         model: model.modelId,
@@ -178,8 +191,6 @@ export async function reconcileEmbeddingIndexOnStartup(): Promise<void> {
     );
     return;
   }
-  const db = getDb();
-  const previousDim = getCurrentVecDim(db);
   const dimFixed = ensureEntryVecDim(db, probedDim);
   // force 分档：存量含其他模型（几何空间失效）→ 全量重嵌；仅 pending 积压、模型一致 →
   // 只重试待补行。注意 ensureEntryVecDim 刚 DROP 过表时全库 hash 已清（E1），所有行都
@@ -192,6 +203,8 @@ export async function reconcileEmbeddingIndexOnStartup(): Promise<void> {
       model: model.modelId,
       probedDim,
       previousDim,
+      craftVecDim,
+      craftDimDrifted,
       dimFixed,
       force,
       storyPending: signals.storyPending,

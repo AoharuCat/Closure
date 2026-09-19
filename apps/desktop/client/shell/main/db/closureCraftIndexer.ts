@@ -343,8 +343,14 @@ export function reindexCraftDelete(craftId: string): void {
  * 调用内把重嵌补回。craft KB 零文档但有卡的形态（两百份语料先行蒸馏、未挂任何 doc）：探针
  * 体回退到首个卡 condensed，避免早退把卡 sweep 一并跳过。
  *
- * @returns `reindexed` (success count), `dimChanged`, `newDim` (null when no docs),
- *   `cardsReembedded` (E10.2b additive — card sweep success count).
+ * F1：结构自愈段（探维度 + 缺表/维度不符 → DROP+reCREATE + 清 hash 联动）在「无文件无卡」
+ * 早退**之前**跑——craft KB 零文档零卡时 closure_craft_entry 里仍可能住着材料 chunk 行
+ * （全局材料车道同表共栖），早退会把整表锁死在旧维度：材料行重嵌全被维度门拒收，「重建
+ * Craft KB」永远修不好降级横幅。维度一致且表在 → 零重建零写零清（不做每次空轮 DROP）；
+ * 迁移完成后零文件零卡 → 原样早退。代价：空库也走一次探测 embed——维度一致性只能实测。
+ *
+ * @returns `reindexed` (success count), `dimChanged`, `newDim` (null when no docs and
+ *   no structural repair happened), `cardsReembedded` (E10.2b additive — card sweep success count).
  */
 export async function reindexAllCraft(
   deps: CraftReindexDeps = {},
@@ -367,13 +373,12 @@ export async function reindexAllCraft(
 
   const files = listCraftMdFiles();
   const firstCardCondensed = firstCraftCardCondensed();
-  if (files.length === 0 && firstCardCondensed === null) {
-    return { reindexed: 0, dimChanged: false, newDim: null, cardsReembedded: 0 };
-  }
+  const hasInputs = files.length > 0 || firstCardCondensed !== null;
 
   // Probe the new model's dim by embedding the first non-empty body (E10.2b:
   // fallback to the first card condensed when the craft KB has no docs but
-  // cards exist — the sweep still needs a dim-true probe).
+  // cards exist — the sweep still needs a dim-true probe). F1：零文档零卡也照探
+  //（'probe' 占位体）——维度自愈不依赖「有东西可重嵌」。
   let probeBody = 'probe';
   for (const f of files) {
     try {
@@ -447,6 +452,19 @@ export async function reindexAllCraft(
       { oldDim: currentDim, newDim, reason: vecMissing ? 'missing-recreate' : 'dim-change' },
       'craft reindexAllCraft: closure_craft_vec recreated',
     );
+  }
+
+  // F1：无输入早退挪到结构自愈段之后。零文档零卡 + 结构段无事可做 → 原样返回（零写零清）；
+  // 结构段刚修复（换维度重建/缺表补建）→ 如实回报结构事件。reindexed 恒 0——craft 文档一枚
+  // 都没枚举到；材料 chunk / 卡行的补嵌走各自车道（backfill / 卡 sweep 触发点），不并入本计数。
+  if (!hasInputs) {
+    const repaired = dimChanged || vecMissing;
+    return {
+      reindexed: 0,
+      dimChanged: repaired,
+      newDim: repaired ? newDim : null,
+      cardsReembedded: 0,
+    };
   }
 
   // Re-embed every craft doc (force=true bypasses the hash skip — body unchanged

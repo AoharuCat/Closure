@@ -126,6 +126,11 @@ export interface AgyPoolDeps {
   warn?: (message: string) => void;
   /** 观测 info（低频仪表类；defaultAgyPoolDeps 门控 ORISON_PROTOCOL_DEBUG，mirror generate.ts 每请求仪表先例）。 */
   info?: (message: string) => void;
+  /**
+   * 观测缝：`commitSeenHashes` 实收序列（镜像记账断言用——R7 纠正续跑的记账断言需要看
+   * 「本 cycle 全序列 + 纠正段」这一形态，生产缺省不挂）。
+   */
+  onCommitSeenHashes?: (hashes: readonly string[]) => void;
 }
 
 /**
@@ -452,7 +457,7 @@ export class AgySessionPool {
 
   private makeSession(entry: SessionEntry, spec: CliSpawnSpec): AgyTurnSession {
     // 对象字面量内以箭头属性捕获本池实例（this）——方法简写在字面量 this 上，勿改。
-    return {
+    const session: AgyTurnSession = {
       get seenHashes(): readonly string[] {
         return [...entry.seenHashes];
       },
@@ -501,12 +506,24 @@ export class AgySessionPool {
         handle.turnExitObserver = cb;
       },
       commitSeenHashes: (hashes) => {
+        // CR-9：观察缝绝不侵入控制流——`onCommitSeenHashes` 是观测缝（镜像记账断言用），
+        // 观察者 throw 曾沿调用方 async 体上抛：首行路径 = 未处理 rejection；纠正路径 =
+        // 被误报成「写失败」+ 502 作废会话（观测面问题改写 turn 结果）。记账本体照常推进
+        // （镜像语义是「已发」，与观察者无关），观察者失败降级为 warn（不静默）。
+        try {
+          this.deps.onCommitSeenHashes?.(hashes);
+        } catch (err) {
+          this.deps.warn?.(
+            `[antigravity-cli] onCommitSeenHashes observer threw (ignored; mirror bookkeeping continues): ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
         entry.seenHashes = [...hashes];
       },
       invalidate: (reason) => {
         this.invalidateEntry(entry, reason);
       },
     };
+    return session;
   }
 
   private invalidateEntry(entry: SessionEntry, reason: string): void {

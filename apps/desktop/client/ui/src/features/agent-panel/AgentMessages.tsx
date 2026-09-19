@@ -372,11 +372,13 @@ export function AgentMessages({ messages, loading, error }: Props) {
         </div>
       )}
       {/* 子4 W6（design §8）：桥运行期通知（打回/二次未调/软拒）——运行阶段可见性纪律：
-          不静默。mirror 回退通知条形态；soft-denied 带 warning 强度（AC7 指向授权机制）。 */}
+          不静默。mirror 回退通知条形态；soft-denied 带 warning 强度（AC7 指向授权机制）；
+          R5 起含「模型离开了桥工具族」相位（与桥工具相位可区分——不走「正在调用 X」）；
+          R6 起含内置工具被权限拦下（F13）。 */}
       {bridgeNotices.length > 0 && (
         <div className="agent-bridge-notices">
           {bridgeNotices.map((notice) => (
-            <BridgeNoticeStrip key={notice.id} notice={notice.notice} t={t} />
+            <BridgeNoticeStrip key={notice.id} notice={notice} t={t} />
           ))}
         </div>
       )}
@@ -467,32 +469,63 @@ function ModelFallbackNoticeStrip({
 }
 
 /**
- * 子4 W6：单条桥运行期通知（三信号各有可见形态——运行阶段可见性纪律：不静默）：
+ * 子4 W6：单条桥运行期通知（各信号各有可见形态——运行阶段可见性纪律：不静默）：
  * - sendback（中性）：present_result 未按协议收尾 → 已打回重跑一次；
  * - sendback-missed（警示）：重跑后仍未收尾 → 接受结果并记录；
- * - soft-denied（警示）：工具调用被预授权策略拦下 → 指向设置页授权入口（AC7）。
+ * - soft-denied（警示）：工具调用被预授权策略拦下 → 指向设置页授权入口（AC7）；
+ * - builtin-tool-started（警示，R5）：模型离开桥工具族去调 agy 内置工具——工具名作后缀标出
+ *   （缺席不渲染后缀；mirror 回退通知条的 scopeLabel 形态）；
+ * - builtin-tool-denied（警示，R6/F13）：该内置调用被 headless 权限系统拦下（软拒的内置
+ *   工具主体侧；与 soft-denied 的 MCP 预授权语义分开）——工具名同上作后缀。
+ * - 本版本未登记的 kind：走兜底条目（不崩、不静默、不泄露 kind 原文），见下注释。
  */
 function BridgeNoticeStrip({
   notice,
   t,
 }: {
-  notice: BridgeNotice['notice'];
+  notice: BridgeNotice;
   t: (key: string, vars?: Record<string, string | number>) => string;
 }) {
-  const meta = BRIDGE_NOTICE_PRESENTATION[notice];
+  const meta = bridgeNoticePresentationOf(notice.notice);
   return (
     <div className={`agent-bridge-notice agent-bridge-notice--${meta.tone}`} role="status">
       <span className="material-symbols-outlined" aria-hidden="true">{meta.icon}</span>
-      <span>{t(meta.key)}</span>
+      <span>
+        {t(meta.key)}
+        {notice.toolName ? <span className="agent-bridge-notice-scope"> · {notice.toolName}</span> : null}
+      </span>
     </div>
   );
 }
 
+type BridgeNoticePresentation = { icon: string; key: string; tone: 'neutral' | 'warn' };
+
 const BRIDGE_NOTICE_PRESENTATION: Record<
   BridgeNotice['notice'],
-  { icon: string; key: string; tone: 'neutral' | 'warn' }
+  BridgeNoticePresentation
 > = {
   sendback: { icon: 'replay', key: 'agent.bridgeNoticeSendback', tone: 'neutral' },
   'sendback-missed': { icon: 'warning', key: 'agent.bridgeNoticeSendbackMissed', tone: 'warn' },
   'soft-denied': { icon: 'gpp_maybe', key: 'agent.bridgeNoticeSoftDenied', tone: 'warn' },
+  'builtin-tool-started': { icon: 'open_in_new', key: 'agent.bridgeNoticeBuiltinTool', tone: 'warn' },
+  'builtin-tool-denied': { icon: 'block', key: 'agent.bridgeNoticeBuiltinToolDenied', tone: 'warn' },
 };
+
+/**
+ * 未知 kind 兜底条目：wire 事件（IPC 载荷）不经 schema 校验，kind 可以是本版本不认识的
+ * 字符串（主进程更新 / 事件形态漂移）——旧行为是 `BRIDGE_NOTICE_PRESENTATION[kind]` 取到
+ * undefined 后 `meta.tone` 直接 TypeError，整个 agent 面板渲染崩溃（白屏）。
+ * 兜底取中性条目 + 说人话文案（不泄露原始 kind 这类实现词）；仍渲染 = 不静默（运行阶段
+ * 可见性纪律），但不谎报语义。
+ */
+const UNKNOWN_BRIDGE_NOTICE_PRESENTATION: BridgeNoticePresentation = {
+  icon: 'info',
+  key: 'agent.bridgeNoticeUnknown',
+  tone: 'neutral',
+};
+
+/** kind → 呈现条目；未登记 kind 落兜底（`kind` 按 wire 字符串处理，非封闭枚举假设）。 */
+function bridgeNoticePresentationOf(kind: string): BridgeNoticePresentation {
+  return (BRIDGE_NOTICE_PRESENTATION as Record<string, BridgeNoticePresentation | undefined>)[kind]
+    ?? UNKNOWN_BRIDGE_NOTICE_PRESENTATION;
+}

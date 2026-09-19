@@ -1,0 +1,122 @@
+/* ── 设置页「反重力状态探测」小节：每个 CLI key 一行凭据状态 + 测试按钮 ──
+ * 骨架与语汇 mirror agy-bridge.css（同一设置页上的姊妹卡片）：settings-page-title
+ * 标题 + 填充 chip 徽标 + 描边次级钮。全部 theme token，零裸色值，深浅主题同源。 */
+
+.agy-probe-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2xs);
+  padding: var(--space-md) var(--space-lg);
+  border: 1px solid var(--outline-variant);
+  border-radius: var(--radius-md);
+  background: var(--surface-container);
+}
+
+.agy-probe-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+}
+
+.agy-probe-head .settings-page-title {
+  margin: 0;
+}
+
+.agy-probe-section-subtitle {
+  margin: 0;
+  font-size: var(--text-xs);
+  line-height: 1.45;
+  color: var(--on-surface-variant);
+}
+
+.agy-probe-rows {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+}
+
+.agy-probe-row {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.agy-probe-row-main {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  flex-wrap: wrap;
+}
+
+.agy-probe-key-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: var(--text-sm);
+  font-weight: 500;
+}
+
+/* 状态徽标（mirror .agy-bridge-state-chip 的填充 chip 语汇；配色对：
+ * 连接正常 = success/diff-add-bg；登录失效/探测失败 = error/error-bg；未探测 = 中性 chip）。 */
+.agy-probe-chip {
+  display: inline-block;
+  padding: 0.05rem var(--space-2xs);
+  border-radius: var(--radius-pill);
+  font-size: var(--text-2xs);
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+.agy-probe-chip.is-ok {
+  color: var(--success);
+  background: var(--diff-add-bg);
+}
+
+.agy-probe-chip.is-error {
+  color: var(--error);
+  background: var(--error-bg);
+  font-weight: 500;
+}
+
+.agy-probe-chip.is-neutral {
+  color: var(--chip-text);
+  background: var(--chip-bg);
+}
+
+/* 次级描边钮（测试连接——mirror .agy-bridge-recheck-button）。 */
+.agy-probe-test-button {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2xs);
+  flex-shrink: 0;
+  padding: 0.3rem 0.8rem;
+  border: 1px solid var(--outline-variant);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--on-surface);
+  font: inherit;
+  font-size: var(--text-sm);
+  cursor: pointer;
+  transition: background var(--duration-fast) ease;
+}
+
+.agy-probe-test-button:hover:not(:disabled) {
+  background: var(--hover-overlay);
+}
+
+.agy-probe-test-button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.agy-probe-test-button .material-symbols-outlined {
+  font-size: 1rem;
+}
+
+/* 登录失效指引（mirror .agy-bridge-hint 弱化小字）。 */
+.agy-probe-hint {
+  margin: 0;
+  font-size: var(--text-2xs);
+  line-height: 1.5;
+  color: var(--on-surface-variant);
+}

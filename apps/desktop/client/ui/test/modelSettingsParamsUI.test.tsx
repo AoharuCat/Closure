@@ -4,6 +4,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ApiKeyEntry, ModelConfig } from '@orison/shared-contracts';
 import { ModelSettingsPage } from '../src/features/model-settings/ModelSettingsPage';
 import { useAppStore } from '../src/shared/store/appStore';
+import { translate } from '../src/shared/i18n/useI18n';
+import { useToastStore } from '../src/shared/store/toastStore';
 
 // ── 09-12 子3 W4：设置页参数面渲染（常用直出 + 高级折叠 / CLI 形态隐藏）+ applyDraft
 // 前置校验与 schema 拒收的 notice 通道（design §5.2/§6）。──
@@ -48,6 +50,7 @@ async function selectKey(name: RegExp) {
 describe('model-settings params face (09-12 子3 W4)', () => {
   beforeEach(() => {
     useAppStore.setState({ outputEntries: [], appendOutputEntry: vi.fn() } as any);
+    useToastStore.setState({ toasts: [] });
     (window as any).orisonDesktop = {
       listRemoteModels: vi.fn().mockResolvedValue([]),
       listCliModels: vi.fn().mockResolvedValue({ ok: true, resolvedExecutable: 'C:/agy/bin/agy.exe', models: [] }),
@@ -162,7 +165,7 @@ describe('model-settings params face (09-12 子3 W4)', () => {
     expect(setModelConfig).not.toHaveBeenCalled();
   });
 
-  it('applyDraft schema 拒收 → notice（实修：此前 setModelConfig rejection 无人处理）', async () => {
+  it('applyDraft schema 拒收 → notice + toast（实修：此前 setModelConfig rejection 无人处理；R10 补可见反馈）', async () => {
     const setModelConfig = vi.fn().mockRejectedValue(new Error('Schema validation failed'));
     render(
       <ModelSettingsPage t={tFake} modelConfig={buildConfig([baseKey])} setModelConfig={setModelConfig} />,
@@ -176,11 +179,79 @@ describe('model-settings params face (09-12 子3 W4)', () => {
     await userEvent.click(screen.getByRole('button', { name: 'settings.applyChanges' }));
     await waitFor(() => expect(setModelConfig).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(screen.getByText('settings.modelSaveRejected')).toBeInTheDocument());
+    // R10：壳侧 schema 拒收与本地前置校验同属「应用被拒」——toast 通道同步给可见反馈。
+    await waitFor(() =>
+      expect(useToastStore.getState().toasts.some((item) => item.message === 'settings.modelSaveRejected')).toBe(true),
+    );
     // 诊断 detail 落输出日志（appendOutputEntry mock 在 appStore setState 里）。
     await waitFor(() =>
       expect((useAppStore.getState() as any).appendOutputEntry).toHaveBeenCalledWith(
         expect.objectContaining({ scope: 'model', level: 'error' }),
       ),
     );
+  });
+});
+
+// ── R10（dogfood F14）：越界值保存被拦下必须「看得见」——notice 条在编辑器顶部、应用钮在
+// 底部，长编辑器里提示条落在视口外 ⇒ 用户只见「点了没反应」。toast 通道（本页既有惯例）
+// 给即时可见反馈；合法值路径零变化（回归锚）。──
+describe('R10 保存被拒可见反馈', () => {
+  const tReal = (key: string, vars?: Record<string, string | number>): string => translate('zh-CN', key, vars);
+
+  beforeEach(() => {
+    useAppStore.setState({ outputEntries: [], appendOutputEntry: vi.fn() } as any);
+    useToastStore.setState({ toasts: [] });
+    (window as any).orisonDesktop = {
+      listRemoteModels: vi.fn().mockResolvedValue([]),
+      listCliModels: vi.fn().mockResolvedValue({ ok: true, resolvedExecutable: 'C:/agy/bin/agy.exe', models: [] }),
+    };
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it('越界 temperature（99）→ 可见反馈（含模型/字段/合法范围）且不落盘', async () => {
+    const setModelConfig = vi.fn().mockResolvedValue(undefined);
+    render(
+      <ModelSettingsPage t={tReal} modelConfig={buildConfig([baseKey])} setModelConfig={setModelConfig} />,
+    );
+    await selectKey(/GPT-4o/);
+    await userEvent.click(screen.getByRole('button', { name: tReal('settings.modelDefaultsToggle') }));
+
+    fireEvent.change(screen.getByLabelText(tReal('settings.modelTemperature')), { target: { value: '99' } });
+    await userEvent.click(screen.getByRole('button', { name: tReal('settings.applyChanges') }));
+
+    // 可见反馈（toast）：模型名 + 字段 + 合法范围（0~2 来自 MODEL_DEFAULT_RANGES，禁手抄）。
+    const toast = await waitFor(() => {
+      const found = useToastStore.getState().toasts.find((item) => item.level === 'error');
+      expect(found).toBeTruthy();
+      return found!;
+    });
+    expect(toast.message).toContain('gpt-4o');
+    expect(toast.message).toContain('temperature');
+    expect(toast.message).toContain('0 到 2');
+    // 既有 notice 条同步保留（持久、可关闭）。
+    expect(screen.getByText(toast.message)).toBeInTheDocument();
+    // 被拒 = 不落盘。
+    expect(setModelConfig).not.toHaveBeenCalled();
+  });
+
+  it('合法 temperature（1.2）→ 照常保存且零错误反馈（回归锚）', async () => {
+    const setModelConfig = vi.fn().mockResolvedValue(undefined);
+    render(
+      <ModelSettingsPage t={tReal} modelConfig={buildConfig([baseKey])} setModelConfig={setModelConfig} />,
+    );
+    await selectKey(/GPT-4o/);
+    await userEvent.click(screen.getByRole('button', { name: tReal('settings.modelDefaultsToggle') }));
+
+    fireEvent.change(screen.getByLabelText(tReal('settings.modelTemperature')), { target: { value: '1.2' } });
+    await userEvent.click(screen.getByRole('button', { name: tReal('settings.applyChanges') }));
+
+    await waitFor(() => expect(setModelConfig).toHaveBeenCalledTimes(1));
+    const saved = setModelConfig.mock.calls[0]![0] as ModelConfig;
+    expect(saved.keys[0]!.models[0]!.defaults?.temperature).toBe(1.2);
+    expect(useToastStore.getState().toasts).toHaveLength(0);
   });
 });

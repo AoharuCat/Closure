@@ -475,4 +475,25 @@ describe('antigravityCli sessions（进程池，design §3.1）', () => {
     await flush();
     expect(env.removedDirs).toContain(homeDir);
   });
+
+  it('CR-9：onCommitSeenHashes 观察者抛错不侵入控制流——记账照常推进 + warn 落账（不误报写失败）', async () => {
+    const env = fakePoolEnv();
+    // 观察缝抛错：旧实现裸调观察者，throw 沿调用方 async 体上抛（首行路径 = 未处理
+    // rejection；纠正路径 = 被误报成写失败 + 502 作废会话）。
+    env.deps.onCommitSeenHashes = () => {
+      throw new Error('observer boom');
+    };
+    const pool = makePool(env);
+    await pool.runTurn({ sessionKey: 's1', keyId: 'k1', modelId: 'm1' }, SPEC, undefined, async (session) => {
+      await session.writeLine('one');
+      // 观察者抛错被吞在观察缝内：commitSeenHashes 本体照常落账（镜像「已发」语义）。
+      expect(() => session.commitSeenHashes(['h1'])).not.toThrow();
+      expect(session.seenHashes).toEqual(['h1']);
+      return 'ok';
+    });
+    expect(env.warns.some((w) => w.includes('onCommitSeenHashes observer threw'))).toBe(true);
+    expect(env.spawns[0]!.writtenLines).toEqual(['one']); // 写路径零影响
+    expect(env.spawns[0]!.killed).toBe(false); // 不因观察者失败误作废会话
+    pool.dispose();
+  });
 });

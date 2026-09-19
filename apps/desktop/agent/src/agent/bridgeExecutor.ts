@@ -7,6 +7,7 @@ import type {
 } from '@orison/shared-contracts';
 import { zodToJsonSchema } from 'zod-to-json-schema';
 import type {
+  AgyBridgeNoticeData,
   SessionMessage,
   StreamDeltaData,
   ToolDefinition,
@@ -30,8 +31,10 @@ import { logger } from '../logger';
 //     SessionMessage 对（assistant.toolCalls + tool.toolResults）+ 终文 assistant 消息
 //     ——与 runLoop 产物同构，后续轮次（切回 HTTP 模型/压缩/summarizer）零特殊处理；
 //   - 事件发射（既有 RuntimeEventPayload 契约）：delta 文本流（messageId = 预分配
-//     assistantId，终帧同 id）+ tool 通道相位（「正在调用 X」）+ bridge-notice 运行期
-//     通知（打回/二次未调/软拒——UI 消费面归 W6）；
+//     assistantId，终帧同 id）+ tool 通道相位（「正在调用 X」，仅桥工具步）+ bridge-notice
+//     运行期通知（打回/二次未调/软拒——UI 消费面归 W6；R5 起含内置工具步「模型离开了桥
+//     工具族」呈报、R6 起含内置工具被权限拦下，两信号走通知面而非 tool 通道，防与桥工具
+//     相位混淆）；
 //   - abort 贯通 + 中断落盘门（mirror runLoop §3.3：!text && !reasoning 丢弃，text 已流
 //     → aborted_partial）。
 //
@@ -41,7 +44,7 @@ import { logger } from '../logger';
 
 // ── 工具面策展（design §7）──
 
-/** Tier 1（MVP）：桥原生收尾 + 写章派发 + 只读十件主体 + 研究两件。 */
+/** Tier 1（MVP）：桥原生收尾 + 写章派发 + 只读十件主体 + 通用只读件 + 研究两件。 */
 export const BRIDGE_TOOL_FACE_TIER1: readonly string[] = [
   'present_result',
   'write_chapter',
@@ -56,6 +59,16 @@ export const BRIDGE_TOOL_FACE_TIER1: readonly string[] = [
   'scene_graph_read',
   'query_promise',
   'query_cognition_graph',
+  // 通用只读件（F4b）：对话附件/引用文件场景的唯一读路——没有它，模型面对文件路径在
+  // 桥工具面内无路可读（白名单 agent **收窄但未清零**内置工具面——F4b 时代「改用内置」
+  // 的岔路仍可能出现，见 BRIDGE_TOOL_FACE 注；本件在场正是让模型有正路可走）。
+  'read_file',
+  // 通用只读件补件（F8 同型复发——与 F4b 缺 read_file 同一类事故）：模型想「项目里哪里有
+  // X」「某个目录下有什么」时桥面内无件可答，于是伸手够 agy 内置检索/列目录件，被 headless
+  // 软拒 ⇒ 整轮空输出。两件与 read_file 同簇；classifyTool 对二者缺省归 read，readonly /
+  // suggest / auto 三档全可见（零 toolPolicy 登记）。
+  'search',
+  'list_files',
   // 研究两件（近邻撞名注意：agy 内置是 search_web，词序互反——描述已写清归属）。
   'web_search',
   'wiki_search',
@@ -75,7 +88,20 @@ export const BRIDGE_TOOL_FACE_TIER2: readonly string[] = [
   'asset_cards_update',
 ];
 
-/** 全量桥面（Tier 1 + Tier 2；W0 §7 定谳与 agy 57 内置零撞）。 */
+/**
+ * 全量桥面（Tier 1 + Tier 2）。read_file 入面（F4b）时与 agy 内置同名读文件工具并存，
+ * 曾靠描述归属句 + 桥指令硬禁令双面消歧（MCP 派发器 ServerName+ToolName 本就分命名
+ * 空间，技术上无冲突）。09-19 白名单落地后桥 spawn 恒挂声明式 agent，消歧文案随 W5
+ * 瘦身移除（CR-21 收口：不改名）。
+ *
+ * ⚠️ 归因纠正（2026-09-19 F8 真机实证）：零工具 agent **没有**把内置工具面从桥会话
+ * 模型侧清零——agy 1.2.2 实测挂 agent（日志 agent=true、system prompt 被整体替换、
+ * input tokens 腰斩）时内置工具仍可调用、可执行（`find_by_name` 在默认无头权限下执行
+ * 成功并逐字回读随机标记文件名）。`--agent` 的真实效果 = 替换 system prompt + **收窄**
+ * 内置工具面（收窄但未清零）；「出现内置工具步 ⇒ agent 未加载」不成立，工具步与加载
+ * 状态**无因果关系**。故本面策展是给模型铺正路，不是「同名词机制性不存在」的兜底。
+ * 证据：task 09-19-agy-toolface-fix-batch research/f8-builtin-tool-stream-signal.md §4/§5。
+ */
 export const BRIDGE_TOOL_FACE: readonly string[] = [...BRIDGE_TOOL_FACE_TIER1, ...BRIDGE_TOOL_FACE_TIER2];
 
 /**
@@ -91,6 +117,21 @@ export const BRIDGE_TOOL_DESCRIPTION_OVERRIDES: Readonly<Record<string, string>>
   write_chapter:
     '为指定章节触发完整写作流程：编译写作简报 → 生成初稿 → 同步故事档案 → 五维审核 → 定稿路线判定与修订闭环。' +
     '只回摘要（标题/字数/判定结论）。写作简报传本章目标/参数/信息控制/节奏/禁写/情绪目标。',
+  // read_file（F4b 入面 / W5 简化）：归属消歧句删除（命名空间分派本无硬冲突 + CR-21 不改
+  // 名）——描述回归工具本义（路径契约、场景与章节正文指引保留）。
+  read_file:
+    '读取项目内的文件内容（对话附件、引用文件、设定/资料文档等场景），filePath 传相对项目根的相对路径' +
+    '（如 inbox/简介.txt、research/设定集.md）。章节正文优先用 chapter_read。',
+  // search / list_files（F8 同型补件）：builtin.ts 原描述是英文且只写「能做什么」的泛话——
+  // 桥面用中文写作域措辞写清「能回答什么问题」与路径/参数契约（agent-tools spec 说人话双规则）。
+  search:
+    '在项目内的文件里按文本检索，回答「某句话出现在哪里」——命中给出所在文件、第几行与该行内容。' +
+    'query 支持正则；glob 按文件名后缀过滤（如 *.md；**/*.md 这类路径式通配无效）；maxResults 限制命中条数。' +
+    '查故事设定与档案（人物、伏笔、章摘要等）用 query_story 等专项查询；读整份文件用 read_file。',
+  list_files:
+    '列出项目内某个目录下的文件与子目录，回答「这个目录里有什么」——dirPath 传相对项目根的相对路径' +
+    '（缺省即项目根），recursive 传 true 递归列出全部层级（条目多时先列浅层、再按需下钻）；' +
+    '点开头的条目（如 .orison、.git）不会列出，属正常现象。',
 };
 
 // ── seam 类型（本地声明——mirror GenerationDelta 先例；shell 实现按导出类型编译）──
@@ -123,6 +164,13 @@ export interface BridgeToolCallRecord {
 /** 桥 turn 运行期相位事件（protocol 层 AgyBridgePhaseEvent 的 seam 同构声明）。 */
 export type BridgeTurnPhaseEvent =
   | { kind: 'tool-started'; toolName: string; stepIndex: number }
+  // 09-19 工具面修复批 R5：agy 内置工具步（非桥工具族）——「模型离开了桥工具族」的可观测
+  // 相位；与 tool-started 分开发（内置工具不是桥件，混进桥相位 = UI 语义错误）。
+  | { kind: 'builtin-tool-started'; toolName: string; stepIndex: number }
+  // 09-19 工具面修复批 R6（F13）：内置工具**权限软拒**——模型离开桥工具族且该调用被
+  // headless 权限系统拦下（与 soft-denied 分开：后者是 MCP 预授权缺失，指向设置页授权）。
+  // 工具名/步号可缺席（stderr 兜底信号无步上下文——见 protocol 层相位注）。
+  | { kind: 'builtin-tool-denied'; toolName?: string; stepIndex?: number }
   | { kind: 'sendback' }
   | { kind: 'sendback-missed' }
   | { kind: 'soft-denied' };
@@ -373,8 +421,8 @@ export interface BridgeExecutorOptions {
   face?: BridgeFaceEntry[];
   /** delta 事件发射钩子（messageId = 预分配 assistantId，终帧 assistant 同 id）。 */
   emitDelta?: (event: StreamDeltaData) => void;
-  /** 运行期通知（打回/二次未调/软拒——bridge-notice 事件面，UI 消费归 W6）。 */
-  onNotice?: (notice: { notice: 'sendback' | 'sendback-missed' | 'soft-denied' }) => void;
+  /** 运行期通知（打回/二次未调/软拒/内置工具步/内置工具被拒——bridge-notice 事件面，UI 消费归 W6/R5/R6）。 */
+  onNotice?: (notice: AgyBridgeNoticeData) => void;
 }
 
 function isAbortLike(err: unknown): boolean {
@@ -433,13 +481,25 @@ export async function runBridgeExecutor(opts: BridgeExecutorOptions): Promise<Se
       }
       return;
     }
+    // 其余相位 → bridge-notice 通知面（打回/二次未调/软拒，以及 R5/R6 的内置工具步与
+    // 内置工具被拒呈报）。
+    // R5（09-19 工具面修复批）：内置工具步与桥工具相位**分开**呈报——走通知条而非 tool
+    // 通道的「正在调用 X」占位 chip（内置工具不是桥件，混用会给出错误的桥工具语义）。
+    // R6：内置工具权限软拒（F13）同走通知面；工具名缺席时条件展开（stderr 兜底信号无
+    // 步上下文——缺席即不带键，防 undefined 混进渲染面）。
+    const notice: AgyBridgeNoticeData =
+      event.kind === 'builtin-tool-started'
+        ? { notice: 'builtin-tool-started', toolName: event.toolName }
+        : event.kind === 'builtin-tool-denied'
+          ? { notice: 'builtin-tool-denied', ...(event.toolName !== undefined ? { toolName: event.toolName } : {}) }
+          : { notice: event.kind };
     // CR-5（子4 CR 批）：onNotice 消费者 throw 不冒泡穿协议层中断整桥 turn（mirror
     // driver onDelta catch 先例）——记 warn 后继续；异常处文本以 result 为权威。
     try {
-      opts.onNotice?.({ notice: event.kind });
+      opts.onNotice?.(notice);
     } catch (err) {
       logger.warn(
-        { err: err instanceof Error ? err.message : String(err), notice: event.kind },
+        { err: err instanceof Error ? err.message : String(err), notice: notice.notice },
         'bridgeExecutor: onNotice consumer threw (ignored; turn continues)',
       );
     }

@@ -55,7 +55,7 @@ export const gitCommitHandler: ToolHandler = async ({ params, projectDir }) => {
     fs,
     dir: root,
     message,
-    author: author ?? { name: 'Orison Agent', email: 'agent@orison.local' },
+    author: author ?? { name: 'Closure Agent', email: 'agent@closure.local' },
   });
 
   notifyUI({ type: 'git:changed', projectPath: projectDir });

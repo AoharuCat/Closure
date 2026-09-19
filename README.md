@@ -14,7 +14,7 @@
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)
 ![Electron](https://img.shields.io/badge/Electron-37-47848F.svg)
 
-**⬇ [下载安装](../../releases/latest)** · [📖 文档](docs/) · [🕒 时间线指南](docs/guides/时间线指南.md) · [📋 更新日志](CHANGELOG.md)
+**⬇ [下载安装](https://github.com/AoharuCat/Closure/releases/latest)** · [📖 文档](docs/) · [🕒 时间线指南](docs/guides/时间线指南.md) · [📋 更新日志](CHANGELOG.md)
 
 </div>
 
@@ -89,7 +89,7 @@ Closure（可露希尔）是《明日方舟》里的干员，罗德岛的工程�
 - **拆书引擎** — 选一本导入的书，按档位与维度跑拆解：事实设定（世界观 / 人物 / 势力）、读法、章评与细批、风格特征逐层产出，关键节点停下人工把关；风格分析导出为风格卡，写作经验蒸馏为手艺卡——别人写得好在哪里，拆开看清楚再学
 - **双层审核** — 先跑免费的纯代码规则，零命中的稿子直接放行；有问题的才交给模型细审（一致性、叙事特征、承诺兑现、认知状态、情绪落地、设定契约六组）。纪律有二：**每条意见必须附原文引证**，说不出证据就不许说；**宁可误报不可漏报**，审核层永远不许「假通过」
 - **模型分档路由** — 规划、正文写作、审核、研究、风格分析等各个环节，可以分别指定不同的模型与档位：最强的模型留给正文，便宜的模型跑杂活；每个环节的思考深度（推理力度）也能单独调节，成本花在刀刃上
-- **Antigravity CLI 接入** — 除 OpenAI / Anthropic 兼容端点外的第三条模型通道：经 Google 官方 agy CLI 直连 Antigravity，调用 Gemini 系列模型——不经第三方中转（反代），密钥与请求数据不经他人之手，也没有中转站跑路、计量注水一类风险；订阅配额内的成本远低于按 token 计费的官方 API。配合工具桥，对话模型还能在一次性授权后调用 Closure 的写作工具（写章、查设定、资料检索）；间接调用的 ToS 灰区与账号风险，应用内配置处另有明示
+- **Antigravity CLI 接入** — 除 OpenAI / Anthropic 兼容端点外的第三条模型通道：经 Google 官方 agy CLI 直连 Antigravity，调用 Gemini 系列模型——不经第三方中转（反代），密钥与请求数据不经他人之手，也没有中转站跑路、计量注水一类风险；订阅配额内的成本远低于按 token 计费的官方 API。配合工具桥，对话模型还能在一次性授权后调用 Closure 的写作工具（资料检索、读文件、查故事档案、更新大纲与设定等）；间接调用的 ToS 灰区与账号风险，应用内配置处另有明示
 - **用量面板** — 「用量」页为本机调用留账：token 与耗时按模型、按任务档位分解，估算费用、失败次数与首字延迟一目了然；记录按保留窗自动清理，只存本机
 - **创作决策留档** — 重大创作选择像架构决策一样留档记录（为什么这么定、备选是什么），审核据此判断后续章节有没有违背你定下的承诺
 
@@ -102,7 +102,7 @@ Closure（可露希尔）是《明日方舟》里的干员，罗德岛的工程�
 - **IDE 式编辑器** — 分屏、Minimap、多标签、命令面板
 - **模型自由** — 接入任何 OpenAI 兼容端点，密钥仅本地加密保存
 
-> **实验性功能：** Agent Orchestration（多步编排）、Auto Mode（自动推进）、视频生成目前为实验性，不保证稳定。
+> **多步编排已转正**：曾经的「Agent Orchestration（实验性）」已落地为写章链核心能力（0.3.x 主打）——对话下意图、导演核对设定、写手两阶段成稿、审核修订，链内自动推进，关键节点停下等你拍板；不再有「实验性，不保证稳定」的保留条款。
 
 ## 适合谁
 
@@ -171,9 +171,9 @@ docs/               — 架构与设计文档
 
 ## 下载安装
 
-> ⚠️ 项目仍处于**早期开发阶段**，可能遇到各种奇怪的 BUG——遇到了请[提 Issue](../../issues)，见[项目状态](#项目状态)。
+> ⚠️ 项目仍处于**早期开发阶段**，可能遇到各种奇怪的 BUG——遇到了请[提 Issue](https://github.com/AoharuCat/Closure/issues)，见[项目状态](#项目状态)。
 
-在 [GitHub Releases](../../releases) 下载安装包：
+在 [GitHub Releases](https://github.com/AoharuCat/Closure/releases) 下载安装包：
 
 | 平台 | 格式 |
 |------|------|
@@ -185,9 +185,9 @@ docs/               — 架构与设计文档
 
 - **macOS 包未签名**：Alpha 阶段无 Apple 开发者证书，首次启动会被 Gatekeeper 拦截——右键 App 选「打开」，或对解压/挂载出的 `Closure.app` 执行 `xattr -cr /Applications/Closure.app` 后再启动。
 - **macOS 自动更新不可用**：应用内自动更新在 macOS 要求构建经过签名（electron-updater 拒绝安装未签名构建）——签名落地前升级请手动下载新版安装包覆盖。
-- **arm64 产物未做真机验证**：Windows / macOS / Linux 的 arm64 包为理论可用（原生模块的 arm64 预编译均已在位），但我们手上没有 arm64 实机——遇到问题请[提 Issue](../../issues) 附平台与机型信息。
+- **arm64 产物未做真机验证**：Windows / macOS / Linux 的 arm64 包为理论可用（原生模块的 arm64 预编译均已在位），但我们手上没有 arm64 实机——遇到问题请[提 Issue](https://github.com/AoharuCat/Closure/issues) 附平台与机型信息。
 - **Linux 首选 AppImage**：免安装、无发行版包管理器耦合；deb/rpm 等格式暂未提供。
-- **CI 已覆盖三平台机械验证**：全仓测试与启动冒烟（Electron 拉起到首帧）在 Windows / macOS / Linux CI 逐平台运行；日常使用的功能实测重心仍在 Windows——其他平台遇到平台相关问题请[提 Issue](../../issues)。
+- **CI 已覆盖三平台机械验证**：全仓测试与启动冒烟（Electron 拉起到首帧）在 Windows / macOS / Linux CI 逐平台运行；日常使用的功能实测重心仍在 Windows——其他平台遇到平台相关问题请[提 Issue](https://github.com/AoharuCat/Closure/issues)。
 
 ## 使用指南
 
@@ -233,7 +233,7 @@ docs/               — 架构与设计文档
 
 ## 项目状态
 
-> ⚠️ **早期开发阶段（Alpha）** — Closure 仍在快速迭代，功能与界面都可能变化，你也可能遇到各种奇怪的 BUG：界面错乱、生成中断、数据表现异常，甚至更离谱的。**遇到问题请[提 Issue](../../issues)**，附上复现步骤、操作系统与版本号（设置 → 关于 可见），每一条我们都会认真看。
+> ⚠️ **早期开发阶段（Alpha）** — Closure 仍在快速迭代，功能与界面都可能变化，你也可能遇到各种奇怪的 BUG：界面错乱、生成中断、数据表现异常，甚至更离谱的。**遇到问题请[提 Issue](https://github.com/AoharuCat/Closure/issues)**，附上复现步骤、操作系统与版本号（设置 → 关于 可见），每一条我们都会认真看。
 
 叙事核心链路（结构 → 设定 → 写章 → 审核 → 修订 → 长程供给）已贯通并在真实创作中实测。**Windows 平台优先发布**；macOS / Linux 继承自上游架构，尚未充分实测。
 

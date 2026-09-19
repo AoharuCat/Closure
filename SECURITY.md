@@ -12,7 +12,7 @@ only.
 
 | Version | Supported |
 |---------|-----------|
-| 0.1.x (latest) | ✅ |
+| 0.3.x (latest) | ✅ |
 | older | ❌ |
 
 ## Reporting a vulnerability
@@ -20,7 +20,7 @@ only.
 **Please do not report security vulnerabilities through public GitHub issues.**
 
 Instead, report privately via GitHub's private vulnerability reporting:
-**https://github.com/chillison/Closure/security/advisories/new**
+**https://github.com/AoharuCat/Closure/security/advisories/new**
 (Repository → Security → Advisories → Report a vulnerability).
 
 Please include:

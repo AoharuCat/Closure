@@ -33,8 +33,17 @@ export {
   classifyCliError,
   disposeAntigravityCliDriver,
   isAuthError,
+  // 09-19 CLI 白名单（W3）：纯文本车道零工具 agent 解析器注入缝（shell agentIpc 装配；
+  // 生产单例驱动器每 turn 消费；wiring 测试经 __get 探针钉死漏装配）。
+  setAntigravityCliTextAgentResolver,
+  __getAntigravityCliTextAgentResolverForTest,
 } from './antigravityCli/driver';
-export type { AntigravityCliDriver, AntigravityCliGenerateFn } from './antigravityCli/driver';
+export type {
+  AntigravityCliDriver,
+  AntigravityCliGenerateFn,
+  ResolveTextAgentFn,
+  AntigravityCliDriverOptions,
+} from './antigravityCli/driver';
 // 09-12 子4 agy MCP 工具桥：桥 turn 编排（W4 executor 经注入 seam 消费；shell
 // installShellAgyBridgeCore 装配内核——wiring 测试钉死漏装配）。桥 turn 不经 generate
 // 两分派点（design §6 边界），独立导出块。
@@ -50,12 +59,22 @@ export {
   BRIDGE_MCP_SERVER_NAME,
   BRIDGE_OUTPUT_DIRECTIVE,
   BRIDGE_SENDBACK_MESSAGE,
-  MCP_SOFT_DENY_TOOL_MESSAGE_NEEDLE,
-  MCP_SOFT_DENY_STDERR_NEEDLE,
   isMcpSoftDenyStderr,
   isMcpSoftDenyToolError,
   hasMcpDeniedAction,
 } from './antigravityCli/bridgeTurn';
+// 09-19 工具面修复批 R6（F13 + F9 单点收口）：权限软拒族**主体判据**——桥侧三针与纯文本
+// 车道 isBuiltinToolAutoDeny 共用（两车道按主体分派不漂移）；旧 mcp 特化针常量随泛化退役。
+export {
+  PERMISSION_SOFT_DENY_MESSAGE_PREFIX,
+  MCP_PERMISSION_SUBJECT,
+  parsePermissionSoftDenyMessageSubject,
+  parsePermissionSoftDenyStderrSubject,
+  findPermissionSoftDenySubject,
+  hasMcpPermissionSoftDeny,
+  isMcpPermissionSubject,
+} from './antigravityCli/permissionSoftDeny';
+export type { PermissionSoftDenySubject } from './antigravityCli/permissionSoftDeny';
 export type {
   AgyBridgeCore,
   BridgeToolFaceEntry,
@@ -67,5 +86,10 @@ export type {
   BridgePermissionMode,
   AgyBridgePhaseEvent,
 } from './antigravityCli/bridgeTurn';
+// 09-19 CLI 内置工具白名单（W1 内容源 + W2 桥落盘消费）：agy 声明式 agent 单一来源——
+// 布局常量 / 注册表名单（R7 升级回归用）/ 双 agent 定义 / 渲染 + hash 尾标记（自有认定
+// 与版本检测）。内容常量归协议层、fs 归 shell（module-boundaries）：shell 消费
+// renderAgentMarkdown + 布局常量做假宿（W2）/ 真实全局（W3）落盘——协议层不管 fs。
+export * from './antigravityCli/agents';
 export { defaultAgyPoolDeps } from './antigravityCli/driver';
 

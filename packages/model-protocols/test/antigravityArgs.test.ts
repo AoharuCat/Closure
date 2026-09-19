@@ -7,6 +7,7 @@ import {
   BRIDGE_PRINT_TIMEOUT,
   BRIDGE_PRINT_TIMEOUT_GRACE_MS,
 } from '../src/antigravityCli/args';
+import { CLOSURE_TEXT_AGENT_LAYOUT } from '../src/antigravityCli/agents';
 
 describe('antigravityCli args', () => {
   it('snapshot: background lane + thinking low → full arg array (no -p ever)', () => {
@@ -87,5 +88,21 @@ describe('antigravityCli args', () => {
     // 裸查表会返 undefined，调用方 printTimeout.arg 即 TypeError——本用例钉回落不崩。
     expect(printTimeoutForLane('backgroundx' as never)).toEqual({ arg: '5m', ms: 300_000 });
     expect(buildCliArgs({ model: 'm', lane: 'backgroundx' as never })).toContain('--print-timeout');
+  });
+
+  it('agentName 传入 → 尾部追加 --agent <激活值>（白名单 W1；布局常量取值不钉字面）', () => {
+    const base = buildCliArgs({ model: 'm', lane: 'background' });
+    const withAgent = buildCliArgs({
+      model: 'm',
+      lane: 'background',
+      agentName: CLOSURE_TEXT_AGENT_LAYOUT.agentName,
+    });
+    expect(withAgent).toEqual([...base, '--agent', CLOSURE_TEXT_AGENT_LAYOUT.agentName]);
+  });
+
+  it('agentName 缺席/空串 → 与现状逐字节一致（回归保证；条件展开统一 truthy）', () => {
+    const base = buildCliArgs({ model: 'm', lane: 'background' });
+    expect(buildCliArgs({ model: 'm', lane: 'background', agentName: undefined })).toEqual(base);
+    expect(buildCliArgs({ model: 'm', lane: 'background', agentName: '' })).toEqual(base);
   });
 });

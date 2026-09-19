@@ -90,6 +90,17 @@ try {
   sqliteUsable = false;
 }
 
+// 批量任务 prompt 反工具硬化：纯文本 CLI 车道无工具可用，模型调内置工具会被无头权限
+// 拒收、整回合拖成空响应，批量蒸馏整批失败——三缝 system 均须带禁用工具约束行。
+describe('蒸馏三缝 system prompt 反工具硬化行', () => {
+  it('切条/归类/分歧判定三缝均带禁用工具约束', () => {
+    for (const prompt of [CLAIM_EXTRACTION_SYSTEM_PROMPT, CATEGORIZATION_SYSTEM_PROMPT, DISPUTE_SYSTEM_PROMPT]) {
+      expect(prompt).toContain('仅基于提供的文本作答');
+      expect(prompt).toContain('不要使用任何工具（联网搜索、命令执行、浏览器等）');
+    }
+  });
+});
+
 function clean() {
   closeDb();
   resetSqliteVecState();

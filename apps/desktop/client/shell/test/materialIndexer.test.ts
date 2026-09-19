@@ -74,7 +74,11 @@ import {
   deleteMaterialRows,
   upsertMaterialRow,
 } from '../main/db/materialIndexer';
-import { scanAndReindexCraftKb } from '../main/db/closureCraftIndexer';
+import {
+  reindexAllCraft,
+  getCurrentCraftVecDim,
+  scanAndReindexCraftKb,
+} from '../main/db/closureCraftIndexer';
 import { listCatalogEntries } from '../main/db/catalogRepository';
 import { EMBED_DIM } from '../main/db/closureIndexer';
 import { closeDb, getDb } from '../main/db/index';
@@ -1215,5 +1219,67 @@ describe.skipIf(!sqliteUsable)('materialIndexer DB integration (Story 10.1 Wave 
       .prepare('SELECT entry_id FROM entry_fts WHERE entry_fts MATCH ?')
       .all('节奏控制') as Array<{ entry_id: string }>;
     expect(ftsHit.map((h) => h.entry_id)).toContain(materialEntryId(PID!, materialId, 0, 0));
+  });
+});
+
+// ── dogfood R4 F1 恢复链：craft 表维度重建后，材料重嵌过维度门落向量 ──
+// 事故全链在 db 层的重演 + 解锁验证：旧模型遗留维度（initSchema 缺省 float[1024]）下新模型
+// 4096 向量整批被维度门拒收（行落 pending）→ reindexAllCraft 重建表到探测维度 → 再跑材料
+// 重索引，同一批向量落库 + content_hash 落值（pending 清零）。
+describe.skipIf(!sqliteUsable)('craft vec dim rebuild -> material re-embed restore chain (dogfood R4 F1)', () => {
+  beforeAll(clean);
+  afterAll(clean);
+
+  function vecOf(dim: number): number[] {
+    return new Array(dim).fill(0);
+  }
+
+  it('表 1024 拒收 4096 embed → reindexAllCraft 重建 4096 → reindexMaterial 向量落地清 pending', async () => {
+    if (!isSqliteVecAvailable()) return; // vec0 gate
+    const db = getDb();
+    expect(getCurrentCraftVecDim(db)).toBe(1024);
+
+    // 1) 事故半场：4096 向量 vs 1024 表——维度门整批拒收，行落 pending（FTS-only）。
+    writeGlobalSource('r4-restore.txt', chapteredNovel(2));
+    const dim4096Deps = {
+      resolveModel: () => stubModel(),
+      embedBatch: async (_m: ResolvedModel, texts: string[]) => texts.map(() => vecOf(4096)),
+    };
+    const reg = await registerMaterial({ scope: 'global' }, 'r4-restore.txt', dim4096Deps);
+    const materialId = reg.materialId!;
+    const pendingRows = craftRowsRaw(materialId);
+    expect(pendingRows.length).toBeGreaterThan(0);
+    for (const r of pendingRows) expect(r.content_hash).toBeNull();
+    expect(craftVecRows(`mat:${materialId}`)).toHaveLength(0);
+
+    // 2) 修复中场：reindexAllCraft（craft KB 零文档零卡——表里住客只有材料行）重建表到 4096。
+    const rebuild = await reindexAllCraft({
+      resolveModel: () => stubModel(),
+      embed: async () => vecOf(4096),
+    });
+    expect(rebuild).toMatchObject({ reindexed: 0, dimChanged: true, newDim: 4096, cardsReembedded: 0 });
+    expect(
+      (
+        db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='closure_craft_vec'").get() as {
+          sql: string;
+        }
+      ).sql,
+    ).toContain('float[4096]');
+
+    // 3) 恢复后场：同一批 4096 向量过维度门 → 落库 + content_hash 落值（pending 清零）。
+    const res = await reindexMaterial(materialId, dim4096Deps);
+    expect(res.outcome).toBe('written');
+    const restored = craftRowsRaw(materialId);
+    expect(restored.length).toBe(pendingRows.length);
+    for (const r of restored) {
+      expect(r.content_hash).toHaveLength(64);
+      expect(r.model).toBe('text-embedding-3-test');
+      expect(r.dim).toBe(4096);
+    }
+    expect(craftVecRows(`mat:${materialId}`)).toHaveLength(restored.length);
+
+    // 4) 收敛：再跑一遍 hash-skip 零重嵌（终态稳定，不反复重写）。
+    const again = await reindexMaterial(materialId, dim4096Deps);
+    expect(again.outcome).toBe('hash-skip');
   });
 });

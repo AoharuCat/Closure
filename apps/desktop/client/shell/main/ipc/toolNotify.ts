@@ -34,7 +34,21 @@ export type ToolEvent =
       // it is handled BEFORE the current-project match guard - quarantine can fire
       // during cold-start project listing, before any project is open.
       | { type: 'project:quarantined'; backupPath: string | null; reason: string; recovered: boolean }
-    ));
+    ))
+    // CLI 凭据探针（09-19 dogfood R4）：CLI key 凭据判死（探针 stderr/err 命中认证词表）。
+    // 机器级事件（**无 projectPath**——在外层 union 顶层，不进上面的 project-scoped
+    // 交叉），与 quarantine 同族——renderer 在 projectPath 守卫之前处理；shell 侧只在
+    // 「上一态非 auth-dead → auth-dead」转变时推一次（防骚扰判定单点在 shell 探针内存），
+    // renderer 只弹不二次去重。keys 恒数组：手动重测单元素；启动自动扫的多 key 死票在
+    // 扫完时合并成单条事件（keys 多元素）——renderer 单 toast 列全部 key 名，不堆叠。
+    | { type: 'cli:auth-dead'; keys: ReadonlyArray<{ keyId: string; keyName: string }> }
+    // 09-19 CLI 白名单（W4）：纯文本车道挂 --agent 的 turn 仍出现内置工具 step（⚠️ 工具
+    // step ≠ agent 未加载——F12 真机实证：内置工具面收窄但未清零）→ 本 turn 已自动以无
+    // agent 车道重跑（γ 反工具硬化兜底恒在）。
+    // 机器级事件（无 projectPath，cli:auth-dead 同族）；shell 侧进程级只推一次（agentIpc
+    // 事件面单点旗——多会话链每会话首 turn 各触发一次降级带，一次性 toast 语义在此收敛），
+    // renderer 只弹不二次去重。
+    | { type: 'cli:text-agent-fallback' };
 
 export function notifyUI(event: ToolEvent) {
   BrowserWindow.getAllWindows().forEach((w) => {

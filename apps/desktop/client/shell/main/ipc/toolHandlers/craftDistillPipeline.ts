@@ -398,6 +398,7 @@ export const CLAIM_EXTRACTION_SYSTEM_PROMPT = [
   '- scenarios：适用场景（同上）；',
   '- counterexamples：反例/常见误用（同上）；',
   '- tags：自由标签——按题材/场景/流派/强度/适用文体等你认为有用的维度自由打标，不受任何词表限制。',
+  '仅基于提供的文本作答；不要使用任何工具（联网搜索、命令执行、浏览器等）——本环境不提供工具，调用工具会导致失败。',
   '输出：纯 JSON 数组（每元素含上述字段），不要输出任何解释或前后缀。',
 ].join('\n');
 
@@ -412,6 +413,7 @@ export const CATEGORIZATION_SYSTEM_PROMPT = [
   '- 优先从 active 词目清单中选最贴合的词目：输出 {"category":"<大类slug>","termId":"<清单内词目id>","confidence":0到1的小数}；category 必须与所选词目的大类一致；清单外的 termId 会被整体拒收。',
   '- 清单内确实没有合适词目时才提新词目：输出 {"proposedTerm":{"category":"<13类内slug>","name":"<简短中文词目名>"},"confidence":0到1的小数}；大类永远只能取 13 类之一，禁止自造类目。',
   '- confidence 是你对该归类的置信度（0-1），只用于人审队列排序，不会被自动采纳。',
+  '仅基于提供的文本作答；不要使用任何工具（联网搜索、命令执行、浏览器等）——本环境不提供工具，调用工具会导致失败。',
   '只输出 JSON，不要任何其他文字。',
 ].join('\n');
 
@@ -419,6 +421,7 @@ export const CATEGORIZATION_SYSTEM_PROMPT = [
 export const DISPUTE_SYSTEM_PROMPT = [
   '你是写作手艺卡的分歧判定器。同一招式下两条来自不同来源的主张，判断它们是否语义相反（教法冲突：「一说应该 X，另一说应该非 X」）。',
   '只判语义是否相反，不裁决谁对——分歧保留给人审确认。',
+  '仅基于提供的文本作答；不要使用任何工具（联网搜索、命令执行、浏览器等）——本环境不提供工具，调用工具会导致失败。',
   '输出 {"dispute":true或false,"reason":"判定理由（一句话）"}，只输出 JSON，不要任何其他文字。',
 ].join('\n');
 

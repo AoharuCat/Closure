@@ -12,7 +12,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { AgyBridgeSection } from '../src/features/model-settings/AgyBridgeSection';
+import { AgyBridgeSection, BRIDGE_SESSION_IDLE_TTL_MINUTES } from '../src/features/model-settings/AgyBridgeSection';
 import { translate } from '../src/shared/i18n/useI18n';
 import { __resetAgyBridgeStoreForTest, useAgyBridgeStore } from '../src/shared/store/agyBridgeStore';
 import { useConfirmStore } from '../src/shared/store/confirmStore';
@@ -149,6 +149,32 @@ describe('AgyBridgeSection 操作', () => {
     );
     // 状态保持 ok（未翻转）。
     expect(useAgyBridgeStore.getState().status?.state).toBe('ok');
+  });
+
+  // ── R11（dogfood F15）：释放条件是 idle TTL 自动回收，不是「对话结束」——提示必须如实 ──
+  it('R11: 活动会话提示如实说明释放条件（闲置 N 分钟自动释放），不含做不到的「先结束对话」指引', async () => {
+    bridgeMocks.agyBridgeStatus.mockResolvedValue(view());
+    bridgeMocks.agyBridgeRevoke.mockResolvedValue({
+      ok: false,
+      error: 'active-sessions',
+      activeSessions: ['sess-1'],
+    } as AgyBridgeRevokeResult);
+    render(<AgyBridgeSection t={t} />);
+    await waitFor(() => expect(screen.getByRole('button', { name: t('agyBridge.revoke') })).toBeTruthy());
+
+    fireEvent.click(screen.getByRole('button', { name: t('agyBridge.revoke') }));
+    useConfirmStore.getState().resolveConfirm(true);
+    const toast = await waitFor(() => {
+      const found = useToastStore.getState().toasts.find((item) => item.message.includes('正在进行的桥会话'));
+      expect(found).toBeTruthy();
+      return found!;
+    });
+    // 真实释放条件：闲置超时自动回收，且分钟数与 UI 常量（shell TTL 镜像）单源。
+    expect(toast.message).toContain('自动释放');
+    expect(toast.message).toContain(`${BRIDGE_SESSION_IDLE_TTL_MINUTES} 分钟`);
+    // 旧文案的假出路（结束对话）不得再出现——照做关不掉（真机复现）。
+    expect(toast.message).not.toContain('结束');
+    expect(toast.message).not.toContain('对话');
   });
 
   // ── CR-19（子3 CR 批）：busy 复位 finally 化——失败路径操作钮不钉死 ──

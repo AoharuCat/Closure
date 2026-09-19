@@ -500,4 +500,42 @@ describe('ModelSettingsPage', () => {
       expect(document.querySelector('.agy-bridge-section')).toBeNull();
     });
   });
+
+  // ── 「反重力状态探测」卡片接线：桥卡片之后并列，仅存在 CLI key 时渲染 ──
+  describe('AgyProbeSection wiring', () => {
+    const cliKey: ApiKeyEntry = {
+      id: 'key_agy',
+      name: 'Antigravity',
+      protocol: 'antigravity-cli',
+      cliExecutable: 'C:/agy/bin/agy.exe',
+      models: [{ id: 'gemini-3.8-pro-high', alias: 'Gemini 3.8 Pro', capability: 'text', enabled: true }],
+    };
+
+    it('有 CLI key → 探测卡片渲染，且位于桥卡片之后', async () => {
+      (window as any).orisonDesktop.cliProbeStatus = vi.fn().mockResolvedValue({});
+      render(
+        <ModelSettingsPage
+          t={tFake}
+          modelConfig={buildConfig({ keys: [cliKey] })}
+          setModelConfig={vi.fn().mockResolvedValue(undefined)}
+        />,
+      );
+      const bridge = await waitFor(() => {
+        const el = document.querySelector('.agy-bridge-section');
+        expect(el).not.toBeNull();
+        return el as Element;
+      });
+      const probe = document.querySelector('.agy-probe-section') as Element | null;
+      expect(probe).not.toBeNull();
+      // probe 在 bridge 之后（bridge.compareDocumentPosition(probe) 含 FOLLOWING 位）。
+      expect(bridge.compareDocumentPosition(probe!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      // 页面级守卫全文只此一处探测卡片。
+      expect(document.querySelectorAll('.agy-probe-section')).toHaveLength(1);
+    });
+
+    it('仅 HTTP key → 探测卡片不渲染', () => {
+      render(<ModelSettingsPage t={tFake} modelConfig={buildConfig()} setModelConfig={vi.fn().mockResolvedValue(undefined)} />);
+      expect(document.querySelector('.agy-probe-section')).toBeNull();
+    });
+  });
 });

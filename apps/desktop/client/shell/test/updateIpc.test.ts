@@ -39,7 +39,7 @@ describe('checkForUpdate（portable 回退：GitHub API 直查，UPDATE_REPO 已
       // 抛出被吞 → false → 走 checkViaGitHubApi → fetch api.github.com latest。
       const result = await checkForUpdate();
       expect(fetchSpy).toHaveBeenCalledTimes(1);
-      expect(String(fetchSpy.mock.calls[0]?.[0])).toContain('api.github.com/repos/chillison/Closure');
+      expect(String(fetchSpy.mock.calls[0]?.[0])).toContain('api.github.com/repos/AoharuCat/Closure');
       expect(result.status).toBe('available');
       expect(result).toMatchObject({ currentVersion: '0.1.0', latestVersion: '0.2.0', manual: true });
     } finally {

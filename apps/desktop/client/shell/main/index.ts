@@ -16,6 +16,9 @@ import { registerModelProviderIpc } from './ipc/modelProviderIpc';
 // 09-12 agy provider W4：CLI 形态（agy）模型发现端点（spawn `agy models` TSV 解析，
 // 独立于 modelProviderIpc 的 HTTP 发现路径）。
 import { registerModelCliDiscoveryIpc } from './ipc/modelCliDiscoveryIpc';
+// 09-19 dogfood R4：CLI 型 provider 凭据探针（`agy -p "hi"` 微型真生成——`agy models`
+// 不验登录，凭据死活只有真生成探得出）。两通道（读最近结果 / 手动重测）+ 启动自动扫。
+import { probeConfiguredCliKeysOnStartup, registerModelCliProbeIpc } from './ipc/modelCliProbeIpc';
 // 09-12 agy provider W4：app 退出时关停 CLI 驱动器单例会话池（长驻 agy 进程 + 清扫
 // 定时器不得活过 app 生命周期）。CR-15（09-12 agy provider CR 批）shell 半：
 // wasAntigravityCliUsed 据此决定 quit 是否给 CLI 池的异步优雅关停留有界等待窗口。
@@ -36,6 +39,8 @@ import {
 // 陈旧判据取目录 + 直接子项最大 mtime）。
 import { sweepStaleAgyTempSessionDirs } from './fs/agyTempSweep';
 import { registerAgyBridgeIpc, wasAgyBridgeUsed } from './ipc/agyBridgeIpc';
+// 09-19 CLI 白名单（W3）：Closure 文本 Agent 状态面三通道 + 启动对账（α 生命周期后端）。
+import { reconcileTextAgentAtStartupProduction, registerAgyTextAgentIpc } from './ipc/agyTextAgentIpc';
 // 09-12 usage-panel（子5 W3）：应用内用量面两通道（usage:overview / usage:clear）+
 // 计量 sink 生产装配（installUsageMeteringProduction——协议层 wrapper → closure_llm_log
 // 落行，全仓唯一装配点）。
@@ -75,6 +80,8 @@ import { installCraftDistillLlmCoreProduction } from './ipc/toolHandlers/craftDi
 import { installDeconLlmCoreProduction } from './decon/deconLlmCore';
 // E10.3a（task 09-05，CR-1）：拆解 job 启动对账（kill/崩溃残留 running → paused 可续跑）。
 import { reconcileStaleDeconJobsOnStartup } from './decon/deconJob';
+// dogfood R4 F5：蒸馏台账启动对账（进程重启后非终态行必为中断残留 → failed + 中断 note）。
+import { closeStaleRunningDistills } from './db/closureCraftDistillRepository';
 import { registerCraftIpc } from './ipc/craftIpc';
 // E10.3a（task 09-05）W6：拆解管线七通道（decon:create/start/pause/cancel/delete/get/list +
 // decon:progress 广播埋点在 deconIpc 编排层）。
@@ -241,9 +248,13 @@ function registerAllIpc() {
   registerModelProviderIpc();
   // 09-12 agy provider W4：CLI 形态（agy）模型发现（model:list-cli-models）。
   registerModelCliDiscoveryIpc();
+  // 09-19 dogfood R4：CLI 凭据探针两通道（model:cli-probe-status / model:cli-probe-run）。
+  registerModelCliProbeIpc();
   registerModelGatewayIpc();
   // 子4 agy MCP 工具桥（W4）：同意/状态/关闭回收三通道（machine 级，无窗口面）。
   registerAgyBridgeIpc();
+  // 09-19 CLI 白名单（W3）：Closure 文本 Agent 状态面三通道（machine 级，无窗口面）。
+  registerAgyTextAgentIpc();
   // 09-12 usage-panel（子5 W3）：应用内用量面（聚合读 + 清空；machine 级，无窗口面）。
   registerUsageIpc();
   registerStorySyncIpc();
@@ -515,6 +526,23 @@ app.whenReady().then(() => {
       'decon: stale-job startup reconciliation failed (non-fatal)',
     );
   }
+  // dogfood R4 F5：蒸馏台账启动对账——蒸馏在途表是纯内存结构，进程重启后恒空，此刻台账
+  // 里的非终态行（running/pending）必为上次进程中断的残留（kill/崩溃/强退都跳不过管线
+  // finally 释放）。decon 同款纪律：decon 有断点续跑翻 paused；蒸馏无续跑语义 → 翻
+  // failed + 中断 note（UI 徽章回落失败态，craft 页重跑入口天然可用）。时序在
+  // registerAllIpc 之前——UI 首次读台账（craft:distill-status）必见对账后真相。
+  // best-effort（失败不阻启动）。
+  try {
+    const closed = closeStaleRunningDistills();
+    if (closed > 0) {
+      getLogger().info({ closed }, 'craft distill: stale non-terminal ledgers reconciled to failed on startup');
+    }
+  } catch (err) {
+    getLogger().warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'craft distill: startup ledger reconciliation failed (non-fatal)',
+    );
+  }
   // Story 3.6 WP2 (R13/D6; CR P2): apply the persisted research proxy tier
   // before any research network call can fire (all research outbound rides the
   // dedicated `research` partition session, so one setProxy covers netFetch +
@@ -566,6 +594,18 @@ app.whenReady().then(() => {
       'agy-bridge: startup sweep of stale bridge homes failed (non-fatal)',
     );
   });
+  // 09-19 CLI 白名单 W3：Closure 文本 Agent 启动对账（α 默认开启的版本同步面——enabled
+  // 且 missing/stale → 写/重写最新 + 日志行；current → 版本一致；foreign → 跳过呈报；
+  // declined / 无 agy CLI key → 不写）。同步毫秒级小文件 IO。best-effort——失败不阻启动
+  //（spawn 侧 resolver 存在性检查 + γ 反工具硬化兜底恒在）。
+  try {
+    reconcileTextAgentAtStartupProduction();
+  } catch (err) {
+    getLogger().warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'agy-text-agent: startup reconcile failed (non-fatal)',
+    );
+  }
   // W5 R9（design D6）：纯文本 lane 的 agy 临时 cwd 同族清扫（桥假宿清扫只覆盖
   // ~/.orison/agy-bridge/home/*，os.tmpdir()/agy-* 归本函数）。同步执行——tmpdir
   // 扫描 + 少量 rm 为毫秒级，且就位在 marker 之前使冒烟路径也覆盖它。
@@ -626,6 +666,17 @@ app.whenReady().then(() => {
   startCraftKbWatcher();
   registerAllIpc();
   createWindow();
+
+  // 09-19 dogfood R4：CLI 凭据启动自动探（fire-and-forget——存在任一 antigravity-cli
+  // key 才探，逐 key 串行微型真生成，单次 30s 上限）。放窗口创建之后：不拖首帧，也
+  // 不进上方 reconcile 串行链（探针与 embedding/材料扫零资源交集）。结果存探针模块
+  // 内存（per keyId）；auth-dead 转变的 renderer 通知由模块内单点判定。best-effort。
+  void probeConfiguredCliKeysOnStartup().catch((err) => {
+    getLogger().warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'cli probe: startup sweep failed (non-fatal)',
+    );
+  });
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {

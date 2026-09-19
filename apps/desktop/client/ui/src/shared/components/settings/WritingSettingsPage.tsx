@@ -56,6 +56,7 @@ export function WritingSettingsPage({
           />
           <label htmlFor="setting-autosave-enabled">{t('settings.autoSaveEnabled')}</label>
         </div>
+        <span className="form-field-hint">{t('settings.autoSaveEnabledHint')}</span>
         <span className="form-field-label">{t('settings.autoSaveInterval')}</span>
         <div className="form-field-options">
           {INTERVAL_OPTIONS.map((opt) => (
@@ -70,6 +71,7 @@ export function WritingSettingsPage({
             </button>
           ))}
         </div>
+        <span className="form-field-hint">{t('settings.autoSaveIntervalHint')}</span>
       </div>
 
       <div className="form-field-row">
@@ -84,6 +86,7 @@ export function WritingSettingsPage({
           />
           <label htmlFor="setting-paragraph-indent">{t('settings.paragraphIndent')}</label>
         </div>
+        <span className="form-field-hint">{t('settings.paragraphIndentHint')}</span>
         <div className="form-field-toggle-row">
           <input
             type="checkbox"
@@ -94,6 +97,7 @@ export function WritingSettingsPage({
           />
           <label htmlFor="setting-show-word-count">{t('settings.showWordCount')}</label>
         </div>
+        <span className="form-field-hint">{t('settings.showWordCountHint')}</span>
         <div className="form-field-toggle-row">
           <input
             type="checkbox"
@@ -104,6 +108,7 @@ export function WritingSettingsPage({
           />
           <label htmlFor="setting-spellcheck">{t('settings.spellCheck')}</label>
         </div>
+        <span className="form-field-hint">{t('settings.spellCheckHint')}</span>
       </div>
 
       <div className="form-field-row">

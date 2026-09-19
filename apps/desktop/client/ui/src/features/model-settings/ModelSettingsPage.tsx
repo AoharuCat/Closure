@@ -4,6 +4,8 @@ import { ProfileEditor } from './ProfileEditor';
 import { ProfileEmptyState } from './ProfileEmptyState';
 import { DeleteConfirmDialog } from './DeleteConfirmDialog';
 import { AgyBridgeSection } from './AgyBridgeSection';
+import { AgyProbeSection } from './AgyProbeSection';
+import { AgyTextAgentSection } from './AgyTextAgentSection';
 import { useModelLibrary } from './useModelLibrary';
 import { useAgyBridgeStore } from '../../shared/store/agyBridgeStore';
 
@@ -29,6 +31,8 @@ export function ModelSettingsPage({ t, modelConfig, setModelConfig }: Props) {
   const bridgeStatus = useAgyBridgeStore((s) => s.status);
   const bridgeConsentRecorded = bridgeStatus !== null && bridgeStatus.state !== 'missing-consent';
   const showBridgeSection = keys.some((k) => k.protocol === 'antigravity-cli') || bridgeConsentRecorded;
+  // 「反重力状态探测」小节：纯读面（无 consent 之类的悬置状态），存在 CLI key 即渲染。
+  const cliKeys = keys.filter((k) => k.protocol === 'antigravity-cli');
 
   return (
     <div className="settings-page model-library-page">
@@ -42,6 +46,19 @@ export function ModelSettingsPage({ t, modelConfig, setModelConfig }: Props) {
           {t('settings.addModel')}
         </button>
       </header>
+
+      {/* 子4 W6（design §4.4）：「MCP 工具桥」小节——本页供应商管理面上方；存在 CLI
+          key 或 consent 已记录（ok/conflict/declined）时渲染
+          （CR-19：防孤儿 consent 的入口收回）。 */}
+      {showBridgeSection && <AgyBridgeSection t={t} />}
+
+      {/* 「反重力状态探测」小节：桥卡片之后，每个 CLI key 一行凭据状态 + 测试连接。 */}
+      {cliKeys.length > 0 && <AgyProbeSection cliKeys={cliKeys} t={t} />}
+
+      {/* 09-19 CLI 白名单 W4：「Closure 文本 Agent」小节——探测卡之后。存在 CLI key
+          即渲染（纯文本车道只在有 agy CLI 模型时存在；declined 孤儿态无行为差异——
+          无 key 时 resolver 恒 undefined，无 CR-19 式入口收回需求）。 */}
+      {cliKeys.length > 0 && <AgyTextAgentSection t={t} />}
 
       <div className="model-library-layout">
         {showEmptyState ? (
@@ -79,11 +96,6 @@ export function ModelSettingsPage({ t, modelConfig, setModelConfig }: Props) {
           </>
         )}
       </div>
-
-      {/* 子4 W6（design §4.4）：「MCP 工具桥」小节——CLI 形态 key 编辑区旁（本页供应商
-          管理面下方）；存在 CLI key 或 consent 已记录（ok/conflict/declined）时渲染
-          （CR-19：防孤儿 consent 的入口收回）。 */}
-      {showBridgeSection && <AgyBridgeSection t={t} />}
 
       <DeleteConfirmDialog
         open={lib.pendingDeleteId !== null}

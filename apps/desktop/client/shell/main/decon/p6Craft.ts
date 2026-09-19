@@ -259,6 +259,7 @@ export function verifyDeconP6Anchors(
 
 export const DECON_P6_SYSTEM_PROMPT = [
   '你是拆书手艺发现的落卡整理器。把一条拆书发现（对某本书写作手艺的观察结论）整理成手艺库的卡主张，并归入受控词表。',
+  '仅基于提供的文本作答；不要使用任何工具（联网搜索、命令执行、浏览器等）——本环境不提供工具，调用工具会导致失败。',
   formatCraftCardCategories(),
   '词目规则：',
   '- 优先从输入给出的 active 词目清单中选最贴合的词目：输出 "termId" 填清单内词目 id；category 必须与所选词目的大类一致；清单外的 termId 不被接受（会降级转待人审的词目提报流程）。',

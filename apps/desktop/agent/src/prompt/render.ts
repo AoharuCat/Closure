@@ -1,10 +1,10 @@
 export function buildSystemPrompt(opts: {
-  orisonPrompt: string;
+  basePrompt: string;
   projectMeta?: string;
   skillsSummary?: string;
   toolDescriptions?: string;
 }): string {
-  const parts = [opts.orisonPrompt];
+  const parts = [opts.basePrompt];
   if (opts.projectMeta) parts.push(opts.projectMeta);
   if (opts.skillsSummary) parts.push(opts.skillsSummary);
   if (opts.toolDescriptions?.trim()) {

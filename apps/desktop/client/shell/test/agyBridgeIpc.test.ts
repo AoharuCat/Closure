@@ -5,10 +5,27 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vite
 import type { ModelRef, ResolvedModel } from '@orison/shared-contracts';
 
 const { handle } = vi.hoisted(() => ({ handle: vi.fn() }));
+// R9 观测：导出换「记调用 + 真实现（注入收集 sink）」包装——取景时机由 cliLogCalls 断，
+// 行内容由 cliLogLines 断（真定位 / 真归类 / 真降级路径全在链上跑，非 mock 掉断言）。
+const { cliLogCalls, cliLogLines } = vi.hoisted(() => ({
+  cliLogCalls: vi.fn(),
+  cliLogLines: { info: vi.fn(), warn: vi.fn() },
+}));
 
 vi.mock('electron', () => ({
   ipcMain: { handle },
 }));
+
+vi.mock('../main/ipc/agyCliLog', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../main/ipc/agyCliLog')>();
+  return {
+    ...actual,
+    observeAgyCliAgentState: (input: Parameters<typeof actual.observeAgyCliAgentState>[0]) => {
+      cliLogCalls(input);
+      return actual.observeAgyCliAgentState({ ...input, sink: cliLogLines });
+    },
+  };
+});
 
 // Partial mock：runAgyBridgeTurn 换 spy（零真 agy / 零真池），其余导出保持真身
 //（BRIDGE_MCP_SERVER_NAME 等被 agyBridge/modelGatewayIpc 链消费）。
@@ -20,7 +37,7 @@ vi.mock('@orison/model-protocols', async (importOriginal) => {
   };
 });
 
-import { runAgyBridgeTurn, BRIDGE_MCP_SERVER_NAME } from '@orison/model-protocols';
+import { classifyCliError, runAgyBridgeTurn, BRIDGE_MCP_SERVER_NAME } from '@orison/model-protocols';
 import {
   __resetAgyBridgeUsedForTest,
   createAgyBridgeLaneModeResolver,
@@ -29,7 +46,8 @@ import {
   wasAgyBridgeUsed,
   type AgyBridgeProductionDeps,
 } from '../main/ipc/agyBridgeIpc';
-import { createAgyBridgeRegistry } from '../main/ipc/agyBridge';
+import { createAgyBridgeRegistry, defaultAgyBridgeHomeRoot } from '../main/ipc/agyBridge';
+import { agyCliLogDirFor } from '../main/ipc/agyCliLog';
 import {
   createAgyBridgeConsentStore,
   type AgyBridgeConsentStore,
@@ -62,14 +80,33 @@ const HTTP_RESOLVED: ResolvedModel = {
   capability: 'text',
 };
 
+/** temp 夹具登记（顶层 afterEach 统一 rmBestEffort——测试不留残）。 */
+const tempDirs: string[] = [];
+function makeTempDir(prefix: string): string {
+  const dir = mkdtempSync(path.join(os.tmpdir(), prefix));
+  tempDirs.push(dir);
+  return dir;
+}
+
+afterEach(() => {
+  for (const dir of tempDirs.splice(0)) rmBestEffort(dir);
+});
+
 function makeDeps(opts: {
   resolved?: ResolvedModel;
   consent?: 'allowed' | 'declined';
   settings?: string;
-} = {}): { deps: AgyBridgeProductionDeps; store: AgyBridgeConsentStore; realHome: string } {
-  const realHome = mkdtempSync(path.join(os.tmpdir(), 'agy-bridge-ipc-home-'));
+} = {}): {
+  deps: AgyBridgeProductionDeps;
+  store: AgyBridgeConsentStore;
+  realHome: string;
+  homeRoot: string;
+} {
+  const realHome = makeTempDir('agy-bridge-ipc-home-');
+  // R9 观测面的假宿根（观测模块按它定位本会话日志；缺省真根是用户家目录——测试一律 temp）。
+  const homeRoot = makeTempDir('agy-bridge-ipc-fakehome-');
   const store = createAgyBridgeConsentStore({
-    filePath: path.join(mkdtempSync(path.join(os.tmpdir(), 'agy-bridge-ipc-consent-')), 'consent.json'),
+    filePath: path.join(makeTempDir('agy-bridge-ipc-consent-'), 'consent.json'),
   });
   if (opts.consent !== undefined) store.set(opts.consent);
   if (opts.settings !== undefined) {
@@ -85,9 +122,21 @@ function makeDeps(opts: {
     registry: () => createAgyBridgeRegistry(),
     consentStore: () => store,
     realHome,
+    homeRoot,
   };
-  return { deps, store, realHome };
+  return { deps, store, realHome, homeRoot };
 }
+
+// ── R9 观测断言面（真实现 + 收集 sink 包装）──
+
+type CliLogCallInput = { homeRoot: string; sessionId: string; reason: string };
+
+const cliLogReasons = (): string[] => cliLogCalls.mock.calls.map(([i]) => (i as CliLogCallInput).reason);
+const cliLogCount = (reason: string): number => cliLogReasons().filter((r) => r === reason).length;
+const cliLogPayloads = (reason: string): Record<string, unknown>[] =>
+  [...cliLogLines.info.mock.calls, ...cliLogLines.warn.mock.calls]
+    .map(([p]) => p as Record<string, unknown>)
+    .filter((p) => p.reason === reason);
 
 const REF: ModelRef = { keyId: 'key-cli', modelId: 'gemini-3.8-pro-high' };
 
@@ -151,6 +200,9 @@ describe('模式判定生产实现（createAgyBridgeLaneModeResolver）', () => 
 describe('turn 生产入口（createAgyBridgeTurnProduction）', () => {
   beforeEach(() => {
     vi.mocked(runAgyBridgeTurn).mockReset();
+    cliLogCalls.mockReset();
+    cliLogLines.info.mockReset();
+    cliLogLines.warn.mockReset();
     __resetAgyBridgeUsedForTest();
   });
 
@@ -273,6 +325,166 @@ describe('turn 生产入口（createAgyBridgeTurnProduction）', () => {
     deps.registry = () => undefined;
     await expect(createAgyBridgeTurnProduction(deps)(makeRequest())).rejects.toThrow(/installShellAgyBridgeCore/);
   });
+
+  // ── R9 观测取景（三时机；真实现链上跑——记调用断取景，收集 sink 断行内容）──
+
+  const okOutcome = (text = '终文') => ({
+    text, usage: undefined, presentResultCalled: false, presentResultAwaiting: undefined,
+    sentBack: false, secondPassMissedPresentResult: false, mcpSoftDenied: false, bridgeToolCalls: 0,
+    toolSteps: [],
+  });
+  const writeLoadedLog = (root: string, sessionId: string): string => {
+    const logDir = agyCliLogDirFor(root, sessionId);
+    mkdirSync(logDir, { recursive: true });
+    writeFileSync(
+      path.join(logDir, 'cli-20260919_191305.log'),
+      [
+        'I0919 19:13:05.112423       1 conversation_manager.go:451] Starting new conversation (agent=true)',
+        'I0919 19:13:05.112423       1 server.go:1142] Creating new cascade trajectory (agentScript=true)',
+      ].join('\n'),
+      'utf8',
+    );
+    return logDir;
+  };
+
+  it('R9 取景①：桥会话开启恰读一次（同会话后续 turn 不重读；homeRoot 取自 deps）', async () => {
+    const { deps, homeRoot } = makeDeps({ resolved: CLI_RESOLVED, consent: 'allowed' });
+    const registry = createAgyBridgeRegistry();
+    deps.registry = () => registry;
+    vi.mocked(runAgyBridgeTurn).mockImplementation(async () => okOutcome());
+    const turn = createAgyBridgeTurnProduction(deps);
+    await turn(makeRequest());
+    await turn(makeRequest());
+    expect(cliLogCount('session-open')).toBe(1);
+    expect(cliLogCalls).toHaveBeenCalledWith({ homeRoot, sessionId: 'sess-1', reason: 'session-open' });
+    registry.disposeAll();
+  });
+
+  it('R9 取景 homeRoot：deps 未注入 → 缺省 defaultAgyBridgeHomeRoot()（与生产装配同源）', async () => {
+    const { deps } = makeDeps({ resolved: CLI_RESOLVED, consent: 'allowed' });
+    delete deps.homeRoot;
+    const registry = createAgyBridgeRegistry();
+    deps.registry = () => registry;
+    vi.mocked(runAgyBridgeTurn).mockImplementation(async () => okOutcome());
+    await createAgyBridgeTurnProduction(deps)(makeRequest());
+    expect(cliLogCalls).toHaveBeenCalledWith({
+      homeRoot: defaultAgyBridgeHomeRoot(),
+      sessionId: 'sess-1',
+      reason: 'session-open',
+    });
+    registry.disposeAll();
+  });
+
+  it('R9 取景②：空回合失败读一次；非空回合失败（abort/quota）不读，失败语义原样上抛', async () => {
+    const { deps, homeRoot } = makeDeps({ resolved: CLI_RESOLVED, consent: 'allowed' });
+    const registry = createAgyBridgeRegistry();
+    deps.registry = () => registry;
+    vi.mocked(runAgyBridgeTurn).mockResolvedValueOnce(okOutcome());
+    const turn = createAgyBridgeTurnProduction(deps);
+    await turn(makeRequest()); // 首 turn 正常完成（取景① + ③）
+
+    // 空回合失败族①：内置工具无头自动拒（真实分类产物 412）。
+    vi.mocked(runAgyBridgeTurn).mockRejectedValueOnce(
+      classifyCliError('', 'jetski: no output produced — the "read_file" permission that headless mode cannot prompt for'),
+    );
+    await expect(turn(makeRequest())).rejects.toThrow(/auto-denied/);
+    expect(cliLogCount('empty-turn-failure')).toBe(1);
+    expect(cliLogCalls).toHaveBeenCalledWith({ homeRoot, sessionId: 'sess-1', reason: 'empty-turn-failure' });
+
+    // 空回合失败族②：空 SUCCESS 终态（协议层 EMPTY 原文）。
+    vi.mocked(runAgyBridgeTurn).mockRejectedValueOnce(
+      classifyCliError(
+        'antigravity-cli turn ended with SUCCESS but produced no response text (empty response and zero text deltas)',
+        '',
+      ),
+    );
+    await expect(turn(makeRequest())).rejects.toThrow(/produced no response text/);
+    expect(cliLogCount('empty-turn-failure')).toBe(2);
+
+    // 非空回合失败（quota）不读——取景只对齐空回合。
+    vi.mocked(runAgyBridgeTurn).mockRejectedValueOnce(new Error('quota exceeded'));
+    await expect(turn(makeRequest())).rejects.toThrow(/quota/);
+    expect(cliLogCount('empty-turn-failure')).toBe(2);
+    registry.disposeAll();
+  });
+
+  it('R9 取景③：首个正常完成的 turn 恰读一次（info 级）；同会话后续 turn 不重读', async () => {
+    const { deps, homeRoot } = makeDeps({ resolved: CLI_RESOLVED, consent: 'allowed' });
+    const registry = createAgyBridgeRegistry();
+    deps.registry = () => registry;
+    vi.mocked(runAgyBridgeTurn).mockImplementation(async () => okOutcome());
+    const turn = createAgyBridgeTurnProduction(deps);
+    await turn(makeRequest());
+    await turn(makeRequest());
+    await turn(makeRequest());
+    expect(cliLogCount('first-turn-completed')).toBe(1);
+    expect(cliLogCalls).toHaveBeenCalledWith({ homeRoot, sessionId: 'sess-1', reason: 'first-turn-completed' });
+    // 健康会话专道走 info（警示面只留空回合失败）。
+    expect(cliLogPayloads('first-turn-completed')).toHaveLength(1);
+    expect(
+      cliLogLines.warn.mock.calls.filter(([p]) => (p as { reason?: string }).reason === 'first-turn-completed'),
+    ).toHaveLength(0);
+    registry.disposeAll();
+  });
+
+  it('R9 取景③：首 turn 失败不记账——首个「正常完成」的 turn 才读', async () => {
+    const { deps } = makeDeps({ resolved: CLI_RESOLVED, consent: 'allowed' });
+    const registry = createAgyBridgeRegistry();
+    deps.registry = () => registry;
+    vi.mocked(runAgyBridgeTurn).mockRejectedValueOnce(new Error('quota exceeded'));
+    const turn = createAgyBridgeTurnProduction(deps);
+    await expect(turn(makeRequest())).rejects.toThrow(/quota/);
+    expect(cliLogCount('first-turn-completed')).toBe(0);
+    vi.mocked(runAgyBridgeTurn).mockResolvedValueOnce(okOutcome());
+    await turn(makeRequest());
+    expect(cliLogCount('first-turn-completed')).toBe(1);
+    registry.disposeAll();
+  });
+
+  it('R9 取景③：日志缺失 / 格式漂移 → 仍落行且 agentState=unknown，turn 正常返回不受影响', async () => {
+    const { deps, homeRoot } = makeDeps({ resolved: CLI_RESOLVED, consent: 'allowed' });
+    const registry = createAgyBridgeRegistry();
+    deps.registry = () => registry;
+    vi.mocked(runAgyBridgeTurn).mockImplementation(async () => okOutcome('救回正文'));
+    const turn = createAgyBridgeTurnProduction(deps);
+
+    // ① 日志缺失（假宿内空无一物）——仍落行，unknown。
+    const first = await turn(makeRequest());
+    expect(first.text).toBe('救回正文');
+    expect(cliLogPayloads('first-turn-completed')[0]).toMatchObject({
+      sessionId: 'sess-1',
+      agentState: 'unknown',
+      logDir: agyCliLogDirFor(homeRoot, 'sess-1'),
+    });
+
+    // ② 格式漂移（认不出任何三态）——换会话验证（取景③ 每会话恰一次）。
+    const logDir = agyCliLogDirFor(homeRoot, 'sess-2');
+    mkdirSync(logDir, { recursive: true });
+    writeFileSync(path.join(logDir, 'cli-20260919_191305.log'), 'unrelated line\nanother\n', 'utf8');
+    const second = await turn(makeRequest({ sessionId: 'sess-2' }));
+    expect(second.text).toBe('救回正文');
+    expect(cliLogPayloads('first-turn-completed').at(-1)).toMatchObject({
+      sessionId: 'sess-2',
+      agentState: 'unknown',
+      logFile: path.join(logDir, 'cli-20260919_191305.log'),
+    });
+    registry.disposeAll();
+  });
+
+  it('R9 取景③ 正例：假宿日志含 agent=true → 落行 agentState=agent-loaded（真定位 / 真归类在链上）', async () => {
+    const { deps, homeRoot } = makeDeps({ resolved: CLI_RESOLVED, consent: 'allowed' });
+    const registry = createAgyBridgeRegistry();
+    deps.registry = () => registry;
+    vi.mocked(runAgyBridgeTurn).mockImplementation(async () => okOutcome());
+    const logDir = writeLoadedLog(homeRoot, 'sess-1');
+    await createAgyBridgeTurnProduction(deps)(makeRequest());
+    expect(cliLogPayloads('first-turn-completed')[0]).toMatchObject({
+      sessionId: 'sess-1',
+      agentState: 'agent-loaded',
+      logDir,
+    });
+    registry.disposeAll();
+  });
 });
 
 describe('IPC 三通道（registerAgyBridgeIpc）', () => {
@@ -306,9 +518,12 @@ describe('IPC 三通道（registerAgyBridgeIpc）', () => {
   });
 
   beforeEach(() => {
-    holder.realHome = mkdtempSync(path.join(os.tmpdir(), 'agy-bridge-ipc-home-'));
+    // 经 makeTempDir 登记（顶层 afterEach 统一清理）——本 describe 的 afterEach 只认
+    // holder.store 当前值，而「存储错误」用例会把它换成 stub store ⇒ 原 consent 目录
+    // 走占位清理会漏（历史泄漏：每跑一次留一个空目录）。
+    holder.realHome = makeTempDir('agy-bridge-ipc-home-');
     holder.store = createAgyBridgeConsentStore({
-      filePath: path.join(mkdtempSync(path.join(os.tmpdir(), 'agy-bridge-ipc-consent-')), 'consent.json'),
+      filePath: path.join(makeTempDir('agy-bridge-ipc-consent-'), 'consent.json'),
     });
     holder.registry = undefined;
   });

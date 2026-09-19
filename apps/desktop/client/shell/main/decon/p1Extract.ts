@@ -338,6 +338,7 @@ export function buildDeconAnchor(
 
 export const DECON_P1B_SYSTEM_PROMPT = [
   '你是小说拆解的事实层提取器，为一本小说逐章提取「作者需要的素材」（供后续拆书分析用，非读者向摘要）。',
+  '仅基于提供的文本作答；不要使用任何工具（联网搜索、命令执行、浏览器等）——本环境不提供工具，调用工具会导致失败。',
   '只依据给定正文，禁止编造正文中不存在的内容。每章输出一个 JSON 对象，字段：',
   '- synopsis：本章情节概要，一到三句话；',
   '- entities：本章出现的实体，数组元素 {"name","type","paraRange","quote"}——type ∈ person/place/item/organization/concept；name 优先使用【实体词典】中的名字写法（跨章保持一致，便于归并）；词典没有的新实体也提取；',

@@ -30,8 +30,10 @@ import {
   type CliUsageCounters,
 } from './events';
 import { diffMirror, hashSegments } from './mirror';
+import { findPermissionSoftDenySubject, hasMcpPermissionSoftDeny, isMcpPermissionSubject } from './permissionSoftDeny';
 import {
   AgySessionPool,
+  agySessionKeyId,
   createCliAbortError,
   type AgyPoolDeps,
   type AgyTurnSession,
@@ -43,7 +45,8 @@ import {
 //
 // generateText / generateTextStream 的 CLI 形态分派目标（generate.ts 顶部早退——不经
 // 流式韧性层，防 CLI 502 被「回退非流式重发」）。单实现两态消费：非流式同跑 stream-json
-// 聚合，onDelta 缺省不外发。driver 内**不自动重试**（防放大；重试/回退归调用方与子2 链）。
+// 聚合，onDelta 缺省不外发。driver 内唯一自动重试 = 空 SUCCESS 整 turn 恰一次（CLI 纯文本
+// 车道模型偶发空转的整 turn 级兜底）；其余失败不自动重试（防放大；重试/回退归调用方与子2 链）。
 
 /** stderr 摘要素材上限（退出无 result 时的 502 excerpt）。 */
 const STDERR_EXCERPT_LIMIT = 2_000;
@@ -58,10 +61,47 @@ function stderrExcerpt(buffer: string): string {
 
 /**
  * CLI 凭据缺失的短语族判定（driver 错误分类与 shell 侧 `agy models` 未登录检测
- * 共用同一词表——两处判定不得各自漂移）。
+ * 共用同一词表——两处判定不得各自漂移）。三类信号形态：交互登录引导
+ *（Authentication required…）、登录等待超时（authentication failed or timed out…）、
+ * 裸 401 状态行（status: 401）。
  */
 export function isAuthError(text: string): boolean {
-  return /authenticat|auth required|not logged in|login required/i.test(text);
+  return /authenticat|auth required|not logged in|login required|status: ?401\b/i.test(text);
+}
+
+/**
+ * CLI 内置工具权限自动拒绝的短语族判定（子串取自 agy headless 拒绝通知的稳定原文）：
+ * headless print 模式弹不出权限窗，agy 对模型调用的内置工具（command/浏览器/搜索类）
+ * 一律自动拒绝并在 stderr 打通知，turn 仍以 SUCCESS 零文本收尾。
+ *
+ * R6/F9 单源主语分派（先于旧短语族）：文本命中**权限软拒主体**时按主体归族——主体
+ * 'mcp' = MCP 工具预授权被拒（桥侧 soft-denied 诊断路径），**绝不**判成内置工具族
+ *（旧针 `cannot prompt for` 把 MCP 软拒通知一并卷进来 → 用户面拿到归因错误的指引）；
+ * 其它主体（command/read_file/…）= 内置工具被权限拦下，属本族。主体判据单源 =
+ * permissionSoftDeny.ts（桥侧三针同源——两车道不漂移），**含 CR-3 去装饰归一与 MCP
+ * 主体优先**：haystack 同时含两类主体时以 MCP 为准（显式规则，非文本位置首次命中）。
+ * 无主体形态回落旧三子串。
+ */
+export function isBuiltinToolAutoDeny(text: string): boolean {
+  const subject = findPermissionSoftDenySubject(text);
+  if (subject !== undefined) return !isMcpPermissionSubject(subject);
+  return /no output produced|auto-denied|cannot prompt for/i.test(text);
+}
+
+/**
+ * 空 SUCCESS 错误的判定缝（driver 单次重试的唯一信号读取点）：finishOutcome 在终态
+ * status='EMPTY'（SUCCESS 收尾但零文本）时给分类产物挂内部标记——错误面（类型/message/
+ * excerpt）零变化，仅作重试包装层判别。认证命中时不挂标记（凭据失效重试必然同死），
+ * 其余分类照挂（含内置工具自动拒——模型行为有随机性，恰一次重试给第二次机会）。
+ */
+export function isCliEmptySuccessError(err: unknown): boolean {
+  return err instanceof Error && (err as Error & { cliEmptySuccess?: boolean }).cliEmptySuccess === true;
+}
+
+/** 挂空 SUCCESS 内部标记（对错误对象自身的附加位，不改写任何既有字段）。 */
+function tagCliEmptySuccess(err: Error): Error {
+  (err as Error & { cliEmptySuccess?: boolean }).cliEmptySuccess = true;
+  return err;
 }
 
 function isQuotaError(text: string): boolean {
@@ -72,12 +112,62 @@ function isInvalidModelError(text: string): boolean {
   return /invalid model|unknown model|model not (found|supported)/i.test(text);
 }
 
-/** 错误文本 → 协议层错误类型（顺序：auth → quota → 模型配置 → 上下文溢出 → 502 兜底）。 */
+/**
+ * CLI 认证错误的用户面文案（driver 层错误文案惯例为英文）：认证信号通常来自 stderr
+ *（原文留在 bodyExcerpt 作证据），message 统一换成带操作指引的一句话——
+ * 「SUCCESS 但零文本」等泛化终态文本不再顶到用户面（对认证失效场景不可读也无指引）。
+ */
+const CLI_AUTH_GUIDANCE_MESSAGE =
+  'antigravity-cli authentication failed: the CLI is not logged in or its login has expired. Run the agy CLI in a terminal to complete the interactive login, then retry.';
+
+/**
+ * CLI 内置工具权限被拒的用户面文案（driver 层错误文案惯例为英文，风格对齐认证指引）：
+ * 「SUCCESS 但零文本」谜语换成因果 + 出路——内置工具在无头运行里拿不到授权，工具面
+ * 操作必须走会话桥接进来的 MCP 工具。server 名不在此硬编码（单源在 bridgeTurn，跨模块
+ * 引用会成环），文案用「本会话桥接的 MCP 工具」指称。
+ */
+const CLI_TOOL_AUTO_DENY_GUIDANCE_MESSAGE =
+  'antigravity-cli turn produced no output: the model invoked a built-in agy tool (command/browser/search family) that headless mode cannot prompt permissions for, so it was auto-denied. Built-in tools cannot be granted in headless runs; file, story-data and web work must go through the MCP bridge tools provided to this session.';
+
+/**
+ * CLI **MCP 工具预授权**软拒的用户面文案（R6/F9 反向的第二条合成 412 行——与内置工具族
+ * 各说各话）：MCP 主体软拒 = **会话授权事实**，不是模型缺陷——同一条桥、同一套预授权，
+ * 换模型撞同一堵墙（回退链烧一轮纯浪费，故与内置工具行同用 412「合成状态」落
+ * other/eligible=false）。用户面出路 = 补 MCP 工具桥预授权 / 检查 agy 权限规则后重试，
+ * 与桥侧 soft-denied 通知（D6 诊断）同向。server 名不在此硬编码（单源在协议层 agents.ts，
+ * 文案用「本会话桥接的 MCP 工具」指称）。设置页路径措辞对齐 UI 通知条（Settings → Models
+ * → MCP Tool Bridge）。
+ */
+const CLI_MCP_SOFT_DENY_GUIDANCE_MESSAGE =
+  'antigravity-cli turn produced no output: the model called an MCP bridge tool that this session\'s pre-authorization rules deny, and headless mode cannot prompt for permission, so the call was auto-denied. This is a session authorization fact, not a model failure — switching models hits the same wall. Review the MCP tool-bridge authorization in Settings → Models → MCP Tool Bridge (or the agy permission rules), then retry.';
+
+/**
+ * 错误文本 → 协议层错误类型。顺序：auth → quota → 模型配置 → 权限软拒族（内置工具 412 /
+ * MCP 预授权 412）→ 上下文溢出 → 502 兜底。auth 命中时 message 统一为认证指引，两条
+ * 软拒行各自统一为对应指引（形态所致 vs 会话授权事实——两分支由同一主体判据**互斥**
+ * 分派：MCP 主体优先于内置主体，见 permissionSoftDeny.findPermissionSoftDenySubject；
+ * 主语判据单源在 permissionSoftDeny.ts）。排序依据：认证比软拒更终结（凭据失效是全线
+ * 事实）在前；软拒族排在瞬态行（quota/模型配置）之后——turn 真死于瞬态时瞬态才是可
+ * 行动真相（换模型可能有用，链应推进），拒绝通知只作为空 SUCCESS 的解释在无更强信号时
+ * 命中。
+ */
 export function classifyCliError(message: string, excerpt: string): Error {
   const haystack = `${message}\n${excerpt}`;
-  if (isAuthError(haystack)) return new ProtocolHttpError(message, 401, excerpt);
+  if (isAuthError(haystack)) return new ProtocolHttpError(CLI_AUTH_GUIDANCE_MESSAGE, 401, excerpt);
   if (isQuotaError(haystack)) return new ProtocolHttpError(message, 429, excerpt);
   if (isInvalidModelError(haystack)) return new ProtocolSchemaError(message);
+  // 内置工具自动拒 = CLI 无头形态的内禀缺陷，换模型大概率同死 → 合成 412（非特判状态，
+  // 回退分类落 other 行 eligible=false 不烧链）+ stderr 原文留 excerpt 作证据——与认证
+  // 落法同族（合成状态 + 人话 message + excerpt），不新增错误种类。
+  if (isBuiltinToolAutoDeny(haystack)) {
+    return new ProtocolHttpError(CLI_TOOL_AUTO_DENY_GUIDANCE_MESSAGE, 412, excerpt);
+  }
+  // MCP 主体预授权软拒（F9 反向 + R6）：**会话授权事实**——同一条桥/同一套预授权换模型
+  // 同死（不烧链，回落 other/eligible=false 同一机制），但用户面出路是「去设置页补授权 /
+  // 查 agy 权限规则」而非「换模型/改工具用法」→ 独立文案独立行（与内置工具行各说各话）。
+  if (hasMcpPermissionSoftDeny(haystack)) {
+    return new ProtocolHttpError(CLI_MCP_SOFT_DENY_GUIDANCE_MESSAGE, 412, excerpt);
+  }
   // 上下文溢出：构造 ProtocolHttpError 后走共享谓词（isContextOverflowError 短语族），
   // 命中则升级 ProtocolContextOverflowError（runLoop 压缩重试路自动兼容）。
   const candidate = new ProtocolHttpError(message, 502, excerpt);
@@ -109,6 +199,17 @@ interface TurnRunOptions {
   /** 观测 seam（CR-24：driver 侧观测统一走 deps.warn/deps.info——缺省静默，测试注入收集器）。 */
   warn: ((message: string) => void) | undefined;
   info: ((message: string) => void) | undefined;
+  /**
+   * 行为级降级带信号（09-19 白名单 W3/R3）：本轮出现任何内置工具 step。仅在挂 agent 的
+   * spawn 上武装——无 agent 的 turn 本就走默认形态，没有可降级的 agent 车道。
+   *
+   * ⚠️ 归因纪律（2026-09-19 真机实证纠正）：工具 step **不是**「agent 未加载」的证据——
+   * agy 1.2.2 实测挂 agent 加载成功（agent=true、system prompt 被整体替换、input tokens
+   * 腰斩）时内置工具仍可调用、可执行。零工具 agent 的效果是**收窄但未清零**内置工具面。
+   * 证据：`.trellis/tasks/09-19-agy-toolface-fix-batch/research/f8-builtin-tool-stream-signal.md`
+   * （§0/§4/§5）。
+   */
+  onToolStep: (() => void) | undefined;
 }
 
 interface TurnRunResult {
@@ -183,7 +284,12 @@ async function runTurnOnSession(
           reject(createCliAbortError());
           return;
         case 'error': {
-          const err = classifyCliError(outcome.message, stderrExcerpt(stderrBuf));
+          const excerpt = stderrExcerpt(stderrBuf);
+          const err = classifyCliError(outcome.message, excerpt);
+          // 空 SUCCESS 挂重试标记（仅纯空收尾——stderr 认证信号命中即凭据问题，重试无意义）。
+          if (outcome.status === 'EMPTY' && !isAuthError(`${outcome.message}\n${excerpt}`)) {
+            tagCliEmptySuccess(err);
+          }
           // WAITING/RUNNING/INVALID（等待权限/卡运行/非法态）→ 会话不可信，作废。
           //（EMPTY 不作废：重试请求 = 零尾段 → 镜像分歧 → 自动冷重启，无需显式杀。）
           if (/^(WAITING|RUNNING|INVALID)$/.test(outcome.status)) {
@@ -222,6 +328,9 @@ async function runTurnOnSession(
         opts.warn?.(
           `[antigravity-cli] model invoked a built-in tool (step ${effect.toolStepStarted.stepIndex}) — CLI form does not bridge Closure tools; continuing`,
         );
+        // 降级带信号（W3/R3）：仅挂 agent 的 spawn 武装了此缝——记账给 generateText 层的
+        // 恰一次降级判定（见下）。
+        opts.onToolStep?.();
       }
       if (effect?.init !== undefined) {
         // init 观测（CR-17）：tools 数 / permission_mode / model——落 info（默认门控
@@ -505,6 +614,22 @@ export function defaultAgyPoolDeps(): AgyPoolDeps {
 
 // ── 驱动器组装 ──
 
+/**
+ * 纯文本车道零工具 agent 解析器（09-19 白名单 W3）：返回布局常量激活值
+ *（agents.ts CLOSURE_TEXT_AGENT_LAYOUT.agentName）挂 `--agent`，或 undefined 走现状
+ * 无 agent 路径（γ 反工具硬化兜底）。决策（enabled/文件态/CLI key 前提）归 shell 闭包
+ * ——协议层只消费激活值。
+ */
+export type ResolveTextAgentFn = () => string | undefined;
+
+export interface AntigravityCliDriverOptions {
+  /**
+   * 每 turn 组 spec 时咨询的 agent 解析器（工厂显式注入——测试用）。缺省 = 模块级
+   * override（shell 生产注入缝 setAntigravityCliTextAgentResolver，单例驱动器消费）。
+   */
+  resolveTextAgent?: ResolveTextAgentFn;
+}
+
 export interface AntigravityCliDriver {
   /** CLI 形态生成（流式/非流式同实现；onDelta 缺省 = 非流式消费面）。 */
   generateText(
@@ -517,11 +642,18 @@ export interface AntigravityCliDriver {
   dispose(): void;
 }
 
+/** 降级会话键记账上限（防无界增长；FIFO 逐出——链会话键一次性，过期即弃）。 */
+const MAX_DEGRADED_SESSION_KEYS = 200;
+
 export function createAntigravityCliDriver(
   deps: AgyPoolDeps,
   opts?: ConstructorParameters<typeof AgySessionPool>[1],
+  driverOpts?: AntigravityCliDriverOptions,
 ): AntigravityCliDriver {
   const pool = new AgySessionPool(deps, opts);
+  // 降级带触发过的会话键记账（AC3：降级后同会话恒走无 agent spec——防逐 turn 重降级的
+  // 作废/重启 churn）。驱动器实例级（生产单例 = app 生命周期，重启即清）。
+  const degradedSessionKeys = new Set<string>();
   return {
     async generateText(model, request, ctx, onDelta) {
       // CLI 形态配置错防御（resolveModel 已在解析点拦截；协议层兜底）。
@@ -553,30 +685,114 @@ export function createAntigravityCliDriver(
       const segments = buildTurnSegments(system, rest);
       const hashes = hashSegments(segments);
       const lane = effectiveRequest.lane ?? ctx?.lane;
+
+      // ── 零工具 agent 解析（09-19 白名单 W3，design §1.1/§3.1）──每 turn 组 spec 时
+      // 咨询。已降级的会话键恒无 agent（防循环，AC3）；resolver undefined = 现状无 agent
+      // 路径——driver 侧静默（原因与警示归 shell 闭包），不触发降级带。
+      const sessionKeyIdText =
+        effectiveRequest.sessionKey !== undefined && effectiveRequest.sessionKey.length > 0
+          ? agySessionKeyId({ sessionKey: effectiveRequest.sessionKey, keyId: model.keyId, modelId: model.modelId })
+          : undefined;
+      const degraded = sessionKeyIdText !== undefined && degradedSessionKeys.has(sessionKeyIdText);
+      const resolveTextAgent = driverOpts?.resolveTextAgent ?? textAgentResolverOverride;
+      const resolvedAgentName = degraded || resolveTextAgent === undefined ? undefined : resolveTextAgent();
+      const agentName =
+        typeof resolvedAgentName === 'string' && resolvedAgentName.length > 0 ? resolvedAgentName : undefined;
+
       const spec: CliSpawnSpec = {
         executable: model.cliExecutable,
-        args: buildCliArgs({ model: model.modelId, lane, thinking: effectiveRequest.thinking }),
+        args: buildCliArgs({
+          model: model.modelId,
+          lane,
+          thinking: effectiveRequest.thinking,
+          ...(agentName !== undefined ? { agentName } : {}),
+        }),
       };
       const outerBeltMs = printTimeoutForLane(lane).ms + PRINT_TIMEOUT_GRACE_MS;
+      // 工具 step 证据按进程代次记账（CR-4）：每次 runTurn 进入 = 一次进程尝试，进入时
+      // 旧证据作废。本调用内的 runTurn 重入只有两形态、都必然重生进程——空 SUCCESS 重试
+      // 走零尾段分歧冷重启；降级重跑换 spec 触发池重生。故干净重试成功后不残留首轮证据
+      // （空 SUCCESS 干净重试成功不再触发第三次无谓降级重跑）。
+      let sawToolStep = false;
       const turnOpts: TurnRunOptions = {
         onDelta,
         signal: ctx?.signal,
         outerBeltMs,
         warn: deps.warn,
         info: deps.info,
+        // 降级带信号仅在挂 agent 的 spawn 上武装——无 agent 的 turn 本就走默认形态，没有
+        // 可降级的 agent 车道（归因纪律见 TurnRunOptions.onToolStep）。
+        onToolStep: agentName !== undefined ? () => { sawToolStep = true; } : undefined,
       };
 
-      const runTurn = (session: AgyTurnSession): Promise<TurnRunResult> =>
-        runTurnOnSession(session, segments, hashes, turnOpts, deps.setTimer);
+      const runTurn = (session: AgyTurnSession): Promise<TurnRunResult> => {
+        sawToolStep = false;
+        return runTurnOnSession(session, segments, hashes, turnOpts, deps.setTimer);
+      };
 
-      const result = effectiveRequest.sessionKey !== undefined && effectiveRequest.sessionKey.length > 0
-        ? await pool.runTurn(
-            { sessionKey: effectiveRequest.sessionKey, keyId: model.keyId, modelId: model.modelId },
-            spec,
-            ctx?.signal,
-            runTurn,
-          )
-        : await pool.runOneshot(spec, ctx?.signal, runTurn);
+      // 空 SUCCESS 单次重试：整 turn 恰重试一次，会话车道与 oneshot 同过此缝（最小公共缝）。
+      // 重试对同一会话句柄再跑一轮——首轮已提交镜像 → 零尾段分歧 → 自动冷重启，即同 spec
+      // 全新尝试。第二次仍空（或首轮是认证等不可重试终因）→ 原样上抛，调用方错误面零变化。
+      // 记账跨降级重跑共享（恰一次语义覆盖整个 generateText 调用）。
+      let retriedEmptySuccess = false;
+      const runTurnWithEmptyRetry = (session: AgyTurnSession): Promise<TurnRunResult> =>
+        runTurn(session).catch((err) => {
+          if (!isCliEmptySuccessError(err) || retriedEmptySuccess) throw err;
+          retriedEmptySuccess = true;
+          deps.warn?.(
+            `[antigravity-cli] turn ended SUCCESS with no text — retrying the whole turn once (fresh attempt) key=${model.keyId} model=${model.modelId}`,
+          );
+          return runTurn(session);
+        });
+
+      const runOnce = (runSpec: CliSpawnSpec): Promise<TurnRunResult> =>
+        sessionKeyIdText !== undefined
+          ? pool.runTurn(
+              { sessionKey: effectiveRequest.sessionKey!, keyId: model.keyId, modelId: model.modelId },
+              runSpec,
+              ctx?.signal,
+              runTurnWithEmptyRetry,
+            )
+          : pool.runOneshot(runSpec, ctx?.signal, runTurnWithEmptyRetry);
+
+      let result = await runOnce(spec);
+      if (agentName !== undefined && sawToolStep) {
+        // ── 行为级降级带（09-19 白名单 W3/R3，design 权衡 8）──挂 agent 的 turn 出现内置
+        // 工具 step ⇒ 恰一次以无 agent spec 重跑本 turn：会话车道下镜像「已发」比对判零尾
+        // 段分歧 → 自动冷重启换新 spec 进程（旧 agent 进程走优雅关停）；oneshot 直接新
+        // spawn。CR-4：判定读的是当前进程代次的证据（runTurn 重入即重置，见上）；重跑失败
+        // 不整 turn 拒绝（下方 catch 保首试成功结果）。
+        //
+        // ⚠️ 归因纠正（2026-09-19 F12 真机实证）：工具 step **不是** agent 未加载的证据——
+        // 挂 agent 时内置工具仍可调用（收窄未清零），本分支在正常加载态同样触发；且「退回
+        // 无 agent」的有效性**未经验证**（欠账，见 task design §W3.1）——本段只保留行为，
+        // 不背书归因。证据：research/f8-builtin-tool-stream-signal.md §4/§5。
+        if (sessionKeyIdText !== undefined) {
+          degradedSessionKeys.add(sessionKeyIdText);
+          if (degradedSessionKeys.size > MAX_DEGRADED_SESSION_KEYS) {
+            const oldest = degradedSessionKeys.values().next().value;
+            if (oldest !== undefined) degradedSessionKeys.delete(oldest);
+          }
+        }
+        deps.warn?.(
+          `[antigravity-cli] text agent '${agentName}' lane produced a built-in tool step (a tool step is not evidence the agent failed to load — the declarative agent narrows, but does not zero, agy's built-in tool face) — retrying this turn without --agent (once); session stays on the no-agent lane key=${model.keyId} model=${model.modelId}`,
+        );
+        try {
+          result = await runOnce({
+            executable: model.cliExecutable,
+            args: buildCliArgs({ model: model.modelId, lane, thinking: effectiveRequest.thinking }),
+          });
+        } catch (err) {
+          // CR-4：降级重跑失败不把首试成功结果变整 turn 拒绝（mirror bridgeTurn CR-5
+          // 打回重跑失败先例——接受首轮结果 + 警告）。abort 族照常上抛：用户中断不是
+          // 可吞失败（createCliAbortError 归一 name='AbortError'）。
+          const abortLike = (err instanceof Error && err.name === 'AbortError') || ctx?.signal?.aborted === true;
+          if (abortLike) throw err;
+          deps.warn?.(
+            `[antigravity-cli] degradation rerun without --agent failed (${err instanceof Error ? err.message : String(err)}) — keeping the first-pass result key=${model.keyId} model=${model.modelId}`,
+          );
+        }
+      }
 
       return {
         model: model.modelId,
@@ -602,6 +818,22 @@ let generateOverride: AntigravityCliGenerateFn | undefined;
 /** 测试缝：覆写/还原 generate.ts CLI 分派实际调用的驱动器。 */
 export function setAntigravityCliGenerateForTest(fn: AntigravityCliGenerateFn | undefined): void {
   generateOverride = fn;
+}
+
+let textAgentResolverOverride: ResolveTextAgentFn | undefined;
+
+/**
+ * 生产注入缝（shell agentIpc 装配调用；undefined 复位）：生产单例驱动器（裸工厂构造，
+ * 无 driverOpts）每 turn 读此 override。wiring 测试经 __getAntigravityCliTextAgentResolverForTest
+ * 钉死漏装配（mirror agent 包 __getAgyBridgeModeResolverForTest 先例）。
+ */
+export function setAntigravityCliTextAgentResolver(fn: ResolveTextAgentFn | undefined): void {
+  textAgentResolverOverride = fn;
+}
+
+/** wiring 测试探针：当前注入的文本 agent 解析器（漏装配 = undefined → 红）。 */
+export function __getAntigravityCliTextAgentResolverForTest(): ResolveTextAgentFn | undefined {
+  return textAgentResolverOverride;
 }
 
 /** generate.ts 两分派点的唯一入口（缺省真驱动器；测试可覆写）。 */

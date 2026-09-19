@@ -1,0 +1,223 @@
+/* ── 设置页「Closure 文本 Agent」小节（09-19 CLI 白名单 W4）──
+ * 骨架与语汇 mirror agy-probe.css / agy-bridge.css（同一设置页上的姊妹卡片）：
+ * settings-page-title 标题 + 填充 chip 徽标 + 描边主/破坏钮 + 冲突指引块。
+ * 全部 theme token，零裸色值，深浅主题同源。 */
+
+.agy-text-agent-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2xs);
+  padding: var(--space-md) var(--space-lg);
+  border: 1px solid var(--outline-variant);
+  border-radius: var(--radius-md);
+  background: var(--surface-container);
+}
+
+.agy-text-agent-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+}
+
+.agy-text-agent-head .settings-page-title {
+  margin: 0;
+}
+
+.agy-text-agent-section-subtitle {
+  margin: 0;
+  font-size: var(--text-xs);
+  line-height: 1.45;
+  color: var(--on-surface-variant);
+}
+
+/* 状态徽标（mirror .agy-bridge-state-chip 的填充 chip 语汇；配色对：
+ * 开启/current = success/diff-add-bg；stale = warning/warning-bg；
+ * foreign = error/error-bg；关闭/missing = 中性 chip）。 */
+.agy-text-agent-state-chip {
+  display: inline-block;
+  padding: 0.05rem var(--space-2xs);
+  border-radius: var(--radius-pill);
+  font-size: var(--text-2xs);
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+.agy-text-agent-state-chip.is-ok {
+  color: var(--success);
+  background: var(--diff-add-bg);
+}
+
+.agy-text-agent-state-chip.is-warn {
+  color: var(--warning);
+  background: var(--warning-bg);
+  font-weight: 500;
+}
+
+.agy-text-agent-state-chip.is-conflict {
+  color: var(--error);
+  background: var(--error-bg);
+  font-weight: 500;
+}
+
+.agy-text-agent-state-chip.is-neutral {
+  color: var(--chip-text);
+  background: var(--chip-bg);
+}
+
+/* 行为披露（常显清单——α 默认开启的知情面）。 */
+.agy-text-agent-disclosure {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin: 0;
+  padding-left: 1.2em;
+  font-size: var(--text-2xs);
+  line-height: 1.5;
+  color: var(--on-surface-variant);
+}
+
+/* 写入位置 / 文件状态（机器路径原样展示，mirror .agy-bridge-fact）。 */
+.agy-text-agent-fact {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-sm);
+  flex-wrap: wrap;
+}
+
+.agy-text-agent-fact-label {
+  flex-shrink: 0;
+  font-size: var(--text-2xs);
+  font-weight: 600;
+  color: var(--on-surface-variant);
+}
+
+.agy-text-agent-fact-value {
+  font-size: var(--text-xs);
+  overflow-wrap: anywhere;
+  color: var(--on-surface-variant);
+}
+
+.agy-text-agent-hint {
+  margin: 0;
+  font-size: var(--text-2xs);
+  line-height: 1.5;
+  color: var(--on-surface-variant);
+}
+
+/* 冲突/遮蔽指引块（mirror .agy-bridge-conflict）。 */
+.agy-text-agent-conflict {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3xs);
+  padding: var(--space-2xs) var(--space-sm);
+  border: 1px solid color-mix(in srgb, var(--error) 45%, transparent);
+  border-radius: var(--radius-sm);
+  background: var(--surface-container-low);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+}
+
+.agy-text-agent-conflict-title {
+  font-weight: 600;
+  color: var(--error);
+}
+
+.agy-text-agent-conflict > code {
+  font-family: var(--font-mono, monospace);
+  font-size: var(--text-xs);
+  overflow-wrap: anywhere;
+  color: var(--on-surface-variant);
+}
+
+.agy-text-agent-conflict-paths {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin: 0;
+  padding: 0;
+  padding-left: 1.2em;
+  list-style: disc;
+}
+
+.agy-text-agent-conflict-paths code {
+  font-family: var(--font-mono, monospace);
+  font-size: var(--text-xs);
+  overflow-wrap: anywhere;
+  color: var(--on-surface-variant);
+}
+
+/* 操作行（mirror .agy-bridge-actions）。 */
+.agy-text-agent-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-md);
+  flex-wrap: wrap;
+  padding-top: var(--space-2xs);
+}
+
+/* 主操作（开启）= accent 描边（mirror .agy-bridge-authorize-button）。 */
+.agy-text-agent-enable-button {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2xs);
+  flex-shrink: 0;
+  padding: 0.35rem 0.8rem;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  font-size: var(--text-sm);
+  font-weight: 500;
+  cursor: pointer;
+  transition: background var(--duration-fast) ease;
+}
+
+.agy-text-agent-enable-button:hover:not(:disabled) {
+  background: var(--accent-soft);
+}
+
+.agy-text-agent-enable-button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.agy-text-agent-enable-button:disabled:hover {
+  background: transparent;
+}
+
+/* 回收操作（关闭——错误色描边，mirror .agy-bridge-revoke-button）。 */
+.agy-text-agent-disable-button {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2xs);
+  flex-shrink: 0;
+  padding: 0.35rem 0.8rem;
+  border: 1px solid color-mix(in srgb, var(--error) 45%, transparent);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--error);
+  font: inherit;
+  font-size: var(--text-sm);
+  font-weight: 500;
+  cursor: pointer;
+  transition: background var(--duration-fast) ease;
+}
+
+.agy-text-agent-disable-button:hover:not(:disabled) {
+  background: var(--error-bg);
+}
+
+.agy-text-agent-disable-button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.agy-text-agent-disable-button:disabled:hover {
+  background: transparent;
+}
+
+.agy-text-agent-actions .material-symbols-outlined {
+  font-size: 1rem;
+}

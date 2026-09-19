@@ -96,10 +96,10 @@ describe('loadAgentPrompt（集成：读真实 prompts/<role>.yaml）', () => {
     expect(r.userTemplate.length).toBeGreaterThan(0);
   });
 
-  it('system 段是 yaml 契约内容（非 Orison 默认 systemPrompt "You are Orison"）', async () => {
+  it('system 段是 yaml 契约内容（非运行时默认 systemPrompt "You are Closure"）', async () => {
     // 核心断言（design §4.2 verify-point）：节点用 yaml system，不是 runChildAgent 的 .md/默认 system。
     const r = await loadAgentPrompt('draft-writer-agent');
-    expect(r.system).not.toContain('You are Orison');
+    expect(r.system).not.toContain('You are Closure');
   });
 
   it('userTemplate 含 {{var}} 占位（交 renderTemplate 渲染）', async () => {

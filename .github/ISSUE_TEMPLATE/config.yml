@@ -1,5 +1,5 @@
 blank_issues_enabled: false
 contact_links:
   - name: Security vulnerability
-    url: https://github.com/chillison/Closure/security/advisories/new
+    url: https://github.com/AoharuCat/Closure/security/advisories/new
     about: Please report security issues privately, not as a public issue. See SECURITY.md.

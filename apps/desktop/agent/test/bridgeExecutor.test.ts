@@ -51,7 +51,9 @@ function fullTools(): ToolDefinition[] {
     makeTool('outline_update'), // Tier 2 diff
     makeTool('memory_update'), // Tier 2 write
     makeTool('spawn_agent'), // 本地工具（结构性排除——不在策展表）
-    makeTool('read_file'), // 未策展的 remote 工具
+    makeTool('read_file'), // 策展内 remote 工具（F4b 入面——通用只读件）
+    makeTool('search'), // F8 同型补件——通用只读件
+    makeTool('list_files'), // F8 同型补件——通用只读件
   ];
 }
 
@@ -78,12 +80,15 @@ describe('面策展（design §7 分层表）', () => {
     registry.__clearForTest();
   });
 
-  it('策展常量：Tier1 + Tier2 = 全量 24 id，零重复', () => {
-    expect(BRIDGE_TOOL_FACE).toHaveLength(24);
-    expect(new Set(BRIDGE_TOOL_FACE).size).toBe(24);
+  it('策展常量：Tier1 + Tier2 = 全量 27 id，零重复', () => {
+    expect(BRIDGE_TOOL_FACE).toHaveLength(27);
+    expect(new Set(BRIDGE_TOOL_FACE).size).toBe(27);
     expect([...BRIDGE_TOOL_FACE_TIER1, ...BRIDGE_TOOL_FACE_TIER2]).toEqual([...BRIDGE_TOOL_FACE]);
-    // Tier1 锚点（design §7 逐项）。
-    for (const id of ['present_result', 'write_chapter', 'query_story', 'web_search', 'wiki_search']) {
+    // Tier1 锚点（design §7 逐项 + F4b 通用只读件 + F8 检索/列目录补件）。
+    for (const id of [
+      'present_result', 'write_chapter', 'query_story', 'read_file',
+      'search', 'list_files', 'web_search', 'wiki_search',
+    ]) {
       expect(BRIDGE_TOOL_FACE_TIER1).toContain(id);
     }
     // Tier2 diff 家族（W5 入面）。
@@ -95,22 +100,24 @@ describe('面策展（design §7 分层表）', () => {
   it('bridgeFaceToolIds：策展 ∩ policy——suggest 档含 diff（Tier2）剔 write；readonly 档只剩 read 类', () => {
     const tools = fullTools();
     expect(bridgeFaceToolIds(tools, 'suggest')).toEqual([
-      'present_result', 'write_chapter', 'query_story', 'outline_update',
+      'present_result', 'write_chapter', 'query_story', 'read_file', 'search', 'list_files', 'outline_update',
     ]);
     // memory_update 是 write 类——suggest 档被 policy 面剔除。
     expect(bridgeFaceToolIds(tools, 'suggest')).not.toContain('memory_update');
     // readonly 档：diff 家族也剔（outline_update）——只剩 read 分类（write_chapter 现行
-    // classifyTool 归 read——随现行 policy 单源，不在策展层覆写）。
-    expect(bridgeFaceToolIds(tools, 'readonly')).toEqual(['present_result', 'write_chapter', 'query_story']);
+    // classifyTool 归 read——随现行 policy 单源，不在策展层覆写）；只读件（read_file +
+    // F8 补件 search/list_files）三档全在。
+    expect(bridgeFaceToolIds(tools, 'readonly')).toEqual([
+      'present_result', 'write_chapter', 'query_story', 'read_file', 'search', 'list_files',
+    ]);
     // auto 档全量。
     expect(bridgeFaceToolIds(tools, 'auto')).toEqual([
-      'present_result', 'write_chapter', 'query_story', 'outline_update', 'memory_update',
+      'present_result', 'write_chapter', 'query_story', 'read_file', 'search', 'list_files',
+      'outline_update', 'memory_update',
     ]);
-    // 桥面外工具（spawn_agent/read_file）任何档不入面（结构性排除——策展表不含）。
+    // 桥面外工具（spawn_agent 本地工具）任何档不入面（结构性排除——策展表不含）。
     for (const mode of ['readonly', 'suggest', 'auto'] as const) {
-      const ids = bridgeFaceToolIds(tools, mode);
-      expect(ids).not.toContain('spawn_agent');
-      expect(ids).not.toContain('read_file');
+      expect(bridgeFaceToolIds(tools, mode)).not.toContain('spawn_agent');
     }
   });
 
@@ -120,6 +127,20 @@ describe('面策展（design §7 分层表）', () => {
     // 写作域措辞改写（w0-findings §8 两例基线——剥离工作台/产品名/实现词）。
     expect(byName.get('present_result')!.description).not.toContain('工作台');
     expect(byName.get('write_chapter')!.description).toContain('完整写作流程');
+    // read_file 描述（F4b 入面 / W5 简化）：内置同名读文件工具已随零工具 agent 从桥
+    // 会话模型侧消失，归属消歧句不在场；路径契约与章节正文指引保留。
+    expect(byName.get('read_file')!.description).toContain('相对项目根的相对路径');
+    expect(byName.get('read_file')!.description).toContain('章节正文优先用 chapter_read');
+    expect(byName.get('read_file')!.description).not.toContain('不要用同名内置读文件工具');
+    expect(byName.get('read_file')!.description).not.toContain('权限系统');
+    // search / list_files 描述覆盖（F8 同型补件）：写作域措辞写清「能回答什么问题」与
+    // 路径/参数契约；builtin.ts 的英文泛描述不上桥面（mirror read_file 的覆盖纪律）。
+    expect(byName.get('search')!.description).toContain('query 支持正则');
+    expect(byName.get('search')!.description).toContain('读整份文件用 read_file');
+    expect(byName.get('search')!.description).not.toContain('Search for text content across project files');
+    expect(byName.get('list_files')!.description).toContain('相对项目根的相对路径');
+    expect(byName.get('list_files')!.description).toContain('点开头的条目');
+    expect(byName.get('list_files')!.description).not.toContain('List files and directories in the project');
     // 未列改写的工具沿用 registry 描述。
     expect(byName.get('query_story')!.description).toBe('工具 query_story 描述。');
     // inputSchema = zodToJsonSchema 产物（$schema 剥除）。
@@ -133,7 +154,7 @@ describe('车道判定（resolveAgyBridgeDialogueLane）', () => {
   it('面空 → off（resolver 不被调用——HTTP 模型零开销）', () => {
     const resolver = vi.fn(() => ({ mode: 'bridge' as const }));
     setAgyBridgeModeResolver(resolver);
-    const lane = resolveAgyBridgeDialogueLane({ tools: [makeTool('read_file')], permissionMode: 'suggest', modelRef: { keyId: 'k', modelId: 'm' } });
+    const lane = resolveAgyBridgeDialogueLane({ tools: [makeTool('spawn_agent')], permissionMode: 'suggest', modelRef: { keyId: 'k', modelId: 'm' } });
     expect(lane).toEqual({ kind: 'off', reason: 'empty-face' });
     expect(resolver).not.toHaveBeenCalled();
   });
@@ -291,7 +312,10 @@ describe('executor：持久化同构映射（与 runLoop 产物 shape 对拍）'
     expect(requests[0]!.system).toBe('SYSTEM');
     expect(requests[0]!.messages).toEqual([{ role: 'user', content: '写第一章' }]);
     expect(requests[0]!.requirePresentResult).toBe(true);
-    expect(requests[0]!.face.map((f) => f.name)).toEqual(['present_result', 'write_chapter', 'query_story', 'outline_update']);
+    expect(requests[0]!.face.map((f) => f.name)).toEqual([
+      // 注：entries 沿 tools 注册序（buildBridgeFaceEntries 遍历 tools 数组），非策展表序。
+      'present_result', 'write_chapter', 'query_story', 'outline_update', 'read_file', 'search', 'list_files',
+    ]);
     expect(requests[0]!.sessionKey).toBe('dialogue:s1');
 
     // delta 流：text 两段 + tool 相位一次（「正在调用 X」）。
@@ -321,6 +345,54 @@ describe('executor：持久化同构映射（与 runLoop 产物 shape 对拍）'
     expect(persisted[2]!.content).toBe('终文。');
     expect(result.map((m) => m.role)).toEqual(['assistant', 'tool', 'assistant']);
     expect(result[2]!.id).toBe(persisted[2]!.id);
+  });
+
+  it('R5 相位转发：内置工具步 → bridge-notice（builtin-tool-started + toolName）；桥工具相位仍只走 tool 通道', async () => {
+    const deltas: Array<{ channel: string; toolName?: string }> = [];
+    const notices: Array<{ notice: string; toolName?: string }> = [];
+    setBridgeTurnFn(async (req) => {
+      req.onPhase?.({ kind: 'tool-started', toolName: 'query_story', stepIndex: 1 });
+      req.onPhase?.({ kind: 'builtin-tool-started', toolName: 'list_dir', stepIndex: 2 });
+      return makeOutcome({ text: '收尾。' });
+    });
+    await runBridgeExecutor({
+      sessionId: 's1', projectPath: 'p', messages: [], systemPrompt: '', tools: fullTools(),
+      modelRef: undefined, sessionKey: 'k', permissionMode: 'suggest', behaviorMode: 'normal',
+      abort: new AbortController().signal, onMessage: () => {},
+      emitDelta: (event) => deltas.push({ channel: event.channel, toolName: event.toolName }),
+      onNotice: (n) => notices.push({ notice: n.notice, toolName: n.toolName }),
+    });
+    // 桥工具相位 → tool 通道（「正在调用 X」占位 chip），不入通知面。
+    expect(deltas).toEqual([{ channel: 'tool', toolName: 'query_story' }]);
+    // 内置工具步 → 通知面（与桥工具相位视觉可区分），携被调工具名。
+    expect(notices).toEqual([{ notice: 'builtin-tool-started', toolName: 'list_dir' }]);
+  });
+
+  it('R6 相位转发：内置工具被权限拦下 → bridge-notice（builtin-tool-denied）；无名形态不带 toolName 键', async () => {
+    const deltas: Array<{ channel: string; toolName?: string }> = [];
+    const notices: Array<{ notice: string; toolName?: string }> = [];
+    setBridgeTurnFn(async (req) => {
+      // 有名（流事件 error 主信号）/ 无名（stderr 兜底信号无步上下文）两种形态。
+      req.onPhase?.({ kind: 'builtin-tool-denied', toolName: 'list_dir', stepIndex: 3 });
+      req.onPhase?.({ kind: 'builtin-tool-denied' });
+      return makeOutcome({ text: '收尾。' });
+    });
+    await runBridgeExecutor({
+      sessionId: 's1', projectPath: 'p', messages: [], systemPrompt: '', tools: fullTools(),
+      modelRef: undefined, sessionKey: 'k', permissionMode: 'suggest', behaviorMode: 'normal',
+      abort: new AbortController().signal, onMessage: () => {},
+      emitDelta: (event) => deltas.push({ channel: event.channel, toolName: event.toolName }),
+      onNotice: (n) => notices.push({ ...n }),
+    });
+    // 内置工具被拒不走 tool 通道（与桥工具相位分开——防 UI 显示「正在调用 X」的错误语义）。
+    expect(deltas).toEqual([]);
+    expect(notices).toEqual([
+      { notice: 'builtin-tool-denied', toolName: 'list_dir' },
+      { notice: 'builtin-tool-denied' },
+    ]);
+    // 缺席即不带键（条件展开——undefined 不混进通知载荷）。
+    expect('toolName' in notices[0]!).toBe(true);
+    expect('toolName' in notices[1]!).toBe(false);
   });
 
   it('失败工具结果 = "Error: " 前缀（gate 拒绝/执行异常同形——mirror runLoop 惯例）；metadata 不携带', async () => {

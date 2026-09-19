@@ -14,6 +14,20 @@ import { refreshProjectDocument } from '../store/projectSubscription';
 
 const MARKDOWN_EXT = /\.md$/i;
 
+/**
+ * CLI 凭据判死 toast 的展示时限（09-19 dogfood R4）：toast 体系支持自定义 duration
+ *（toastStore.showToast 第三参），warning 默认仅 4s 太短——凭据失效是用户必须看到的
+ * 事实，给 30s 长时限；设置页 CLI key 状态行同时常驻同态信息（未看到 toast 也不丢）。
+ */
+const CLI_AUTH_DEAD_TOAST_MS = 30_000;
+
+/**
+ * 文本 Agent 降级 toast 的展示时限（09-19 CLI 白名单 W4）：比 auth-dead 轻一档——降级
+ * 已自愈（本 turn 已用无 agent 车道重跑，γ 提示词硬化兜底），但默认 warning 4s 读不完
+ * 一句中文；给 15s 知情窗。设置页文本 Agent 卡片常显同域状态（未看到 toast 也不丢）。
+ */
+const CLI_TEXT_AGENT_FALLBACK_TOAST_MS = 15_000;
+
 export function useToolEvents() {
   useEffect(() => {
     const api = (window as any).orisonDesktop;
@@ -94,6 +108,39 @@ export function useToolEvents() {
     };
 
     const unsubscribe = api.onToolEvent((event: { type: string; [key: string]: unknown }) => {
+      // CLI 凭据探针判死（09-19 dogfood R4）：机器级事件（无 projectPath），必须先于
+      // 下方的 projectPath 守卫处理（无 projectPath 走守卫会被吞）。shell 侧只在「上一态
+      // 非 auth-dead → auth-dead」转变时推一次（启动自动探 + 手动重测同源判定，内存
+      // 上次结果为准），此处只弹不做二次去重。keys 恒数组：手动重测单元素；启动扫的
+      // 多 key 死票已由 shell 合并成单条事件——这里一条 toast 列全部 key 名，不堆叠。
+      if (event.type === 'cli:auth-dead') {
+        const locale = useAppStore.getState().resolvedLocale ?? 'en-US';
+        const names = (Array.isArray(event.keys) ? event.keys : [])
+          .map((k) => (k && typeof k.keyName === 'string' && k.keyName ? k.keyName : null))
+          .filter((n): n is string => n !== null);
+        const keyName = names.join(locale === 'zh-CN' ? '、' : ', ');
+        useToastStore
+          .getState()
+          .showToast(translate(locale, 'notifications.cliAuthDead', { keyName }), 'warning', CLI_AUTH_DEAD_TOAST_MS);
+        return;
+      }
+
+      // 文本 Agent 降级（09-19 CLI 白名单 W4）：机器级事件（无 projectPath），同样先于
+      // projectPath 守卫处理。shell 侧进程级只推一次（agentIpc 事件面单点旗），此处只弹
+      // 不二次去重。toast 文案 = 观察 + 处置（工具 step ≠ agent 未加载——F12 实证纠正，
+      // 见 zh-CN/en-US workspace.yaml 该键上方注）。
+      if (event.type === 'cli:text-agent-fallback') {
+        const locale = useAppStore.getState().resolvedLocale ?? 'en-US';
+        useToastStore
+          .getState()
+          .showToast(
+            translate(locale, 'notifications.cliTextAgentFallback'),
+            'warning',
+            CLI_TEXT_AGENT_FALLBACK_TOAST_MS,
+          );
+        return;
+      }
+
       const eventProjectPath = typeof event.projectPath === 'string'
         ? normalizePath(event.projectPath)
         : null;
@@ -108,6 +155,9 @@ export function useToolEvents() {
         pushQuarantineNotification(event, eventProjectPath);
         return;
       }
+
+      // CLI 凭据探针判死的 toast 分支在上方（先于 projectPath 守卫——机器级事件无
+      // projectPath）。
 
       const currentProjectPath = useAppStore.getState().currentProject?.path;
       if (

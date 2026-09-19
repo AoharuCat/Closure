@@ -1,5 +1,6 @@
 import type {
   CliModelDiscoveryResult,
+  CliProbeSnapshot,
   ImageGenerationRequest,
   ImageGenerationResponse,
   ImageInput,
@@ -46,6 +47,22 @@ export async function loadRemoteModels(request: ListRemoteModelsRequest): Promis
 export async function discoverCliModels(request: ListCliModelsRequest): Promise<CliModelDiscoveryResult> {
   if (window.orisonDesktop?.listCliModels) {
     return window.orisonDesktop.listCliModels(request);
+  }
+  throw new Error('Desktop model provider bridge is unavailable');
+}
+
+// ── 09-19 dogfood R4：CLI 凭据探针两通道（读最近结果 / 手动重测）。auth-dead 转变
+// 的 toast 通知走 tool:event 既有推送（shell 单点判定），此处只承载查询与触发。──
+export async function fetchCliProbeStatus(): Promise<Record<string, CliProbeSnapshot>> {
+  if (window.orisonDesktop?.cliProbeStatus) {
+    return window.orisonDesktop.cliProbeStatus();
+  }
+  throw new Error('Desktop model provider bridge is unavailable');
+}
+
+export async function runCliProbe(input: { keyId: string }): Promise<CliProbeSnapshot> {
+  if (window.orisonDesktop?.cliProbeRun) {
+    return window.orisonDesktop.cliProbeRun(input);
   }
   throw new Error('Desktop model provider bridge is unavailable');
 }

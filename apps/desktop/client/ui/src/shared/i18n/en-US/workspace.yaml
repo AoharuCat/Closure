@@ -89,6 +89,15 @@ notifications:
   quarantineBodyEmpty: "The original file was backed up as {backup} (in the project folder; it can be restored manually). The project was opened empty."
   quarantineBodyRecovered: "The original file was backed up as {backup} (in the project folder; it can be restored manually). The project was reopened from salvaged data."
   quarantineBodyNoBackup: "The project file was judged unreadable, but the automatic backup failed (the file may be in use); the original file is still in the project folder. Reason: {reason}"
+  # CLI credential probe auth-dead toast (09-19 dogfood R4; the shell pushes once per transition only.
+  # {keyName} = name of the dead key — when the startup sweep finds several, the shell merges them
+  # into one event and the renderer joins the names with commas)
+  cliAuthDead: "CLI login has expired ({keyName}) — switch accounts or run agy in a terminal to log in again"
+  # Text agent fallback toast (09-19 CLI whitelist W4; the shell pushes once per process.
+  # Self-healed — the turn already reran on the no-agent lane, with prompt hardening as backstop.
+  # Copy corrected per F12: no more "did not take effect" attribution (a built-in tool step is not
+  # evidence the agent failed to load) — it says only what was observed and what was done)
+  cliTextAgentFallback: "The Closure text agent invoked a built-in agy tool this turn — automatically reran the turn in standard mode."
 common:
   cancel: "Cancel"
   confirm: "Confirm"

@@ -27,7 +27,7 @@ vi.mock('../src/skill/discovery', () => ({
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * CR-D1 拆分后静态能力段 = system 尾 `---` 块（buildMainRunConfig 拼）——剥 DEFAULT_ORISON_PROMPT /
+ * CR-D1 拆分后静态能力段 = system 尾 `---` 块（buildMainRunConfig 拼）——剥 DEFAULT_CLOSURE_PROMPT /
  * path 行 / skills 与 runLoop 追加的工具描述，能力句断言打在此隔离段。
  */
 function capabilityOnly(system: string): string {

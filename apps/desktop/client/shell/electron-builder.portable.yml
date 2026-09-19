@@ -51,6 +51,6 @@ win:
 
 publish:
   provider: github
-  owner: chillison
+  owner: AoharuCat
   repo: Closure
   releaseType: release

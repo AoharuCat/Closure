@@ -124,7 +124,7 @@ function notifyGitChanged() {
 }
 
 /** git 节点作者（时间线展示用；全部节点统一）。 */
-const GIT_AUTHOR = { name: 'Orison', email: 'user@orison.local' };
+const GIT_AUTHOR = { name: 'Closure', email: 'user@closure.local' };
 /**
  * CR-28（dogfood R2）：新项目首节点消息——初始内容（project.yaml + 先行落盘的封面）
  * 落地那一刻由 commitProjectCreateNode 挂上。详设要求首节点含初始内容，而不是空节点。

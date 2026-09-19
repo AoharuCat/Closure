@@ -44,6 +44,7 @@ import {
   _resetAntigravityCliUsedForTest,
 } from '../main/ipc/modelGatewayIpc';
 import {
+  classifyCliError,
   FallbackChainExhaustedError,
   ProtocolContextOverflowError,
   ProtocolHttpError,
@@ -431,6 +432,51 @@ describe('gateway fallback loop (09-12 子2 W3) — non-streaming', () => {
     ]);
     // HTTP B 恰一次；CLI 走驱动器 mock 零 fetch。
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('跨形态链：A CLI 的 MCP 预授权软拒 → 直抛不烧链（B 零出站——会话授权事实与模型无关）', async () => {
+    await seedConfig({
+      keys: [
+        {
+          id: 'key_agy',
+          name: 'Antigravity CLI',
+          protocol: 'antigravity-cli',
+          apiKey: '',
+          cliExecutable: 'C:\\agy\\bin\\agy.exe',
+          models: [
+            { id: 'gemini-3.8-pro-high', alias: 'Gemini 3.8 Pro (High)', capability: 'text', enabled: true },
+          ],
+        },
+        ...TWO_KEY_CONFIG.keys.slice(1),
+      ],
+    });
+    // CLI 驱动器 mock：抛**真实分类产物**——MCP 主体软拒 stderr → 合成 412（other/ineligible）。
+    setAntigravityCliGenerateForTest(async () => {
+      throw classifyCliError(
+        'antigravity-cli turn ended with SUCCESS but produced no response text (empty response and zero text deltas)',
+        'jetski: no output produced — a tool required the "mcp" permission that headless mode cannot prompt for, so it was auto-denied.',
+      );
+    });
+    const fetchMock = urlRoutingFetch({
+      'https://b.example.com/v1': () => openAiTextResponse('should not be reached'),
+    });
+    globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch;
+
+    const err = await handleGenerateText({
+      ref: { keyId: 'key_agy', modelId: 'gemini-3.8-pro-high' },
+      request: { model: 'gemini-3.8-pro-high', messages: [{ role: 'user', content: 'hi' }] },
+      fallbacks: [{ ref: { keyId: 'key_b', modelId: 'gpt-4o-mini' } }],
+    }).then(
+      () => { throw new Error('expected rejection'); },
+      (e: unknown) => e,
+    );
+
+    // 原错误原样上抛（412 合成状态 → 回退分类 other/ineligible，链不推进）；文案指预授权出路。
+    expect(err).toBeInstanceOf(ProtocolHttpError);
+    expect((err as ProtocolHttpError).status).toBe(412);
+    expect((err as ProtocolHttpError).message).toContain('pre-authorization');
+    // B 零出站（同一条桥/同一套预授权，换模型撞同一堵墙——烧一轮纯浪费）。
+    expect(fetchMock).toHaveBeenCalledTimes(0);
   });
 });
 

@@ -2578,6 +2578,11 @@ describe('closure:chapter-derivation-status handler（链流程重排 W4 / R6 �
   }
 
   it('db 无摘要行（未提取/未注册）→ 全章 summaryPresent=false + stale=true（重提取候选如实标出）', async () => {
+    // 未注册语义就地封闭（getProject → undefined）：文件级 mock 默认委托真实现，而真实现
+    // 首调 getDb 才加载 better-sqlite3 原生模块（v12 lazy binding）——Electron-ABI 本地
+    // vitest 下 dlopen 炸 → handler best-effort catch → 空 chapters 假红（ABI skip 门
+    // 探不到这种 import 存活的文件）。in-test 覆写 mirror 下方「摘要行在」用例的惯例。
+    getProjectDb.mockReturnValue(undefined);
     const handler = derivationStatusHandler();
 
     const result = await handler({}, { projectPath: TEST_DIR }) as {

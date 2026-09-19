@@ -23,6 +23,9 @@ import {
 // 子4 W4（09-12 agy MCP 工具桥）：dialogue 桥车道生产实现（consent 硬门 + 模型解析 +
 // 注册表 live 监听）——本文件只做注入接线（mirror setGenerateTextFn 装配形态）。
 import { agyBridgeProductionDeps, createAgyBridgeLaneModeResolver, createAgyBridgeTurnProduction } from './agyBridgeIpc';
+// 09-19 CLI 白名单（W3）：纯文本车道零工具 agent 解析器生产实现 + 协议层注入缝。
+import { createTextAgentResolverProduction } from './agyTextAgentIpc';
+import { setAntigravityCliTextAgentResolver } from '@orison/model-protocols';
 import { enrichSlotAssignment, handleGenerateText, handleGenerateTextStream, resolveModel } from './modelGatewayIpc';
 import { installAgentImagePartsCore } from './agentImageParts';
 import { prepareVisionImage } from '../research/visionAnalysis';
@@ -30,12 +33,95 @@ import { readModelConfigFromDisk, readTaskModelSlots, readUserPreferencesFromDis
 import { handleToolExecute } from './toolExecution';
 import { normalizeProjectKey } from './pathGuard';
 import { getLogger } from '../logger';
+import { notifyUI, type ToolEvent } from './toolNotify';
 import {
   generateTextPayloadSchema,
   type GenerateTextPayload,
 } from '@orison/shared-contracts';
 
 const logger = getLogger();
+
+// ── 09-19 CLI 白名单（W4）：文本 Agent 降级带 warn → 事件面上浮（一次性 toast）──
+//
+// 协议层 driver.ts 零改动：生产 deps.warn = console.warn（driver.ts defaultAgyPoolDeps
+// 的箭头函数每次调用现取 console.warn），此处包装 console.warn 拦截降级带签名串后委托
+// 原实现。签名串 = 协议层降级带 warn 的前缀 + 标记（driver.ts W3；归因 2026-09-19 F12
+// 真机实证纠正——工具 step 不等于 agent 未加载，见 driver.ts 降级带注）——
+// **跨包文案耦合（shell → 协议层单向，常量不可共享）：由交叉校验测试守门**——
+// agentIpcTextAgentWiring.test.ts 跑真 driver 产出真实降级 warn（真 defaultAgyPoolDeps
+// warn → 真 console.warn），断言本拦截层命中；driver 文案变更而此处不同步 = 该测试红，
+// 不是 toast 静默消失。升级回归清单项（docs/antigravity-cli-upgrade-regression.md §3）。
+// 防骚扰收敛在 shell 单点（mirror cli:auth-dead「只弹转变」）：降级带按会话首 turn 各
+// 触发一次，多会话链（蒸馏/拆书逐章）会连发——进程级只推一次，renderer 只弹不二次去重。
+const TEXT_AGENT_DEGRADED_WARN_PREFIX = '[antigravity-cli] text agent ';
+const TEXT_AGENT_DEGRADED_WARN_MARKER = 'built-in tool step';
+let textAgentDegradationNotified = false;
+let textAgentDegradationFaceInstalled = false;
+
+/**
+ * 降级 toast 的投递前提探测（CR-3）：零 BrowserWindow（冷启动后台蒸馏先于首窗）时投递
+ * 必然丢失——此时**不消费**进程单次旗（旗留给首个窗口出现后的下次触发）。探测本身失败
+ * （electron mock / 环境异常）按「有窗」处理——事件面 best-effort，绝不阻断原 warn。
+ */
+function hasWindowTargetForTextAgentToast(): boolean {
+  try {
+    return BrowserWindow.getAllWindows().length > 0;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * 安装文本 Agent 降级事件面（registerAgentIpc 装配恰一次）。返回还原函数（测试用；
+ * 生产忽略）。通知面失败不阻断原 warn（best-effort 事件面——降级已自愈，toast 只是
+ * 知情面）。CR-3 幂等守卫：已安装状态下重复安装直接返回 no-op restore——防 registerAgentIpc
+ * 双跑 / 多装配点把 console.warn wrapper 层层堆叠（每层都拦一遍 + restore 只剥顶层）。
+ */
+export function installTextAgentDegradationEventFace(
+  notify: (event: ToolEvent) => void,
+): () => void {
+  if (textAgentDegradationFaceInstalled) {
+    return () => {}; // 幂等：单例 wrapper 已在位，不再堆叠（restore 也无从还原——没动过）
+  }
+  const originalWarn = console.warn.bind(console);
+  const patchedWarn = (...args: unknown[]) => {
+    try {
+      const first = args[0];
+      if (
+        !textAgentDegradationNotified
+        && hasWindowTargetForTextAgentToast()
+        && typeof first === 'string'
+        && first.startsWith(TEXT_AGENT_DEGRADED_WARN_PREFIX)
+        && first.includes(TEXT_AGENT_DEGRADED_WARN_MARKER)
+      ) {
+        textAgentDegradationNotified = true;
+        try {
+          notify({ type: 'cli:text-agent-fallback' });
+        } catch {
+          // 通知面抛错吞掉——原 warn 必须原样出去
+        }
+      }
+    } finally {
+      originalWarn(...args);
+    }
+  };
+  console.warn = patchedWarn;
+  textAgentDegradationFaceInstalled = true;
+  return () => {
+    console.warn = originalWarn;
+    textAgentDegradationFaceInstalled = false;
+  };
+}
+
+/** wiring 测试探针：事件面已安装（agentIpc 装配行被删 = false → 红）。 */
+export function __isTextAgentDegradationFaceInstalledForTest(): boolean {
+  return textAgentDegradationFaceInstalled;
+}
+
+/** 测试缝：复位单次旗（module-level state 不得跨测试泄漏）。 */
+export function _resetTextAgentDegradationFaceForTest(): void {
+  textAgentDegradationNotified = false;
+}
 
 let runtime: WorkflowRuntime;
 
@@ -295,6 +381,17 @@ export function registerAgentIpc(getWin: () => BrowserWindow | null) {
   const agyBridgeDeps = agyBridgeProductionDeps();
   setAgyBridgeModeResolver(createAgyBridgeLaneModeResolver(agyBridgeDeps));
   setBridgeTurnFn(createAgyBridgeTurnProduction(agyBridgeDeps));
+
+  // 09-19 CLI 白名单 W3：纯文本车道零工具 agent 解析器注入（mirror 桥 seam 注入形态——
+  // 协议层驱动器每 turn 组 spec 时咨询；决策全在 shell 闭包：无 declined 记录 + 存在
+  // agy CLI key + 文件 current → 布局常量激活值，否则 undefined 走 γ 反工具硬化兜底）。
+  // wiring 测试钉死漏装配——删此行 spawn 静默回无 agent 路径（行为等价旧状，γ 兜底恒在，
+  // 但注入缝失明）。
+  setAntigravityCliTextAgentResolver(createTextAgentResolverProduction());
+
+  // 09-19 CLI 白名单 W4：降级带 warn → 事件面上浮安装（一次性 toast 的 shell 补线——
+  // 拦截 console.warn 降级签名串；wiring 测试钉死漏安装）。
+  installTextAgentDegradationEventFace(notifyUI);
 
   // 09-01 附件 B3（design §2.3）：agentImageParts 防环注入内核装配——prepareImage
   // （visionAnalysis）/ resolveModelRef（modelGatewayIpc）/ readModelConfig（configIpc）

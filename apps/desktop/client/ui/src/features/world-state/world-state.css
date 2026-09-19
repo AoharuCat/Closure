@@ -44,6 +44,9 @@
   flex-direction: column;
   height: 100%;
   overflow: hidden;
+  /* 表面区隔（U3）：同槽 .project-tree-panel 同款 token——无壁纸时纯色，壁纸态经
+   * global.css html[data-wallpaper] override 转半透明（左槽大面板档），不与壁纸融成一体。 */
+  background: var(--project-tree-bg);
 }
 
 .world-head {

@@ -4,7 +4,7 @@
  *
  * 验证方式 mirror leader-write-chapter-prompt.test.ts：mock generate() 捕获 system
  * prompt，断言含 Research 段引导文字（grep-able）——不读源文件（抗重构）。
- * `DEFAULT_ORISON_PROMPT`（workflow.ts 内部 const，非 export）经 buildRuntimeSystemPrompt
+ * `DEFAULT_CLOSURE_PROMPT`（workflow.ts 内部 const，非 export）经 buildRuntimeSystemPrompt
  * 组装进 leader system prompt。
  */
 import { mkdtempSync } from 'node:fs';

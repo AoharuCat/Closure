@@ -94,7 +94,7 @@ import { findActiveBatchRun, upsertBatchRun } from './batch-state';
 // （mirror spawn_agent：可见于 readonly/suggest/auto，执行时 permission ask 把关）。不改 toolPolicy / permission。
 //
 // ⚠️ leader 交互式触发 UX（工作台「写章 N」对话）= Story 4.1 Step 5（design §3.4）：
-// DEFAULT_ORISON_PROMPT 加 write_chapter 引导 + ChapterListPanel「生成」按钮 → sendAgentMessage
+// DEFAULT_CLOSURE_PROMPT 加 write_chapter 引导 + ChapterListPanel「生成」按钮 → sendAgentMessage
 // → leader runLoop 凭引导调本工具。E3 工作台完整横切工作面仍 defer。dogfood 走 closure:run-chapter-chain IPC。
 //
 // expected_downstream_consumers:

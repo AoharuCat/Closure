@@ -1,6 +1,6 @@
 # Closure 贡献指南
 
-> **English quick start:** fork `chillison/Closure` → branch off `main` → `pnpm install && pnpm rebuild:native` → make your change → `pnpm typecheck && pnpm lint && pnpm test` → open a PR. CI runs the same three gates on Linux / Windows / macOS. By submitting a contribution you agree it is licensed under AGPL-3.0-or-later. The full guide below is in Chinese.
+> **English quick start:** fork `AoharuCat/Closure` → branch off `main` → `pnpm install && pnpm rebuild -r better-sqlite3` (Node ABI, required by the test gates) → make your change → `pnpm typecheck && pnpm lint && pnpm test` → open a PR. To run the app itself, rebuild for the Electron ABI first (`pnpm rebuild:native` — see [Native module & ABI](README.md#原生模块与-abi)). CI runs the same three gates on Linux / Windows / macOS. By submitting a contribution you agree it is licensed under AGPL-3.0-or-later. The full guide below is in Chinese.
 
 感谢你愿意为 Closure 出力！这是一份 Alpha 阶段的本地优先 AI 小说创作 IDE（Electron 桌面应用）。本指南覆盖环境搭建、双仓模型、开发流程与提交要求。
 
@@ -8,8 +8,8 @@
 
 Closure 有两个仓库：
 
-- **公仓 [`chillison/Closure`](https://github.com/chillison/Closure)**（`main` 单分支）——发布面与协作面。**所有 Issue 与 Pull Request 落在这里**，CI 在三个平台（Linux / Windows / macOS）上对每个 PR 跑同一组门。
-- **私仓 `chillison/Closure-private`**（`dev`）——维护者的开发发生地。改动定期以同步快照（`sync: dev@<hash>`）发布到公仓。
+- **公仓 [`AoharuCat/Closure`](https://github.com/AoharuCat/Closure)**（`main` 单分支）——发布面与协作面。**所有 Issue 与 Pull Request 落在这里**，CI 在三个平台（Linux / Windows / macOS）上对每个 PR 跑同一组门。
+- **私仓 `AoharuCat/Closure-private`**（`dev`）——维护者的开发发生地。改动定期以同步快照（`sync: dev@<hash>`）发布到公仓。
 
 因此公仓的历史是快照形态、没有细粒度开发脉络——这是设计使然，不是事故。**贡献者只需要与公仓打交道**：fork 公仓 → 从 `main` 切分支 → 提 PR。
 
@@ -20,13 +20,23 @@ Closure 有两个仓库：
 
 ## 本地开发
 
+贡献者的真实路径是改代码 + 跑三道门（typecheck / lint / test），这套门跑在 Node 上：
+
 ```bash
-pnpm install        # 安装依赖
-pnpm rebuild:native # 重建 better-sqlite3 原生模块
+pnpm install                    # 安装依赖
+pnpm rebuild -r better-sqlite3  # 按 Node ABI 重建 better-sqlite3（跑测试前）
+# …改代码…
+pnpm typecheck && pnpm lint && pnpm test
+```
+
+要跑应用（`pnpm dev`）时，先切回 Electron ABI 再启动：
+
+```bash
+pnpm rebuild:native # 按 Electron ABI 重建 better-sqlite3（跑应用前）
 pnpm dev            # 以开发模式启动 Electron 应用
 ```
 
-`rebuild:native` 说明：better-sqlite3 是原生模块，ABI 与当前 Node / Electron 不匹配时测试会被静默 skip 而不是报错。**打包之后、切换 Node 版本之后、或者测试突然大面积 skip 时，先跑一遍 `pnpm rebuild:native` 再跑测试。**
+**原生模块与 ABI**：better-sqlite3 必须按**当前运行时**编译——跑测试（`pnpm test`）用 Node ABI（`pnpm rebuild -r better-sqlite3`），跑应用（`pnpm dev`）用 Electron ABI（`pnpm rebuild:native`），两者互斥；切换用途或切换 Node 版本后必须重编。ABI 不匹配时数据库相关测试会整族**静默 skip**（不是测试坏了）——先按目标用途重编，再排查。详见 [README「原生模块与 ABI」](README.md#原生模块与-abi)。
 
 常用根脚本：
 
@@ -38,7 +48,7 @@ pnpm dev            # 以开发模式启动 Electron 应用
 | `pnpm test` | 跑测试套件（Vitest，经 Turbo 按包执行） |
 | `pnpm typecheck` | 全包类型检查 |
 | `pnpm lint` | ESLint + 依赖边界/安全门（dependency-cruiser） |
-| `pnpm rebuild:native` | 重建 better-sqlite3 原生模块 |
+| `pnpm rebuild:native` | 按 Electron ABI 重建 better-sqlite3（跑应用前；跑测试用 `pnpm rebuild -r better-sqlite3`） |
 | `pnpm package:desktop` | 产出 Windows NSIS 安装包 |
 
 > 注意：不要在仓库根直接跑 `npx vitest run`——单一 node 环境会丢掉各包 vitest 配置（UI 包需要 jsdom），产生大片假失败。全量用 `pnpm test`，单包用 `pnpm --filter <pkg> test`。
@@ -56,7 +66,7 @@ pnpm dev            # 以开发模式启动 Electron 应用
 
 ## 开发流程
 
-1. Fork 公仓 `chillison/Closure`，从 `main` 切一个描述性命名的分支。
+1. Fork 公仓 `AoharuCat/Closure`，从 `main` 切一个描述性命名的分支。
 2. 做你的改动。保持聚焦——一个 PR 只处理一个关注点。
 3. **提交 PR 之前**跑：
    ```bash

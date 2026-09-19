@@ -8,8 +8,13 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { atomicWriteFileSync } from '@orison/shared-contracts/fs/atomicWrite';
 import {
+  AGY_GLOBAL_AGENTS_ROOT_SEGMENTS,
+  CLOSURE_BRIDGE_AGENT,
+  CLOSURE_BRIDGE_AGENT_LAYOUT,
+  CLOSURE_TEXT_AGENT_LAYOUT,
   defaultAgyPoolDeps,
   installAgyBridgeCore as installBridgeCoreIntoProtocols,
+  renderAgentMarkdown,
   type BridgePermissionMode,
   type BridgeSessionOpenInput,
   type BridgeToolFaceEntry,
@@ -27,6 +32,10 @@ import {
   parseAgySettings,
   type AgyBridgeConsentStore,
 } from './agyBridgeConsent';
+// 09-19 CLI 白名单 CR-2：假宿整树拷贝后、写我方 agent 文件前——对拷贝树内 agents 根跑
+// name 遮蔽检测（本方每会话新鲜写 = 无 fallback 面，同名外来 agent 一旦被 agy 竞速选中，
+// 桥 agent 被静默顶替零信号——桥会话开启即 typed 响应失败，宁误报不漏报）。
+import { detectAgentNameShadowing } from './agyTextAgentConsent';
 import { getLogger } from '../logger';
 
 // ── agy MCP 工具桥基座（子4 W2，design §0/§3/§5.2/§6）──
@@ -41,7 +50,7 @@ import { getLogger } from '../logger';
 //   - 工具调用路径 = §5.2 三道闸重建（**同一 agent toolPolicy 模块**——面外拒 /
 //     autoApply 档位强制 / 自审闸拦截文案回工具结果）→ handleToolExecute（统一工具通道，
 //     pathGuard/日志照常）→ 结果双投（管道回程 + 会话调用记录）；
-//   - 假宿准备实现（四件套 + marker；真实 ~/.gemini 只读——**零写入红线**）；
+//   - 假宿准备实现（四件套 + 桥声明式 agent 文件 + marker；真实 ~/.gemini 只读——**零写入红线**）；
 //   - 启动清扫守卫（marker pid 判活矩阵）+ 可选版本探测（已验版本带外禁用）；
 //   - installShellAgyBridgeCore：装配 model-protocols bridgeTurn 内核（防环注入，
 //     mirror installAgentImagePartsCore；wiring 测试钉死漏装配）。
@@ -70,8 +79,14 @@ export function defaultAgyBridgeHomeRoot(home: string = os.homedir()): string {
 }
 
 /**
- * 假宿路径断言：homeDir 必须严格位于 homeRoot 之内，且与真实用户目录/.gemini 零重叠
- * （含反向包含——realHome/.gemini 不得落在假宿树内）。违例 = 阻断（宁可响亮失败）。
+ * 假宿路径断言（守卫意图：保护真实用户目录与真实 .gemini 凭据树不被假宿写入/包裹）：
+ *   第一道——homeDir 必须严格位于 homeRoot 之内（typed 拒绝不变）；
+ *   第二道——三条禁令（假宿位于真实用户目录内的 .orison 数据子树是设计内合法落点，
+ *   不算违例）：
+ *     ① 假宿不得等于/包含真实用户目录（真实目录整个落进假宿树 = 灾难形态）；
+ *     ② 假宿不得等于/包含真实 .gemini（真实凭据树必须完整留在假宿外）；
+ *     ③ 假宿不得落进真实 .gemini 之内。
+ * 违例 = 阻断（宁可响亮失败）。
  */
 export function assertFakeHomePath(homeDir: string, homeRoot: string, realHome: string): void {
   const root = path.resolve(homeRoot);
@@ -82,16 +97,25 @@ export function assertFakeHomePath(homeDir: string, homeRoot: string, realHome: 
   }
   const real = path.resolve(realHome);
   const realGemini = path.join(real, '.gemini');
-  const overlaps = (a: string, b: string): boolean => {
-    const oneWay = (x: string, y: string): boolean => {
-      const r = path.relative(x, y);
-      return r === '' || (r !== '..' && !r.startsWith(`..${path.sep}`) && !path.isAbsolute(r));
-    };
-    // 双向：任一目录含于另一方（假宿在真实目录树内 / 真实目录树在假宿内都算重叠）。
-    return oneWay(a, b) || oneWay(b, a);
+  // x 是否为 y 本人或祖先（即 y 位于 x 之内）。
+  const contains = (x: string, y: string): boolean => {
+    const r = path.relative(x, y);
+    return r === '' || (r !== '..' && !r.startsWith(`..${path.sep}`) && !path.isAbsolute(r));
   };
-  if (overlaps(home, real) || overlaps(home, realGemini)) {
-    throw new AgyBridgeHomeError(`假宿目录不得与真实用户目录重叠（${home} vs ${realHome}）`);
+  if (contains(home, real)) {
+    throw new AgyBridgeHomeError(
+      `假宿目录不得等于或包含真实用户目录（${home} vs ${real}）——真实目录整个落进假宿树会被假宿写入或清扫误删`,
+    );
+  }
+  if (contains(home, realGemini)) {
+    throw new AgyBridgeHomeError(
+      `假宿目录不得等于或包含真实 agy 凭据目录（${home} vs ${realGemini}）——真实 .gemini 必须完整留在假宿树外`,
+    );
+  }
+  if (contains(realGemini, home)) {
+    throw new AgyBridgeHomeError(
+      `假宿目录不得位于真实 agy 凭据目录之内（${home} 在 ${realGemini} 内）——假宿不得落进真实凭据树`,
+    );
   }
 }
 
@@ -106,6 +130,12 @@ export interface PrepareBridgeHomeInput {
   pipeName: string;
   token: string;
   tools: BridgeToolFaceEntry[];
+  /**
+   * 桥声明式 agent.md 全文（09-19 白名单 W2）。installShellAgyBridgeCore 装配处以
+   * renderAgentMarkdown(CLOSURE_BRIDGE_AGENT) 填充（内容单源 = 协议层 agents.ts）；
+   * prepareBridgeHome 只落盘不管内容。
+   */
+  agentMarkdown: string;
   /** mcpServer.js 静态资产绝对路径（bundle: dist/agy-bridge/；测试显式传）。 */
   mcpServerPath: string;
   /** server 进程载体（生产 process.execPath + ELECTRON_RUN_AS_NODE）。 */
@@ -121,12 +151,16 @@ export interface PrepareBridgeHomeInput {
  *   2. marker 撞段预检：homeDir 已归属其他 sessionId → typed 阻断（CR-10——两 sessionId
  *      sanitize 到同段时绝不静默读错首会话配置，他人假宿不误删）；
  *   3. `.gemini` 整体拷贝（~17MB，含缓存登录凭据——知情拍板记录在 design §2.5）；
+ *   3.5 CR-2 遮蔽闸：对拷贝树内 agents 根跑 bridge/text 双名 frontmatter `name` 遮蔽
+ *      检测（用户真实全局同名 agent 随整拷进入假宿——命中即 typed 阻断，宁误报不漏报）；
  *   4. `antigravity-cli/settings.json` = 用户真实 settings verbatim 副本 + permissions.allow
  *      追加精确预授权条目（用户真实 deny/ask 随副本保全——安全边界不被旁路）；
  *   5. `config/mcp_config.json` **全新写**（不合并用户既有——隔离原则：用户自有 server
  *      不进 Closure 驱动的会话）；
  *   6. `bridge/tools.json`（本桥会话工具面）；
- *   7. `marker.json` {pid, sessionId, createdAt}（清扫守卫判活）。
+ *   7. `config/agents/<closure 布局>/agent.md`（桥声明式 agent——agent 文件不声明
+ *      `tools` + system prompt 通道；目录段 = 协议层布局常量拼接勿硬编码——09-19 白名单 W2）；
+ *   8. `marker.json` {pid, sessionId, createdAt}（清扫守卫判活）。
  * 步骤 3 起任何失败 → catch 内 best-effort 清理已拷内容再抛（凭据副本零滞留——启动
  * 清扫只是兜底）。真实 `~/.gemini` 全程只读（源拷贝 + settings 读）——红线：零写入。
  */
@@ -183,6 +217,20 @@ export async function prepareBridgeHome(input: PrepareBridgeHomeInput): Promise<
       dereference: true,
     });
 
+    // 3.5 CR-2 遮蔽闸（整树拷贝后、写我方 agent 文件前）：用户真实 home 若有同名
+    //     （bridge/text）全局 agent，会随整拷进入假宿 agents 根——agy 对同名零警告静默
+    //     竞速，桥 agent 可能被顶替且零信号。命中 → typed 阻断（catch 统一清理已拷假宿
+    //     ——凭据副本零滞留），桥会话开启即响应失败，宁误报不漏报。
+    const shadowPaths = detectAgentNameShadowing(input.homeDir, [
+      CLOSURE_BRIDGE_AGENT_LAYOUT.agentName,
+      CLOSURE_TEXT_AGENT_LAYOUT.agentName,
+    ]);
+    if (shadowPaths.length > 0) {
+      throw new AgyBridgeHomeError(
+        `假宿内同名 agent 遮蔽，桥 agent 可能被静默顶替：${shadowPaths.join('；')}——桥会话拒绝开启。请处理你的 agy 全局 agents（改名或移走同名文件）后重试。`,
+      );
+    }
+
     // 4. settings 副本。
     const settingsCopyPath = path.join(input.homeDir, '.gemini', 'antigravity-cli', 'settings.json');
     await fsp.mkdir(path.dirname(settingsCopyPath), { recursive: true });
@@ -212,7 +260,21 @@ export async function prepareBridgeHome(input: PrepareBridgeHomeInput): Promise<
     await fsp.mkdir(path.dirname(toolsJsonPath), { recursive: true });
     atomicWriteFileSync(toolsJsonPath, JSON.stringify(input.tools, null, 2), 'utf8');
 
-    // 7. marker（清扫守卫判活：pid 死/无 marker → 删；活且非本进程 → 跳过）。
+    // 7. 桥声明式 agent 文件（09-19 白名单 W2）：spawn `--agent` 激活的声明式 agent——
+    //    agent 文件不声明 `tools` + system prompt 通道。目录段 = AGY_GLOBAL_AGENTS_ROOT_SEGMENTS +
+    //    CLOSURE_BRIDGE_AGENT_LAYOUT.dirSegments 布局常量拼接（勿硬编码——装机探针定谳
+    //    改常量即全链生效，agents.ts 布局节隔离注释）；每会话新鲜写 = 天然版本同步
+    //    （design 权衡 7）。MCP 继承与 --agent 正交（研究报告 §5 P5/P6），预授权机制不变。
+    const agentPath = path.join(
+      input.homeDir,
+      ...AGY_GLOBAL_AGENTS_ROOT_SEGMENTS,
+      ...CLOSURE_BRIDGE_AGENT_LAYOUT.dirSegments,
+      'agent.md',
+    );
+    await fsp.mkdir(path.dirname(agentPath), { recursive: true });
+    atomicWriteFileSync(agentPath, input.agentMarkdown, 'utf8');
+
+    // 8. marker（清扫守卫判活：pid 死/无 marker → 删；活且非本进程 → 跳过）。
     atomicWriteFileSync(
       markerPath,
       JSON.stringify({ pid: input.pid, sessionId: input.sessionId, createdAt: new Date().toISOString() }, null, 2),
@@ -488,7 +550,12 @@ export interface AgyBridgeRegistry {
   disposeAll(): void;
 }
 
-/** 桥会话 idle 回收阈值（CR-7：无任何帧活动即关管道 + 出表；默认 30min）。 */
+/**
+ * 桥会话 idle 回收阈值（CR-7：无任何帧活动即关管道 + 出表；默认 30min）。
+ * UI 提示文案镜像此值（「关闭工具桥」被活动会话拦下时如实说明释放条件）：
+ * `apps/desktop/client/ui/src/features/model-settings/AgyBridgeSection.tsx` 的
+ * BRIDGE_SESSION_IDLE_TTL_MINUTES——改此值须两处同步校准（R11）。
+ */
 export const BRIDGE_SESSION_IDLE_TTL_MS = 30 * 60_000;
 /** 桥会话 idle 清扫间隔（默认 60s）。 */
 export const BRIDGE_SESSION_SWEEP_INTERVAL_MS = 60_000;
@@ -762,6 +829,9 @@ export function installShellAgyBridgeCore(opts: ShellAgyBridgeInstallOptions = {
   const registry = opts.registry ?? createAgyBridgeRegistry({ warn: opts.warn });
   installBridgeCoreIntoProtocols({
     homeRoot,
+    // 09-19 白名单 W2：桥 agent 内容装配（单一来源 = 协议层 renderAgentMarkdown——本层
+    // 零内容编写；内核经 prepareHome 载荷透传给 prepareBridgeHome 落盘）。
+    bridgeAgentMarkdown: renderAgentMarkdown(CLOSURE_BRIDGE_AGENT),
     poolDeps: defaultAgyPoolDeps(),
     writeHomePayload: (payload) =>
       prepareBridgeHome({
@@ -772,6 +842,7 @@ export function installShellAgyBridgeCore(opts: ShellAgyBridgeInstallOptions = {
         pipeName: payload.pipeName,
         token: payload.token,
         tools: payload.tools,
+        agentMarkdown: payload.agentMarkdown,
         mcpServerPath,
         execPath: opts.execPath ?? process.execPath,
         pid: process.pid,

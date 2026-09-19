@@ -4102,6 +4102,12 @@
   background: var(--warning-bg, rgba(230, 167, 0, 0.13));
 }
 
+/* R5（09-19 工具面修复批）：通知条后缀（内置工具名等）——mirror 回退通知条的 scope 形态
+   （agent-fallback-notice-scope），弱化呈现不抢主句。 */
+.agent-bridge-notice-scope {
+  opacity: 0.8;
+}
+
 /* 「桥」徽标：工具卡头（AgentToolCard）与工具参数流指示（live badge 内 chip）共用
    词汇——中性小 pill（chip-bg/chip-text），标注「本次调用经 MCP 工具桥执行」。 */
 .agent-tool-card-bridge-badge,

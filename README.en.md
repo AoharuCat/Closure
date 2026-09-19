@@ -14,7 +14,7 @@
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)
 ![Electron](https://img.shields.io/badge/Electron-37-47848F.svg)
 
-**⬇ [Download](../../releases/latest)** · [📖 Docs](docs/) · [🕒 Timeline Guide](docs/guides/时间线指南.md) · [📋 Changelog](CHANGELOG.md)
+**⬇ [Download](https://github.com/AoharuCat/Closure/releases/latest)** · [📖 Docs](docs/) · [🕒 Timeline Guide](docs/guides/时间线指南.md) · [📋 Changelog](CHANGELOG.md)
 
 </div>
 
@@ -89,7 +89,7 @@ On top of OrisonSpace's writing-IDE base, Closure rebuilt the generation pipelin
 - **Book-deconstruction engine** — pick an imported book and run a tiered deconstruction: factual canon (worldview / characters / factions), reading notes, chapter critiques, fine-grained annotations, and style features are produced layer by layer, with human review gates at the key points; style analysis exports as a style card, and writing experience distills into craft cards — see clearly why someone's writing works, then learn from it
 - **Two-layer review** — free pure-code rules run first; drafts with zero findings pass straight through; only flagged drafts go to the model for detailed review (six groups: consistency, narrative features, promise fulfillment, cognitive state, emotion landing, setting contracts). Two disciplines: **every finding must cite the original text** — no evidence, no opinion; and **false positives are preferred over misses** — the review layer is never allowed a "fake pass"
 - **Tiered model routing** — planning, prose writing, review, research, style analysis, and every other stage can each be assigned a different model and tier: the strongest model for prose, cheap models for chores; each stage's thinking depth (reasoning effort) is also individually adjustable — cost goes where it counts
-- **Antigravity CLI access** — a third model channel beyond OpenAI / Anthropic-compatible endpoints: connect through Google's official agy CLI to Antigravity and call the Gemini family directly — no third-party reverse proxy in between; keys and request data never pass through anyone else's hands, and there is no exposure to reseller risks like sudden shutdowns or padded metering. Within subscription quota, the cost sits far below token-priced official APIs. With the tool bridge, the dialog model can also call Closure's writing tools (chapter writing, setting lookup, research) after one-time authorization; the ToS gray area and account risk of indirect CLI use are disclosed at the in-app settings
+- **Antigravity CLI access** — a third model channel beyond OpenAI / Anthropic-compatible endpoints: connect through Google's official agy CLI to Antigravity and call the Gemini family directly — no third-party reverse proxy in between; keys and request data never pass through anyone else's hands, and there is no exposure to reseller risks like sudden shutdowns or padded metering. Within subscription quota, the cost sits far below token-priced official APIs. With the tool bridge, the dialog model can also call Closure's writing tools (research search, file reading, story archive lookup, outline and setting updates) after one-time authorization; the ToS gray area and account risk of indirect CLI use are disclosed at the in-app settings
 - **Usage panel** — a "Usage" page keeps the local account of every call: tokens and latency broken down by model and by task tier, with cost estimates, failure counts, and first-token latency at a glance; records auto-clean on a retention window and stay on your machine
 - **Creative decision records** — major creative choices are archived like architecture decision records (why it was decided this way, what the alternatives were); review uses them to check whether later chapters betray the promises you made
 
@@ -102,7 +102,7 @@ On top of OrisonSpace's writing-IDE base, Closure rebuilt the generation pipelin
 - **IDE-style editor** — split view, minimap, multi-tab, command palette
 - **Model freedom** — connect any OpenAI-compatible endpoint; keys stored encrypted, locally only
 
-> **Experimental features:** Agent Orchestration (multi-step pipelines), Auto Mode (auto-advance), and video generation are currently experimental and not guaranteed to be stable.
+> **Multi-step orchestration has graduated**: the former "Agent Orchestration (experimental)" has landed as the core write-chapter chain (the 0.3.x flagship) — intent is dialogued, the director checks settings, the writer drafts in two phases, review and revision run, the chain advances on its own and pauses for your call at the key checkpoints; there is no "experimental, not guaranteed stable" caveat anymore.
 
 ## Who It's For
 
@@ -171,9 +171,9 @@ docs/               — architecture & design docs
 
 ## Download & Install
 
-> ⚠️ The project is still in **early development**; you may run into all kinds of weird bugs — if you do, please [open an issue](../../issues); see [Project Status](#project-status).
+> ⚠️ The project is still in **early development**; you may run into all kinds of weird bugs — if you do, please [open an issue](https://github.com/AoharuCat/Closure/issues); see [Project Status](#project-status).
 
-Download installers from [GitHub Releases](../../releases):
+Download installers from [GitHub Releases](https://github.com/AoharuCat/Closure/releases):
 
 | Platform | Format |
 |----------|--------|
@@ -185,9 +185,9 @@ Download installers from [GitHub Releases](../../releases):
 
 - **macOS builds are unsigned**: the Alpha has no Apple developer certificate, so Gatekeeper blocks the first launch — right-click the app and choose "Open", or run `xattr -cr /Applications/Closure.app` on the extracted/mounted `Closure.app` before launching.
 - **macOS auto-update is unavailable**: in-app auto-update on macOS requires signed builds (electron-updater refuses to install unsigned ones) — until code signing lands, please download the new installer manually to upgrade.
-- **arm64 builds are not verified on real hardware**: the Windows / macOS / Linux arm64 packages are theoretically usable (arm64 prebuilds for all native modules are in place), but we have no arm64 machines on hand — if something breaks, please [open an issue](../../issues) with your platform and device model.
+- **arm64 builds are not verified on real hardware**: the Windows / macOS / Linux arm64 packages are theoretically usable (arm64 prebuilds for all native modules are in place), but we have no arm64 machines on hand — if something breaks, please [open an issue](https://github.com/AoharuCat/Closure/issues) with your platform and device model.
 - **AppImage is the preferred Linux format**: no installation, no distro package-manager coupling; deb/rpm are not provided yet.
-- **CI mechanically covers all three platforms**: the full test suite and a startup smoke test (Electron launch through first frame) run per-platform on Windows / macOS / Linux CI; hands-on daily-use testing still focuses on Windows — for platform-specific issues, please [open an issue](../../issues).
+- **CI mechanically covers all three platforms**: the full test suite and a startup smoke test (Electron launch through first frame) run per-platform on Windows / macOS / Linux CI; hands-on daily-use testing still focuses on Windows — for platform-specific issues, please [open an issue](https://github.com/AoharuCat/Closure/issues).
 
 ## User Guide
 
@@ -233,7 +233,7 @@ Download installers from [GitHub Releases](../../releases):
 
 ## Project Status
 
-> ⚠️ **Early development stage (Alpha)** — Closure is still iterating fast; features and UI may change, and you may hit all kinds of weird bugs: broken layouts, interrupted generation, odd data behavior, or stranger things. **If you hit a problem, please [open an issue](../../issues)** with reproduction steps, your OS, and the app version (visible in Settings → About) — we read every single one.
+> ⚠️ **Early development stage (Alpha)** — Closure is still iterating fast; features and UI may change, and you may hit all kinds of weird bugs: broken layouts, interrupted generation, odd data behavior, or stranger things. **If you hit a problem, please [open an issue](https://github.com/AoharuCat/Closure/issues)** with reproduction steps, your OS, and the app version (visible in Settings → About) — we read every single one.
 
 The core narrative chain (structure → settings → chapter writing → review → revision → long-range supply) is complete and field-tested in real creative work. **Windows is the priority release platform**; macOS / Linux are inherited from the upstream architecture and not yet thoroughly tested.
 

@@ -1,4 +1,4 @@
-# 发布身份（08-28 快速发布）：GitHub 公仓 chillison/Closure（M2 双仓 = upstream）。
+# 发布身份（08-28 快速发布）：GitHub 公仓 AoharuCat/Closure（M2 双仓 = upstream）。
 appId: com.aoharucat.closure
 productName: Closure
 copyright: Copyright © 2026 AoharuCat
@@ -110,6 +110,6 @@ linux:
 # release」时会整批 skipped publishing——v0.1.0 mac/linux 产物蒸发实录）。
 publish:
   provider: github
-  owner: chillison
+  owner: AoharuCat
   repo: Closure
   releaseType: release

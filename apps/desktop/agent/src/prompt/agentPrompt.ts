@@ -9,7 +9,7 @@ import { logger } from '../logger';
 // verify-point 2.0 resolved（controller 2026-07-31 读 agentDefinitions.ts）：OrisonSpace 的
 // `loadAgentDefinition` 读 `.md`（`.orison/agents/<role>.md` / `.claude/agents/` / extraRoots），
 // **不读 `prompts/*.yaml`**。runSubagent/runChildAgent 取的是 `.md` systemPrompt（无则 fallback
-// `DEFAULT_ORISON_PROMPT`），与 `prompts/*.yaml` 的 `system:` 段是两套。故 LLM 节点不能复用
+// `DEFAULT_CLOSURE_PROMPT`），与 `prompts/*.yaml` 的 `system:` 段是两套。故 LLM 节点不能复用
 // runSubagent 取 system——须自行 load yaml（ADR-4 单契约源：system + user 都从 yaml）。
 //
 // 本模块 = 「读 prompts/<role>.yaml + 解析出 {system, userTemplate}」的纯函数 + FS 读。

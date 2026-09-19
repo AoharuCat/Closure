@@ -6,7 +6,7 @@ import {
   ProtocolSchemaError,
   ProtocolTimeoutError,
 } from '../src/errors';
-import { classifyCliError, createAntigravityCliDriver, type AntigravityCliDriver } from '../src/antigravityCli/driver';
+import { classifyCliError, createAntigravityCliDriver, isBuiltinToolAutoDeny, type AntigravityCliDriver } from '../src/antigravityCli/driver';
 import { buildTurnSegments, composeTurnText, splitSystemMessages } from '../src/antigravityCli/compose';
 import type { FakePoolEnv, FakeAgyProcess } from './antigravityCliFakes';
 import { fakePoolEnv } from './antigravityCliFakes';
@@ -430,6 +430,104 @@ describe('antigravityCli driver（全链集成，fake 子进程事件流）', ()
     driver.dispose();
   });
 
+  it('空 SUCCESS 单次重试：首轮空 → 重试整 turn 成功（会话车道，冷重启全量重发）', async () => {
+    let spawnCount = 0;
+    const env = fakePoolEnv((proc) => {
+      const isFirst = spawnCount === 0;
+      spawnCount += 1;
+      proc.responder = () => {
+        if (isFirst) proc.emitEvent({ type: 'result', status: 'SUCCESS', response: '' });
+        else proc.scriptSuccessTurn('重试后的正文', { input: 1, output: 1 });
+      };
+    });
+    const driver = createAntigravityCliDriver(env.deps);
+    const req = request([{ role: 'user', content: 'x' }], { sessionKey: 's1' });
+    const r = await driver.generateText(cliModel(), req);
+    expect(r.text).toBe('重试后的正文');
+    // 重试 = 首轮镜像已提交 → 零尾段分歧 → 冷重启新进程全量重发（同 spec 全新尝试）。
+    expect(env.spawns).toHaveLength(2);
+    expect(parseWrittenLine(env.spawns[1]!)).toBe(expectedFullTurn(req));
+    // 重试前恰一条观测 warn。
+    expect(env.warns.filter((w) => w.includes('retrying the whole turn once'))).toHaveLength(1);
+    driver.dispose();
+  });
+
+  it('空 SUCCESS 单次重试：oneshot 车道同过此缝（即用即弃形态保持）', async () => {
+    let spawnCount = 0;
+    const env = fakePoolEnv((proc) => {
+      const isFirst = spawnCount === 0;
+      spawnCount += 1;
+      proc.responder = () => {
+        if (isFirst) proc.emitEvent({ type: 'result', status: 'SUCCESS', response: '' });
+        else proc.scriptSuccessTurn('ok', { input: 1, output: 1 });
+      };
+    });
+    const driver = createAntigravityCliDriver(env.deps);
+    const r = await driver.generateText(cliModel(), request([{ role: 'user', content: 'x' }]));
+    expect(r.text).toBe('ok');
+    expect(env.spawns).toHaveLength(2);
+    // oneshot 收尾形态不变：两个进程都优雅关停 + 临时目录清理。
+    expect(env.spawns.every((p) => p.stdinEnded)).toBe(true);
+    expect(env.removedDirs).toContain(env.spawns[1]!.spawnArgs.cwd);
+    driver.dispose();
+  });
+
+  it('空 SUCCESS 重试恰一次：两次都空 → 现行 502 空响应错误原样上抛', async () => {
+    const env = fakePoolEnv((proc) => {
+      proc.responder = () => proc.emitEvent({ type: 'result', status: 'SUCCESS', response: '' });
+    });
+    const driver = createAntigravityCliDriver(env.deps);
+    await expect(driver.generateText(cliModel(), request([{ role: 'user', content: 'x' }]))).rejects.toMatchObject({
+      name: 'ProtocolHttpError',
+      status: 502,
+      message: 'antigravity-cli turn ended with SUCCESS but produced no response text (empty response and zero text deltas)',
+    });
+    expect(env.spawns).toHaveLength(2);
+    expect(env.warns.filter((w) => w.includes('retrying the whole turn once'))).toHaveLength(1);
+    driver.dispose();
+  });
+
+  it('认证以空 SUCCESS 终态（F3 形态）不重试：401 指引即时上抛，不烧第二轮', async () => {
+    const env = fakePoolEnv((proc) => {
+      proc.responder = () => {
+        proc.emitStderr('status: 401\n');
+        proc.emitStderr('error: authentication failed or timed out\n');
+        proc.emitEvent({ type: 'result', conversation_id: 'conv-1', status: 'SUCCESS', response: '' });
+      };
+    });
+    const driver = createAntigravityCliDriver(env.deps);
+    await expect(driver.generateText(cliModel(), request([{ role: 'user', content: 'x' }]))).rejects.toMatchObject({
+      name: 'ProtocolHttpError',
+      status: 401,
+    });
+    expect(env.spawns).toHaveLength(1);
+    expect(env.warns.some((w) => w.includes('retrying the whole turn once'))).toBe(false);
+    driver.dispose();
+  });
+
+  it('内置工具自动拒的空 SUCCESS 照常重试：重试拿到正文则 412 不再出现', async () => {
+    let spawnCount = 0;
+    const env = fakePoolEnv((proc) => {
+      const isFirst = spawnCount === 0;
+      spawnCount += 1;
+      proc.responder = () => {
+        if (isFirst) {
+          proc.emitStderr(
+            'jetski: no output produced — a tool required the "command" permission that headless mode cannot prompt for, so it was auto-denied.\n',
+          );
+          proc.emitEvent({ type: 'result', conversation_id: 'conv-1', status: 'SUCCESS', response: '' });
+        } else {
+          proc.scriptSuccessTurn('正文照常', { input: 1, output: 1 });
+        }
+      };
+    });
+    const driver = createAntigravityCliDriver(env.deps);
+    const r = await driver.generateText(cliModel(), request([{ role: 'user', content: 'x' }]));
+    expect(r.text).toBe('正文照常');
+    expect(env.spawns).toHaveLength(2);
+    driver.dispose();
+  });
+
   it('已退进程的退出观察同步回调不撞 TDZ——类型化 502 保持（CR-2）', async () => {
     const env = fakePoolEnv((proc) => {
       proc.exit(1); // spawn 即死：setExitObserver 注册时进程已退 → sessions 同步回调路径
@@ -522,13 +620,212 @@ describe('antigravityCli driver（全链集成，fake 子进程事件流）', ()
     expect(excerpt.length).toBeLessThanOrEqual(2_000);
     driver.dispose();
   });
+
+  it('认证失败以 SUCCESS 空响应终态（F3）→ 认证错误 401 + 指引，非空响应谜语', async () => {
+    // 真机形态：agy 凭据失效 → stderr 打登录引导 + 60s 等待超时 → 仍以 SUCCESS
+    // 收尾零文本。stderr 先于 result 到达（分类缝全文可见）。
+    const env = fakePoolEnv((proc) => {
+      proc.responder = () => {
+        proc.emitStderr('status: 401\n');
+        proc.emitStderr('Authentication required. Please visit the URL to log in: https://example.invalid\n');
+        proc.emitStderr('Waiting for authentication (timeout 60s)…\n');
+        proc.emitStderr('Error: authentication timed out.\n');
+        proc.emitStderr('error: authentication failed or timed out\n');
+        proc.emitEvent({ type: 'result', conversation_id: 'conv-1', status: 'SUCCESS', response: '' });
+      };
+    });
+    const driver = createAntigravityCliDriver(env.deps);
+    const rejection = await driver.generateText(cliModel(), request([{ role: 'user', content: 'x' }])).then(
+      () => {
+        throw new Error('expected rejection');
+      },
+      (err: unknown) => err,
+    );
+    expect(rejection).toBeInstanceOf(ProtocolHttpError);
+    expect((rejection as ProtocolHttpError).status).toBe(401);
+    expect((rejection as ProtocolHttpError).message).toContain('terminal');
+    expect((rejection as ProtocolHttpError).message).not.toContain('produced no response text');
+    // stderr 原文保留在 excerpt 作证据。
+    expect((rejection as ProtocolHttpError).bodyExcerpt).toContain('authentication failed or timed out');
+    driver.dispose();
+  });
+
+  it('SUCCESS 空响应且 stderr 无认证信号 → 空响应守卫原样兜底（502 谜语原文保留）', async () => {
+    const env = fakePoolEnv((proc) => {
+      proc.responder = () => {
+        proc.emitStderr('unrelated chatter\n');
+        proc.emitEvent({ type: 'result', conversation_id: 'conv-1', status: 'SUCCESS', response: '' });
+      };
+    });
+    const driver = createAntigravityCliDriver(env.deps);
+    await expect(driver.generateText(cliModel(), request([{ role: 'user', content: 'x' }]))).rejects.toMatchObject({
+      name: 'ProtocolHttpError',
+      status: 502,
+      message: 'antigravity-cli turn ended with SUCCESS but produced no response text (empty response and zero text deltas)',
+    });
+    driver.dispose();
+  });
+
+  it('内置工具权限自动拒以 SUCCESS 空响应终态 → 412 能力指引，非空响应谜语', async () => {
+    // 真机形态：消息带「引用文件+路径」块 → 模型改用内置工具读文件 → headless 弹不出
+    // 权限窗自动拒绝 → stderr 打 jetski 通知，agy 仍以 SUCCESS 零文本收尾。
+    const env = fakePoolEnv((proc) => {
+      proc.responder = () => {
+        proc.emitStderr(
+          'jetski: no output produced — a tool required the "command" permission that headless mode cannot prompt for, so it was auto-denied.\n',
+        );
+        proc.emitEvent({ type: 'result', conversation_id: 'conv-1', status: 'SUCCESS', response: '' });
+      };
+    });
+    const driver = createAntigravityCliDriver(env.deps);
+    const rejection = await driver.generateText(cliModel(), request([{ role: 'user', content: 'x' }])).then(
+      () => {
+        throw new Error('expected rejection');
+      },
+      (err: unknown) => err,
+    );
+    expect(rejection).toBeInstanceOf(ProtocolHttpError);
+    expect((rejection as ProtocolHttpError).status).toBe(412);
+    expect((rejection as ProtocolHttpError).message).toContain('built-in agy tool');
+    expect((rejection as ProtocolHttpError).message).toContain('MCP bridge tools');
+    expect((rejection as ProtocolHttpError).message).not.toContain('produced no response text');
+    // stderr 原文通知保留在 excerpt 作证据（与认证落法同口径）。
+    expect((rejection as ProtocolHttpError).bodyExcerpt).toContain('auto-denied');
+    driver.dispose();
+  });
 });
 
 describe('antigravityCli 错误分类表（design §3.7）', () => {
-  it('authentication → 401', () => {
+  it('authentication → 401 + 人话指引（message 不再透传原始终态文本）', () => {
     const err = classifyCliError('authentication required', '');
     expect(err).toBeInstanceOf(ProtocolHttpError);
     expect((err as ProtocolHttpError).status).toBe(401);
+    expect((err as ProtocolHttpError).message).toContain('terminal');
+  });
+
+  it('SUCCESS 零文本终态 + stderr 认证信号 → 认证错误（三类信号逐一命中，非空响应谜语）', () => {
+    const emptyBoilerplate =
+      'antigravity-cli turn ended with SUCCESS but produced no response text (empty response and zero text deltas)';
+    const signals = [
+      'Authentication required. Please visit the URL to log in: https://example.invalid',
+      'error: authentication failed or timed out',
+      'status: 401',
+    ];
+    for (const signal of signals) {
+      const err = classifyCliError(emptyBoilerplate, signal);
+      expect(err).toBeInstanceOf(ProtocolHttpError);
+      expect((err as ProtocolHttpError).status).toBe(401);
+      expect((err as ProtocolHttpError).message).toContain('terminal');
+      expect((err as ProtocolHttpError).message).toContain('agy');
+      expect((err as ProtocolHttpError).message).not.toContain('produced no response text');
+      expect((err as ProtocolHttpError).bodyExcerpt).toBe(signal);
+    }
+  });
+
+  it('SUCCESS 零文本终态 + stderr 无认证信号 → 泛化空响应兜底不变（502 原文透传）', () => {
+    const emptyBoilerplate =
+      'antigravity-cli turn ended with SUCCESS but produced no response text (empty response and zero text deltas)';
+    const err = classifyCliError(emptyBoilerplate, 'some unrelated stderr chatter');
+    expect(err).toBeInstanceOf(ProtocolHttpError);
+    expect((err as ProtocolHttpError).status).toBe(502);
+    expect((err as ProtocolHttpError).message).toBe(emptyBoilerplate);
+  });
+
+  it('SUCCESS 零文本终态 + stderr 内置工具拒绝信号 → 412 能力指引（三信号逐一命中，非空响应谜语）', () => {
+    const emptyBoilerplate =
+      'antigravity-cli turn ended with SUCCESS but produced no response text (empty response and zero text deltas)';
+    // 真机 jetski 通知原形 + 两个稳定子串单独命中形态。
+    const signals = [
+      'jetski: no output produced — a tool required the "command" permission that headless mode cannot prompt for, so it was auto-denied.',
+      'a tool was auto-denied',
+      'that headless mode cannot prompt for',
+    ];
+    for (const signal of signals) {
+      const err = classifyCliError(emptyBoilerplate, signal);
+      expect(err).toBeInstanceOf(ProtocolHttpError);
+      expect((err as ProtocolHttpError).status).toBe(412);
+      expect((err as ProtocolHttpError).message).toContain('built-in agy tool');
+      expect((err as ProtocolHttpError).message).toContain('MCP bridge tools');
+      expect((err as ProtocolHttpError).message).not.toContain('produced no response text');
+      expect((err as ProtocolHttpError).bodyExcerpt).toBe(signal);
+    }
+  });
+
+  it('R6/F9 主语分派（两向 + 防过度匹配）：mcp 主体走 MCP 专属行 / 内置主体走内置行 / 无主体文本皆不命中', () => {
+    const emptyBoilerplate =
+      'antigravity-cli turn ended with SUCCESS but produced no response text (empty response and zero text deltas)';
+    // ① MCP 主体软拒（F9 反向）：'mcp' 主体 → **MCP 专属合成 412 行**（会话授权事实，
+    // 不烧链）——文案指向 MCP 预授权出路；绝不落内置工具指引（旧针的归因错误）。
+    const mcpSoftDeny = classifyCliError(
+      emptyBoilerplate,
+      'jetski: no output produced — a tool required the "mcp" permission that headless mode cannot prompt for, so it was auto-denied. Add an allow-rule under permissions.allow in settings.json (e.g. mcp(<target>)).',
+    );
+    expect(mcpSoftDeny).toBeInstanceOf(ProtocolHttpError);
+    expect((mcpSoftDeny as ProtocolHttpError).status).toBe(412);
+    expect((mcpSoftDeny as ProtocolHttpError).message).toContain('MCP');
+    expect((mcpSoftDeny as ProtocolHttpError).message).toContain('pre-authorization');
+    expect((mcpSoftDeny as ProtocolHttpError).message).not.toContain('built-in agy tool');
+    expect((mcpSoftDeny as ProtocolHttpError).message).not.toContain('produced no response text');
+    expect((mcpSoftDeny as ProtocolHttpError).bodyExcerpt).toContain('"mcp" permission');
+    // ② 内置工具主体（F13 形态——error.message 前缀取名）：仍走内置工具 412 族（行为不变）。
+    const builtinDeny = classifyCliError(
+      'something broke',
+      'step 2: permission check failed for read_file "C:/tmp/x": user denied permission for read_file(C:/tmp/x)',
+    );
+    expect(builtinDeny).toBeInstanceOf(ProtocolHttpError);
+    expect((builtinDeny as ProtocolHttpError).status).toBe(412);
+    expect((builtinDeny as ProtocolHttpError).message).toContain('built-in agy tool');
+    expect((builtinDeny as ProtocolHttpError).message).not.toContain('pre-authorization');
+    // ③ 两族皆不匹配的无主体文本 → 502 兜底原语义（防过度匹配）。
+    expect((classifyCliError('something broke', 'some unrelated stderr chatter') as ProtocolHttpError).status).toBe(502);
+  });
+
+  it('CR-3 主体优先级（去装饰 + MCP 优先）：族谓词与行分派两处共用同一规则，不落内置工具族', () => {
+    // ① 装饰主体（stderr 引号内带括号/斜杠装饰）→ 归一到 'mcp'：旧行为会把它当内置主体。
+    const decorated = 'jetski: no output produced — a tool required the "mcp(novel-writing/*)" permission that headless mode cannot prompt for, so it was auto-denied.';
+    expect(isBuiltinToolAutoDeny(decorated)).toBe(false);
+    const decoratedErr = classifyCliError('something broke', decorated);
+    expect((decoratedErr as ProtocolHttpError).status).toBe(412);
+    expect((decoratedErr as ProtocolHttpError).message).toContain('pre-authorization');
+    expect((decoratedErr as ProtocolHttpError).message).not.toContain('built-in agy tool');
+    // ② 混合 haystack（内置主体 + MCP 主体各在一条形态里）→ MCP 行（判据与文本顺序无关，
+    // 两形态同时命中时不得「首次命中胜出」——那会让归因随样本顺序静默翻转）。
+    const mixed = [
+      'step 2: permission check failed for read_file "C:/tmp/x": user denied permission for read_file(C:/tmp/x)',
+      'jetski: no output produced — a tool required the "mcp" permission that headless mode cannot prompt for, so it was auto-denied.',
+    ].join('\n');
+    expect(isBuiltinToolAutoDeny(mixed)).toBe(false);
+    const mixedErr = classifyCliError('something broke', mixed);
+    expect((mixedErr as ProtocolHttpError).status).toBe(412);
+    expect((mixedErr as ProtocolHttpError).message).toContain('pre-authorization');
+    expect((mixedErr as ProtocolHttpError).message).not.toContain('built-in agy tool');
+    // ③ 反向排布同判（MCP 在前/内置在后）——优先级是显式规则，不是位置。
+    const mixedReversed = [
+      'permission check failed for mcp "novel-writing/write_chapter": denied',
+      'jetski: a tool required the "command" permission that headless mode cannot prompt for',
+    ].join('\n');
+    expect(isBuiltinToolAutoDeny(mixedReversed)).toBe(false);
+    // ④ 只有内置主体时族谓词照旧为真（优先级不吞非 mcp 形态）。
+    expect(isBuiltinToolAutoDeny('permission check failed for read_file "C:/tmp/x": denied')).toBe(true);
+  });
+
+  it('判定顺序：认证 > 内置工具拒绝（一条 stderr 同含两类信号，认证更终结优先）', () => {
+    const err = classifyCliError(
+      'antigravity-cli turn ended with SUCCESS but produced no response text (empty response and zero text deltas)',
+      'jetski: no output produced — a tool required the "command" permission that headless mode cannot prompt for, so it was auto-denied.\nstatus: 401',
+    );
+    expect(err).toBeInstanceOf(ProtocolHttpError);
+    expect((err as ProtocolHttpError).status).toBe(401);
+    expect((err as ProtocolHttpError).message).toContain('terminal');
+  });
+
+  it('判定顺序：瞬态（quota）> 内置工具拒绝——turn 真死于 quota 时照常 429（链可推进）', () => {
+    const err = classifyCliError(
+      'rate limit exceeded',
+      'jetski: no output produced — a tool required the "command" permission that headless mode cannot prompt for, so it was auto-denied.',
+    );
+    expect(err).toBeInstanceOf(ProtocolHttpError);
+    expect((err as ProtocolHttpError).status).toBe(429);
   });
 
   it('quota / rate limit → 429', () => {
