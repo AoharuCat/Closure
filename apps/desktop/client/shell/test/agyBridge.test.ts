@@ -215,19 +215,24 @@ describe('agyBridge：prepareBridgeHome（四件套 + 桥 agent 文件 + marker 
     const realHome = tempDir('agy-bridge-realhome-');
     buildRealHomeFixture(realHome);
     const cliRoot = path.join(realHome, '.gemini', 'antigravity-cli');
+    // 真日志目录（排除面正主）：CR-4 的界外 symlink 指向它（指入排除面才该拒）。
+    const logDirReal = path.join(cliRoot, 'log');
+    mkdirSync(logDirReal, { recursive: true });
+    writeFileSync(path.join(logDirReal, 'session.log'), 'real log line', 'utf8');
     // CR-3：直宿轮转变体（cli.log.1 / cli-<ts>.log）——旧精确比对（src !== logLinkSrc）会漏。
     writeFileSync(path.join(cliRoot, 'cli.log.1'), 'rotated log line', 'utf8');
     writeFileSync(path.join(cliRoot, 'cli-20260919_184948.log'), 'rotated ts log line', 'utf8');
-    // CR-2：日志目录以大小写变体落盘——win32 盘面不区分大小写，归一比较才不漏滤。
+    // CR-2：日志目录以大小写变体落盘——win32/darwin（默认 APFS）盘面不区分大小写，
+    // `Log` 与真 `log` 同目录、落排除面；仅 linux（大小写敏感盘面）`Log` 是独立合法目录。
     const logDirVariant = path.join(cliRoot, 'Log');
     mkdirSync(logDirVariant, { recursive: true });
     writeFileSync(path.join(logDirVariant, 'cli-variant-case.log'), 'case variant log line', 'utf8');
-    // CR-4：界外 symlink 指入 log/（对 dereference 拷贝是内容拷入——前缀测试对 symlink
+    // CR-4：界外 symlink 指入真 log/（对 dereference 拷贝是内容拷入——前缀测试对 symlink
     // 失效）；对照组 symlink 指向其余结构（brain）——照常 dereference 拷入。
     const linkToLog = path.join(realHome, '.gemini', 'config', 'loglink');
     const linkToBrain = path.join(realHome, '.gemini', 'config', 'brainlink');
     try {
-      symlinkSync(logDirVariant, linkToLog, process.platform === 'win32' ? 'junction' : 'dir');
+      symlinkSync(logDirReal, linkToLog, process.platform === 'win32' ? 'junction' : 'dir');
       symlinkSync(path.join(cliRoot, 'brain'), linkToBrain, process.platform === 'win32' ? 'junction' : 'dir');
     } catch {
       return; // 无特权环境无法布景（mirror 既有 junction 先例）
@@ -243,18 +248,21 @@ describe('agyBridge：prepareBridgeHome（四件套 + 桥 agent 文件 + marker 
       pipeName: 'p', token: 't', tools: [], agentMarkdown: BRIDGE_AGENT_MD, mcpServerPath: 'm', execPath: 'e', pid: 1, sessionId: 'u8-variants',
     });
 
+    // 真日志目录零带入（全平台——排除面正主）。
+    expect(existsSync(path.join(homeDir, '.gemini', 'antigravity-cli', 'log'))).toBe(false);
     // CR-3：轮转变体零带入。
     expect(existsSync(path.join(homeDir, '.gemini', 'antigravity-cli', 'cli.log.1'))).toBe(false);
     expect(existsSync(path.join(homeDir, '.gemini', 'antigravity-cli', 'cli-20260919_184948.log'))).toBe(false);
-    // CR-2：大小写变体目录零带入（win32 归一比较）；POSIX 大小写敏感——`Log` 与 agy 的
-    // `log` 是不同目录，不在排除面（语义如实拷入）。
-    expect(existsSync(path.join(homeDir, '.gemini', 'antigravity-cli', 'Log'))).toBe(process.platform !== 'win32');
-    // CR-4：指入 log/ 的界外 symlink 不拷（lstat 分流 + realpath 目标判拒）；指向 brain
+    // CR-2：大小写变体目录——win32/darwin 盘面不区分大小写（与真 log 同目录被排除）；
+    // 仅 linux 大小写敏感盘面上 `Log` 是独立合法目录，语义如实拷入。
+    expect(existsSync(path.join(homeDir, '.gemini', 'antigravity-cli', 'Log'))).toBe(process.platform === 'linux');
+    // CR-4：指入真 log/ 的界外 symlink 不拷（lstat 分流 + realpath 目标判拒）；指向 brain
     // 的 symlink 照常 dereference 拷入（非日志目标不误伤）。
     expect(existsSync(path.join(homeDir, '.gemini', 'config', 'loglink'))).toBe(false);
     expect(existsSync(path.join(homeDir, '.gemini', 'config', 'brainlink', 'conv-1.json'))).toBe(true);
     // 真实 home 零触碰。
-    expect(existsSync(path.join(logDirVariant, 'cli-variant-case.log'))).toBe(true);
+    expect(readFileSync(path.join(logDirReal, 'session.log'), 'utf8')).toBe('real log line');
+    expect(readFileSync(path.join(logDirVariant, 'cli-variant-case.log'), 'utf8')).toBe('case variant log line');
     expect(readFileSync(path.join(cliRoot, 'cli.log.1'), 'utf8')).toBe('rotated log line');
   });
 
