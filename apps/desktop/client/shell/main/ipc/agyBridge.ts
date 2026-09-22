@@ -232,12 +232,22 @@ export async function prepareBridgeHome(input: PrepareBridgeHomeInput): Promise<
     //    realpath 目标再判一次；realpath 失败（悬空链接等）保守放行，交 cp 自行处理。
     const logDirSrc = path.join(realGemini, 'antigravity-cli', 'log');
     const cliRootSrc = path.join(realGemini, 'antigravity-cli');
+    // macOS 根符号链接（/var → /private/var）会让 realpathSync(symlink) 解析出
+    // /private/var/… 前缀，与未解析的排除基永不相等——排除基备「原路径 + 解析态」双基。
+    let resolvedLogDir = logDirSrc;
+    try {
+      resolvedLogDir = realpathSync(logDirSrc);
+    } catch {
+      // 目录不存在（无日志可排）——保留原路径，排除面自然空转。
+    }
     const norm = (p: string): string => (process.platform === 'win32' ? p.toLowerCase() : p);
-    const normLogDir = norm(logDirSrc);
+    const logDirBases = [norm(logDirSrc), norm(resolvedLogDir)];
     const normCliRoot = norm(cliRootSrc);
     const isWithinLogDir = (p: string): boolean => {
       const np = norm(p);
-      return np === normLogDir || np.startsWith(normLogDir + path.sep);
+      return logDirBases.some(
+        (base) => np === base || np.startsWith(base + path.sep),
+      );
     };
     await fsp.cp(realGemini, path.join(input.homeDir, '.gemini'), {
       recursive: true,
