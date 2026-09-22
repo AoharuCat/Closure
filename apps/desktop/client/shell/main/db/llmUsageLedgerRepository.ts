@@ -45,6 +45,9 @@ function toInsertBindings(record: GenerationCallRecord): Array<string | number |
     record.totalTokens ?? null,
     record.latencyMs,
     record.firstDeltaMs ?? null,
+    record.callId ?? null,     // C3.1：逻辑调用分组 id
+    record.sessionId ?? null,  // C3.1：逻辑会话 id
+    record.imageCount ?? null, // C3.1：生图张数（仅生图行）
   ];
 }
 
@@ -68,13 +71,16 @@ function rowToRecentCall(row: AnyRow): UsageRecentCall {
     totalTokens: (row.totalTokens as number | null) ?? null,
     latencyMs: row.latencyMs as number,
     firstDeltaMs: (row.firstDeltaMs as number | null) ?? null,
+    imageCount: (row.imageCount as number | null) ?? null,
   };
 }
 
 // ── 写入 ──
 
 /**
- * 落一行生成调用计量（每 attempt 一行；失败行 token 全 NULL——CR-18）。
+ * 落一行生成调用计量（每 attempt 一行）。token 列 CR-18 v2：**未知才 ABSENT**（NULL）——
+ * 计数器在场即记（含失败/被弃 attempt 的已知消耗）；total 缺席不合成。C3.1 三新列
+ * （call_id/session_id/image_count）optional 透传，ABSENT 落 NULL。
  * never-throws：db 错误 warn 不上抛（计量绝不阻生成）。
  */
 export function insertUsageLog(record: GenerationCallRecord): void {
@@ -85,8 +91,9 @@ export function insertUsageLog(record: GenerationCallRecord): void {
          ts, protocol, key_id, model_id, task_type, lane, session_key,
          stream, success, error_kind, error_message,
          input_tokens, output_tokens, thinking_tokens, cache_read_tokens, total_tokens,
-         latency_ms, first_delta_ms
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         latency_ms, first_delta_ms,
+         call_id, session_id, image_count
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(...toInsertBindings(record));
   } catch (err) {
     getLogger().warn(
@@ -181,7 +188,8 @@ export function recentUsageLogs(limit: number): UsageRecentCall[] {
               error_kind AS errorKind, error_message AS errorMessage,
               input_tokens AS inputTokens, output_tokens AS outputTokens,
               thinking_tokens AS thinkingTokens, cache_read_tokens AS cacheReadTokens,
-              total_tokens AS totalTokens, latency_ms AS latencyMs, first_delta_ms AS firstDeltaMs
+              total_tokens AS totalTokens, latency_ms AS latencyMs, first_delta_ms AS firstDeltaMs,
+              image_count AS imageCount
          FROM closure_llm_log ORDER BY id DESC LIMIT ?`,
     )
     .all(limit) as AnyRow[];

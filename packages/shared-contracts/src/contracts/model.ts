@@ -151,6 +151,14 @@ export const slotAssignmentSchema = slotFallbackEntrySchema.extend({
 });
 
 /**
+ * The taskModels record shape as its own export (C3.2 W2 多套预设): consumed by
+ * modelConfigSchema / modelConfigSaveSchema below AND re-used by the shell's
+ * apply-preset path as the loud gate for preset snapshots — one schema, zero
+ * second copies (and no zod import needed outside this package).
+ */
+export const taskModelRecordSchema = z.record(taskModelSlotSchema, slotAssignmentSchema);
+
+/**
  * Recursive JSON value (09-12 子3, design §2 #2): string / number / boolean /
  * null / array / record. Backs `extraBody` — an arbitrary JSON attachment
  * payload whose keys/values come from disk (YAML/JSON), so the lazy recursion
@@ -542,7 +550,18 @@ export const modelConfigSchema = z.object({
    * unchanged (no data migration), and ref-only slot values keep parsing
    * unchanged too (the policy fields are optional).
    */
-  taskModels: z.record(taskModelSlotSchema, slotAssignmentSchema).optional(),
+  taskModels: taskModelRecordSchema.optional(),
+  /**
+   * Name of the task-model preset currently applied to the sidecar (C3.2 W2
+   * 多套预设). Written by the `taskPresets:apply` path ONLY — the save face
+   * (modelConfigSaveSchema) deliberately omits this field, so any manual
+   * slot-designation save strips the key on disk = the「自定义」marker (explicit
+   * marker, no content comparison — a hand-edited preset file would make a
+   * comparison lie). Load-face `.optional()` means existing configs parse
+   * unchanged; the sidecar reader ignores keys outside the slot enum, so the
+   * marker is invisible to the pre-existing disk reader (rollback-safe).
+   */
+  activePreset: z.string().min(1).optional(),
 });
 
 /**
@@ -574,7 +593,7 @@ export const modelConfigSaveSchema = z.object({
   /** Vision model (Story 3.6 R9b) — mirror of modelConfigSchema.visionModel. */
   visionModel: modelRefSchema.optional(),
   /** Task model routing slots (C3.2 + thinking policy) — mirror of modelConfigSchema.taskModels. */
-  taskModels: z.record(taskModelSlotSchema, slotAssignmentSchema).optional(),
+  taskModels: taskModelRecordSchema.optional(),
 });
 
 export type ModelCapability = z.infer<typeof modelCapabilitySchema>;
@@ -587,6 +606,41 @@ export type ApiKeyEntry = z.infer<typeof apiKeyEntrySchema>;
 export type ModelConfig = z.infer<typeof modelConfigSchema>;
 export type SlotAssignment = z.infer<typeof slotAssignmentSchema>;
 export type SlotFallbackEntry = z.infer<typeof slotFallbackEntrySchema>;
+
+/* ── C3.2 W2 多套预设：taskPresets:* 通道族契约（一预设一档 sidecar）──
+ *
+ * 预设 = 全部任务档（taskModelSlotSchema 动态迭代，现行 10 档）指派的全量快照
+ *（modelRef + thinking/thinkingCustom + fallbacks），一预设一档存
+ * `~/.orison/model/task-model-presets/<name>.yaml`（mirror keys/ 一键一档先例）。
+ * 刻意不含 embed/rerank/vision 指派——embedding 换模型触发全量重嵌，预设切换
+ * 不得静默引发（prd D2 边界）。载荷形状与 task-models.yaml 同构（flat
+ * slot.* 键），读侧复用同一容错 reader（旁路 mtime 缓存防串档）。
+ */
+
+/**
+ * Preset name — file-name-safe subset only (`[A-Za-z0-9_-]`, 1–64 chars): the
+ * name IS the file name (`<name>.yaml`), so path-traversal characters are
+ * structurally impossible. Loud zod rejection (模式 A caller-side).
+ */
+export const taskPresetNameSchema = z.string().regex(/^[A-Za-z0-9_-]{1,64}$/);
+
+/** One entry of the `taskPresets:list` payload. */
+export const taskPresetSummarySchema = z.object({
+  name: z.string().min(1),
+  slotCount: z.number().int().nonnegative(),
+  hasFallbacks: z.boolean(),
+});
+export type TaskPresetSummary = z.infer<typeof taskPresetSummarySchema>;
+
+/**
+ * 模式 A typed result for save/apply/delete (预期内用户失败不 throw——见
+ * spec shell/ipc-handlers 错误返回契约)。Stable machine-readable codes:
+ * `invalid-name`（zod name 校验失败）/ `not-found`（预设档不存在或无有效档）/
+ * `no-slots`（save 时当前无任何任务档指派可快照）/ `operation-failed`
+ * （磁盘读写异常）。
+ */
+export type TaskPresetErrorCode = 'invalid-name' | 'not-found' | 'no-slots' | 'operation-failed';
+export type TaskPresetMutationResult = { ok: true } | { ok: false; error: TaskPresetErrorCode };
 export type ModelDefaults = z.infer<typeof modelDefaultsSchema>;
 export type ModelPricing = z.infer<typeof pricingSchema>;
 

@@ -44,10 +44,26 @@ export function remoteToolProxy<T>(def: {
   description: string;
   parameters: z.ZodType<T>;
 }): ToolDefinition<T> {
-  return defineTool({
-    ...def,
-    async execute(params, ctx) {
-      return executeRemoteTool(def.id, params, ctx);
-    },
-  });
+  return Object.assign(
+    defineTool({
+      ...def,
+      async execute(params, ctx) {
+        return executeRemoteTool(def.id, params, ctx);
+      },
+    }),
+    { [REMOTE_PROXY_TOOL_FLAG]: true as const },
+  );
+}
+
+/**
+ * 注册形态标记（09-20 F17 桥车道工具对等 design §1.1）：remoteToolProxy 注册件带本标记
+ * （proxy——执行经 setExecuteToolFn 注入缝转发 shell）；defineTool 直建件天然 local（进程内
+ * ctx 执行，无标记）。`isRemoteProxyTool` 是形态判定单源——registry.getLocalToolDefinition
+ * 据此分派，不维护第二份本地工具 id 清单（防漂移；15 件枚举基准留档 research/g6 §1.1）。
+ */
+const REMOTE_PROXY_TOOL_FLAG = '__orisonRemoteProxyTool';
+
+/** 注册形态判定（单源）：remoteToolProxy 注册的 proxy 件 → true；defineTool 直建件 → false。 */
+export function isRemoteProxyTool(tool: ToolDefinition): boolean {
+  return (tool as unknown as Record<string, unknown>)[REMOTE_PROXY_TOOL_FLAG] === true;
 }

@@ -518,6 +518,8 @@ agent:
   fallbackKindServer: "server error"
   fallbackKindNetwork: "connection lost"
   fallbackKindConfig: "config unavailable"
+  fallbackKindCircuitOpen: "circuit open (cooling down)"
+  fallbackKindBudget: "monthly budget exceeded"
   messageGeneratedBy: "Served by {model}"
   messageGeneratedByFallback: "fallback from {from}"
   chainModelSwitch: "{node}: {from} failed → switched to {to}"
@@ -529,8 +531,36 @@ agent:
   bridgeNoticeBuiltinTool: "The model left the writing toolset and tried another tool (such calls may be rejected)"
   bridgeNoticeBuiltinToolDenied: "The model tried a tool outside the writing toolset and was rejected by the system — this turn may be missing content"
   bridgeNoticeUnknown: "An unrecognized run notice arrived (it does not affect continued use)"
+  # Residue b (dogfood R4): outcome annotation for process warn strips once the turn
+  # ends successfully — truthful copy (the events did happen, history is kept); failed
+  # turns / in-flight runs stay un-annotated (warn strength kept).
+  bridgeNoticeTurnSettledOk: "This turn completed successfully (entries above are process notes)"
   bridgeToolBadge: "bridge"
   bridgeToolBadgeTitle: "This tool call runs through the MCP tool bridge (inside the model's turn)"
   bridgeConsentNeeded: "The MCP tool bridge is not authorized yet — this message was not executed (authorize, then resend)"
   bridgeConsentConflict: "The MCP tool bridge is blocked by your agy permission rules — this message was not executed"
   bridgeConsentDeclined: "The MCP tool bridge stays off per your choice — this message was not executed"
+
+  # W4 (09-21-subagent-bg-decouple): background task bar (four-state cards / cancel / inspect)
+  # + child inspect view header + bg-update / interrupted notice. 'aborted' renders as
+  # "Cancelled" (user-initiated); coarse elapsed buckets.
+  bgTaskBarLabel: "Background tasks"
+  bgTaskRunning: "Running"
+  bgTaskCompleted: "Completed"
+  bgTaskFailed: "Failed"
+  bgTaskCancelled: "Cancelled"
+  bgTaskInterrupted: "Interrupted"
+  bgTaskUnknown: "Unknown"
+  bgTaskCancel: "Cancel task"
+  bgTaskCompletedToast: "Background task finished: {role}"
+  bgTaskFailedToast: "Background task failed: {role}"
+  bgTaskInterruptedToast: "{count} background task(s) were interrupted by the last exit (background tasks do not survive restarts)"
+  bgTaskOverflow: "{count} older record(s) not shown"
+  childInspect: "Inspect this subagent"
+  childInspectDisabled: "Synced subagents do not support inspection yet — tasks in the background task bar can be opened"
+  childViewReadonlyBanner: "This subagent session is read-only — return to the main conversation to keep chatting"
+  childViewReadonlyBadge: "Read-only inspection"
+  childViewBack: "Back to main conversation"
+  elapsedSeconds: "{value}s"
+  elapsedMinutes: "{value} min"
+  elapsedHours: "{value}h {rest}m"

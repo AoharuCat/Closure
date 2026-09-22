@@ -4,11 +4,14 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 import { registry } from '../src/tool/registry';
+import { registerBuiltinTools } from '../src/tool/builtin';
 import type { GenerateFn } from '../src/nodes/llm-node';
 import type { SessionMessage, ToolDefinition } from '../src/types';
 import {
   AgyBridgeConsentRequiredError,
   BRIDGE_TOOL_FACE,
+  BRIDGE_TOOL_FACE_EXCLUSIONS,
+  BRIDGE_TOOL_FACE_PARITY,
   BRIDGE_TOOL_FACE_TIER1,
   BRIDGE_TOOL_FACE_TIER2,
   __clearBridgeSeamsForTest,
@@ -42,7 +45,7 @@ function makeTool(id: string, extra: Partial<ToolDefinition> = {}): ToolDefiniti
   };
 }
 
-/** 全量工具 fixture：桥面内（Tier1/Tier2 各取样）+ 桥面外（本地工具/未策展）。 */
+/** 全量工具 fixture：桥面内（Tier1/Tier2/对等扩面各取样）+ 排除件（skill 族）。 */
 function fullTools(): ToolDefinition[] {
   return [
     makeTool('present_result'),
@@ -50,7 +53,7 @@ function fullTools(): ToolDefinition[] {
     makeTool('query_story'),
     makeTool('outline_update'), // Tier 2 diff
     makeTool('memory_update'), // Tier 2 write
-    makeTool('spawn_agent'), // 本地工具（结构性排除——不在策展表）
+    makeTool('spawn_agent'), // 本地工具（W2 对等入面——经进程内执行器执行）
     makeTool('read_file'), // 策展内 remote 工具（F4b 入面——通用只读件）
     makeTool('search'), // F8 同型补件——通用只读件
     makeTool('list_files'), // F8 同型补件——通用只读件
@@ -75,16 +78,16 @@ afterEach(() => {
   __clearBridgeSeamsForTest();
 });
 
-describe('面策展（design §7 分层表）', () => {
+describe('面策展（W2 对等反转：registry 全集 − 排除表）', () => {
   beforeEach(() => {
     registry.__clearForTest();
   });
 
-  it('策展常量：Tier1 + Tier2 = 全量 27 id，零重复', () => {
-    expect(BRIDGE_TOOL_FACE).toHaveLength(27);
-    expect(new Set(BRIDGE_TOOL_FACE).size).toBe(27);
-    expect([...BRIDGE_TOOL_FACE_TIER1, ...BRIDGE_TOOL_FACE_TIER2]).toEqual([...BRIDGE_TOOL_FACE]);
-    // Tier1 锚点（design §7 逐项 + F4b 通用只读件 + F8 检索/列目录补件）。
+  it('策展常量：Tier1 + Tier2 + 对等扩面 = 全量 89 id，零重复', () => {
+    expect(BRIDGE_TOOL_FACE).toHaveLength(89);
+    expect(new Set(BRIDGE_TOOL_FACE).size).toBe(89);
+    expect([...BRIDGE_TOOL_FACE_TIER1, ...BRIDGE_TOOL_FACE_TIER2, ...BRIDGE_TOOL_FACE_PARITY]).toEqual([...BRIDGE_TOOL_FACE]);
+    // Tier1 锚点（首发策展——design §7 逐项 + F4b 通用只读件 + F8 检索/列目录补件）。
     for (const id of [
       'present_result', 'write_chapter', 'query_story', 'read_file',
       'search', 'list_files', 'web_search', 'wiki_search',
@@ -95,29 +98,78 @@ describe('面策展（design §7 分层表）', () => {
     for (const id of ['outline_update', 'memory_update', 'setting_md_update', 'asset_cards_update']) {
       expect(BRIDGE_TOOL_FACE_TIER2).toContain(id);
     }
+    // 对等扩面锚点（W2）：代理 48（写盘/git/研究补全/story-sync 反哺等）+ 本地 10
+    // （dispatch_* 外派 + 批量四件 + 涟漪诊断 + 通用子代理——F17 主缺口面）。
+    for (const id of [
+      'write_file', 'chapter_write', 'git_commit', 'story_sync_apply', 'request_style_input',
+      'wiki_read', 'web_fetch', 'query_craft', 'creative_brief_update', 'growth_curve_update',
+    ]) {
+      expect(BRIDGE_TOOL_FACE_PARITY).toContain(id);
+    }
+    for (const id of [
+      'spawn_agent', 'diagnose_impacts', 'start_batch', 'batch_status', 'end_batch',
+      'set_participation_gear', 'dispatch_researcher', 'dispatch_story_planner',
+      'dispatch_episode_planner', 'dispatch_style_analyzer',
+    ]) {
+      expect(BRIDGE_TOOL_FACE_PARITY).toContain(id);
+    }
   });
 
-  it('bridgeFaceToolIds：策展 ∩ policy——suggest 档含 diff（Tier2）剔 write；readonly 档只剩 read 类', () => {
+  it('漂移护栏：BRIDGE_TOOL_FACE = registerBuiltinTools 全注册 id 集 − 排除表（集合对拍）', () => {
+    registerBuiltinTools();
+    const expected = new Set(
+      registry.all().map((t) => t.id).filter((id) => !BRIDGE_TOOL_FACE_EXCLUSIONS.includes(id)),
+    );
+    expect(new Set(BRIDGE_TOOL_FACE)).toEqual(expected);
+    // 排除表恰为 skill 族三件（design §2：confirm_required UI 回路缺失 + shell 同名
+    // handler 只读文件实现——同名不同义不上面）。
+    expect([...BRIDGE_TOOL_FACE_EXCLUSIONS]).toEqual(['skill', 'skill_resource_list', 'skill_resource_read']);
+    for (const id of BRIDGE_TOOL_FACE_EXCLUSIONS) {
+      expect(BRIDGE_TOOL_FACE).not.toContain(id);
+    }
+  });
+
+  it('CR-8 schema 转换覆盖：真实注册面 89 件 inputSchema 全部有效（本地件 zod→JSON Schema 上线）', () => {
+    registry.__clearForTest();
+    registerBuiltinTools();
+    const entries = buildBridgeFaceEntries(registry.all(), 'auto');
+    expect(entries).toHaveLength(89);
+    for (const entry of entries) {
+      expect(entry.inputSchema).toBeTypeOf('object');
+      expect((entry.inputSchema as { type?: unknown }).type).toBe('object');
+    }
+    // 本地件抽查（转换此前只被代理件 schema 生产消费过——20 本地件首次上面）：
+    // write_chapter / dispatch_story_planner / spawn_agent / present_result 属性面在场
+    //（枚举/必填位不因转换丢壳）。
+    for (const name of ['write_chapter', 'dispatch_story_planner', 'spawn_agent', 'present_result']) {
+      const entry = entries.find((e) => e.name === name);
+      expect(entry, name).toBeDefined();
+      const props = (entry!.inputSchema as { properties?: unknown }).properties;
+      expect(props, name).toBeTypeOf('object');
+    }
+  });
+
+  it('bridgeFaceToolIds：面 ∩ policy——suggest 档含 diff（Tier2）与本地只读件、剔 write；readonly 档只剩 read 类', () => {
     const tools = fullTools();
     expect(bridgeFaceToolIds(tools, 'suggest')).toEqual([
-      'present_result', 'write_chapter', 'query_story', 'read_file', 'search', 'list_files', 'outline_update',
+      'present_result', 'write_chapter', 'query_story', 'read_file', 'search', 'list_files', 'outline_update', 'spawn_agent',
     ]);
     // memory_update 是 write 类——suggest 档被 policy 面剔除。
     expect(bridgeFaceToolIds(tools, 'suggest')).not.toContain('memory_update');
     // readonly 档：diff 家族也剔（outline_update）——只剩 read 分类（write_chapter 现行
     // classifyTool 归 read——随现行 policy 单源，不在策展层覆写）；只读件（read_file +
-    // F8 补件 search/list_files）三档全在。
+    // F8 补件 search/list_files）三档全在；本地件 spawn_agent 缺省归 read 同样三档全在。
     expect(bridgeFaceToolIds(tools, 'readonly')).toEqual([
-      'present_result', 'write_chapter', 'query_story', 'read_file', 'search', 'list_files',
+      'present_result', 'write_chapter', 'query_story', 'read_file', 'search', 'list_files', 'spawn_agent',
     ]);
     // auto 档全量。
     expect(bridgeFaceToolIds(tools, 'auto')).toEqual([
       'present_result', 'write_chapter', 'query_story', 'read_file', 'search', 'list_files',
-      'outline_update', 'memory_update',
+      'outline_update', 'memory_update', 'spawn_agent',
     ]);
-    // 桥面外工具（spawn_agent 本地工具）任何档不入面（结构性排除——策展表不含）。
+    // 排除表件（skill 族——W2 语义反转后唯一的结构性排除）任何档不入面。
     for (const mode of ['readonly', 'suggest', 'auto'] as const) {
-      expect(bridgeFaceToolIds(tools, mode)).not.toContain('spawn_agent');
+      expect(bridgeFaceToolIds([...tools, makeTool('skill')], mode)).not.toContain('skill');
     }
   });
 
@@ -126,6 +178,12 @@ describe('面策展（design §7 分层表）', () => {
     const byName = new Map(entries.map((e) => [e.name, e]));
     // 写作域措辞改写（w0-findings §8 两例基线——剥离工作台/产品名/实现词）。
     expect(byName.get('present_result')!.description).not.toContain('工作台');
+    // R12 残留措辞（F16 同族）：「正文」承重词限定为呈现性回复文字——与 agents.ts 桥
+    // agent 正文呈现纪律句同句基线（CR-1 家族两站点同步）；旧措辞禁回。
+    expect(byName.get('present_result')!.description).toContain(
+      '呈现给用户看的呈现性回复文字（讨论/说明/评审等，不含章节正文/改稿产物）必须写在调用本工具的同一条消息里',
+    );
+    expect(byName.get('present_result')!.description).not.toContain('呈现给用户看的正文');
     expect(byName.get('write_chapter')!.description).toContain('完整写作流程');
     // read_file 描述（F4b 入面 / W5 简化）：内置同名读文件工具已随零工具 agent 从桥
     // 会话模型侧消失，归属消歧句不在场；路径契约与章节正文指引保留。
@@ -154,7 +212,8 @@ describe('车道判定（resolveAgyBridgeDialogueLane）', () => {
   it('面空 → off（resolver 不被调用——HTTP 模型零开销）', () => {
     const resolver = vi.fn(() => ({ mode: 'bridge' as const }));
     setAgyBridgeModeResolver(resolver);
-    const lane = resolveAgyBridgeDialogueLane({ tools: [makeTool('spawn_agent')], permissionMode: 'suggest', modelRef: { keyId: 'k', modelId: 'm' } });
+    // W2 语义反转后唯一不入面的件 = 排除表（skill 族）——面交集为空用排除件构造。
+    const lane = resolveAgyBridgeDialogueLane({ tools: [makeTool('skill')], permissionMode: 'suggest', modelRef: { keyId: 'k', modelId: 'm' } });
     expect(lane).toEqual({ kind: 'off', reason: 'empty-face' });
     expect(resolver).not.toHaveBeenCalled();
   });
@@ -313,8 +372,9 @@ describe('executor：持久化同构映射（与 runLoop 产物 shape 对拍）'
     expect(requests[0]!.messages).toEqual([{ role: 'user', content: '写第一章' }]);
     expect(requests[0]!.requirePresentResult).toBe(true);
     expect(requests[0]!.face.map((f) => f.name)).toEqual([
-      // 注：entries 沿 tools 注册序（buildBridgeFaceEntries 遍历 tools 数组），非策展表序。
-      'present_result', 'write_chapter', 'query_story', 'outline_update', 'read_file', 'search', 'list_files',
+      // 注：entries 沿 tools 注册序（buildBridgeFaceEntries 遍历 tools 数组），非策展表序；
+      // memory_update 是 write 类被 suggest 档 policy 剔除；spawn_agent（本地件，W2 入面）在场。
+      'present_result', 'write_chapter', 'query_story', 'outline_update', 'spawn_agent', 'read_file', 'search', 'list_files',
     ]);
     expect(requests[0]!.sessionKey).toBe('dialogue:s1');
 

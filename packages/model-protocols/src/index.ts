@@ -21,7 +21,20 @@ export {
   setGenerationUsageSink,
   dispatchGenerationCallRecord,
 } from './usageSink';
-export type { GenerationCallRecord, GenerationUsageSink } from './usageSink';
+export type {
+  AttemptMeteringRecord,
+  GenerationCallRecord,
+  GenerationUsageSink,
+} from './usageSink';
+// C3.2 W3 月度预算硬线门：setBudgetGate shell main whenReady 装配（usageIpc
+// installBudgetGateProduction——全仓唯一装配点）；checkBudgetGate 仅 wrapper 入口族消费
+// （W4 grep 守门）。BudgetExceededError / budgetExceededMessage 经 errors.ts 转出
+// （`export * from './errors'` 载出——错误类出口单一来源）。
+export {
+  setBudgetGate,
+  checkBudgetGate,
+} from './budgetGate';
+export type { BudgetGate, BudgetGateResult } from './budgetGate';
 // 09-12 agy provider：CLI 形态驱动器（generate.ts 两分派点经 antigravityCliGenerateText
 // 早退分派；setAntigravityCliGenerateForTest 是 generate.ts 分派的测试覆写缝；
 // disposeAntigravityCliDriver 供 Electron main 退出关停单例会话池（W4 接线）；

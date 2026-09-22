@@ -15,6 +15,9 @@ import { batchProgressFrom, findActiveBatch } from './batchMeta';
 import { roleLabel } from './toolMeta';
 import { GEAR_OPTIONS, gearLabelKey } from './gearMeta';
 import { deriveChildActivity } from './messageGrouping';
+// W4（09-21-subagent-bg-decouple §6.2 U5/U7）：后台任务条 + 子会话检视图头部（bg-update /
+// child lane 事件驱动，不进消息流——mirror chainRunAnchorByProject 锚定先例的独立呈现面）。
+import { BgTaskBar, ChildInspectHeader } from './BgTaskBar';
 import type { ParticipationGear } from '@orison/shared-contracts';
 import { deriveSessionBadge, getSessionProject, type SessionBadgeState } from '../../shared/store/agentEvents';
 // 09-13 子3 CR-7（09-18 CR 批 B）：后台链待审卡的项目归属过滤（同 spec 路径比较单源纪律）。
@@ -62,6 +65,7 @@ export function AgentPanel() {
     resolvedAuthorProfilePatches, resolvedSettingMdPatches,
     uploadInboxFiles, uploadChatImages,
     contextUsageBySession,
+    loadAgentBgTasks,
   } = useAppStore(useShallow((s) => {
     // dogfood T1 Stage 3（r8 键控）：挂载门只看当前视图会话的键（后台挂起卡不顶前台面板）。
     // 09-13 子3 W4（D-g 切分）：patch 挂载门按「是否含链产物 chapter_candidate」拆两判定——
@@ -92,6 +96,8 @@ export function AgentPanel() {
     uploadChatImages: s.uploadChatImages,
     // 09-12 子5 R6：leader 上下文占用 last 值（context-usage 事件源；本会话条数据源）。
     contextUsageBySession: s.contextUsageBySession,
+    // W4：后台任务注册表 hydrate（`agent:bg-tasks`——项目打开/面板挂载时拉全量）。
+    loadAgentBgTasks: s.loadAgentBgTasks,
     };
   }));
 
@@ -230,6 +236,14 @@ export function AgentPanel() {
   useEffect(() => {
     void loadAgentSkills();
   }, [loadAgentSkills]);
+
+  // W4：后台任务注册表 hydrate（项目打开/切换时一次；运行期增量走 bg-update / child lane
+  // 事件，此处只补盘面权威行——含重启后 interrupted）。失败静默（loadAgentBgTasks 自容错）。
+  const bgHydrateProjectPath = useAppStore((s) => s.currentProject?.path);
+  useEffect(() => {
+    if (!bgHydrateProjectPath) return;
+    void loadAgentBgTasks();
+  }, [bgHydrateProjectPath, loadAgentBgTasks]);
 
   const handleShowHistory = () => {
     loadAgentSessions();
@@ -468,6 +482,10 @@ export function AgentPanel() {
             onDragLeave={handleDropzoneDragLeave}
             onDrop={handleDropzoneDrop}
           >
+            {/* W4（§6.1）：子会话检视图头部（role/状态/耗时 + 返回键）——仅 bg 子会话视图挂载。 */}
+            <ChildInspectHeader />
+            {/* W4（§6.2 U5）：后台任务条——独立呈现面不进消息流；四态卡 + running 取消 + 钻取。 */}
+            <BgTaskBar />
             {/* Story 3.5: active batch strip — gear + scene progress, straight from
                 the latest batch metadata. No active batch → nothing rendered. */}
             {activeBatch && activeBatchProgress && (

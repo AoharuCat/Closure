@@ -38,6 +38,19 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | null> {
   return Promise.race([p, timeout]).finally(() => clearTimeout(timer));
 }
 
+// ── CR-14（c3-2 CR 批）：偏好保存写链串行化 ──
+// retention 与 budget 两条保存都是读改写（loadUserPreferences → 展开覆盖单键 →
+// saveUserPreferences 整对象落盘）。两个保存窗并发时各自读到同一盘面基线，后写者
+// 整体覆盖先写者的键 = 静默丢首写者。模块级 promise 链把读改写段排成串行——每段
+// 读到的盘面必含前一段已落的键；前段失败不阻断本段（错误归调用方 promise）。
+let prefsWriteChain: Promise<unknown> = Promise.resolve();
+
+function enqueuePrefsWrite<T>(task: () => Promise<T>): Promise<T> {
+  const next = prefsWriteChain.then(task, task);
+  prefsWriteChain = next.catch(() => undefined); // 链本身永不 reject
+  return next;
+}
+
 export async function fetchUsageOverview(): Promise<UsageOverview | null> {
   try {
     return (await api()?.usageOverview()) ?? null;
@@ -54,18 +67,50 @@ export async function clearUsage(): Promise<UsageClearResult | null> {
   }
 }
 
-/** 保留天数落盘（返回钳制后的落盘值；失败/超时 null → 调用方 toast）。见文件头说明。 */
+/** 保留天数落盘（返回钳制后的落盘值；失败/超时 null → 调用方 toast）。见文件头说明。
+ *  CR-14：读改写段进模块级写链串行（并发保存不丢首写者的键）。 */
 export async function saveUsageRetentionDays(days: number): Promise<number | null> {
   try {
-    const bridge = api();
-    if (!bridge?.loadUserPreferences || !bridge?.saveUserPreferences) return null;
-    // CR-15：两跳各带 5s 竞速超时——任一 invoke 永挂即按失败返回（阻输入永久禁用）。
-    const current = await withTimeout(bridge.loadUserPreferences(), RETENTION_SAVE_TIMEOUT_MS);
-    if (current === null) return null;
-    const next = clampUsageRetentionDays(days);
-    const saved = await withTimeout(bridge.saveUserPreferences({ ...current, usageRetentionDays: next }), RETENTION_SAVE_TIMEOUT_MS);
-    if (saved === null) return null;
-    return next;
+    return await enqueuePrefsWrite(async () => {
+      const bridge = api();
+      if (!bridge?.loadUserPreferences || !bridge?.saveUserPreferences) return null;
+      // CR-15：两跳各带 5s 竞速超时——任一 invoke 永挂即按失败返回（阻输入永久禁用）。
+      const current = await withTimeout(bridge.loadUserPreferences(), RETENTION_SAVE_TIMEOUT_MS);
+      if (current === null) return null;
+      const next = clampUsageRetentionDays(days);
+      const saved = await withTimeout(bridge.saveUserPreferences({ ...current, usageRetentionDays: next }), RETENTION_SAVE_TIMEOUT_MS);
+      if (saved === null) return null;
+      return next;
+    });
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 月度预算双线落盘（C3.2 W3，mirror saveUsageRetentionDays 读改写 + 超时竞速）：
+ * undefined = 清线（键不写）。soft > hard 由**调用方预检**（表单内联 warn 拒提交——
+ * shell save handler validateBudgetCapsForSave 拒写是绕过表单面的兜底）；盘面读回已经
+ * readUserPreferences 归一，载荷键值即归一后形态。返回落盘后的双线值；失败/超时 null。
+ * CR-14：读改写段进模块级写链串行（retention/budget 两保存并发不互冲）。
+ */
+export async function saveBudgetCaps(
+  softCny: number | undefined,
+  hardCny: number | undefined,
+): Promise<{ softCny?: number; hardCny?: number } | null> {
+  try {
+    return await enqueuePrefsWrite(async () => {
+      const bridge = api();
+      if (!bridge?.loadUserPreferences || !bridge?.saveUserPreferences) return null;
+      const current = await withTimeout(bridge.loadUserPreferences(), RETENTION_SAVE_TIMEOUT_MS);
+      if (current === null) return null;
+      const saved = await withTimeout(
+        bridge.saveUserPreferences({ ...current, budgetSoftCny: softCny, budgetHardCny: hardCny }),
+        RETENTION_SAVE_TIMEOUT_MS,
+      );
+      if (saved === null) return null;
+      return { softCny, hardCny };
+    });
   } catch {
     return null;
   }

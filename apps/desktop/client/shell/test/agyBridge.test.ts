@@ -27,6 +27,7 @@ vi.mock('../main/ipc/toolExecution', () => ({
 import {
   AgyBridgeHomeError,
   assertFakeHomePath,
+  abortBridgeSession,
   BRIDGE_HOME_MAX_AGE_MS,
   bridgePipeName,
   createAgyBridgeRegistry,
@@ -36,10 +37,12 @@ import {
   isVerifiedAgyVersionBand,
   prepareBridgeHome,
   probeAgyCliVersion,
+  setProductionAgyBridgeRuntime,
   sweepStaleBridgeHomes,
   VERIFIED_AGY_MAJOR_MINOR,
   type BridgeSessionRecord,
 } from '../main/ipc/agyBridge';
+import { registry, type SkillExecutorRef, type ToolContext } from '@orison/desktop-agent';
 import type { BridgeToolFaceEntry } from '@orison/model-protocols';
 
 // ── 子4 W2：桥基座（假宿四件套 + 清扫守卫矩阵 + 三道闸 + 管道协议 + wiring）──
@@ -172,6 +175,87 @@ describe('agyBridge：prepareBridgeHome（四件套 + 桥 agent 文件 + marker 
 
     // 🔴 红线：真实 home 快照逐项不变（零写入）。
     expect(snapshot(realHome)).toEqual(before);
+  });
+
+  it('U8：整拷排除 agy CLI 日志（log/ 目录 + cli.log 指针）——假宿无日志、其余结构在位、真实 home 零触碰', async () => {
+    const realHome = tempDir('agy-bridge-realhome-');
+    buildRealHomeFixture(realHome);
+    // 日志形态（U8 取证）：antigravity-cli/log/ 历史日志（无轮转，65 份 1.56MB 线性增长）
+    // + antigravity-cli/cli.log 指针（生产是 symlink → log/cli-<ts>.log，dereference 会把
+    // 指针拷成实体文件）。这里以普通文件布景——filter 只按路径判，不涉节点类型；
+    // symlink 场景的 dereference 语义已在注释面覆盖。
+    const logDir = path.join(realHome, '.gemini', 'antigravity-cli', 'log');
+    mkdirSync(logDir, { recursive: true });
+    writeFileSync(path.join(logDir, 'cli-20260919_184948.log'), 'history log line', 'utf8');
+    writeFileSync(path.join(realHome, '.gemini', 'antigravity-cli', 'cli.log'), 'latest log line', 'utf8');
+    const homeRoot = tempDir('agy-bridge-root-');
+    const homeDir = path.join(homeRoot, 'u8');
+
+    await prepareBridgeHome({
+      homeDir,
+      homeRoot,
+      realHome,
+      serverName: BRIDGE_MCP_SERVER_NAME,
+      pipeName: 'p', token: 't', tools: [], agentMarkdown: BRIDGE_AGENT_MD, mcpServerPath: 'm', execPath: 'e', pid: 1, sessionId: 'u8',
+    });
+
+    // 日志零带入（目录整个缺席 + 指针文件不拷）。
+    expect(existsSync(path.join(homeDir, '.gemini', 'antigravity-cli', 'log'))).toBe(false);
+    expect(existsSync(path.join(homeDir, '.gemini', 'antigravity-cli', 'cli.log'))).toBe(false);
+    // 其余结构原样：settings 副本 / 凭据子树 / config 新写。
+    expect(existsSync(path.join(homeDir, '.gemini', 'antigravity-cli', 'settings.json'))).toBe(true);
+    expect(existsSync(path.join(homeDir, '.gemini', 'antigravity-cli', 'brain', 'conv-1.json'))).toBe(true);
+    expect(existsSync(path.join(homeDir, '.gemini', 'config', 'mcp_config.json'))).toBe(true);
+    // 真实 home 日志零触碰。
+    expect(existsSync(path.join(logDir, 'cli-20260919_184948.log'))).toBe(true);
+    expect(readFileSync(path.join(realHome, '.gemini', 'antigravity-cli', 'cli.log'), 'utf8')).toBe('latest log line');
+  });
+
+  it('U8 CR-2/3/4：轮转变体 + win32 大小写变体 + 界外 symlink 指入 log/ 均不带入；symlink 指向其余结构照拷', async () => {
+    const realHome = tempDir('agy-bridge-realhome-');
+    buildRealHomeFixture(realHome);
+    const cliRoot = path.join(realHome, '.gemini', 'antigravity-cli');
+    // CR-3：直宿轮转变体（cli.log.1 / cli-<ts>.log）——旧精确比对（src !== logLinkSrc）会漏。
+    writeFileSync(path.join(cliRoot, 'cli.log.1'), 'rotated log line', 'utf8');
+    writeFileSync(path.join(cliRoot, 'cli-20260919_184948.log'), 'rotated ts log line', 'utf8');
+    // CR-2：日志目录以大小写变体落盘——win32 盘面不区分大小写，归一比较才不漏滤。
+    const logDirVariant = path.join(cliRoot, 'Log');
+    mkdirSync(logDirVariant, { recursive: true });
+    writeFileSync(path.join(logDirVariant, 'cli-variant-case.log'), 'case variant log line', 'utf8');
+    // CR-4：界外 symlink 指入 log/（对 dereference 拷贝是内容拷入——前缀测试对 symlink
+    // 失效）；对照组 symlink 指向其余结构（brain）——照常 dereference 拷入。
+    const linkToLog = path.join(realHome, '.gemini', 'config', 'loglink');
+    const linkToBrain = path.join(realHome, '.gemini', 'config', 'brainlink');
+    try {
+      symlinkSync(logDirVariant, linkToLog, process.platform === 'win32' ? 'junction' : 'dir');
+      symlinkSync(path.join(cliRoot, 'brain'), linkToBrain, process.platform === 'win32' ? 'junction' : 'dir');
+    } catch {
+      return; // 无特权环境无法布景（mirror 既有 junction 先例）
+    }
+    const homeRoot = tempDir('agy-bridge-root-');
+    const homeDir = path.join(homeRoot, 'u8-variants');
+
+    await prepareBridgeHome({
+      homeDir,
+      homeRoot,
+      realHome,
+      serverName: BRIDGE_MCP_SERVER_NAME,
+      pipeName: 'p', token: 't', tools: [], agentMarkdown: BRIDGE_AGENT_MD, mcpServerPath: 'm', execPath: 'e', pid: 1, sessionId: 'u8-variants',
+    });
+
+    // CR-3：轮转变体零带入。
+    expect(existsSync(path.join(homeDir, '.gemini', 'antigravity-cli', 'cli.log.1'))).toBe(false);
+    expect(existsSync(path.join(homeDir, '.gemini', 'antigravity-cli', 'cli-20260919_184948.log'))).toBe(false);
+    // CR-2：大小写变体目录零带入（win32 归一比较）；POSIX 大小写敏感——`Log` 与 agy 的
+    // `log` 是不同目录，不在排除面（语义如实拷入）。
+    expect(existsSync(path.join(homeDir, '.gemini', 'antigravity-cli', 'Log'))).toBe(process.platform !== 'win32');
+    // CR-4：指入 log/ 的界外 symlink 不拷（lstat 分流 + realpath 目标判拒）；指向 brain
+    // 的 symlink 照常 dereference 拷入（非日志目标不误伤）。
+    expect(existsSync(path.join(homeDir, '.gemini', 'config', 'loglink'))).toBe(false);
+    expect(existsSync(path.join(homeDir, '.gemini', 'config', 'brainlink', 'conv-1.json'))).toBe(true);
+    // 真实 home 零触碰。
+    expect(existsSync(path.join(logDirVariant, 'cli-variant-case.log'))).toBe(true);
+    expect(readFileSync(path.join(cliRoot, 'cli.log.1'), 'utf8')).toBe('rotated log line');
   });
 
   it('用户 settings 损坏 → 类型化阻断（不产出副本）；settings 缺失 → 副本基 {}', async () => {
@@ -858,5 +942,224 @@ describe('agyBridge：mcpServer.mjs 资产在位', () => {
     expect(source).toContain('present_result');
     expect(source).toContain('ORISON_BRIDGE_TOOLS_JSON');
     expect(source).toContain('novel-writing');
+  });
+});
+
+// ── 09-20 F17 W1/W3：本地工具分派（design §1.2/§1.3）+ abort 联动（design §4-1）──
+
+/**
+ * 在 agent 库 registry 注册 stub 本地件（defineTool 直建形态）。桥分派只透传 params——
+ * zod schema 不解析，stub 面只需形态满足 ToolDefinition（zod 非 shell 直接依赖，cast 补）。
+ * afterEach 经 registry.__clearForTest() 清（agent 模块级单例不跨 describe 泄漏）。
+ */
+function registerStubLocalTool(
+  id: string,
+  execute: (params: Record<string, unknown>, ctx: ToolContext) => Promise<{ title: string; output: string; metadata?: Record<string, unknown> }>,
+): void {
+  registry.register({
+    id,
+    description: `stub ${id}`,
+    parameters: {} as never,
+    execute: execute as unknown as Parameters<typeof registry.register>[0]['execute'],
+  });
+}
+
+describe('agyBridge：本地工具分派（三闸后 registry 本地件 → 进程内 ToolContext 执行）', () => {
+  afterEach(() => {
+    registry.__clearForTest();
+  });
+
+  it('本地命中：ctx 八字段同源基准（loop.ts:497-507）+ 结果/metadata 透传 + 不经 shell 通道', async () => {
+    const seen: Array<{ params: Record<string, unknown>; ctx: ToolContext }> = [];
+    registerStubLocalTool('stub_local_probe', async (params, ctx) => {
+      seen.push({ params: params as Record<string, unknown>, ctx });
+      return { title: '探测', output: '本地件完成', metadata: { k: 1 } };
+    });
+    const runtimeStub = { runChapterChain: vi.fn() } as unknown as SkillExecutorRef;
+    const chainSender = vi.fn();
+    const childSender = vi.fn();
+    const face = [...FACE, { name: 'stub_local_probe', description: 'stub', inputSchema: { type: 'object' } }];
+    const record = makeRecord({
+      permissionMode: 'auto',
+      face,
+      faceNames: new Set(face.map((t) => t.name)),
+      agentRuntime: () => runtimeStub,
+      emitChainEvent: chainSender,
+      emitChildEvent: childSender,
+      lastActivityAt: 0,
+    });
+    const result = await executeBridgeToolCall(record, 'stub_local_probe', { a: 1 });
+    expect(result).toMatchObject({ ok: true, output: '本地件完成', metadata: { k: 1 } });
+    expect(handleToolExecuteMock).not.toHaveBeenCalled(); // 不经 shell 统一通道
+    // ctx 八字段（design §1.3）：sessionId = leader 会话键位；projectPath = 假宿外的项目根；
+    // abort = 记录信号（UI 停止联动面）；skillExecutor = deps.agentRuntime()；spawnDepth = 0
+    //（桥 = leader 层）；emitChainEvent/emitChildEvent = 记录上的发送器；emitConfirmation 缺席。
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.params).toEqual({ a: 1 });
+    const ctx = seen[0]!.ctx;
+    expect(ctx.sessionId).toBe(record.sessionId);
+    expect(ctx.projectPath).toBe(record.projectDir);
+    expect(ctx.abort).toBe(record.abortController.signal);
+    expect(ctx.skillExecutor).toBe(runtimeStub);
+    expect(ctx.spawnDepth).toBe(0);
+    expect(ctx.emitChainEvent).toBe(chainSender);
+    expect(ctx.emitChildEvent).toBe(childSender);
+    expect(ctx.emitConfirmation).toBeUndefined();
+    // idle 续活（design §4-2）：本地工具执行起止各 touch（此处至少起步 touch 可观测）。
+    expect(record.lastActivityAt).toBeGreaterThan(0);
+  });
+
+  it('activeSkill 预埋（design §1.4）：metadata.activeSkill → 会话级收窄面 → 闸1b 拒后续面外调用；垃圾形态零写入', async () => {
+    let metadata: Record<string, unknown> | undefined;
+    registerStubLocalTool('stub_skill_loader', async () => ({
+      title: 'skill',
+      output: 'loaded',
+      ...(metadata !== undefined ? { metadata } : {}),
+    }));
+    const face = [
+      ...FACE,
+      { name: 'stub_skill_loader', description: 'stub', inputSchema: { type: 'object' } },
+      { name: 'query_story', description: '查询', inputSchema: { type: 'object' } },
+    ];
+    const record = makeRecord({ permissionMode: 'auto', face, faceNames: new Set(face.map((t) => t.name)) });
+    // 垃圾形态（非对象 / allowedTools 非数组）→ 零写入。
+    metadata = { activeSkill: 'garbage' };
+    await executeBridgeToolCall(record, 'stub_skill_loader', {});
+    expect(record.activeSkillAllowedTools).toBeUndefined();
+    metadata = { activeSkill: { name: 's', allowedTools: 'not-array', permission: 'auto' } };
+    await executeBridgeToolCall(record, 'stub_skill_loader', {});
+    expect(record.activeSkillAllowedTools).toBeUndefined();
+    // 正常形态 → 写入 + 闸1b 收窄（同源 loop.ts:529-534 的 activeSkillAllowedTools 参数）。
+    metadata = { activeSkill: { name: 's', allowedTools: ['query_story'], permission: 'auto' } };
+    await executeBridgeToolCall(record, 'stub_skill_loader', {});
+    expect(record.activeSkillAllowedTools).toEqual(['query_story']);
+    // 面外于 allowedTools 的调用（write_chapter 在会话面内、classify=read 档位闸本放行）→
+    // activeSkill 收窄拒。
+    const rejected = await executeBridgeToolCall(record, 'write_chapter', {});
+    expect(rejected).toMatchObject({ ok: false, gate: 'policy' });
+    if (!rejected.ok) expect(rejected.error).toContain('not allowed by active skill');
+  });
+
+  it('未命中（registry 无此本地件）→ 落回 handleToolExecute 现状（代理工具直达 shell handler）', async () => {
+    // 注册面非空（别件在场）——证分派按 id 判，非「注册面空 → 全走 shell」假绿。
+    registerStubLocalTool('stub_local_probe', async () => ({ title: 't', output: 'x' }));
+    handleToolExecuteMock.mockResolvedValueOnce({ title: '写章', output: 'shell 完成' });
+    const record = makeRecord({ permissionMode: 'auto' });
+    const result = await executeBridgeToolCall(record, 'write_chapter', { chapter: 1 });
+    expect(result).toMatchObject({ ok: true, output: 'shell 完成' });
+    expect(handleToolExecuteMock).toHaveBeenCalledWith(expect.objectContaining({
+      toolId: 'write_chapter',
+      params: { chapter: 1 },
+      projectDir: record.projectDir,
+      sessionId: record.sessionId,
+      abort: record.abortController.signal,
+    }));
+  });
+
+  it('闸拒不变：本地件同受闸1b（readonly 档 write 类 → policy 拒，本地执行器与 shell 通道都不触达）', async () => {
+    const execute = vi.fn(async () => ({ title: 't', output: 'x' }));
+    registerStubLocalTool('memory_update', execute);
+    const face = [...FACE, { name: 'memory_update', description: 'stub', inputSchema: { type: 'object' } }];
+    const record = makeRecord({ permissionMode: 'readonly', face, faceNames: new Set(face.map((t) => t.name)) });
+    const result = await executeBridgeToolCall(record, 'memory_update', {});
+    expect(result).toMatchObject({ ok: false, gate: 'policy' });
+    expect(execute).not.toHaveBeenCalled();
+    expect(handleToolExecuteMock).not.toHaveBeenCalled();
+  });
+
+  it('abort signal 贯通：本地件收到 record.abortController 信号，执行中 abort 可观测（CR-2 后预中止记录不再派发，贯通改在执行中验）', async () => {
+    let seenAbort: AbortSignal | undefined;
+    let releaseTool: (() => void) | undefined;
+    const toolGate = new Promise<void>((resolve) => { releaseTool = resolve; });
+    registerStubLocalTool('stub_local_probe', async (_params, ctx) => {
+      seenAbort = ctx.abort;
+      releaseTool?.();
+      await new Promise<void>((resolve) => { setTimeout(resolve, 10); });
+      return { title: 't', output: 'x' };
+    });
+    const face = [...FACE, { name: 'stub_local_probe', description: 'stub', inputSchema: { type: 'object' } }];
+    const record = makeRecord({ permissionMode: 'auto', face, faceNames: new Set(face.map((t) => t.name)) });
+    const pending = executeBridgeToolCall(record, 'stub_local_probe', {});
+    await toolGate; // 工具已拿到 ctx（seenAbort 已置）后再 abort——验贯通不依赖预中止
+    record.abortController.abort(new Error('stop'));
+    await pending;
+    expect(seenAbort).toBe(record.abortController.signal);
+    expect(seenAbort?.aborted).toBe(true);
+  });
+
+  it('CR-2 pre-dispatch abort 门：会话中止后的 call 帧不再执行（本地件与 shell 通道都不触达，mirror loop.ts:511-525）', async () => {
+    const execute = vi.fn(async () => ({ title: 't', output: 'x' }));
+    registerStubLocalTool('stub_local_probe', execute);
+    const record = makeRecord({ permissionMode: 'auto' });
+    const reason = new Error('stop');
+    reason.name = 'AbortError';
+    record.abortController.abort(reason);
+    const result = await executeBridgeToolCall(record, 'write_chapter', {});
+    expect(result).toMatchObject({ ok: false });
+    if (!result.ok) expect(result.error).toContain('会话已被用户中止');
+    expect(execute).not.toHaveBeenCalled();
+    expect(handleToolExecuteMock).not.toHaveBeenCalled();
+  });
+
+  it('本地件执行失败 → ok:false 错误结果（G4 顺带：catch 留痕不炸管道回程）', async () => {
+    registerStubLocalTool('stub_local_probe', async () => {
+      throw new Error('本地件炸了');
+    });
+    const face = [...FACE, { name: 'stub_local_probe', description: 'stub', inputSchema: { type: 'object' } }];
+    const record = makeRecord({ permissionMode: 'auto', face, faceNames: new Set(face.map((t) => t.name)) });
+    const result = await executeBridgeToolCall(record, 'stub_local_probe', {});
+    expect(result).toMatchObject({ ok: false, error: '本地件炸了' });
+    expect(handleToolExecuteMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('agyBridge：abort 联动（UI 停止钮掐桥会话在途本地执行）', () => {
+  afterEach(() => {
+    setProductionAgyBridgeRuntime(undefined);
+  });
+
+  it('abortBridgeSession：在册会话 → abort 记录信号（abort-only 不 revoke）；无会话 → false', () => {
+    const registryInstance = createAgyBridgeRegistry();
+    setProductionAgyBridgeRuntime(registryInstance);
+    registryInstance.openSession({
+      sessionId: 'session-ab',
+      projectDir: os.tmpdir(),
+      permissionMode: 'auto',
+      face: FACE,
+    });
+    expect(abortBridgeSession('session-ab')).toBe(true);
+    // abort-only：会话仍在册（销毁归 turn 生产的 abort catch revoke 语义——turn 级所有权）。
+    const record = registryInstance.getSession('session-ab');
+    expect(record).toBeDefined();
+    expect(record!.abortController.signal.aborted).toBe(true);
+    // CR-1（09-21 三层 CR）：reason 须 AbortError 形——isAbortLikeError 只认 name，
+    // 裸 Error 会被 turn 生产 catch 当普通失败误分类（abort→revoke 链断裂）。
+    const reason = record!.abortController.signal.reason as Error;
+    expect(reason).toBeInstanceOf(Error);
+    expect(reason.name).toBe('AbortError');
+    expect(reason.message).toBe('agy bridge session aborted by user');
+    expect(abortBridgeSession('no-such-session')).toBe(false);
+    registryInstance.disposeAll();
+  });
+
+  it('CR-1 中止后会话复用：同输入幂等复用 → 重建 abort 控制器（不毒化会话余下生命周期）+ warn 留痕', () => {
+    const warn = vi.fn();
+    const registryInstance = createAgyBridgeRegistry({ warn });
+    const input = { sessionId: 'session-cr1', projectDir: os.tmpdir(), permissionMode: 'auto' as const, face: FACE };
+    const first = registryInstance.openSession(input);
+    const record = registryInstance.getSession('session-cr1')!;
+    expect(record.abortController.signal.aborted).toBe(false);
+    const stop = new Error('stop');
+    stop.name = 'AbortError';
+    record.abortController.abort(stop); // 模拟用户停止且无在途 turn（无 revoke 路径）
+    const second = registryInstance.openSession(input);
+    expect(second.token).toBe(first.token); // 幂等复用（管道/token 不变）
+    expect(record.abortController.signal.aborted).toBe(false); // 控制器已重建
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('重建 abort 控制器'));
+    registryInstance.disposeAll();
+  });
+
+  it('未装配生产注册表 → false（幂等，不 throw）', () => {
+    expect(abortBridgeSession('any-session')).toBe(false);
   });
 });

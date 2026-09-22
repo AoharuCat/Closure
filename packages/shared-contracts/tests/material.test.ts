@@ -3,6 +3,8 @@ import {
   MATERIAL_CHUNK_STRATEGIES,
   MATERIAL_DESCRIPTION_MAX_CHARS,
   MATERIAL_FORMATS,
+  MATERIAL_ONLINE_CATEGORIES,
+  MATERIAL_ONLINE_IMPORT_FAILURE_KINDS,
   MATERIAL_STATUSES,
   chapterChunkSchema,
   chunkChapter,
@@ -304,5 +306,57 @@ describe('E10.2a — 字幕三格式 + provenance.description（旧行零迁移�
   it('materials:update-name 进 desktopIpcSchema enum（E10.2a 契约半；materials:rename 仍拒）', () => {
     expect(desktopIpcSchema.safeParse({ channel: 'materials:update-name' }).success).toBe(true);
     expect(desktopIpcSchema.safeParse({ channel: 'materials:rename' }).success).toBe(false);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// E10.4（task 09-20）W1：在线解析生态契约——provenance.url additive（旧行零迁移，mirror
+// description 先例）+ via='web-fetch' 词表 + 在线两 IPC 通道进 enum + 类别/失败分类词表钉死。
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('E10.4 — provenance.url（additive 旧行零迁移）', () => {
+  it('旧行无 url 键：parse 通过且补 null（provenance_json 回读容忍，零迁移）', () => {
+    const provenance = { ...SAMPLE_PROVENANCE };
+    expect('url' in provenance).toBe(false); // 旧行形态
+    const parsed = materialSchema.parse(sampleMaterial({ provenance }));
+    expect(parsed.provenance.url).toBeNull();
+  });
+
+  it('新行带键：URL 字符串/null 均合法，round-trip 保留（在线拉取溯源呈现面）', () => {
+    const parsed = materialSchema.parse(
+      sampleMaterial({ provenance: { ...SAMPLE_PROVENANCE, url: 'https://zh.moegirl.org.cn/示例词条' } }),
+    );
+    expect(parsed.provenance.url).toBe('https://zh.moegirl.org.cn/示例词条');
+    const nulled = materialSchema.parse(sampleMaterial({ provenance: { ...SAMPLE_PROVENANCE, url: null } }));
+    expect(nulled.provenance.url).toBeNull();
+  });
+
+  it("via='web-fetch' 不拒（E10.4 在线拉取解析 provenance——开放字符串词表注记）", () => {
+    expect(() =>
+      materialSchema.parse(sampleMaterial({ provenance: { ...SAMPLE_PROVENANCE, via: 'web-fetch' } })),
+    ).not.toThrow();
+  });
+});
+
+describe('E10.4 — 在线两通道 IPC 契约（materials:import-online / materials:search-online）', () => {
+  it('两通道进 desktopIpcSchema enum（契约半——shell handler W1 占位、W2 落实现；自造通道拒）', () => {
+    expect(desktopIpcSchema.safeParse({ channel: 'materials:import-online' }).success).toBe(true);
+    expect(desktopIpcSchema.safeParse({ channel: 'materials:search-online' }).success).toBe(true);
+    expect(desktopIpcSchema.safeParse({ channel: 'materials:import-web' }).success).toBe(false);
+  });
+
+  it('失败分类六档穷举钉死（PRD R1 失败矩阵基线——UI 分文案键集对拍；多档少档都红）', () => {
+    expect(MATERIAL_ONLINE_IMPORT_FAILURE_KINDS).toEqual([
+      'bad-url',
+      'fetch-failed',
+      'empty-content',
+      'oversize',
+      'stem-conflict',
+      'ingest-failed',
+    ]);
+  });
+
+  it('类别四档穷举钉死（UI 类别选择 + medium/tier 预填映射基线——映射表落 shell W2）', () => {
+    expect(MATERIAL_ONLINE_CATEGORIES).toEqual(['community-wiki', 'criticism', 'author-interview', 'other']);
   });
 });

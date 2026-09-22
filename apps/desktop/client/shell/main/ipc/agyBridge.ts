@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, lstatSync, realpathSync } from 'node:fs';
 import fsp from 'node:fs/promises';
 import net from 'node:net';
 import os from 'node:os';
@@ -23,7 +23,12 @@ import {
   AUTO_APPLY_SELF_REVIEW_MESSAGE,
   assertToolAllowed,
   enforceAutoApplyTier,
+  getLocalToolDefinition,
   shouldGateAutoApply,
+  type ChainStreamEvent,
+  type ChildStreamEvent,
+  type SkillExecutorRef,
+  type ToolContext,
 } from '@orison/desktop-agent';
 import { handleToolExecute } from './toolExecution';
 import {
@@ -150,7 +155,9 @@ export interface PrepareBridgeHomeInput {
  *   1. 真实 settings 容错读 + corrupt 预检（**先于一切拷贝**——半成品凭据副本不留盘）；
  *   2. marker 撞段预检：homeDir 已归属其他 sessionId → typed 阻断（CR-10——两 sessionId
  *      sanitize 到同段时绝不静默读错首会话配置，他人假宿不误删）；
- *   3. `.gemini` 整体拷贝（~17MB，含缓存登录凭据——知情拍板记录在 design §2.5）；
+ *   3. `.gemini` 整体拷贝（~17MB，含缓存登录凭据——知情拍板记录在 design §2.5；
+ *      U8 排除 `antigravity-cli/log/` 与直宿 `cli*.log*` 日志入口（CR-3 收轮转变体；
+ *      CR-2 win32 归一比较；CR-4 symlink realpath 目标校验）——无轮转 + 隐私面）；
  *   3.5 CR-2 遮蔽闸：对拷贝树内 agents 根跑 bridge/text 双名 frontmatter `name` 遮蔽
  *      检测（用户真实全局同名 agent 随整拷进入假宿——命中即 typed 阻断，宁误报不漏报）；
  *   4. `antigravity-cli/settings.json` = 用户真实 settings verbatim 副本 + permissions.allow
@@ -211,10 +218,55 @@ export async function prepareBridgeHome(input: PrepareBridgeHomeInput): Promise<
   await fsp.mkdir(input.homeDir, { recursive: true });
   try {
     // 3. .gemini 整拷（force 覆盖重拷残留；dereference 仿造符号链接源）。
+    //    U8（dogfood R4）：排除 agy CLI 日志——`antigravity-cli/log/`（agy 运行日志，
+    //    无轮转、随使用无限累积）与 `antigravity-cli/` 直宿下的 `cli*.log*`（cli.log
+    //    指针 / cli.log.1 / cli-<ts>.log 轮转变体——dereference 会把内容拷成实体文件）。
+    //    日志与凭据/配置无关，拷进去 = 每个桥会话平白多带 1.5MB+ 且随用户日志积累线性
+    //    增长，还把用户其他 agy 会话的日志（隐私面）搬进假宿副本。其余 .gemini 结构
+    //    （凭据/config/agents/brain）原样。
+    //    CR-2/3/4（09-20 三层 CR）：① 路径比较经 norm 归一——win32 盘面大小写不敏感，
+    //    源树内 `Log/`、`AntiGravity-CLI/` 等大小写变体按同径比对才不漏滤（POSIX 大小写
+    //    敏感保持恒等比较——归一会把用户自建 `LOG/` 误并进排除面）；② 排除模式扩
+    //    `cli*.log*`（直宿下，收轮转变体）；③ 界外符号链接指向 log/ 时前缀测试失效
+    //    （dereference 会把界外日志内容拷入）——lstat 廉价分流，仅 symlink 项解析
+    //    realpath 目标再判一次；realpath 失败（悬空链接等）保守放行，交 cp 自行处理。
+    const logDirSrc = path.join(realGemini, 'antigravity-cli', 'log');
+    const cliRootSrc = path.join(realGemini, 'antigravity-cli');
+    const norm = (p: string): string => (process.platform === 'win32' ? p.toLowerCase() : p);
+    const normLogDir = norm(logDirSrc);
+    const normCliRoot = norm(cliRootSrc);
+    const isWithinLogDir = (p: string): boolean => {
+      const np = norm(p);
+      return np === normLogDir || np.startsWith(normLogDir + path.sep);
+    };
     await fsp.cp(realGemini, path.join(input.homeDir, '.gemini'), {
       recursive: true,
       force: true,
       dereference: true,
+      filter: (src) => {
+        if (isWithinLogDir(src)) return false;
+        // antigravity-cli/ 直宿下的 cli*.log*（指针 + 轮转变体）；子目录内不套用
+        //（agy 只在直宿落这族文件）。文件名按 case-insensitive 模式匹配（glob 语义）。
+        if (
+          norm(path.dirname(src)) === normCliRoot
+          && /^cli.*\.log/.test(path.basename(src).toLowerCase())
+        ) {
+          return false;
+        }
+        // 界外 symlink 校验（CR-4）：普通条目零额外开销（一次 lstat 分流即返）。
+        let isLink: boolean;
+        try {
+          isLink = lstatSync(src).isSymbolicLink();
+        } catch {
+          return true; // 竞态消失——交给 cp 自行处理
+        }
+        if (!isLink) return true;
+        try {
+          return !isWithinLogDir(realpathSync(src));
+        } catch {
+          return true; // realpath 失败（悬空链接等）——保守放行
+        }
+      },
     });
 
     // 3.5 CR-2 遮蔽闸（整树拷贝后、写我方 agent 文件前）：用户真实 home 若有同名
@@ -472,6 +524,33 @@ export interface BridgeSessionRecord {
   lastActivityAt: number;
   /** 注册表内部：管道 server 句柄（revoke/dispose 时关闭）。 */
   pipeServer?: net.Server;
+  /**
+   * 09-20 F17 W3（design §3）：chain 事件发送器——write_chapter 等本地工具转发
+   * runChapterChain 的链事件到 UI（agent:stream-event，与 agent 车道同通道同载荷：
+   * workflow.ts emitChainEvent → agentIpc sendEvent）。装配 = 桥 turn 生产在记录上
+   * 注入（agyBridgeIpc attachBridgeRecordEventSenders——design §3 认可的「record 装配时
+   * 注入」落位）。未装配 → undefined，工具内 `ctx.emitChainEvent?.(...)` 优雅零事件。
+   */
+  emitChainEvent?: (event: ChainStreamEvent) => void;
+  /**
+   * 09-20 F17 W3（design §3）：child 事件发送器——dispatch_* / spawn_agent 的子 agent 组
+   * UI 可见性依赖它（缺了 = 子 agent 组在 UI 全不可见，dogfood R2 #3 同型缺口）。同上装配。
+   */
+  emitChildEvent?: (event: ChildStreamEvent) => void;
+  /**
+   * 09-20 F17 W1（design §1.3）：本地执行缝 skillExecutor 取件缝（deps.agentRuntime()——
+   * lazy；避免 agyBridgeIpc → agentIpc 静态 import 环，mirror deps.registry() 注入缝形态）。
+   * 缺席（测试/未装配环境）→ ctx 省略 skillExecutor，工具自身 graceful 降级（"no runtime
+   * bound"）与 HTTP 车道 mock 形态同源。
+   */
+  agentRuntime?: () => SkillExecutorRef;
+  /**
+   * 09-20 F17 W1（design §1.4）：activeSkill 收窄预埋——本地工具结果 metadata.activeSkill
+   * → 会话级 allowedTools（比 runLoop 的 per-run 更长命）；闸1b assertToolAllowed 传参消费
+   * （函数已支持，同源 loop.ts:529-534）。skill 族缓入桥面（design §2）——此线暂零消费者，
+   * 预埋不删（skill 族入面即收窄生效）。
+   */
+  activeSkillAllowedTools?: string[];
 }
 
 /** mcpServer → shell 管道帧（行分隔 JSON；projectDir/sessionId 不上线——token 解析）。 */
@@ -494,24 +573,55 @@ export function bridgePipeName(pipeId: string): string {
 /**
  * 单个工具调用的三道闸执行路径（§5.2——与 runLoop 派发段同一 toolPolicy 模块等价重建）：
  *   闸1 面外（会话注册面）拒 → MCP 错误结果；
- *   闸1b assertToolAllowed（会话权限档）拒 → 错误结果（文案原样回给模型，同 runLoop 语义）；
+ *   闸1b assertToolAllowed（会话权限档 + activeSkill 收窄预埋）拒 → 错误结果（文案原样回给
+ *       模型，同 runLoop 语义）；
  *   闸2 enforceAutoApplyTier：非 auto 档 diff 家族 autoApply 强制 false（suggest 恒走
  *       patch 人审的产品承诺在桥下不破）；
  *   闸3 shouldGateAutoApply：首发未自审 → **不执行**，闸门提示文案作为工具结果返回
  *       （模型读结果重发即放行——载体从合成消息变工具结果文本，语义同源）；
- *   通过 → handleToolExecute（统一通道）。
+ *   通过 → 本地工具分派（09-20 F17 W1，design §1.2）：agent 库 registry 本地件命中 →
+ *       进程内 ToolContext 执行 `tool.execute(params, ctx)`（ctx 八字段同源基准
+ *       loop.ts:497-507）；未命中 → handleToolExecute（统一通道——代理工具直达 shell
+ *       handler，remoteToolProxy 不绕 registry 一圈）。G1 主缺口（write_chapter 面内但
+ *       死在 shell handlers 无此 id 的 Unknown tool）由此解——工具本体单源，无平行实现。
  */
 export async function executeBridgeToolCall(
   record: BridgeSessionRecord,
   toolId: string,
   args: unknown,
 ): Promise<{ ok: true; output: string; metadata?: Record<string, unknown>; gate?: 'self-review' } | { ok: false; error: string; gate?: 'face' | 'policy' }> {
+  // CR-2（09-21 三层 CR）：pre-dispatch abort 检查——mirror loop.ts 执行前 cancel-stub
+  // （loop.ts:511-525）。用户中止后管道里排队的 call 帧不再执行（防 post-abort 副作用：
+  // write_chapter / dispatch_* 类长链在中止后仍会落盘/外派）。
+  if (record.abortController.signal.aborted) {
+    return { ok: false, error: '会话已被用户中止，本次工具调用不再执行' };
+  }
   if (!record.faceNames.has(toolId)) {
+    // CR-3（09-21 三层 CR，G4 收口）：闸拒绝同样留宿主日志——「模型调了、日志全零」
+    // 取证盲区最常见类（面外拒绝此前零留痕）。
+    logger.warn(
+      { component: 'agy-bridge', sessionId: record.sessionId, tool: toolId },
+      '[agy-bridge] 面外工具调用拒绝',
+    );
     return { ok: false, error: `工具 ${toolId} 不在本次会话可用的工具面内`, gate: 'face' };
   }
   try {
-    assertToolAllowed({ toolName: toolId, sessionMode: record.permissionMode });
+    assertToolAllowed({
+      toolName: toolId,
+      sessionMode: record.permissionMode,
+      // 09-20 F17 W1（design §1.4）：activeSkill 收窄预埋——本地工具结果 metadata.activeSkill
+      // 已写入 record.activeSkillAllowedTools 后由本闸收窄（同源 loop.ts:529-534）。skill 族
+      // 缓入桥面，此参数暂恒 undefined——预埋不删。
+      ...(record.activeSkillAllowedTools !== undefined
+        ? { activeSkillAllowedTools: record.activeSkillAllowedTools }
+        : {}),
+    });
   } catch (err) {
+    // CR-3（同上）：权限闸拒绝留痕。
+    logger.warn(
+      { component: 'agy-bridge', sessionId: record.sessionId, tool: toolId },
+      `[agy-bridge] 权限闸拒绝：${err instanceof Error ? err.message : String(err)}`,
+    );
     return { ok: false, error: err instanceof Error ? err.message : String(err), gate: 'policy' };
   }
   const params = (args !== null && typeof args === 'object' && !Array.isArray(args)
@@ -519,8 +629,71 @@ export async function executeBridgeToolCall(
     : {}) as Record<string, unknown>;
   const enforced = enforceAutoApplyTier(toolId, params, record.permissionMode) as Record<string, unknown>;
   if (shouldGateAutoApply(toolId, enforced)) {
+    // CR-3：自审闸 mirror loop.ts 语义用 info（流程提示非失败，不进错误口径）。
+    logger.info(
+      { component: 'agy-bridge', sessionId: record.sessionId, tool: toolId },
+      'autoApply self-review gate: intercepted (bridge lane)',
+    );
     return { ok: true, output: AUTO_APPLY_SELF_REVIEW_MESSAGE, metadata: { bridgeGate: 'self-review' }, gate: 'self-review' };
   }
+
+  // ── 09-20 F17 W1：本地工具分派（design §1.2/§1.3）──
+  const localTool = getLocalToolDefinition(toolId);
+  if (localTool !== undefined) {
+    // idle 续活（design §4-2）：本地工具执行起止各 touch 一次——write_chapter 整链可远超
+    // 30min，链内事件不经管道（帧口径活动），不 touch 会被 idle 清扫误杀在途链。
+    record.lastActivityAt = Date.now();
+    try {
+      let skillExecutor: SkillExecutorRef | undefined;
+      try {
+        skillExecutor = record.agentRuntime?.();
+      } catch (err) {
+        // CR-4（09-21 三层 CR）：吞错不再静默——装配竞态降级也留痕（与 G4 纪律一致）。
+        logger.warn(
+          { component: 'agy-bridge', sessionId: record.sessionId },
+          `[agy-bridge] agentRuntime 取件失败，skillExecutor 省略：${err instanceof Error ? err.message : String(err)}`,
+        );
+        skillExecutor = undefined;
+      }
+      const ctx: ToolContext = {
+        sessionId: record.sessionId,
+        projectPath: record.projectDir,
+        abort: record.abortController.signal,
+        ...(skillExecutor !== undefined ? { skillExecutor } : {}),
+        spawnDepth: 0,
+        ...(record.emitChainEvent !== undefined ? { emitChainEvent: record.emitChainEvent } : {}),
+        ...(record.emitChildEvent !== undefined ? { emitChildEvent: record.emitChildEvent } : {}),
+        // emitConfirmation: undefined——skill 族缓入面（design §2），此字段暂无消费面。
+      };
+      const result = await localTool.execute(enforced, ctx);
+      record.lastActivityAt = Date.now();
+      // activeSkill 预埋（design §1.4）：metadata.activeSkill → 会话级收窄面。只写不删——
+      // skill 族入面即生效。presentResult 的 metadata 不消费：协议层 notePresentResult
+      //（bridgeTurn 流事件 + 管道通知帧双源）已覆盖（已文档化差异 design §7-1）。
+      const activeSkill = result.metadata?.activeSkill;
+      if (activeSkill !== null && typeof activeSkill === 'object') {
+        const allowedTools = (activeSkill as { allowedTools?: unknown }).allowedTools;
+        if (Array.isArray(allowedTools)) {
+          record.activeSkillAllowedTools = allowedTools.filter((t): t is string => typeof t === 'string');
+        }
+      }
+      return {
+        ok: true,
+        output: result.output,
+        ...(result.metadata !== undefined ? { metadata: result.metadata } : {}),
+      };
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+      // G4：现状只把错误回模型零落日志——「Unknown tool 与 write_chapter 双零」取证盲区
+      // 成因之一。本地分支与 shell 分支统一 warn 留痕。
+      logger.warn(
+        { component: 'agy-bridge', sessionId: record.sessionId, tool: toolId },
+        `[agy-bridge] 本地工具执行失败：${error}`,
+      );
+      return { ok: false, error };
+    }
+  }
+
   try {
     const result = await handleToolExecute({
       toolId,
@@ -531,7 +704,13 @@ export async function executeBridgeToolCall(
     });
     return { ok: true, output: result.output, metadata: result.metadata };
   } catch (err) {
-    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    const error = err instanceof Error ? err.message : String(err);
+    // G4：同上——shell 执行路径失败也留痕（此前 Unknown tool 类调用零日志）。
+    logger.warn(
+      { component: 'agy-bridge', sessionId: record.sessionId, tool: toolId },
+      `[agy-bridge] 工具执行失败：${error}`,
+    );
+    return { ok: false, error };
   }
 }
 
@@ -686,7 +865,11 @@ export function createAgyBridgeRegistry(opts: AgyBridgeRegistryOptions = {}): Ag
   };
 
   const closeRecord = (record: BridgeSessionRecord): void => {
-    record.abortController.abort(new Error('agy bridge session revoked'));
+    const revokeReason = new Error('agy bridge session revoked');
+    // CR-1（09-21 三层 CR）：reason 须 AbortError 形——isAbortLikeError 只认
+    // name === 'AbortError'，裸 Error 会被下游当普通失败误分类。
+    revokeReason.name = 'AbortError';
+    record.abortController.abort(revokeReason);
     try {
       record.pipeServer?.close();
       // 在途 socket 强断（ typings 版本未含该方法——运行时 Node ≥18.2 恒有；可选调用）。
@@ -728,6 +911,13 @@ export function createAgyBridgeRegistry(opts: AgyBridgeRegistryOptions = {}): Ag
           || JSON.stringify(existing.face) !== JSON.stringify(input.face);
         if (!configChanged) {
           // 幂等：完全相同输入直接复用管道/token（同会话后续 turn）。
+          if (existing.abortController.signal.aborted) {
+            // CR-1（09-21 三层 CR）：abort 时无在途 turn 则无 revoke 路径——记录残留
+            // 毒化控制器（后续本地工具全瞬败）。复用即检测，重建控制器：abort 只为取消
+            // 在途执行，不应毒化会话余下生命周期。
+            existing.abortController = new AbortController();
+            warn(`[agy-bridge] 中止后会话复用，重建 abort 控制器（session=${input.sessionId}）`);
+          }
           touchActivity(existing);
           return { pipeName: existing.pipeName, token: existing.token };
         }
@@ -875,6 +1065,24 @@ export function setProductionAgyBridgeRuntime(
 /** 生产注册表（未装配 → undefined——调用方按未配置处理，不 throw）。 */
 export function getProductionAgyBridgeRegistry(): AgyBridgeRegistry | undefined {
   return productionRegistry;
+}
+
+/**
+ * 09-20 F17 W3（design §4-1）：UI 停止钮联动——abort 指定桥会话的在途本地工具执行
+ * （本地执行缝 ToolContext.abort 持 record.abortController.signal；abort 后 write_chapter
+ * 整链经 throwIfAborted 一并终止。此前用户点停止只 abort runtime/IPC 控制器，桥上链会
+ * 继续跑到完成/自身失败）。只 abort 不 revoke——会话销毁归 turn 生产的 abort catch
+ * 路径（既有 revoke 语义，turn 级所有权）。无会话 → false（幂等）。
+ */
+export function abortBridgeSession(sessionId: string): boolean {
+  const record = productionRegistry?.getSession(sessionId);
+  if (record === undefined) return false;
+  const reason = new Error('agy bridge session aborted by user');
+  // CR-1（09-21 三层 CR）：reason 须 AbortError 形——isAbortLikeError 只认
+  // name === 'AbortError'，裸 Error 会被下游当普通失败误分类（abort 分类链断裂）。
+  reason.name = 'AbortError';
+  record.abortController.abort(reason);
+  return true;
 }
 
 /** 生产同意存储（懒建；路径单源 defaultAgyBridgeConsentFilePath）。 */

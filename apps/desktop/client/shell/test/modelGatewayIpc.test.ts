@@ -22,10 +22,17 @@ vi.mock('electron', () => ({
 
 import { _setModelConfigDirForTest, registerConfigIpc } from '../main/ipc/configIpc';
 import { enrichSlotAssignment, handleGenerateText, handleGenerateTextStream, registerModelGatewayIpc, resolveEmbeddingModel, resolveModel, wasAntigravityCliUsed, _resetAntigravityCliUsedForTest, _resetLaneWarnForTest } from '../main/ipc/modelGatewayIpc';
+import { _resetBreakerForTest } from '../main/ipc/circuitBreaker';
 import { ProtocolTimeoutError, setAntigravityCliGenerateForTest } from '@orison/model-protocols';
 
 const TEST_MODEL_DIR = path.join(process.cwd(), 'test-tmp-model-gateway');
 const ORIGINAL_FETCH = globalThis.fetch;
+
+// C3.2 W1：熔断进程内态跨用例复位——本文件多处故意打 eligible 失败（超时/5xx），
+// 不复位会在套件 <60s 窗口内跨用例累计中途 open，制造顺序依赖红（顶层兜住全部 describe）。
+beforeEach(() => {
+  _resetBreakerForTest();
+});
 
 /**
  * 挂死 fetch（死端点形态）：只在所持 signal 中止时 reject。CR-34/CR-35 各用例共用——

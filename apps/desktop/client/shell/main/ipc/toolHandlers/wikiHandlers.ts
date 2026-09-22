@@ -44,7 +44,8 @@ import type { ToolHandler, ToolExecuteResponse } from './types';
 export const WIKITEXT_CAP = 16_000;
 const SEARCH_LIMIT_MIN = 1;
 const SEARCH_LIMIT_MAX = 10;
-const DEFAULT_SEARCH_LIMIT = 10;
+/** 站内搜索默认 limit（E10.4 materials:search-online wiki 车道同源引用）。 */
+export const DEFAULT_SEARCH_LIMIT = 10;
 const DEFAULT_READ_SITE_ID = 'moegirl-cn';
 /**
  * wiki_read degradation budget (P17, CR 2026-08-15): primary + fallback sites
@@ -419,6 +420,64 @@ export function coerceSearchParams(
   return { query, site, limit };
 }
 
+/** One per-site search outcome（E10.4 materials:search-online 合并消费面）。 */
+export interface WikiSiteSearchEntry {
+  site: WikiSite;
+  hits: WikiSearchHit[];
+  error?: string;
+}
+
+export interface WikiSiteSearchInput {
+  /** 本轮目标站（handler = resolveTargetSites 结果；search-online = 全注册表）。 */
+  sites: readonly WikiSite[];
+  query: string;
+  limit: number;
+  /** SSRF allowlist（调用方按 wikiOutboundAllowlist(sites) 装配——信任=加入 allowlist）。 */
+  allowlist: readonly string[];
+  signal: AbortSignal;
+  /** Per-host throttle gate（缺省模块级 defaultWikiGate）。 */
+  gate?: EngineGate;
+  /** JSON fetcher seam（缺省 netFetchJson）。 */
+  fetchJson?: WikiJsonFetcher;
+  /** SSRF guard seam（缺省 assertPublicHttpUrl）。 */
+  guard?: (url: string, allowlist: readonly string[]) => Promise<void>;
+}
+
+/**
+ * Per-site wiki 搜索核心（E10.4 W2 自 createWikiSearchHandler 提取的复用面——wiki_search
+ * handler 与 materials:search-online 两消费站）：逐站顺序（registry 序 = 优先级；per-host
+ * gate 节流），单站失败落 error 不抛（never-throws，调用方汇总 notes）。
+ */
+export async function runWikiSiteSearches(input: WikiSiteSearchInput): Promise<WikiSiteSearchEntry[]> {
+  const gate = input.gate ?? defaultWikiGate;
+  const fetchJson = input.fetchJson ?? netFetchJson;
+  const guard = input.guard ?? assertPublicHttpUrl;
+  const perSite: WikiSiteSearchEntry[] = [];
+  for (const site of input.sites) {
+    if (input.signal.aborted) break; // P17 symmetry: stop between sites on abort
+    const url = site.searchKind === 'fulltext'
+      ? fulltextSearchUrl(site, input.query, input.limit)
+      : opensearchUrl(site, input.query, input.limit);
+    await gate.acquire(siteHost(site));
+    let guarded: WikiJsonResult | null = null;
+    try {
+      await guard(url, input.allowlist);
+    } catch (err) {
+      guarded = { ok: false, status: 0, error: err instanceof Error ? err.message : String(err) };
+    }
+    const res = guarded ?? await fetchJson(url, input.signal);
+    if (!res.ok || res.json === undefined || extractApiError(res.json) !== undefined) {
+      perSite.push({ site, hits: [], error: describeFetchFailure(res) });
+    } else {
+      const hits = site.searchKind === 'fulltext'
+        ? parseFulltextSearchResponse(res.json, site)
+        : parseOpenSearchResponse(res.json, site);
+      perSite.push({ site, hits });
+    }
+  }
+  return perSite;
+}
+
 export function createWikiSearchHandler(deps: WikiHandlerDeps = {}): ToolHandler {
   const resolveSites = (): readonly WikiSite[] => deps.sites ?? resolveActiveSites();
   const gate = deps.gate ?? defaultWikiGate;
@@ -446,29 +505,7 @@ export function createWikiSearchHandler(deps: WikiHandlerDeps = {}): ToolHandler
     const allowlist = wikiOutboundAllowlist(sites);
     // Sequential per-site queries (registry order = priority; the per-host gate
     // spaces repeat calls to the same host, different hosts don't wait).
-    const perSite: { site: WikiSite; hits: WikiSearchHit[]; error?: string }[] = [];
-    for (const site of targets) {
-      if (abort.aborted) break; // P17 symmetry: stop between sites on abort
-      const url = site.searchKind === 'fulltext'
-        ? fulltextSearchUrl(site, query, limit)
-        : opensearchUrl(site, query, limit);
-      await gate.acquire(siteHost(site));
-      let guarded: WikiJsonResult | null = null;
-      try {
-        await guard(url, allowlist);
-      } catch (err) {
-        guarded = { ok: false, status: 0, error: err instanceof Error ? err.message : String(err) };
-      }
-      const res = guarded ?? await fetchJson(url, abort);
-      if (!res.ok || res.json === undefined || extractApiError(res.json) !== undefined) {
-        perSite.push({ site, hits: [], error: describeFetchFailure(res) });
-      } else {
-        const hits = site.searchKind === 'fulltext'
-          ? parseFulltextSearchResponse(res.json, site)
-          : parseOpenSearchResponse(res.json, site);
-        perSite.push({ site, hits });
-      }
-    }
+    const perSite = await runWikiSiteSearches({ sites: targets, query, limit, allowlist, signal: abort, gate, fetchJson, guard });
 
     const merged = mergeSearchHits(perSite.map((p) => ({ site: p.site, hits: p.hits }))).slice(0, limit);
     const notes: string[] = [];

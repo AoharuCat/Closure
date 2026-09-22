@@ -26,6 +26,7 @@ import {
   extractReasoningMiddleware,
 } from 'ai';
 import { createOpenAI } from '@ai-sdk/openai';
+import { randomUUID } from 'node:crypto';
 import { base64ToBlob, getInsecureDispatcher, normalizeBaseUrl, postJson, postMultipart, postSse } from './http';
 import { normalizeImageResponse } from './imageNormalize';
 import {
@@ -38,8 +39,15 @@ import {
 } from './errors';
 import { withRetry, isRetryableProtocolError } from './retry';
 import type { GenerationDelta, ProtocolCallContext } from './types';
-import { antigravityCliGenerateText } from './antigravityCli/driver';
-import { dispatchGenerationCallRecord } from './usageSink';
+import { antigravityCliGenerateText, readCliAttemptUsage } from './antigravityCli/driver';
+import {
+  dispatchGenerationCallRecord,
+  enforceBudgetGateOrThrow,
+  truncateForLedger,
+  usageToLedgerTokenFields,
+  withEntryUsageMetering,
+  type AttemptMeteringRecord,
+} from './usageSink';
 
 // 09-12 agy provider：GenerationDelta 已迁至 types.ts（driver 同型消费免环）；此处
 // 再导出保既有 `from './generate'` / 包入口导入路径零变化。
@@ -952,13 +960,11 @@ function mapAnthropicFinishReason(raw: string | null | undefined): GenerationFin
 //
 // CR-18 零伪造：usage 单源 = response.usage，缺的计数器落 ABSENT（≠0）、totalTokens
 // 缺席不由 input+output 合成；失败行 token 恒 ABSENT（abort/中断的部分消耗不可知）。
+// C3.1 v2 演进：CLI attempt 旁挂 usage 在场则如实落列（「未知才 ABSENT」，见 catch）。
 
-/** 失败行错误摘要上限（design §2 error_message 列口径：≤500 字符，本地 db 无外发）。 */
-const LEDGER_ERROR_MESSAGE_CHAR_CAP = 500;
-
-function truncateForLedger(value: string): string {
-  return value.length > LEDGER_ERROR_MESSAGE_CHAR_CAP ? value.slice(0, LEDGER_ERROR_MESSAGE_CHAR_CAP) : value;
-}
+// 截断常量/usage→token 字段映射已上收 usageSink.ts（C3.1：三新入口 wrapper 与 CLI
+// attempt 收集器共用单源）——LEDGER_ERROR_MESSAGE_CHAR_CAP / truncateForLedger /
+// usageToLedgerTokenFields。
 
 /** 计量 wrapper 的 run 钩子：markFirstDelta 在首个 delta 抵达时调（流式 first_delta_ms）。 */
 type UsageMeteringHooks = { markFirstDelta: () => void };
@@ -967,11 +973,27 @@ async function withUsageMetering(
   meta: {
     model: ResolvedModel;
     request: TextGenerationRequest;
-    ctx: ProtocolCallContext | undefined;
+    /** 入口归一后的 ctx（withLedgerCallContext 唯一装配）——callId 保证在场，CLI attempt 收集器与之同源。 */
+    ctx: ProtocolCallContext;
     stream: boolean;
   },
   run: (hooks: UsageMeteringHooks) => Promise<TextGenerationResponse>,
 ): Promise<TextGenerationResponse> {
+  // C3.2 W3：预算硬线前置门（wrapper 族五入口共享单源 enforceBudgetGateOrThrow）——
+  // 被拦落 budget 失败行后抛 BudgetExceededError（'budget' ineligible 链不烧），run 与
+  // CLI 早退分派都不发起。放行 → 零开销穿过（字节级无 gate 现行为）。
+  enforceBudgetGateOrThrow({
+    ts: Date.now(),
+    protocol: meta.model.protocol,
+    keyId: meta.model.keyId,
+    modelId: meta.model.modelId,
+    taskType: meta.request.taskType,
+    lane: meta.ctx.lane,
+    sessionKey: meta.request.sessionKey,
+    callId: meta.ctx.callId,
+    sessionId: meta.ctx.sessionId,
+    stream: meta.stream,
+  });
   const startedAt = Date.now();
   let firstDeltaAt: number | undefined;
   const identity = {
@@ -980,8 +1002,12 @@ async function withUsageMetering(
     keyId: meta.model.keyId,
     modelId: meta.model.modelId,
     taskType: meta.request.taskType,
-    lane: meta.ctx?.lane,
+    lane: meta.ctx.lane,
     sessionKey: meta.request.sessionKey,
+    // C3.1：callId/sessionId 由入口归一保证（withLedgerCallContext）——最终行与 CLI
+    // attempt 收集器行共享同一 call_id。
+    callId: meta.ctx.callId,
+    sessionId: meta.ctx.sessionId,
     stream: meta.stream,
   };
   try {
@@ -993,12 +1019,8 @@ async function withUsageMetering(
     dispatchGenerationCallRecord({
       ...identity,
       success: true,
-      inputTokens: response.usage?.promptTokens,
-      outputTokens: response.usage?.completionTokens,
-      thinkingTokens: response.usage?.thinkingTokens,
-      cacheReadTokens: response.usage?.cacheReadTokens,
-      // 缺席不合成（CR-18）——provider 没报 total 就记 ABSENT。
-      totalTokens: response.usage?.totalTokens,
+      // usage 单源映射（CR-18：缺席计数器 ABSENT ≠0，total 缺席不合成）。
+      ...usageToLedgerTokenFields(response.usage),
       latencyMs: Date.now() - startedAt,
       firstDeltaMs: firstDeltaAt !== undefined ? firstDeltaAt - startedAt : undefined,
     });
@@ -1007,15 +1029,102 @@ async function withUsageMetering(
     // 分类单源 = 子2 classifyGenerationFailure（errors.ts）——失败行 error_kind 与回退
     // 环 trace.reason 同一判据（行级可对账）。原样重抛：溢出标记/abort/中断语义全保。
     const classified = classifyGenerationFailure(err);
+    // C3.1 M1（CR-18 v2「未知才 ABSENT」）：CLI 空 SUCCESS 错误对象旁挂的 attempt usage
+    // （driver tagCliEmptySuccess 同点挂）在场则如实落列——失败行不再恒无计量；无旁挂时
+    // token 位保持 ABSENT（原形态零变化）。
+    const attemptUsage = readCliAttemptUsage(err);
     dispatchGenerationCallRecord({
       ...identity,
       success: false,
       errorKind: classified.kind,
       errorMessage: truncateForLedger(errorMessage(err)),
+      ...(attemptUsage !== undefined ? usageToLedgerTokenFields(attemptUsage) : {}),
       latencyMs: Date.now() - startedAt,
       firstDeltaMs: firstDeltaAt !== undefined ? firstDeltaAt - startedAt : undefined,
     });
     throw err;
+  }
+}
+
+/**
+ * C3.1：sessionId 归一单源（CR-7 复核）：trim 后判空——'' 与 whitespace-only 同归
+ * ABSENT（空白垃圾落列 = DB 非 NULL 脏值，违两态纪律）；有效值落 trim 后形态
+ * （终端列不存首尾空白）。wire（agent 缝 as any 直调豁免 zod parse）与 ctx 两通道
+ * 同防线（schema transform 兜不到直调缝）。
+ */
+function normalizeLedgerSessionId(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed !== undefined && trimmed.length > 0 ? trimmed : undefined;
+}
+
+/**
+ * C3.1：入口级 ctx 归一（generateText / generateTextStream 两入口唯一装配点）。
+ * callId 缺省自生成——每入口调用恰一次，wrapper 最终行与 CLI attempt 收集器行共享同一
+ * id；sessionId 从 wire request 归一（normalizeLedgerSessionId：'' / whitespace-only
+ * 防线兜底）。无可补字段时返回原引用（既有调用方零分配快径）。
+ */
+function withLedgerCallContext(ctx: ProtocolCallContext | undefined, request: TextGenerationRequest): ProtocolCallContext {
+  const wireSessionId = normalizeLedgerSessionId(request.sessionId);
+  const ctxSessionId = normalizeLedgerSessionId(ctx?.sessionId);
+  const needsRebuild =
+    ctx?.callId === undefined ||
+    (ctxSessionId === undefined && wireSessionId !== undefined) ||
+    ctx?.sessionId !== ctxSessionId;
+  if (!needsRebuild && ctx !== undefined) return ctx;
+  return {
+    ...ctx,
+    callId: ctx?.callId ?? randomUUID(),
+    sessionId: ctxSessionId ?? wireSessionId,
+  };
+}
+
+// ── C3.1：CLI attempt 级记账收集器（design §4）────────────────────────────────
+//
+// driver 不直接 dispatch——被弃/失败 attempt 的计量事实经 ctx.onMeteringAttempt 上抛，
+// 本收集器（CLI 早退分支内组装）统一 dispatch（发射面单点 = wrapper 族 + 本收集器，
+// 零业务散点）。行身份取入口归一后的 ledgerCtx——callId 与外层 wrapper 最终行同源，
+// 一次逻辑调用的全部行（attempts + final）共享 call_id。finally = 成败两路都落行
+// （driver 抛错时 attempt 行先于 wrapper 最终失败行 dispatch——时间序即账序）。
+
+async function runCliWithAttemptLedger(
+  model: ResolvedModel,
+  request: TextGenerationRequest,
+  ledgerCtx: ProtocolCallContext,
+  /** 入口实际形态（CR-1 复核：generateText=false / generateTextStreamInner CLI 分支=true）——attempt 行如实落列，不恒标非流。 */
+  stream: boolean,
+  runDriver: (collectorCtx: ProtocolCallContext) => Promise<TextGenerationResponse>,
+): Promise<TextGenerationResponse> {
+  const collected: AttemptMeteringRecord[] = [];
+  const collectorCtx: ProtocolCallContext = {
+    ...ledgerCtx,
+    // 本缝是 generate.ts↔driver 的内部约定（网关/业务调用方不传 onMeteringAttempt——
+    // types.ts ctx 注释），此处覆写安全。
+    onMeteringAttempt: (rec) => {
+      collected.push(rec);
+    },
+  };
+  try {
+    return await runDriver(collectorCtx);
+  } finally {
+    for (const rec of collected) {
+      dispatchGenerationCallRecord({
+        ts: Date.now(),
+        protocol: model.protocol,
+        keyId: model.keyId,
+        modelId: model.modelId,
+        taskType: request.taskType,
+        lane: ledgerCtx.lane,
+        sessionKey: request.sessionKey,
+        callId: ledgerCtx.callId,
+        sessionId: ledgerCtx.sessionId,
+        stream,
+        success: rec.success,
+        ...(rec.errorKind !== undefined ? { errorKind: rec.errorKind } : {}),
+        ...(rec.errorMessage !== undefined ? { errorMessage: truncateForLedger(rec.errorMessage) } : {}),
+        ...usageToLedgerTokenFields(rec.usage),
+        latencyMs: rec.latencyMs,
+      });
+    }
   }
 }
 
@@ -1024,16 +1133,21 @@ export async function generateText(
   request: TextGenerationRequest,
   ctx?: ProtocolCallContext,
 ): Promise<TextGenerationResponse> {
-  return withUsageMetering({ model, request, ctx, stream: false }, () => {
+  const ledgerCtx = withLedgerCallContext(ctx, request);
+  return withUsageMetering({ model, request, ctx: ledgerCtx, stream: false }, () => {
     // 09-12 agy provider（design §1 复核 H2）：CLI 形态顶部早退——先于一切重试/降级包装。
     // 否则 CLI 502 会落进 generateTextInternal 的 catch（max_tokens 兼容重试 / thinking 剥离
     // 重试）甚至流式层的「回退非流式重发」= 静默冷重启全量重发一次，违反「driver 内不自动
     // 重试」（重试/回退归调用方与子2 链）。CLI 路径自身无超时/护栏包装（print-timeout 即
     // 唯一时长闸，外层兜底在 driver 内）。
     if (model.protocol === 'antigravity-cli') {
-      return antigravityCliGenerateText(model, request, ctx);
+      // C3.1：attempt 收集器同罩（空 SUCCESS 重试 / 降级重跑两族每 attempt 落行，
+      // design §4 时序）；入口形态 = 非流式（CR-1）。
+      return runCliWithAttemptLedger(model, request, ledgerCtx, false, (collectorCtx) =>
+        antigravityCliGenerateText(model, request, collectorCtx),
+      );
     }
-    return generateTextInternal(model, request, ctx, {});
+    return generateTextInternal(model, request, ledgerCtx, {});
   });
 }
 
@@ -1493,26 +1607,32 @@ export async function generateTextStream(
   // 09-12 usage-panel（design §1）：计量 wrapper 最外层——CLI 早退在 wrapper 之内（CLI
   // 调用同落行）；首 delta 经 meteredOnDelta 打点（first_delta_ms），与内部
   // state.producedDelta 判定互不干扰（同一 onDelta 链，纯增量观察）。
-  return withUsageMetering({ model, request, ctx, stream: true }, ({ markFirstDelta }) => {
+  const ledgerCtx = withLedgerCallContext(ctx, request);
+  return withUsageMetering({ model, request, ctx: ledgerCtx, stream: true }, ({ markFirstDelta }) => {
     const meteredOnDelta = (d: GenerationDelta) => {
       markFirstDelta();
       onDelta(d);
     };
-    return generateTextStreamInner(model, request, ctx, meteredOnDelta);
+    return generateTextStreamInner(model, request, ledgerCtx, meteredOnDelta);
   });
 }
 
 async function generateTextStreamInner(
   model: ResolvedModel,
   request: TextGenerationRequest,
-  ctx: ProtocolCallContext | undefined,
+  ctx: ProtocolCallContext,
   onDelta: (d: GenerationDelta) => void,
 ): Promise<TextGenerationResponse> {
   // 09-12 agy provider（复核 H2）：CLI 形态顶部早退——不经本函数的流式韧性层（快速
   // 重试 / 首事件窗 / 非流式回退对 CLI 形态全部不适用——那是 SSE 语义；agy stream-json
   // 的事件活性由 driver 的外层兜底罩）。流式/非流式两态在 driver 内单实现消费。
   if (model.protocol === 'antigravity-cli') {
-    return antigravityCliGenerateText(model, request, ctx, onDelta);
+    // C3.1：attempt 收集器同罩流式车道（空 SUCCESS 重试 / 降级重跑两族在流式车道
+    // 同样发生——driver 两态单实现消费）。ctx 已由入口归一（callId 保证在场）；
+    // 入口形态 = 流式（CR-1：attempt 行如实落 stream=true）。
+    return runCliWithAttemptLedger(model, request, ctx, true, (collectorCtx) =>
+      antigravityCliGenerateText(model, request, collectorCtx, onDelta),
+    );
   }
   // 09-12 子3 §4.2：流式入口顶部归一（CLI 早退之后——CLI 键无 defaultTemperature，
   // refine 拒收，归一对 CLI 是恒等）。降级重入 generateTextInternal 时二次归一 no-op。
@@ -2713,10 +2833,15 @@ export async function generateImage(
   request: ImageGenerationRequest,
   ctx?: ProtocolCallContext,
 ): Promise<ImageGenerationResponse> {
-  if (request.image) {
-    return editImage(model, request, ctx);
-  }
-  return generateFromPrompt(model, request, ctx);
+  // C3.1（D1 拍板）：记行 + image_count 张数列——图像 API 无 token 信号，token 列如实
+  // 全 ABSENT（usageOf 缺省），张数是唯一可如实记的量纲。taskType 走 ctx 通道（网关
+  // handler 标 'image-gen'，W3 接线）。分派 generateFromPrompt/editImage 两路罩在同一
+  // 行内（一条逻辑调用恒一行）。
+  return withEntryUsageMetering(
+    { model, ctx, imageCount: request.n ?? 1 },
+    (err) => classifyGenerationFailure(err).kind,
+    () => (request.image ? editImage(model, request, ctx) : generateFromPrompt(model, request, ctx)),
+  );
 }
 
 async function generateFromPrompt(
@@ -2807,6 +2932,21 @@ type OpenAiEmbeddingResponse = {
 };
 
 export async function generateEmbeddings(
+  model: ResolvedModel,
+  request: EmbeddingRequest,
+  ctx?: ProtocolCallContext,
+): Promise<EmbeddingResponse> {
+  // C3.1：计量 wrapper（design §1）——usage {promptTokens,totalTokens} 有则记，
+  // outputTokens 端点不报恒 ABSENT（CR-18 缺席≠0）；taskType 走 ctx 通道（'kb-index-embed'
+  // / 'kb-query-embed' 等由调用方透传，W3 接线）。
+  return withEntryUsageMetering(
+    { model, ctx, usageOf: (r) => r.usage },
+    (err) => classifyGenerationFailure(err).kind,
+    () => generateEmbeddingsInternal(model, request, ctx),
+  );
+}
+
+async function generateEmbeddingsInternal(
   model: ResolvedModel,
   request: EmbeddingRequest,
   ctx?: ProtocolCallContext,

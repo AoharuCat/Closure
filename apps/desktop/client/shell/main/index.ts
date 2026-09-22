@@ -43,8 +43,8 @@ import { registerAgyBridgeIpc, wasAgyBridgeUsed } from './ipc/agyBridgeIpc';
 import { reconcileTextAgentAtStartupProduction, registerAgyTextAgentIpc } from './ipc/agyTextAgentIpc';
 // 09-12 usage-panel（子5 W3）：应用内用量面两通道（usage:overview / usage:clear）+
 // 计量 sink 生产装配（installUsageMeteringProduction——协议层 wrapper → closure_llm_log
-// 落行，全仓唯一装配点）。
-import { installUsageMeteringProduction, registerUsageIpc } from './ipc/usageIpc';
+// 落行，全仓唯一装配点）+ C3.2 W3 月度预算硬线门装配（installBudgetGateProduction）。
+import { installBudgetGateProduction, installUsageMeteringProduction, registerUsageIpc } from './ipc/usageIpc';
 // 09-12 usage-panel（子5 R5）：启动期滚动保留裁剪（retention 带外值 clamp 单源归位）。
 import { pruneExpiredLedger } from './db/llmUsageLedgerRepository';
 import { registerStorySyncIpc } from './ipc/storySyncIpc';
@@ -495,6 +495,9 @@ app.whenReady().then(() => {
   // （先行批已落）→ insertUsageLog 落 closure_llm_log。时序：db 已开（上一步）+ IPC
   // 注册前（任何 generate 都不漏计）；mirror installDeconLlmCoreProduction 先例。
   installUsageMeteringProduction();
+  // C3.2 W3：月度预算硬线 gate 生产装配——紧随 sink 装配（mirror 同点并列纪律；任何
+  // generate 调用先于 IPC 注册期即被 gate 罩住）。gate 闭包自降级（读失败放行 + warn）。
+  installBudgetGateProduction();
   // R5 启动期滚动保留裁剪：过期行删除（读时过滤会让表无界增长）。retention 读侧
   // lenient——preferences 的 usageRetentionDays 经 readUserPreferencesFromDisk 读入并钳回
   // 合法带 [7,730]（缺键/带外 → clamp 默认 90）；prune best-effort（失败不阻启动）。

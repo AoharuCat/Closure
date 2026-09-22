@@ -27,6 +27,9 @@ import type { ChapterChunk } from './closure-retrieval';
 // - C5 已有作品导入：分章能力复用（chapter-splitting.splitChapters）+ 章边界数组形状对齐。
 // - 同1.1 multi-source 摄取：提取器接口（ADR-10）经三预留接入而不改本契约——medium 开放词表
 //   （R1 medium 五值预留）/ kind 开放字符串（event_stream 不拒，AC9）/ 分块策略 seam。
+//   E10.4 在线拉取通道（materials:import-online——provenance.url + via='web-fetch' 预填，
+//   落盘 materials/online/）= 同1.1 社区源摄取的执行面之一；canon 共识整合（FidelityPrincipleSet
+//   消费）归同1.1 按 demonstrated consumer 设计（canon 做薄主消费=同人未动工）。
 
 /**
  * 章界裁决方式（唯一 method 源，F-18：无 material 级冗余字段——分章方法只存在于
@@ -71,7 +74,8 @@ export const MATERIAL_DESCRIPTION_MAX_CHARS = 2000;
  *   `~/.orison/materials/`）。
  * - `via`：解析 provenance（机器可读）。V1 词表 = ParseDocVia 六值
  *   （endpoint-mineru|endpoint-docling|endpoint-custom|builtin-pdfjs|builtin-mammoth|direct-read）
- *   + `builtin-epub`（Story 10.1 新增）+ `builtin-subtitle`（E10.2a 字幕解析新增）。开放字符串：
+ *   + `builtin-epub`（Story 10.1 新增）+ `builtin-subtitle`（E10.2a 字幕解析新增）+
+ *   `web-fetch`（E10.4 在线拉取新增——research session 拉取在线页抽取正文）。开放字符串：
  *   未来提取器路线扩展 via 词表。
  * - `extractor`：提取器标识（ADR-10 提取器接口注册名）；V1 恒 `builtin-text`（小说文本路径）。
  * - `ingestedAt`：摄取完成时刻（ISO 8601）。
@@ -84,6 +88,12 @@ export const MATERIAL_DESCRIPTION_MAX_CHARS = 2000;
  *   缺失（零迁移）；新写入恒带键（F-05「恒在」语义向前延续）——与 author 三字段「缺键即拒」
  *   刻意不对称，换取旧行回读零迁移。上限 MATERIAL_DESCRIPTION_MAX_CHARS（max 只约束非 null
  *   值，CR-6 投影纪律）。
+ * - `url`：〔E10.4〕来源页 URL（在线拉取通道 materials:import-online 预填，via='web-fetch'；
+ *   本地文件材料摄取期恒 null——预填-only 字段，不在 F-05 后补白名单/表单〔updateProvenance
+ *   patch 经 spread 保 url 不清；编辑面按 demonstrated 需求后补〕）。nullable +
+ *   **default(null)**：旧行 provenance_json 无此键回读容忍（零迁移，mirror description
+ *   先例）；同 URL 重导幂等/reingest 判定以落盘路径（stem 含 sha8(url)——W2）+ content_hash
+ *   为键，url 是溯源呈现面。
  */
 export const materialProvenanceSchema = z.object({
   medium: z.string().min(1),
@@ -96,6 +106,7 @@ export const materialProvenanceSchema = z.object({
   lang: z.string().nullable(),
   originDate: z.string().nullable(),
   description: z.string().max(MATERIAL_DESCRIPTION_MAX_CHARS).nullable().default(null),
+  url: z.string().nullable().default(null),
 });
 
 export type MaterialProvenance = z.infer<typeof materialProvenanceSchema>;

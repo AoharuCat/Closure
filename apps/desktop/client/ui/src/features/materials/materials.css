@@ -366,6 +366,19 @@
   opacity: 0.7;
 }
 
+/* 来源三级「原作」徽章（E10.4 W3——craft 讲法 originTier 三色之一：muted 灰系——原作是
+   中性事实非成功态，CR-16；与 --ok 的语义名分离）。 */
+.materials-badge--muted {
+  color: var(--on-surface-variant);
+  opacity: 0.7;
+}
+
+/* 来源三级「社区」徽章（E10.4 W3——craft 讲法 originTier 三色之一：info 蓝）。 */
+.materials-badge--info {
+  background: var(--info);
+  color: var(--surface-container-lowest);
+}
+
 .materials-badge--warn {
   background: var(--error);
   color: var(--surface-container-lowest);
@@ -487,4 +500,233 @@
 
 .materials-form-error {
   color: var(--error);
+}
+
+/* ── 在线导入弹窗（E10.4 W4：URL 直贴 / 关键词搜索两 tab）── */
+.materials-online-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-confirm-dialog);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-xl);
+  background: var(--overlay-backdrop);
+}
+
+.materials-online-dialog {
+  display: flex;
+  flex-direction: column;
+  width: min(680px, calc(100vw - 2rem));
+  max-height: calc(100vh - 2rem);
+  border-radius: var(--radius-lg);
+  background: var(--surface-container-lowest);
+  box-shadow: var(--shadow-soft);
+}
+
+.materials-online-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  padding: var(--space-sm) var(--space-md);
+  border-bottom: 1px solid var(--border-default);
+}
+
+.materials-online-title {
+  font-size: var(--text-md);
+  font-weight: 600;
+  flex: 1;
+}
+
+.materials-online-tabs {
+  display: flex;
+  gap: var(--space-3xs);
+  padding: var(--space-xs) var(--space-md) 0;
+  border-bottom: 1px solid var(--border-default);
+}
+
+.materials-online-tab {
+  border: none;
+  background: transparent;
+  color: var(--on-surface-variant);
+  font-size: var(--text-sm);
+  padding: var(--space-3xs) var(--space-sm);
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+}
+
+.materials-online-tab:hover {
+  color: var(--on-surface);
+}
+
+.materials-online-tab.is-active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  font-weight: 600;
+}
+
+.materials-online-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+  padding: var(--space-md);
+  overflow-y: auto;
+}
+
+.materials-online-pane {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+}
+
+.materials-online-row {
+  display: flex;
+  gap: var(--space-2xs);
+  align-items: center;
+}
+
+.materials-online-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3xs);
+}
+
+.materials-online-field--inline {
+  flex-direction: row;
+  align-items: center;
+  gap: var(--space-2xs);
+}
+
+.materials-online-label {
+  font-size: var(--text-2xs, 10px);
+  color: var(--on-surface-variant);
+}
+
+.materials-online-input,
+.materials-online-select {
+  border: 1px solid var(--border-default);
+  background: var(--input-bg, var(--surface-container-lowest));
+  color: var(--on-surface);
+  border-radius: var(--radius-2xs);
+  padding: var(--space-3xs) var(--space-2xs);
+  font-size: var(--text-sm);
+}
+
+.materials-online-input {
+  flex: 1;
+  min-width: 220px;
+}
+
+.materials-online-input:focus-visible,
+.materials-online-select:focus-visible {
+  border-color: var(--accent);
+}
+
+.materials-online-hint {
+  font-size: var(--text-xs);
+  color: var(--on-surface-variant);
+}
+
+.materials-online-warn {
+  font-size: var(--text-xs);
+  color: var(--warning);
+}
+
+.materials-online-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2xs);
+}
+
+.materials-online-hits {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3xs);
+  max-height: 280px;
+  overflow-y: auto;
+}
+
+.materials-online-hit {
+  display: flex;
+  gap: var(--space-2xs);
+  align-items: flex-start;
+  padding: var(--space-2xs);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-2xs);
+  cursor: pointer;
+}
+
+.materials-online-hit:hover {
+  background: var(--surface-container-low);
+}
+
+.materials-online-hit.is-checked {
+  border-color: var(--accent);
+  background: var(--surface-container-low);
+}
+
+.materials-online-hit-main {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3xs);
+  min-width: 0;
+}
+
+.materials-online-hit-head {
+  display: flex;
+  gap: var(--space-2xs);
+  align-items: center;
+}
+
+.materials-online-hit-title {
+  font-size: var(--text-sm);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.materials-online-hit-snippet {
+  font-size: var(--text-xs);
+  color: var(--on-surface-variant);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.materials-online-hit-url {
+  font-size: var(--text-2xs, 10px);
+  color: var(--on-surface-variant);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.materials-online-results {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3xs);
+  border-top: 1px solid var(--border-default);
+  padding-top: var(--space-2xs);
+}
+
+.materials-online-result {
+  display: flex;
+  gap: var(--space-2xs);
+  align-items: baseline;
+  flex-wrap: wrap;
+  font-size: var(--text-xs);
+}
+
+.materials-online-result--pending {
+  color: var(--on-surface-variant);
+}
+
+.materials-online-result-state--fail {
+  color: var(--error);
+}
+
+.materials-online-result-name {
+  font-weight: 600;
 }

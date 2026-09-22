@@ -189,3 +189,17 @@ describe('query_story 描述更新（Story 8.3——正文段落可查 + 段级�
     }
   });
 });
+
+// ── 09-20 F17（R12 残留措辞统一，F16 同族）：present_result 工具描述（HTTP 车道 leader
+// 可见面——桥车道走 bridgeExecutor 覆写不读此处）。措辞家族四处同步：agents.ts 桥 agent
+// body / bridgeExecutor.ts 覆写 / 本描述 / workflow.ts interaction 能力段（各自有守门断言）。
+// 旧承重词「正文」可被后向推导出「章节正文写在对话里」授权，禁回。──
+describe('present_result 描述措辞（R12 家族 HTTP 站点守门）', () => {
+  it('呈现纪律句用「呈现性回复文字」限定（与桥侧覆写同句基线）；旧「呈现给用户看的正文」禁回', () => {
+    const description = registry.get('present_result')!.description ?? '';
+    expect(description).toContain(
+      '呈现给用户看的呈现性回复文字（讨论/说明/评审等，不含章节正文/改稿产物）必须写在调用本工具的同一条消息里',
+    );
+    expect(description).not.toContain('呈现给用户看的正文');
+  });
+});

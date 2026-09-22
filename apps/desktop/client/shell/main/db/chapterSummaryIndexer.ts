@@ -90,7 +90,8 @@ export type ChapterSummaryReindexDeps = ChapterReindexDeps;
 
 /** 缺省批量 embed（mirror chapterChunkIndexer.defaultEmbedBatch，独立定义避免跨模块私有耦合）。 */
 async function defaultEmbedBatch(model: ResolvedModel, texts: string[]): Promise<number[][]> {
-  const res = await generateEmbeddings(model, { input: texts }, { signal: AbortSignal.timeout(60_000) });
+  // C3.1 计量台账：章摘要重嵌标签（批量调用 = 一行如实）。
+  const res = await generateEmbeddings(model, { input: texts }, { signal: AbortSignal.timeout(60_000), taskType: 'chapter-summary-embed' });
   return res.embeddings;
 }
 

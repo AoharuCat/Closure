@@ -42,6 +42,24 @@ export function sameProjectPath(
 /** 链 IPC 租约 id 前缀（mirror shell agentIpc.CHAIN_RUN_LEASE_ID——UI 包不依赖 shell）。 */
 export const CHAIN_LEASE_ID_PREFIX = 'chain-run:closure';
 
+/**
+ * W4（09-21-subagent-bg-decouple U6 存量债）：会话列表可列判定（客户端防御镜像——权威过滤
+ * 在 shell `agent:list-sessions` handler 的 isListableSession）。消费点：
+ * ① 项目自动接续 `agentSessions.find(...)` 跳过 child/stub（W3 移交项②）；
+ * ② 历史列表如有直列场景的兜底。词表（child 角色 + 链 stub agentName）须与 shell 同步——
+ * 新增 stub agentName 两处同步（closureChainIpc.ts :885/:1668 创建点）。
+ * 本函数住 projectRunBusy（非 api/agent）的原因：api 模块被大量测试文件 vi.mock 整体替换，
+ * 部分工厂缺导出 = 访问即抛（vitest mock getter 语义）；store 级纯函数与路径判等同源不受 mock。
+ */
+const STUB_CHAIN_AGENT_NAMES = new Set(['chapter-chain-dogfood', 'chapter-reextract']);
+
+export function isPrimaryListableSession(
+  s: { sessionRole?: 'primary' | 'child' | 'fork' | null; agentName?: string },
+): boolean {
+  if (s.sessionRole === 'child') return false;
+  return !(s.agentName !== undefined && STUB_CHAIN_AGENT_NAMES.has(s.agentName));
+}
+
 /** 占用者是否链租约（stub 会话 id，不可跳转——CR-T1-030）。 */
 export function isChainLeaseId(sessionId: string | undefined): boolean {
   if (!sessionId) return false;

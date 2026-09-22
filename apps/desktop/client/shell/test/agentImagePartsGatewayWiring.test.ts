@@ -34,9 +34,15 @@ vi.mock('../main/ipc/agentImageParts', () => ({ resolveImageParts: resolveImageP
 
 import { _setModelConfigDirForTest, registerConfigIpc } from '../main/ipc/configIpc';
 import { handleGenerateText, handleGenerateTextStream } from '../main/ipc/modelGatewayIpc';
+import { _resetBreakerForTest } from '../main/ipc/circuitBreaker';
 
 const TEST_MODEL_DIR = path.join(process.cwd(), 'test-tmp-agent-image-parts-wiring');
 const ORIGINAL_FETCH = globalThis.fetch;
+
+// C3.2 W1：熔断进程内态跨用例复位（防同文件既有失败用例跨用例累计中途 open）。
+beforeEach(() => {
+  _resetBreakerForTest();
+});
 
 const OPENAI_CONFIG: ModelConfig = {
   keys: [

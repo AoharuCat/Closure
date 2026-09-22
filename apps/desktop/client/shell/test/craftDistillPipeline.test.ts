@@ -170,6 +170,7 @@ function mkMaterial(over: Partial<Material> = {}): Material {
       lang: null,
       originDate: null,
       description: '讲情绪落差与回报节奏',
+      url: null,
     },
     quality: {
       ok: true,
@@ -768,6 +769,31 @@ describe.skipIf(!sqliteUsable)('craftDistillPipeline 蒸馏全链（W3.5）', ()
     upsertMaterialRow(mkMaterial({ status: 'low-confidence' }));
     expect(evaluateCraftDistillGate(MATERIAL_ID).ok).toBe(true);
   });
+
+  // ── E10.4 W3：来源三级透传（材料 provenance.tier → 讲法 originTier；新建卡路径）──
+
+  it.each([
+    ['community'],
+    ['criticism'],
+    ['original'],
+  ] as const)('originTier 透传矩阵（E10.4 W3）：材料 tier=%s → 讲法 originTier 透传', async (tier) => {
+    seedMaterial({ provenance: { ...mkMaterial().provenance, tier } });
+    const { deps } = mkDeps();
+    const result = await distillMaterial(MATERIAL_ID, deps);
+    expect(result.ok).toBe(true);
+    const card = getCraftCard(listCraftCards({ materialId: MATERIAL_ID })[0]!.cardId)!;
+    expect(card.teachings[0]!.originTier).toBe(tier);
+  });
+
+  it('unspecified 材料 → 讲法 originTier absent（键不出现——二态纪律/旧行零迁移）', async () => {
+    seedMaterial(); // 默认 provenance.tier = unspecified
+    const { deps } = mkDeps();
+    await distillMaterial(MATERIAL_ID, deps);
+    const card = getCraftCard(listCraftCards({ materialId: MATERIAL_ID })[0]!.cardId)!;
+    const teaching = card.teachings[0]!;
+    expect(teaching.originTier).toBeUndefined();
+    expect('originTier' in teaching).toBe(false); // 键不出现，非 undefined 哨兵
+  });
 });
 
 describe.skipIf(!sqliteUsable)('craftDistillPipeline 去重三档（需 sqlite-vec；W3.5）', () => {
@@ -889,6 +915,49 @@ describe.skipIf(!sqliteUsable)('craftDistillPipeline 去重三档（需 sqlite-v
     expect(review.newClaim.confidence).toBe(0.7);
     // CR-2b-D1：judgeDispute verdict 随 review 行持久化（一档候选 → review 行带 hint——默认 fixture 无分歧）。
     expect(review.disputeHint).toEqual({ dispute: false, reason: '同向' });
+  });
+
+  it('originTier 进 merge-review newClaim（E10.4 W3）：材料 tier=criticism → newClaim.originTier 透传', async () => {
+    if (!isSqliteVecAvailable()) return;
+    await seedExistingCard('基线主张', vec1024(0));
+    seedMaterial({ provenance: { ...mkMaterial().provenance, tier: 'criticism' } });
+    extractionPayload = JSON.stringify([claimItem({ condensed: '相似主张T' })]);
+    categorizationQueue = [`{"category":"qingxu","termId":"${TERM_QINGXU}","confidence":0.7}`];
+    embedVectors.set('相似主张T', vecAtCosine(0.9));
+    const { deps } = mkDeps();
+
+    await distillMaterial(MATERIAL_ID, deps);
+    const reviews = listCraftMergeReviews();
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]!.newClaim.originTier).toBe('criticism');
+  });
+
+  it('unspecified 材料 → merge-review newClaim.originTier absent（键不出现）', async () => {
+    if (!isSqliteVecAvailable()) return;
+    await seedExistingCard('基线主张', vec1024(0));
+    seedMaterial();
+    extractionPayload = JSON.stringify([claimItem({ condensed: '相似主张U' })]);
+    categorizationQueue = [`{"category":"qingxu","termId":"${TERM_QINGXU}","confidence":0.7}`];
+    embedVectors.set('相似主张U', vecAtCosine(0.9));
+    const { deps } = mkDeps();
+
+    await distillMaterial(MATERIAL_ID, deps);
+    const reviews = listCraftMergeReviews();
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]!.newClaim.originTier).toBeUndefined();
+    expect('originTier' in reviews[0]!.newClaim).toBe(false);
+  });
+
+  it('originTier 进 auto 档 append 讲法（E10.4 W3）：材料 tier=community → teaching.originTier 透传', async () => {
+    if (!isSqliteVecAvailable()) return;
+    const existingCardId = await seedExistingCard('压低起手再给回报，让情绪落差本身成为爽点', vec1024(0));
+    seedMaterial({ provenance: { ...mkMaterial().provenance, tier: 'community' } });
+    embedVectors.set('压低起手再给回报，让情绪落差本身成为爽点', vec1024(0)); // sim 1.0 → auto 档
+    const { deps } = mkDeps();
+
+    await distillMaterial(MATERIAL_ID, deps);
+    const card = getCraftCard(existingCardId)!;
+    expect(card.teachings[1]!.originTier).toBe('community'); // append 走同一 teachingBase 单点
   });
 
   it('review 档 disputeHint 二态（D1 + CR-2b-13）：dispute=true 落 hint；LLM 失败缺省（不写暗示）', async () => {

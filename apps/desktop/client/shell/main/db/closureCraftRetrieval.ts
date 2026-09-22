@@ -248,10 +248,11 @@ function buildCraftRrfQuery(args: {
  * 30s timeout guards a hung endpoint.
  */
 async function defaultEmbed(model: ResolvedModel, text: string): Promise<number[]> {
+  // C3.1 计量台账：craft KB 查询臂标签（与 craft 索引臂 craft-index-embed 区分）。
   const res = await generateEmbeddings(
     model,
     { input: [text] },
-    { signal: AbortSignal.timeout(30_000) },
+    { signal: AbortSignal.timeout(30_000), taskType: 'craft-query-embed' },
   );
   return res.embeddings[0] ?? [];
 }
@@ -357,6 +358,7 @@ export async function searchCraft(
     const ranked = await rerankCandidates(query, hits, k, {
       resolveModel: deps?.resolveRerankModel,
       rerank: deps?.rerank,
+      taskType: 'craft-rerank', // C3.1 计量台账：craft 检索的 rerank 标签（双消费面区分，M2）
     });
     logTagShortfall(ranked);
     return ranked;
@@ -375,6 +377,7 @@ export async function searchCraft(
         const ranked = await rerankCandidates(query, retryHits, k, {
           resolveModel: deps?.resolveRerankModel,
           rerank: deps?.rerank,
+          taskType: 'craft-rerank',
         });
         logTagShortfall(ranked);
         return ranked;

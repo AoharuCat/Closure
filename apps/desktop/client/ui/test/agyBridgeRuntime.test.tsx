@@ -18,6 +18,23 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { create } from 'zustand';
 import type { AgentStreamEvent } from '../src/shared/api/agent';
 
+// CR-09-20-dogfood-1：Part 4 起向真 appStore 派发 done / 调 cancelAgent——两者都会触
+// fetchAgentSession 对账（api 模块级捕获 window.orisonDesktop，本文件装桥晚于模块加载）
+// → mock api/agent 单点（mirror agentEventsDispatch.test.ts 形态）。
+const apiMocks = vi.hoisted(() => ({
+  createAgentSession: vi.fn(async () => ({ id: 'session-1', messages: [] })),
+  fetchAgentSession: vi.fn(async () => ({ id: 'session-1', status: 'idle', messages: [] })),
+  setAgentSessionMode: vi.fn(async () => ({ ok: true })),
+  setAgentSessionBehaviorMode: vi.fn(async () => ({ ok: true })),
+  setAgentSessionParticipationGear: vi.fn(async () => ({ ok: true })),
+  deleteAgentSession: vi.fn(async () => true),
+  listAgentSessions: vi.fn(async () => []),
+  streamAgentMessage: vi.fn(async () => ({ status: 'completed' })),
+  resumeChapterChain: vi.fn(async () => ({ status: 'completed' })),
+}));
+
+vi.mock('../src/shared/api/agent', () => apiMocks);
+
 import {
   handleAgentStreamEvent,
   __clearAgentEventTracks,
@@ -48,6 +65,7 @@ const useBridgeStore = create<BridgeTestState>()((set) => ({
   chainRunBySession: {},
   chainRunAnchorByProject: {},
   bridgeNoticesBySession: {},
+  runOutcomeBySession: {},
   setAgentRunState: vi.fn(),
   setPendingToolConfirm: vi.fn(),
   pushPendingDiff: vi.fn(),
@@ -83,7 +101,7 @@ beforeEach(() => {
   __clearAgentEventTracks();
   __resetAgyBridgeStoreForTest();
   (window as unknown as { orisonDesktop: unknown }).orisonDesktop = { abortAgentRun: vi.fn() };
-  useBridgeStore.setState({ agentSessionId: 's1', agentError: null, bridgeNoticesBySession: {} });
+  useBridgeStore.setState({ agentSessionId: 's1', agentError: null, bridgeNoticesBySession: {}, runOutcomeBySession: {} });
 });
 
 afterEach(() => cleanup());
@@ -215,6 +233,74 @@ describe('agentEvents bridge-notice case（三信号运行期可见性）', () =
         type: 'bridge-notice',
         data: { notice: 'sendback' },
         sessionId: 's1',
+      } as AgentStreamWireEvent),
+    ).not.toThrow();
+  });
+});
+
+// ── Part 1b：run 终态正向观测（CR-09-20-dogfood-1，小残留 b 二次修）──
+// 旧判定读视图级 error——切走切回（switch 清 error 而通知残留）与 abort 回合（done 不写
+// error）都误标「本轮已成功收场」。改 per-session outcome：error 事件→'error' / abort
+// 请求→'aborted'（cancelAgent，slice 面）/ done→'ok'（不覆写已置标记）/ send→null。
+
+describe('run 终态 outcome 追踪（CR-09-20-dogfood-1）', () => {
+  const dispatchDone = (sessionId = 's1'): void => {
+    handleAgentStreamEvent(useBridgeStore, {
+      type: 'done',
+      data: { status: 'completed' },
+      sessionId,
+      projectPath: 'I:/p',
+    } as AgentStreamWireEvent);
+  };
+
+  it('done → ok；error → error（后台会话照写键控槽）', () => {
+    dispatchDone('s1');
+    // s2 非当前视图会话（后台）——outcome 照写（键控槽，切回可见）。
+    handleAgentStreamEvent(useBridgeStore, {
+      type: 'error',
+      data: { message: 'boom' },
+      sessionId: 's2',
+      projectPath: 'I:/p',
+    } as AgentStreamWireEvent);
+    expect(useBridgeStore.getState().runOutcomeBySession!['s1']).toBe('ok');
+    expect(useBridgeStore.getState().runOutcomeBySession!['s2']).toBe('error');
+  });
+
+  it('done 不覆写已置 aborted（abort 回合的 done 不携 error——覆写即误标成功）', () => {
+    useBridgeStore.setState({ runOutcomeBySession: { s1: 'aborted' } });
+    dispatchDone('s1');
+    expect(useBridgeStore.getState().runOutcomeBySession!['s1']).toBe('aborted');
+  });
+
+  it('done 不覆写已置 error（防御——error 已终态，done 不得翻成功）', () => {
+    useBridgeStore.setState({ runOutcomeBySession: { s1: 'error' } });
+    dispatchDone('s1');
+    expect(useBridgeStore.getState().runOutcomeBySession!['s1']).toBe('error');
+  });
+
+  it('最小测试 store 缺省字段 → done 不炸（mirror bridge-notice 守卫形态）', () => {
+    const bare = create<BridgeTestState>()((set) => ({
+      agentSessionId: 's1',
+      agentMessages: [],
+      activeSessionRunning: false,
+      agentError: null,
+      currentProject: { path: 'I:/p' },
+      agentRunStates: {},
+      chainRunBySession: {},
+      setAgentRunState: vi.fn(),
+      setPendingToolConfirm: vi.fn(),
+      pushPendingDiff: vi.fn(),
+      setPausedReview: vi.fn(),
+      setPendingPatch: vi.fn(),
+      fieldMetadata: {},
+      set,
+    }));
+    expect(() =>
+      handleAgentStreamEvent(bare as unknown as Parameters<typeof handleAgentStreamEvent>[0], {
+        type: 'done',
+        data: { status: 'completed' },
+        sessionId: 's1',
+        projectPath: 'I:/p',
       } as AgentStreamWireEvent),
     ).not.toThrow();
   });
@@ -369,5 +455,110 @@ describe('R6：内置工具被拒通知（与 MCP 软拒语义分开）', () => 
   it('zh/en 双语文案在位（translate 通道，回落键名 = 缺键）', () => {
     expect(translate('zh-CN', 'agent.bridgeNoticeBuiltinToolDenied')).toContain('被系统拒绝');
     expect(translate('en-US', 'agent.bridgeNoticeBuiltinToolDenied')).toContain('writing toolset');
+  });
+});
+
+// ── Part 4：小残留 b（dogfood R4）——警示条结局收敛（成功标注 + 失败/运行中维持）──
+// 真机观测：一个成功回合（纠正续跑救回）仍挂 4 条「模型离开了写作工具族」警示条——
+// 事件时点为真，但呈现不随结局收敛。修法 = 成功收场后整组降淡 + 尾部结局标注行（不删
+// 历史）；失败结局/运行中维持警示强度。
+// CR-09-20-dogfood-1（二次修）：结局判定改 per-session run 终态正向观测（done→ok /
+// abort→aborted / error→error / send→null）——四态测试：成功收敛 / 失败维持 / abort 不
+// 误标（done 不翻已置 aborted）/ 切走切回不误标（switch 清 error 而 outcome 留存）。
+
+describe('桥警示条结局收敛（dogfood R4 小残留 b）', () => {
+  /** 真 appStore 派发终态事件（dispatch 谓词 mirror Part 1；active 视图 = session-1）。 */
+  const dispatchTerminal = (type: 'done' | 'error'): void => {
+    handleAgentStreamEvent(useAppStore, {
+      type,
+      ...(type === 'done' ? { data: { status: 'completed' } } : { data: { message: 'boom' } }),
+      sessionId: 'session-1',
+      projectPath: 'I:/echo/project',
+    } as AgentStreamWireEvent);
+  };
+
+  it('回合成功收场（done → outcome ok）→ 收敛类 + 结局标注行（历史条目保留不删）', () => {
+    seedPanelStore({
+      'session-1': [
+        { id: 'n1', notice: 'builtin-tool-started', toolName: 'view_file', at: 1 },
+        { id: 'n2', notice: 'soft-denied', at: 2 },
+      ],
+    });
+    dispatchTerminal('done');
+    render(<AgentPanel />);
+    const container = document.querySelector('.agent-bridge-notices');
+    expect(container).not.toBeNull();
+    expect(container!.className).toContain('agent-bridge-notices--settled-ok');
+    const outcome = container!.querySelector('.agent-bridge-notice-outcome');
+    expect(outcome).not.toBeNull();
+    expect(outcome!.textContent).toContain('本轮已成功收场');
+    // 历史警示条保留（事件时点为真——只降淡不删除）。
+    expect(container!.querySelectorAll('.agent-bridge-notice').length).toBe(2);
+    expect(container!.querySelector('.agent-bridge-notice--warn')).not.toBeNull();
+  });
+
+  it('失败结局（error 事件 → outcome error）→ 无收敛类无标注行，警示条维持原强度', () => {
+    seedPanelStore({
+      'session-1': [{ id: 'n1', notice: 'builtin-tool-started', toolName: 'view_file', at: 1 }],
+    });
+    dispatchTerminal('error');
+    expect(useAppStore.getState().runOutcomeBySession['session-1']).toBe('error');
+    render(<AgentPanel />);
+    const container = document.querySelector('.agent-bridge-notices');
+    expect(container).not.toBeNull();
+    expect(container!.className).not.toContain('agent-bridge-notices--settled-ok');
+    expect(container!.querySelector('.agent-bridge-notice-outcome')).toBeNull();
+    expect(container!.querySelector('.agent-bridge-notice--warn')).not.toBeNull();
+  });
+
+  it('abort 回合不误标（cancelAgent 置 aborted；随后 done 不翻成功）', () => {
+    seedPanelStore({
+      'session-1': [{ id: 'n1', notice: 'builtin-tool-started', toolName: 'view_file', at: 1 }],
+    });
+    // UI 停止请求（真 slice 动作——置 'aborted'）。
+    useAppStore.getState().cancelAgent();
+    expect(useAppStore.getState().runOutcomeBySession['session-1']).toBe('aborted');
+    // abort 后端侧仍以 done 收场（不携 error）——不得覆写已置标记。
+    dispatchTerminal('done');
+    expect(useAppStore.getState().runOutcomeBySession['session-1']).toBe('aborted');
+    render(<AgentPanel />);
+    const container = document.querySelector('.agent-bridge-notices');
+    expect(container).not.toBeNull();
+    expect(container!.className).not.toContain('agent-bridge-notices--settled-ok');
+    expect(container!.querySelector('.agent-bridge-notice-outcome')).toBeNull();
+  });
+
+  it('切走切回不误标（switch 清 error 而 outcome 留存——失败结局不漂白）', () => {
+    seedPanelStore({
+      'session-1': [{ id: 'n1', notice: 'builtin-tool-started', toolName: 'view_file', at: 1 }],
+    });
+    dispatchTerminal('error');
+    expect(useAppStore.getState().agentError).toContain('boom');
+    // switchAgentSession 入口即清视图级 agentError（`set({ agentError: null })`）且不触
+    // outcome 图——此处直改同字段模拟该面（switch 全量调用需整 session 形态，机制等价）。
+    useAppStore.setState({ agentError: null } as any);
+    expect(useAppStore.getState().runOutcomeBySession['session-1']).toBe('error');
+    render(<AgentPanel />);
+    const container = document.querySelector('.agent-bridge-notices');
+    expect(container).not.toBeNull();
+    expect(container!.className).not.toContain('agent-bridge-notices--settled-ok');
+    expect(container!.querySelector('.agent-bridge-notice-outcome')).toBeNull();
+  });
+
+  it('运行中（activeSessionRunning）→ 不标注（事件仍在发生，谈结局为时过早）', () => {
+    seedPanelStore({
+      'session-1': [{ id: 'n1', notice: 'builtin-tool-started', toolName: 'view_file', at: 1 }],
+    });
+    useAppStore.setState({ activeSessionRunning: true } as any);
+    render(<AgentPanel />);
+    const container = document.querySelector('.agent-bridge-notices');
+    expect(container).not.toBeNull();
+    expect(container!.className).not.toContain('agent-bridge-notices--settled-ok');
+    expect(container!.querySelector('.agent-bridge-notice-outcome')).toBeNull();
+  });
+
+  it('zh/en 结局标注文案在位（translate 通道，回落键名 = 缺键）', () => {
+    expect(translate('zh-CN', 'agent.bridgeNoticeTurnSettledOk')).toContain('成功收场');
+    expect(translate('en-US', 'agent.bridgeNoticeTurnSettledOk')).toContain('completed successfully');
   });
 });

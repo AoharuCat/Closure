@@ -41,6 +41,7 @@ const USAGE_PANEL_KEYS = [
   'protocolColumn',
   'latency',
   'firstDelta',
+  'imageCount',
   'statusColumn',
   'statusOk',
   'statusFailed',

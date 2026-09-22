@@ -32,6 +32,7 @@ import {
 } from '../../shared/api/materials';
 import { MaterialRow } from './MaterialRow';
 import { ImportSourcePicker } from './ImportSourcePicker';
+import { OnlineImportDialog } from './OnlineImportDialog';
 import { ProvenanceForm } from './ProvenanceForm';
 import { materialDistillBadge } from '../craft/craftView';
 import type { CraftDistillSkipReason } from '@orison/shared-contracts';
@@ -70,6 +71,8 @@ export function MaterialsPage() {
   const showToast = useToastStore((s) => s.showToast);
   const [dragOver, setDragOver] = useState(false);
   const [actionBusyId, setActionBusyId] = useState<string | null>(null);
+  // E10.4 W4：在线导入弹窗开关（URL 直贴 / 关键词搜索两 tab）。
+  const [onlineImportOpen, setOnlineImportOpen] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // 初装/项目切换装载（去重归 slice loadedFor；打开 force 补偿归 App visibility 接线）。
@@ -263,6 +266,14 @@ export function MaterialsPage() {
         </div>
         <button
           type="button"
+          className="materials-browsebtn"
+          data-materials-online-import="true"
+          onClick={() => setOnlineImportOpen(true)}
+        >
+          {t('materials.online.open')}
+        </button>
+        <button
+          type="button"
           className="materials-iconbtn"
           aria-label={t('materials.action.refresh')}
           onClick={() => { void loadMaterialsList(true); }}
@@ -270,6 +281,10 @@ export function MaterialsPage() {
           <span className="material-symbols-outlined" aria-hidden="true">refresh</span>
         </button>
       </div>
+
+      {/* E10.4 W4：在线导入弹窗（URL 直贴 / 关键词搜索；导入后经既有 material:changed
+          事件面刷新 + 弹窗内终局 belt 重拉）。 */}
+      {onlineImportOpen && <OnlineImportDialog onClose={() => setOnlineImportOpen(false)} />}
 
       {/* 批量拖入导入区（AC7：白名单 shell 侧强制；进度可见 + 三档拒收回报）。 */}
       <div

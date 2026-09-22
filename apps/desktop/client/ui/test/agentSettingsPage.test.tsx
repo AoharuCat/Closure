@@ -3,14 +3,16 @@
  * 任务模型档位路由（C3.2 六档 + 09-13 R1b 审核族细档四档）+ 向量/重排 sidecar 选择器。
  * 原「补丁模式」死开关（autoApplyPatches，零消费者）已整链退役，不再有对应 UI。
  *
- * 纯 props 渲染（t + modelConfig + setModelConfig），无 store/IPC 依赖。
+ * 纯 props 渲染（t + modelConfig + setModelConfig）+ 唯一 store 读（U7：agyBridgeStore
+ * 桥授权态——CLI 徽标两态文案；jsdom 下桥缺席 fetch 返 null 不写状态，零 IPC 依赖）。
  */
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { useState } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ApiKeyEntry, ModelConfig } from '@orison/shared-contracts';
 import { AgentSettingsPage } from '../src/shared/components/settings/AgentSettingsPage';
+import { __resetAgyBridgeStoreForTest, useAgyBridgeStore } from '../src/shared/store/agyBridgeStore';
 
 const baseKey: ApiKeyEntry = {
   id: 'key_001',
@@ -48,7 +50,10 @@ const TASK_SLOT_LABEL_KEYS = [
   'settings.taskSlotDialogue',
 ] as const;
 
-afterEach(() => cleanup());
+afterEach(() => {
+  cleanup();
+  __resetAgyBridgeStoreForTest();
+});
 
 describe('AgentSettingsPage 模型分工（迁自模型配置页，dogfood #43）', () => {
   describe('task model slots', () => {
@@ -251,6 +256,61 @@ describe('AgentSettingsPage 模型分工（迁自模型配置页，dogfood #43�
       expect(arg.taskModels).toEqual({
         'writer-draft': { keyId: 'key_cli', modelId: 'gemini-3.8-pro-high' },
       });
+    });
+
+    // ── U7（dogfood R4）：CLI 徽标按桥授权态两态渲染 ──
+    // 桥已授权（同意态 ok）时 CLI 模型经 MCP 桥有写作工具面——「无工具调用」徽标与模型
+    // 配置页桥小节「工具在模型自己的回合里执行」正对打架，改「工具经 MCP 桥」；未授权/
+    // 缺席态维持原文。判定源 = agyBridgeStore 既有状态面（本处直接 seed，不接 IPC）。
+
+    it('U7: bridge-authorized state swaps the CLI option badge to the via-bridge copy; unauthorized keeps the no-tools copy', () => {
+      const cliKey: ApiKeyEntry = {
+        id: 'key_cli',
+        name: 'Antigravity',
+        protocol: 'antigravity-cli',
+        cliExecutable: 'C:/agy/bin/agy.exe',
+        models: [
+          { id: 'gemini-3.8-pro-high', alias: 'Gemini 3.8 Pro (High)', capability: 'text', enabled: true },
+        ],
+      };
+      const setModelConfig = vi.fn().mockResolvedValue(undefined);
+
+      // 未授权（store 缺席 = 默认）：原文徽标。
+      render(
+        <AgentSettingsPage
+          t={tFake}
+          modelConfig={buildConfig({ keys: [baseKey, cliKey] })}
+          setModelConfig={setModelConfig}
+        />,
+      );
+      const draftSelect = screen.getByLabelText('settings.taskSlotWriterDraft') as HTMLSelectElement;
+      const cliOption = Array.from(draftSelect.options).find((o) => o.value === 'key_cli::gemini-3.8-pro-high');
+      expect(cliOption?.textContent).toBe('Antigravity - Gemini 3.8 Pro (High) · settings.cliNoToolsBadge');
+      cleanup();
+
+      // 桥已授权（status.state = 'ok'）：徽标翻「工具经 MCP 桥」。
+      useAgyBridgeStore.setState({
+        status: {
+          state: 'ok',
+          conflicts: [],
+          consent: 'allowed',
+          homeRoot: 'C:/u/.orison/agy-bridge/home',
+          consentFilePath: 'C:/u/.orison/agy-bridge/consent.json',
+        },
+      });
+      render(
+        <AgentSettingsPage
+          t={tFake}
+          modelConfig={buildConfig({ keys: [baseKey, cliKey] })}
+          setModelConfig={setModelConfig}
+        />,
+      );
+      const draftSelect2 = screen.getByLabelText('settings.taskSlotWriterDraft') as HTMLSelectElement;
+      const cliOption2 = Array.from(draftSelect2.options).find((o) => o.value === 'key_cli::gemini-3.8-pro-high');
+      expect(cliOption2?.textContent).toBe('Antigravity - Gemini 3.8 Pro (High) · settings.cliBridgeToolsBadge');
+      // HTTP 形态不受桥授权态影响（徽标只挂 CLI 模型）。
+      const httpOption2 = Array.from(draftSelect2.options).find((o) => o.value === 'key_001::gpt-4o');
+      expect(httpOption2?.textContent).toBe('GPT-4o - GPT-4o Omni');
     });
   });
 
@@ -733,5 +793,210 @@ describe('AgentSettingsPage 模型分工（迁自模型配置页，dogfood #43�
     expect(screen.queryByText('settings.agentPatchMode')).toBeNull();
     expect(screen.queryByText('settings.patchModeSuggest')).toBeNull();
     expect(screen.queryByText('settings.patchModeAuto')).toBeNull();
+  });
+});
+
+// ── C3.2 W2 多套预设：档位段顶预设条（chip + 切换 + 存为 + 删除）──
+describe('AgentSettingsPage 任务档预设条（C3.2 W2）', () => {
+  const PRESETS = [
+    { name: 'cloud-quality', slotCount: 10, hasFallbacks: true },
+    { name: 'all-localhost', slotCount: 3, hasFallbacks: false },
+  ];
+
+  function mockBridge(overrides: Partial<Record<string, unknown>> = {}) {
+    (window as any).orisonDesktop = {
+      listTaskPresets: vi.fn().mockResolvedValue(PRESETS),
+      saveTaskPreset: vi.fn().mockResolvedValue({ ok: true }),
+      applyTaskPreset: vi.fn().mockResolvedValue({ ok: true }),
+      deleteTaskPreset: vi.fn().mockResolvedValue({ ok: true }),
+      ...overrides,
+    };
+    return (window as any).orisonDesktop;
+  }
+
+  afterEach(() => {
+    delete (window as any).orisonDesktop;
+  });
+
+  it('无 activePreset 时 chip 显示「自定义」；有则显示预设名', () => {
+    mockBridge();
+    const reload = vi.fn().mockResolvedValue(undefined);
+    const { rerender } = render(
+      <AgentSettingsPage
+        t={tFake}
+        modelConfig={buildConfig({ activePreset: undefined })}
+        setModelConfig={vi.fn()}
+        reloadConfig={reload}
+      />,
+    );
+    expect(screen.getByText(/settings.presetCurrent/).textContent).toContain('settings.presetCustom');
+
+    rerender(
+      <AgentSettingsPage
+        t={tFake}
+        modelConfig={buildConfig({ activePreset: 'cloud-quality' })}
+        setModelConfig={vi.fn()}
+        reloadConfig={reload}
+      />,
+    );
+    expect(screen.getByText(/settings.presetCurrent/).textContent).toContain('cloud-quality');
+  });
+
+  it('挂载时拉取预设清单；切换预设调 applyTaskPreset 并经 reloadConfig 重读（不走 setModelConfig 回写）', async () => {
+    const bridge = mockBridge();
+    const reload = vi.fn().mockResolvedValue(undefined);
+    const setModelConfig = vi.fn().mockResolvedValue(undefined);
+    render(
+      <AgentSettingsPage
+        t={tFake}
+        modelConfig={buildConfig()}
+        setModelConfig={setModelConfig}
+        reloadConfig={reload}
+      />,
+    );
+
+    await waitFor(() => expect(bridge.listTaskPresets).toHaveBeenCalled());
+    const select = screen.getByLabelText('settings.presetApplyLabel') as HTMLSelectElement;
+    await userEvent.selectOptions(select, 'cloud-quality');
+
+    await waitFor(() => expect(bridge.applyTaskPreset).toHaveBeenCalledWith({ name: 'cloud-quality' }));
+    await waitFor(() => expect(reload).toHaveBeenCalled());
+    expect(setModelConfig).not.toHaveBeenCalled();
+  });
+
+  it('apply 返回类型化错误时显示对应提示，不触发重读', async () => {
+    const bridge = mockBridge({ applyTaskPreset: vi.fn().mockResolvedValue({ ok: false, error: 'not-found' }) });
+    const reload = vi.fn().mockResolvedValue(undefined);
+    render(
+      <AgentSettingsPage
+        t={tFake}
+        modelConfig={buildConfig()}
+        setModelConfig={vi.fn()}
+        reloadConfig={reload}
+      />,
+    );
+
+    await waitFor(() => expect(bridge.listTaskPresets).toHaveBeenCalled());
+    await userEvent.selectOptions(screen.getByLabelText('settings.presetApplyLabel'), 'cloud-quality');
+
+    await waitFor(() =>
+      expect(screen.getByText('settings.presetNotFound')).toBeInTheDocument(),
+    );
+    expect(reload).not.toHaveBeenCalled();
+  });
+
+  it('存为预设：输入名称点保存 → saveTaskPreset 收到名称；类型化错误显提示', async () => {
+    const bridge = mockBridge({ saveTaskPreset: vi.fn().mockResolvedValue({ ok: false, error: 'invalid-name' }) });
+    render(
+      <AgentSettingsPage
+        t={tFake}
+        modelConfig={buildConfig()}
+        setModelConfig={vi.fn()}
+        reloadConfig={vi.fn().mockResolvedValue(undefined)}
+      />,
+    );
+
+    await waitFor(() => expect(bridge.listTaskPresets).toHaveBeenCalled());
+    await userEvent.type(screen.getByPlaceholderText('settings.presetNamePlaceholder'), 'my-preset');
+    await userEvent.click(screen.getByRole('button', { name: 'settings.presetSaveAction' }));
+
+    await waitFor(() => expect(bridge.saveTaskPreset).toHaveBeenCalledWith({ name: 'my-preset' }));
+    expect(screen.getByText('settings.presetInvalidName')).toBeInTheDocument();
+  });
+
+  it('同名覆盖走两段式确认：第一次点只亮确认文案，第二次才落 saveTaskPreset', async () => {
+    const bridge = mockBridge();
+    render(
+      <AgentSettingsPage
+        t={tFake}
+        modelConfig={buildConfig()}
+        setModelConfig={vi.fn()}
+        reloadConfig={vi.fn().mockResolvedValue(undefined)}
+      />,
+    );
+
+    await waitFor(() => expect(bridge.listTaskPresets).toHaveBeenCalled());
+    await userEvent.type(screen.getByPlaceholderText('settings.presetNamePlaceholder'), 'cloud-quality');
+    await userEvent.click(screen.getByRole('button', { name: 'settings.presetSaveAction' }));
+
+    // 第一次点击：臂章态，未落盘。
+    expect(bridge.saveTaskPreset).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: 'settings.presetOverwriteConfirm' })).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'settings.presetOverwriteConfirm' }));
+    await waitFor(() => expect(bridge.saveTaskPreset).toHaveBeenCalledWith({ name: 'cloud-quality' }));
+  });
+
+  it('CR-4: 重名检查大小写不敏感（`foo` 撞既有 `Foo`）——NTFS 大小写不敏感，覆盖确认不可绕过', async () => {
+    const bridge = mockBridge();
+    render(
+      <AgentSettingsPage
+        t={tFake}
+        modelConfig={buildConfig()}
+        setModelConfig={vi.fn()}
+        reloadConfig={vi.fn().mockResolvedValue(undefined)}
+      />,
+    );
+
+    await waitFor(() => expect(bridge.listTaskPresets).toHaveBeenCalled());
+    // 既有预设 cloud-quality 全小写；输入仅大小写不同的变体（模拟撞 `Foo` 的形态——
+    // 大小写差异本身在本 fixture 的既有清单里不存在合法命中等价项）。
+    await userEvent.type(screen.getByPlaceholderText('settings.presetNamePlaceholder'), 'CLOUD-QUALITY');
+    await userEvent.click(screen.getByRole('button', { name: 'settings.presetSaveAction' }));
+
+    // 第一段：只亮确认臂章，未落盘（大小写不敏感比较命中既有 cloud-quality）。
+    expect(bridge.saveTaskPreset).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: 'settings.presetOverwriteConfirm' })).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'settings.presetOverwriteConfirm' }));
+    await waitFor(() => expect(bridge.saveTaskPreset).toHaveBeenCalledWith({ name: 'CLOUD-QUALITY' }));
+  });
+
+  it('CR-15: 未传 reloadConfig 时经 store 兜底刷新（bridge.loadModelConfig 被调）——apply 后 UI 不静默陈旧', async () => {
+    const bridge = mockBridge({
+      loadModelConfig: vi.fn().mockResolvedValue(buildConfig({ activePreset: 'cloud-quality' })),
+    });
+    // 注意：不传 reloadConfig prop——走组件内 useAppStore.getState().loadModelConfig 兜底。
+    render(
+      <AgentSettingsPage
+        t={tFake}
+        modelConfig={buildConfig()}
+        setModelConfig={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => expect(bridge.listTaskPresets).toHaveBeenCalled());
+    await userEvent.selectOptions(screen.getByLabelText('settings.presetApplyLabel'), 'cloud-quality');
+
+    await waitFor(() => expect(bridge.applyTaskPreset).toHaveBeenCalledWith({ name: 'cloud-quality' }));
+    await waitFor(() => expect(bridge.loadModelConfig).toHaveBeenCalled());
+  });
+
+  it('删除预设走确认对话；删的是活动档时触发重读（chip 回「自定义」）', async () => {
+    const bridge = mockBridge();
+    const reload = vi.fn().mockResolvedValue(undefined);
+    render(
+      <AgentSettingsPage
+        t={tFake}
+        modelConfig={buildConfig({ activePreset: 'cloud-quality' })}
+        setModelConfig={vi.fn()}
+        reloadConfig={reload}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'settings.presetDeleteLabel: cloud-quality' })),
+    );
+    await userEvent.click(screen.getByRole('button', { name: 'settings.presetDeleteLabel: cloud-quality' }));
+
+    const dialog = screen.getByRole('alertdialog');
+    expect(
+      within(dialog).getByText('settings.presetDeleteConfirmTitle'),
+    ).toBeInTheDocument();
+
+    await userEvent.click(within(dialog).getByRole('button', { name: 'settings.presetDeleteConfirmAction' }));
+
+    await waitFor(() => expect(bridge.deleteTaskPreset).toHaveBeenCalledWith({ name: 'cloud-quality' }));
+    await waitFor(() => expect(reload).toHaveBeenCalled());
   });
 });

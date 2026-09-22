@@ -98,7 +98,8 @@ export type SettingReindexDeps = {
  * embed endpoint never hangs a save / backfill forever.
  */
 async function defaultEmbed(model: ResolvedModel, body: string): Promise<number[]> {
-  const res = await generateEmbeddings(model, { input: [body] }, { signal: AbortSignal.timeout(30_000) });
+  // C3.1 计量台账：story KB 设定 md 索引重嵌标签（同族 kb-index-embed）。
+  const res = await generateEmbeddings(model, { input: [body] }, { signal: AbortSignal.timeout(30_000), taskType: 'kb-index-embed' });
   return res.embeddings[0] ?? [];
 }
 

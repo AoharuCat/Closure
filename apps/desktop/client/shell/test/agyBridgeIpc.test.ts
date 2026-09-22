@@ -38,15 +38,18 @@ vi.mock('@orison/model-protocols', async (importOriginal) => {
 });
 
 import { classifyCliError, runAgyBridgeTurn, BRIDGE_MCP_SERVER_NAME } from '@orison/model-protocols';
+import type { ChainStreamEvent, ChildStreamEvent, WorkflowRuntime } from '@orison/desktop-agent';
+import type { BrowserWindow } from 'electron';
 import {
   __resetAgyBridgeUsedForTest,
+  attachBridgeRecordEventSenders,
   createAgyBridgeLaneModeResolver,
   createAgyBridgeTurnProduction,
   registerAgyBridgeIpc,
   wasAgyBridgeUsed,
   type AgyBridgeProductionDeps,
 } from '../main/ipc/agyBridgeIpc';
-import { createAgyBridgeRegistry, defaultAgyBridgeHomeRoot } from '../main/ipc/agyBridge';
+import { createAgyBridgeRegistry, defaultAgyBridgeHomeRoot, type BridgeSessionRecord } from '../main/ipc/agyBridge';
 import { agyCliLogDirFor } from '../main/ipc/agyCliLog';
 import {
   createAgyBridgeConsentStore,
@@ -326,6 +329,49 @@ describe('turn 生产入口（createAgyBridgeTurnProduction）', () => {
     await expect(createAgyBridgeTurnProduction(deps)(makeRequest())).rejects.toThrow(/installShellAgyBridgeCore/);
   });
 
+  // ── 09-20 F17 W3（design §3）：turn 开记录即挂事件发送器——wiring 钉死 ──
+
+  it('F17 W3 wiring：turn 生产开记录即挂 chain/child 发送器 + runtime 缝（删 attach 接线行 → 红）', async () => {
+    const { deps } = makeDeps({ resolved: CLI_RESOLVED, consent: 'allowed' });
+    const registry = createAgyBridgeRegistry();
+    deps.registry = () => registry;
+    const send = vi.fn();
+    deps.getWin = () => ({ webContents: { send } } as unknown as BrowserWindow);
+    const runtimeStub = { runChapterChain: vi.fn() } as unknown as WorkflowRuntime;
+    deps.agentRuntime = () => runtimeStub;
+    let emitter: ((event: ChainStreamEvent) => void) | undefined;
+    let childEmitter: ((event: ChildStreamEvent) => void) | undefined;
+    let runtimeSeen: (() => unknown) | undefined;
+    vi.mocked(runAgyBridgeTurn).mockImplementation(async () => {
+      const record = registry.getSession('sess-1');
+      emitter = record?.emitChainEvent;
+      childEmitter = record?.emitChildEvent;
+      runtimeSeen = record?.agentRuntime;
+      return okOutcome();
+    });
+    await createAgyBridgeTurnProduction(deps)(makeRequest());
+
+    // 发送器在 turn 装配窗内已挂到记录（本地工具经管道 call 帧执行时取的正是这两个）。
+    expect(emitter).toBeTypeOf('function');
+    expect(childEmitter).toBeTypeOf('function');
+    expect(runtimeSeen).toBe(deps.agentRuntime);
+    // 发送载荷：与 agent 车道同通道同载荷（sessionId/projectPath 由记录覆盖注入）。
+    emitter!({ type: 'chain-node-done', data: { nodeId: 'n1', status: 'done' } });
+    expect(send).toHaveBeenCalledWith('agent:stream-event', {
+      type: 'chain-node-done',
+      data: { nodeId: 'n1', status: 'done' },
+      sessionId: 'sess-1',
+      projectPath: 'C:/proj',
+    });
+    // child 事件自带 sessionId 字段——载荷键由记录覆盖（子代理组按 leader 会话键位进 UI）。
+    childEmitter!({ source: 'subagent', role: 'planner', sessionId: 'child-own-id', depth: 1, event: { type: 'started', data: {} } });
+    expect(send).toHaveBeenCalledWith('agent:stream-event', expect.objectContaining({
+      sessionId: 'sess-1',
+      projectPath: 'C:/proj',
+    }));
+    registry.disposeAll();
+  });
+
   // ── R9 观测取景（三时机；真实现链上跑——记调用断取景，收集 sink 断行内容）──
 
   const okOutcome = (text = '终文') => ({
@@ -483,6 +529,87 @@ describe('turn 生产入口（createAgyBridgeTurnProduction）', () => {
       agentState: 'agent-loaded',
       logDir,
     });
+    registry.disposeAll();
+  });
+});
+
+// ── 09-20 F17 W3（design §3/§4-2）：记录级事件发送器装配（attachBridgeRecordEventSenders）──
+
+describe('attachBridgeRecordEventSenders（chain/child 发送器 + runtime 缝挂记录）', () => {
+  function makeRecordForAttach(): { record: BridgeSessionRecord; registry: ReturnType<typeof createAgyBridgeRegistry> } {
+    const registry = createAgyBridgeRegistry();
+    registry.openSession({
+      sessionId: 'sess-attach',
+      projectDir: 'C:/proj-attach',
+      permissionMode: 'auto',
+      face: [{ name: 'present_result', description: '呈现结果。', inputSchema: { type: 'object' } }],
+    });
+    const record = registry.getSession('sess-attach')!;
+    return { record, registry };
+  }
+
+  it('发送载荷：touch 续活 + agent:stream-event 广播（sessionId/projectPath 记录覆盖注入）', () => {
+    const { record, registry } = makeRecordForAttach();
+    const send = vi.fn();
+    const { deps } = makeDeps({ resolved: CLI_RESOLVED, consent: 'allowed' });
+    deps.getWin = () => ({ webContents: { send } } as unknown as BrowserWindow);
+    attachBridgeRecordEventSenders(record, deps);
+
+    record.lastActivityAt = 0;
+    record.emitChainEvent!({ type: 'chain-node-done', data: { nodeId: 'n2', status: 'error' } });
+    // idle 续活（design §4-2）：发送器内 touch——链内事件不经管道，30min 帧口径清扫的
+    // 第二道保险。
+    expect(record.lastActivityAt).toBeGreaterThan(0);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledWith('agent:stream-event', {
+      type: 'chain-node-done',
+      data: { nodeId: 'n2', status: 'error' },
+      sessionId: 'sess-attach',
+      projectPath: 'C:/proj-attach',
+    });
+
+    // child 事件自带 sessionId（子代理自己的 id）——载荷键被记录覆盖（leader 键位）。
+    record.emitChildEvent!({
+      source: 'subagent',
+      role: 'story-planner',
+      sessionId: 'child-session-id',
+      depth: 1,
+      event: { type: 'started', data: {} },
+    });
+    expect(send).toHaveBeenCalledTimes(2);
+    const [, childPayload] = send.mock.calls[1]!;
+    expect(childPayload).toMatchObject({ sessionId: 'sess-attach', projectPath: 'C:/proj-attach' });
+    expect((childPayload as { sessionId?: string }).sessionId).not.toBe('child-session-id');
+    registry.disposeAll();
+  });
+
+  it('getWin 缺席 → 发送器置 undefined（工具 ctx 省略事件通道，优雅零事件）；agentRuntime 独立注入', () => {
+    const { record, registry } = makeRecordForAttach();
+    const { deps } = makeDeps({ resolved: CLI_RESOLVED, consent: 'allowed' });
+    const runtimeStub = { runChapterChain: vi.fn() } as unknown as WorkflowRuntime;
+    deps.agentRuntime = () => runtimeStub;
+    attachBridgeRecordEventSenders(record, deps);
+    expect(record.emitChainEvent).toBeUndefined();
+    expect(record.emitChildEvent).toBeUndefined();
+    expect(record.agentRuntime).toBe(deps.agentRuntime);
+    registry.disposeAll();
+  });
+
+  it('窗口关闭（getWin 返 null / webContents.send 抛）→ 不炸调用方（mirror sendEvent 守卫）', () => {
+    const { record, registry } = makeRecordForAttach();
+    const { deps } = makeDeps({ resolved: CLI_RESOLVED, consent: 'allowed' });
+    deps.getWin = () => null;
+    attachBridgeRecordEventSenders(record, deps);
+    expect(() => record.emitChainEvent!({ type: 'chain-node-done', data: { nodeId: 'n', status: 'done' } })).not.toThrow();
+    expect(record.lastActivityAt).toBeGreaterThan(0); // touch 先于 send（守卫不吞续活）
+
+    const boom = vi.fn(() => {
+      throw new Error('webContents gone');
+    });
+    deps.getWin = () => ({ webContents: { send: boom } } as unknown as BrowserWindow);
+    attachBridgeRecordEventSenders(record, deps);
+    expect(() => record.emitChainEvent!({ type: 'chain-node-done', data: { nodeId: 'n', status: 'done' } })).not.toThrow();
+    expect(boom).toHaveBeenCalledTimes(1);
     registry.disposeAll();
   });
 });

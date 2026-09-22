@@ -364,6 +364,9 @@ function teachingFromNewClaim(
     ...(nc.originKind !== undefined ? { originKind: nc.originKind } : {}),
     ...(nc.bookTitle !== undefined ? { bookTitle: nc.bookTitle } : {}),
     ...(nc.evidence !== undefined ? { evidence: nc.evidence } : {}),
+    // E10.4 W3 additive 透传（absent = unspecified 材料蒸馏语义/旧行零迁移——mirror
+    // originKind）：来源三级经裁决成卡不丢（人审页三色 tier 徽章消费）。
+    ...(nc.originTier !== undefined ? { originTier: nc.originTier } : {}),
   };
 }
 

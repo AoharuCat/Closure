@@ -73,6 +73,8 @@ import type {
   RunStorySyncResult,
   SaveBase64ImageInput,
   StoryRebuildResult,
+  TaskPresetMutationResult,
+  TaskPresetSummary,
   TaskRecord,
   TaskUpsertInput,
   TextGenerationResponse,
@@ -103,6 +105,12 @@ import type {
   MaterialsImportResult,
   MaterialsListInput,
   MaterialSummary,
+  // E10.4（task 09-20）W1：在线解析生态两通道契约类型（type-only 零 runtime 内联——sandbox
+  // 纪律同上；载荷契约单源 shared-contracts ipc.ts「E10.4」段）。
+  MaterialsImportOnlineInput,
+  MaterialsImportOnlineResult,
+  MaterialsSearchOnlineInput,
+  OnlineSourceHit,
   // E10.2b（task 09-05）W3：蒸馏管线契约类型（type-only 零 runtime 内联——同上 sandbox 纪律）。
   CraftDistillRunInput,
   CraftDistillProgressEvent,
@@ -241,6 +249,16 @@ export const exposedDesktopApi = {
   // 模型配置
   loadModelConfig: () => ipcRenderer.invoke('config:load-model') as Promise<ModelConfig>,
   saveModelConfig: (config: ModelConfig) => ipcRenderer.invoke('config:save-model', config) as Promise<void>,
+  // ── C3.2 W2 多套预设四通道（machine 级 sidecar 读写；载荷契约单源
+  // shared-contracts taskPreset* 段；save/apply/delete 模式 A 类型化结果）。──
+  listTaskPresets: () =>
+    ipcRenderer.invoke('taskPresets:list') as Promise<TaskPresetSummary[]>,
+  saveTaskPreset: (input: { name: string }) =>
+    ipcRenderer.invoke('taskPresets:save', input) as Promise<TaskPresetMutationResult>,
+  applyTaskPreset: (input: { name: string }) =>
+    ipcRenderer.invoke('taskPresets:apply', input) as Promise<TaskPresetMutationResult>,
+  deleteTaskPreset: (input: { name: string }) =>
+    ipcRenderer.invoke('taskPresets:delete', input) as Promise<TaskPresetMutationResult>,
   isKeyEncryptionAvailable: () => ipcRenderer.invoke('config:is-key-encryption-available') as Promise<boolean>,
   // Story 3.6 WP10: research settings aggregate (net proxy + search chain with
   // REDACTED keys + doc parser + wiki presets) —「研究与视觉」settings page.
@@ -491,6 +509,12 @@ export const exposedDesktopApi = {
   // 身份不变；落库后 material:changed（reason='name-updated'）驱动列表名刷新。
   updateMaterialName: (input: MaterialUpdateNameInput) =>
     ipcRenderer.invoke('materials:update-name', input) as Promise<MaterialUpdateNameResult>,
+  // ── E10.4（task 09-20）W1：在线解析生态（URL 直贴导入 + 关键词发现——shell handler W1
+  // 占位、W2 落实现；UI「在线导入」弹窗归 W4）──
+  importOnlineMaterial: (input: MaterialsImportOnlineInput) =>
+    ipcRenderer.invoke('materials:import-online', input) as Promise<MaterialsImportOnlineResult>,
+  searchOnlineSources: (input: MaterialsSearchOnlineInput) =>
+    ipcRenderer.invoke('materials:search-online', input) as Promise<OnlineSourceHit[]>,
   // material:changed 推送订阅（材料变更全窗广播，mirror onToolEvent 订阅纪律——返回退订
   // 函数只移除本监听器注册的 listener，绝不 removeAllListeners）。
   onMaterialChanged: (callback: (event: MaterialChangedEvent) => void) => {
@@ -633,8 +657,13 @@ export const exposedDesktopApi = {
     options?: { balancedAskCategories?: ('protagonist_safety' | 'information_gap' | 'direction_turn')[]; trustAdjudication?: boolean },
   ) =>
     ipcRenderer.invoke('agent:set-session-participation-gear', sessionId, projectPath, gear, options),
-  listAgentSessions: (projectPath?: string) =>
-    ipcRenderer.invoke('agent:list-sessions', projectPath),
+  // W4（09-21-subagent-bg-decouple）：shell 侧默认只列用户会话（child/stub 过滤，
+  // includeAllRoles 逃生口）——见 ipc.ts OrisonDesktopApi 注。
+  listAgentSessions: (projectPath?: string, opts?: { includeAllRoles?: boolean }) =>
+    ipcRenderer.invoke('agent:list-sessions', projectPath, opts),
+  // W4：后台任务注册表只读查询（`agent:bg-tasks`）——后台任务条 hydrate 数据源。
+  listAgentBgTasks: (projectPath: string) =>
+    ipcRenderer.invoke('agent:bg-tasks', projectPath),
   deleteAgentSession: (id: string, projectPath?: string) =>
     ipcRenderer.invoke('agent:delete-session', id, projectPath),
   // 从此截断（dogfood 2026-08-21）：纯对话尾巴专用——含工具痕迹的区间 runtime 拒绝。

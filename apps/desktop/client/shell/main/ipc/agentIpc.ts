@@ -19,10 +19,18 @@ import {
   assignmentContextWindowTokens,
   setBridgeTurnFn,
   setAgyBridgeModeResolver,
+  // 09-21-subagent-bg-decouple W3：后台任务注册表消费面（启动对账 + bg 车道帽常量对齐）——
+  // mirror deriveCheckpointPolicy 的 shell→agent 导出姿态（能力面单源在 agent 包，shell 只挂接）。
+  getBgTaskRegistry,
+  MAX_BG_PER_PROJECT,
 } from '@orison/desktop-agent';
 // 子4 W4（09-12 agy MCP 工具桥）：dialogue 桥车道生产实现（consent 硬门 + 模型解析 +
 // 注册表 live 监听）——本文件只做注入接线（mirror setGenerateTextFn 装配形态）。
 import { agyBridgeProductionDeps, createAgyBridgeLaneModeResolver, createAgyBridgeTurnProduction } from './agyBridgeIpc';
+// 09-20 F17 W3（design §4-1）：abort-run 联动——UI 停止钮同时掐桥会话的在途本地工具执行
+// （write_chapter 整链持有 record.abortController.signal）。agyBridge 不反向 import 本文件
+//（无环），abortBridgeSession 读桥生产注册表单例。
+import { abortBridgeSession } from './agyBridge';
 // 09-19 CLI 白名单（W3）：纯文本车道零工具 agent 解析器生产实现 + 协议层注入缝。
 import { createTextAgentResolverProduction } from './agyTextAgentIpc';
 import { setAntigravityCliTextAgentResolver } from '@orison/model-protocols';
@@ -182,10 +190,22 @@ export function unregisterStreamAbortController(sessionId: string, controller: A
 
 type ProjectRunLease = { sessionId: string; projectPath: string };
 
+// 09-21-subagent-bg-decouple W3（design §4.1 / D7）：租约**车道化**——值结构扩双桶。
+// - leader 车道（stream-message / execute-skill / compact / 链两车道）：`lease` + `refCount`
+//   语义**字节级不变**（同项目 leader 车道互斥、同 sessionId 重入引用计数、幂等 release）。
+//   bg-only 期间（后台子会话在跑、无 leader run）`lease` 为 null。
+// - bg 车道：`bgSessions`（childSessionId → 引用计数）独立计数，帽 MAX_BG_PER_PROJECT——
+//   与 leader 车道/彼此并存，互不触发对方拒绝。
+// 写安全依据（research/write-safety-anchors.md）：并发写防护的真不变量在 fs 层 withProjectLock
+// （project.yaml 读-改-写全锚）+ 章节原子写 + git_commit 补闸（gitHandlers.ts）——租约是粗粒度
+// 前置闸，bg 车道豁免 leader 互斥不破写安全。
 type ProjectRunLeaseEntry = {
-  lease: ProjectRunLease;
-  /** 活跃句柄数（同 sessionId 重叠 invoke 各持一个）——归零才真释放。 */
+  /** leader 车道租约；null = 仅 bg 车道占键（后台子会话存活、无 leader run）。 */
+  lease: ProjectRunLease | null;
+  /** leader 车道活跃句柄数（同 sessionId 重叠 invoke 各持一个）——归零且 bg 空才删键。 */
   refCount: number;
+  /** bg 车道：后台子会话引用计数（childSessionId → count），帽 = MAX_BG_PER_PROJECT（distinct sessions）。 */
+  bgSessions: Map<string, number>;
 };
 
 const projectActiveRuns = new Map<string, ProjectRunLeaseEntry>();
@@ -199,9 +219,30 @@ const projectActiveRuns = new Map<string, ProjectRunLeaseEntry>();
  */
 export const CHAIN_RUN_LEASE_ID = 'chain-run:closure';
 
+/**
+ * W4（09-21-subagent-bg-decouple U6 存量债）：会话列表可列判定（`agent:list-sessions`
+ * 默认过滤）。排除两类非用户会话：
+ * ① sessionRole='child'——子会话检视只经钻取/后台任务条进入（防空壳/后台行污染列表）；
+ * ② 链 stub parent——closureChainIpc 两入口建的 dogfood/重提取桩（非视图会话；spec
+ *    ipc-handlers「stub 会话不在会话列表」的既定意图）。字面量与创建点耦合（closureChainIpc.ts
+ *    :885/:1668），mirror :1432 既有字面量判断形态——新增 stub agentName 须两处同步。
+ * undefined/null role = 旧 primary 会话（sessionRole 列后加的历史行）——照列。
+ */
+const STUB_CHAIN_AGENT_NAMES = new Set(['chapter-chain-dogfood', 'chapter-reextract']);
+
+export function isListableSession(s: { sessionRole?: string | null; agentName: string }): boolean {
+  if (s.sessionRole === 'child') return false;
+  return !STUB_CHAIN_AGENT_NAMES.has(s.agentName);
+}
+
 export type ProjectRunGateResult =
   | { ok: true; release: () => void }
   | { ok: false; held: ProjectRunLease };
+
+/** bg 车道闸结果（mirror ProjectRunGateResult 句柄形态；拒绝族新成员 `bg_capacity`）。 */
+export type BgRunGateResult =
+  | { ok: true; release: () => void }
+  | { ok: false; code: 'bg_capacity'; runningCount: number; cap: number; projectPath: string };
 
 /** 无项目归属（不应发生）时的空句柄——不闸，保持既有行为。 */
 function noopRelease(): void { /* no-op */ }
@@ -210,11 +251,19 @@ export function acquireProjectRun(projectPath: string | undefined, sessionId: st
   if (!projectPath) return { ok: true, release: noopRelease };
   const key = normalizeProjectKey(projectPath);
   const entry = projectActiveRuns.get(key);
-  if (entry && entry.lease.sessionId !== sessionId) {
+  // leader 车道互斥只看 leader 桶——bg 会话在场不拦 leader（车道并存，W3）。
+  if (entry && entry.lease && entry.lease.sessionId !== sessionId) {
     return { ok: false, held: entry.lease };
   }
-  if (entry) entry.refCount += 1;
-  else projectActiveRuns.set(key, { lease: { sessionId, projectPath }, refCount: 1 });
+  if (entry && entry.lease) {
+    entry.refCount += 1;
+  } else if (entry) {
+    // bg-only 键：leader 车道空置——收编租约（语义等价新建）。
+    entry.lease = { sessionId, projectPath };
+    entry.refCount = 1;
+  } else {
+    projectActiveRuns.set(key, { lease: { sessionId, projectPath }, refCount: 1, bgSessions: new Map() });
+  }
   let released = false;
   return {
     ok: true,
@@ -223,27 +272,85 @@ export function acquireProjectRun(projectPath: string | undefined, sessionId: st
       if (released) return;
       released = true;
       const current = projectActiveRuns.get(key);
-      if (!current || current.lease.sessionId !== sessionId) return;
+      if (!current || current.lease?.sessionId !== sessionId) return;
       current.refCount -= 1;
-      if (current.refCount <= 0) projectActiveRuns.delete(key);
+      if (current.refCount <= 0) {
+        // W3：bg 会话仍占键时只摘 leader 租约（保留 bg 桶），全空才删键。
+        if (current.bgSessions.size === 0) projectActiveRuns.delete(key);
+        else current.lease = null;
+      }
     },
   };
 }
 
 /**
+ * bg 车道闸（W3，design §4.1）：后台子会话 per-project 独立计数，帽 MAX_BG_PER_PROJECT
+ * （与 agent 包 BgTaskRegistry.dispatchBg 的 BgCapacityError 同常量对齐——agent 侧是工具面
+ * 权威拒绝（spawn_agent_bg 超帽响亮拒绝），本闸是 shell 侧结构化记账面 + 拒绝族
+ * `bg_capacity|heldBy=...` 形态 mirror）。与 leader 车道/彼此并存。
+ *
+ * 挂接：onRuntimeEvent 泵（本文件）在首个 bg 子会话事件登记、`bg-update` 终态事件释放——
+ * agent 包 dispatchBackground 无 IPC 入口，shell 经运行时事件泵感知 bg 子会话生命周期。
+ */
+export function acquireBgRun(projectPath: string | undefined, childSessionId: string): BgRunGateResult {
+  if (!projectPath) return { ok: true, release: noopRelease };
+  const key = normalizeProjectKey(projectPath);
+  let entry = projectActiveRuns.get(key);
+  if (!entry) {
+    entry = { lease: null, refCount: 0, bgSessions: new Map() };
+    projectActiveRuns.set(key, entry);
+  }
+  const prev = entry.bgSessions.get(childSessionId) ?? 0;
+  if (prev === 0 && entry.bgSessions.size >= MAX_BG_PER_PROJECT) {
+    return {
+      ok: false,
+      code: 'bg_capacity',
+      runningCount: entry.bgSessions.size,
+      cap: MAX_BG_PER_PROJECT,
+      projectPath,
+    };
+  }
+  entry.bgSessions.set(childSessionId, prev + 1);
+  let released = false;
+  return {
+    ok: true,
+    release: () => {
+      if (released) return;
+      released = true;
+      releaseBgRun(projectPath, childSessionId);
+    },
+  };
+}
+
+/** bg 车道释放（幂等；bg-only 键随最后一个 bg 会话释放删除——mirror leader 车道句柄语义）。 */
+export function releaseBgRun(projectPath: string | undefined, childSessionId: string): void {
+  if (!projectPath) return;
+  const key = normalizeProjectKey(projectPath);
+  const entry = projectActiveRuns.get(key);
+  if (!entry) return;
+  const count = (entry.bgSessions.get(childSessionId) ?? 0) - 1;
+  if (count <= 0) entry.bgSessions.delete(childSessionId);
+  else entry.bgSessions.set(childSessionId, count);
+  if (entry.bgSessions.size === 0 && !entry.lease) projectActiveRuns.delete(key);
+}
+
+/**
  * 诊断/测试：强制释放某项目键上该会话的**全部**引用（整键删除）。正常路径一律走
- * `acquire().release`——本函数只用于测试复位与对账兜底。
+ * `acquire().release`——本函数只用于测试复位与对账兜底。W3：仅摘 leader 桶（bg 桶不动，
+ * bg 空且无 leader 租约才整键删）。
  */
 export function releaseProjectRun(projectPath: string | undefined, sessionId: string): void {
   if (!projectPath) return;
   const key = normalizeProjectKey(projectPath);
   const entry = projectActiveRuns.get(key);
-  if (entry && entry.lease.sessionId === sessionId) {
-    projectActiveRuns.delete(key);
+  if (entry && entry.lease?.sessionId === sessionId) {
+    entry.lease = null;
+    entry.refCount = 0;
+    if (entry.bgSessions.size === 0) projectActiveRuns.delete(key);
   }
 }
 
-/** 测试/诊断：当前注册表快照（只读；值为 {lease, refCount} 结构）。 */
+/** 测试/诊断：当前注册表快照（只读；值为 {lease|null, refCount, bgSessions} 结构）。 */
 export function getProjectActiveRuns(): ReadonlyMap<string, ProjectRunLeaseEntry> {
   return projectActiveRuns;
 }
@@ -253,16 +360,32 @@ export function getProjectActiveRuns(): ReadonlyMap<string, ProjectRunLeaseEntry
  * 会话会让 runtime 的 mode-setter 永拒（`session.status === 'running'` guard）+ UI 磁盘
  * 兜底误显运行——逐项目核对归位 idle 并清非活跃注册表项。registerAgentIpc 时异步跑
  * （vitest 环境跳过——测试直调本函数驱动，避免测试进程触真实 machine db）。
+ *
+ * W3 扩双车道（design §4.1/§4.2）：
+ * - bg-tasks.json 启动对账——`getBgTaskRegistry().reconcileInterrupted(project.path)` 把
+ *   磁盘 running 行改 interrupted 回写 + 全量 hydrate 进内存（completed/failed/aborted 行
+ *   照常可查——「历史可检视」；不复活不谎报 running，design D6/R7）。
+ * - 子会话面覆盖——W1 起 bg 子会话有真 running 磁盘态（dispatchBackground updateStatus），
+ *   下方逐会话循环天然覆盖 child role（listSessions 无 role 过滤在此恰是正确行为）。
+ * - 注册表清扫扩 bg 桶：bg 条目以 streamAbortControllers(childSid)（onRuntimeEvent 登记，
+ *   本进程活体判据同 leader 车道）为准——无活体的 stale 条目清除。
  */
 export async function reconcileStaleProjectRuns(): Promise<void> {
   try {
     const { listProjects } = await import('../db/projectRepository');
     const projects = listProjects().filter((p) => p.path && !p.deletedAt);
     for (const project of projects) {
+      // W3：后台任务注册表启动对账（先于会话循环——同 reconcile 时序，逐项目幂等）。
+      try {
+        getBgTaskRegistry().reconcileInterrupted(project.path!);
+      } catch (bgErr) {
+        const bgMsg = bgErr instanceof Error ? bgErr.message : String(bgErr);
+        logger.warn({ err: bgMsg, projectPath: project.path }, 'projectRunGate: bg-tasks reconciliation failed (non-fatal)');
+      }
       const sessions = runtime.listSessions(project.path!).sessions;
       for (const s of sessions) {
         if (s.status !== 'running') continue;
-        if (streamAbortControllers.has(s.id)) continue; // 本进程活跃流（直调场景）
+        if (streamAbortControllers.has(s.id)) continue; // 本进程活跃流（直调场景）——bg 子会话经 W3 onRuntimeEvent 登记同判据。
         const live = runtime.getSession(s.id, project.path!);
         if (live && live.status === 'running') {
           updateSessionStatus(s.id, 'idle');
@@ -274,14 +397,118 @@ export async function reconcileStaleProjectRuns(): Promise<void> {
       }
     }
     for (const [key, entry] of [...projectActiveRuns]) {
-      if (!streamAbortControllers.has(entry.lease.sessionId)) {
-        projectActiveRuns.delete(key);
+      if (entry.lease && !streamAbortControllers.has(entry.lease.sessionId)) {
+        entry.lease = null;
+        entry.refCount = 0;
       }
+      for (const sid of [...entry.bgSessions.keys()]) {
+        if (!streamAbortControllers.has(sid)) entry.bgSessions.delete(sid);
+      }
+      if (!entry.lease && entry.bgSessions.size === 0) projectActiveRuns.delete(key);
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     logger.warn({ err: msg }, 'projectRunGate: stale-run reconciliation failed (non-fatal)');
   }
+}
+
+// ─── W3：bg 子会话 shell 侧生命周期记账（design §4.1 车道化挂接 + §5 事件泵） ───
+//
+// agent 包 dispatchBackground 无 IPC 入口（bg 子 run 全程在 agent 包内进程执行）——shell 经
+// onRuntimeEvent 泵（createWorkflowRuntime 装配回调）感知 bg 子会话生命周期：
+// - 首个 child 车道事件（sessionRole='child'，bg 子会话专属通道——同步子代理事件冒泡进
+//   leader sendEvent 不经此泵）→ acquireBgRun 登记 bg 桶 + 注册 shell AbortController
+//   （streamAbortControllers：① 对账「本进程活跃流」判据承认活体 bg 子会话，防 stale 归位
+//   误杀；② agent:abort-run 的 IPC 控制器循环可达。子 runLoop 实际停止走 D2 store 链
+//   （runtime.abortRun(childSid)）与 registry.cancel——此 controller 是生命周期可见性面）。
+// - `bg-update` 终态事件（任务终态恰一次，W2 outcome 链发射）→ 释放 bg 桶 + 注销 controller。
+//
+// 容量：帽 MAX_BG_PER_PROJECT 与 agent 包 BgCapacityError 同常量；泵路径满帽（理论不可达——
+// agent 侧工具面先行拒绝）降级 warn 不破事件流。
+const bgChildAbortControllers = new Map<string, AbortController>();
+
+/**
+ * CR-4：bg 桶登记时记 childSid → projectPath 映射（模块级）。bg-update 到达时父会话可能已删
+ * / 现查 getSession 拿不到 projectPath——释放兜底用登记映射，防 bgSessions 桶泄漏（泄漏槽位
+ * 永久占用 bg 车道帽直至重启）。随终态释放 / 测试复位一并清。
+ */
+const bgChildProjectPaths = new Map<string, string>();
+
+/**
+ * bg 子会话运行时事件记账（onRuntimeEvent 泵调用点；导出供测试直驱）。
+ * 非子会话事件（leader / bg-update 载荷自身的 parent sid）只走 bg-update 终态分支。
+ */
+export function noteBgChildRuntimeEvent(
+  sessionId: string,
+  event: { type: string; data: unknown },
+  session?: { sessionRole?: string; projectPath?: string },
+): void {
+  try {
+    if (event.type === 'bg-update') {
+      const data = event.data as { childSessionId?: string } | undefined;
+      const childSessionId = data?.childSessionId;
+      if (childSessionId) {
+        // 终态信号 = 清账点：controller 登记与 projectPath 映射都清（controller 缺席〔漂移态/
+        // 登记被拒〕不阻碍释放——releaseBgRun 幂等，多减下探为删除）。
+        const controller = bgChildAbortControllers.get(childSessionId);
+        if (controller) {
+          bgChildAbortControllers.delete(childSessionId);
+          unregisterStreamAbortController(childSessionId, controller);
+        }
+        // 反查项目键：终态载荷带 parent 的 projectPath——同键释放（bg-only 键随释放删除）。
+        // CR-4 兜底：父会话已删/现查无 projectPath 时用登记映射（登记时值），防桶泄漏。
+        const projectPath = session?.projectPath ?? bgChildProjectPaths.get(childSessionId);
+        if (projectPath) releaseBgRun(projectPath, childSessionId);
+        bgChildProjectPaths.delete(childSessionId);
+      }
+      return;
+    }
+    if (event.type !== 'child') return;
+    if (session?.sessionRole !== 'child') return;
+    if (bgChildAbortControllers.has(sessionId)) return; // 已登记（每子会话首事件登记一次）。
+    const gate = acquireBgRun(session?.projectPath, sessionId);
+    if (!gate.ok) {
+      logger.warn(
+        { childSessionId: sessionId, projectPath: session?.projectPath, runningCount: gate.runningCount, cap: gate.cap },
+        'bgRunGate: bg lane capacity full at runtime-event registration (agent-side cap should have rejected earlier)',
+      );
+      return;
+    }
+    // ⚠ acquire 内部已计数——上面的 gate.release 若被调会错释放；此处只持有不释放
+    // （释放唯一入口 = bg-update 终态分支）。为句柄语义正确，登记即视为长期持有。
+    const controller = new AbortController();
+    bgChildAbortControllers.set(sessionId, controller);
+    if (session?.projectPath) bgChildProjectPaths.set(sessionId, session.projectPath);
+    registerStreamAbortController(sessionId, controller);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.warn({ err: msg, sessionId }, 'bgRunGate: runtime-event bookkeeping failed (non-fatal)');
+  }
+}
+
+/** 测试/诊断：清空 bg 子会话记账（mirror 各注册表测试复位形态）。 */
+export function _resetBgChildBookkeepingForTest(): void {
+  for (const [childSessionId, controller] of [...bgChildAbortControllers]) {
+    unregisterStreamAbortController(childSessionId, controller);
+  }
+  bgChildAbortControllers.clear();
+  bgChildProjectPaths.clear();
+  for (const [key, entry] of [...projectActiveRuns]) {
+    entry.bgSessions.clear();
+    if (!entry.lease) projectActiveRuns.delete(key);
+  }
+}
+
+/**
+ * 测试专用（CR-15 双簿记偏差场景构造）：摘除某 bg 子会话的 shell abort controller 登记而不清
+ * bg 桶——模拟「bg-update 事件丢失且 controller 生命周期面已消失」的漂移态，供 reconcile
+ * 收敛路径断言（偏差必经启动对账清扫收敛）。
+ */
+export function _unregisterBgChildControllerForTest(childSessionId: string): void {
+  const controller = bgChildAbortControllers.get(childSessionId);
+  if (!controller) return;
+  bgChildAbortControllers.delete(childSessionId);
+  unregisterStreamAbortController(childSessionId, controller);
 }
 
 let registered = false;
@@ -378,7 +605,10 @@ export function registerAgentIpc(getWin: () => BrowserWindow | null) {
   // agent 纯编排，桥 turn 执行在 shell 桥基座 agyBridgeIpc：consent 硬门〔CR-27〕+ 模型
   // 解析 + 注册表 live 监听）。wiring 测试钉死漏装配——删任一行桥车道静默回 runLoop
   // 纯文本路径（resolver 未装配 = off，fail-safe 方向）。
-  const agyBridgeDeps = agyBridgeProductionDeps();
+  // 09-20 F17 W0（design §1.3/§3）：agentRuntime / getWin 经装配点注入——两值都住在
+  // agentIpc 作用域（getAgentRuntime 单例 + registerAgentIpc 的 getWin 参数），agyBridgeIpc
+  // 静态 import 本文件会成环，故走 deps 覆写缝（mirror deps.registry() 避环形态）。
+  const agyBridgeDeps = agyBridgeProductionDeps({ agentRuntime: getAgentRuntime, getWin });
   setAgyBridgeModeResolver(createAgyBridgeLaneModeResolver(agyBridgeDeps));
   setBridgeTurnFn(createAgyBridgeTurnProduction(agyBridgeDeps));
 
@@ -448,8 +678,19 @@ export function registerAgentIpc(getWin: () => BrowserWindow | null) {
   runtime = createWorkflowRuntime({
     onRuntimeEvent: (sessionId, event) => {
       try {
-        const projectPath = runtime.getSession(sessionId)?.projectPath;
-        getWin()?.webContents.send('agent:stream-event', { ...event, sessionId, projectPath });
+        const session = runtime.getSession(sessionId);
+        const projectPath = session?.projectPath;
+        // W3：bg 子会话 shell 侧生命周期记账（bg 车道桶 + abort 可达面）——先于广播，
+        // 失败不破事件流（函数内自容错）。
+        noteBgChildRuntimeEvent(sessionId, event, session);
+        // W3 additive：载荷补 sessionRole——renderer 据此区分 bg 子会话事件（W4 消费：
+        // isProjectRunActive 口径排除 + 检视图路由）。缺省字段不发送（undefined 不入载荷）。
+        getWin()?.webContents.send('agent:stream-event', {
+          ...event,
+          sessionId,
+          projectPath,
+          ...(session?.sessionRole ? { sessionRole: session.sessionRole } : {}),
+        });
       } catch {
         // Window may have been closed — mirror sendEvent 容错
       }
@@ -542,8 +783,19 @@ export function registerAgentIpc(getWin: () => BrowserWindow | null) {
     },
   );
 
-  ipcMain.handle('agent:list-sessions', async (_event, projectPath?: string) => {
-    return runtime.listSessions(projectPath);
+  ipcMain.handle('agent:list-sessions', async (_event, projectPath?: string, opts?: { includeAllRoles?: boolean }) => {
+    const { sessions } = runtime.listSessions(projectPath);
+    // W4（09-21-subagent-bg-decouple U6 存量债）：默认只列用户会话。runtime 层 listSessions
+    // 保持无过滤（reconcileStaleProjectRuns 依赖全量——bg 子会话有真 running 磁盘态后须被
+    // 对账覆盖），过滤收口在本 IPC 面。
+    return { sessions: opts?.includeAllRoles ? sessions : sessions.filter(isListableSession) };
+  });
+
+  // W4（09-21-subagent-bg-decouple）：后台任务注册表只读查询——UI「后台任务」条 hydrate
+  // 数据源（重启后 interrupted 行如实呈现；运行期增量走 bg-update 事件，本查询只在项目
+  // 打开/面板挂载时调，低频）。getBgTaskRegistry 为 W3 已引依赖（零新增 import）。
+  ipcMain.handle('agent:bg-tasks', async (_event, projectPath?: string) => {
+    return { tasks: projectPath ? getBgTaskRegistry().listByProject(projectPath) : [] };
   });
 
   ipcMain.handle('agent:delete-session', async (_event, id: string, projectPath?: string) => {
@@ -610,6 +862,13 @@ export function registerAgentIpc(getWin: () => BrowserWindow | null) {
     // CR-T1-022：Set 形态——同 session 重叠 invoke 的全部 controller 一并 abort。
     for (const controller of streamAbortControllers.get(sessionId) ?? []) {
       controller.abort();
+    }
+    // 09-20 F17 W3（design §4-1）：桥会话 abort 联动——桥车道在途本地工具执行
+    // （write_chapter 整链）持 record.abortController.signal，此处一并掐断（此前只 abort
+    // runtime/IPC 控制器，桥上链会继续跑到完成/自身失败——UI 停止钮对桥车道失联）。
+    // 无桥会话 → false（非桥模型/HTTP 车道，零副作用幂等）。
+    if (abortBridgeSession(sessionId)) {
+      logger.info({ sessionId }, 'agent:abort-run: aborted in-flight agy bridge session (local tool execution)');
     }
     return runtime.abortRun(sessionId);
   });

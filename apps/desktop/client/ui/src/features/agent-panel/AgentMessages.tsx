@@ -175,7 +175,7 @@ export function AgentMessages({ messages, loading, error }: Props) {
   // 通知条 = 本会话「本次 run」的切换记录（send 重置 / 会话删除清）；当前模型 chip 的
   // 初值 = UI 派生（dialogue 档 assignment——dialogueModelRefFromConfig 同款读法；无指派
   // 显示「自动」），model-fallback 事件到达时翻为接管模型（activeModelBySession）。
-  const { fallbackNotices, activeModel, modelConfigForChip, bridgeNotices } = useAppStore(useShallow((s) => {
+  const { fallbackNotices, activeModel, modelConfigForChip, bridgeNotices, runOutcome } = useAppStore(useShallow((s) => {
     const sid = s.agentSessionId;
     return {
       fallbackNotices: sid !== null ? s.modelFallbackNotices[sid] ?? EMPTY_NOTICES : EMPTY_NOTICES,
@@ -183,9 +183,16 @@ export function AgentMessages({ messages, loading, error }: Props) {
       modelConfigForChip: s.modelConfig as ModelConfig | undefined,
       // 子4 W6：桥运行期通知（本次 run 的记录；send 重置 / 会话删除清）。
       bridgeNotices: sid !== null ? s.bridgeNoticesBySession[sid] ?? EMPTY_BRIDGE_NOTICES : EMPTY_BRIDGE_NOTICES,
+      // CR-09-20-dogfood-1：run 终态正向观测（done/abort/error 事件面写，send 重置）。
+      runOutcome: sid !== null ? s.runOutcomeBySession?.[sid] : undefined,
     };
   }));
   const generating = loading || hasStreamingMessage;
+  // 小残留 b（dogfood R4）：桥警示条的结局收敛态 = 本回合 run 终态**正向观测**成功
+  //（done 且未被 abort/error 先行标记）且非运行中。CR-09-20-dogfood-1：不再读视图级
+  // error——切走切回（switch 清 error 而通知残留）与 abort 回合（done 不写 error）都会
+  // 把非成功结局误标成「本轮已成功收场」。
+  const bridgeNoticesSettledOk = runOutcome === 'ok' && !generating;
   const dialogueAssignment = modelConfigForChip?.taskModels?.dialogue;
   const chipModelRef = activeModel
     ?? (dialogueAssignment && dialogueAssignment.keyId && dialogueAssignment.modelId
@@ -374,12 +381,20 @@ export function AgentMessages({ messages, loading, error }: Props) {
       {/* 子4 W6（design §8）：桥运行期通知（打回/二次未调/软拒）——运行阶段可见性纪律：
           不静默。mirror 回退通知条形态；soft-denied 带 warning 强度（AC7 指向授权机制）；
           R5 起含「模型离开了桥工具族」相位（与桥工具相位可区分——不走「正在调用 X」）；
-          R6 起含内置工具被权限拦下（F13）。 */}
+          R6 起含内置工具被权限拦下（F13）。
+          小残留 b（dogfood R4）：回合**成功**收场后警示条随结局收敛——整体降淡 + 尾部
+          结局标注行（事件时点为真，历史保留不删）；运行中/失败结局维持警示强度不标注。 */}
       {bridgeNotices.length > 0 && (
-        <div className="agent-bridge-notices">
+        <div className={`agent-bridge-notices${bridgeNoticesSettledOk ? ' agent-bridge-notices--settled-ok' : ''}`}>
           {bridgeNotices.map((notice) => (
             <BridgeNoticeStrip key={notice.id} notice={notice} t={t} />
           ))}
+          {bridgeNoticesSettledOk ? (
+            <div className="agent-bridge-notice-outcome" role="status">
+              <span className="material-symbols-outlined" aria-hidden="true">check_circle</span>
+              <span>{t('agent.bridgeNoticeTurnSettledOk')}</span>
+            </div>
+          ) : null}
         </div>
       )}
       {generating && (

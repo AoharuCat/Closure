@@ -58,8 +58,13 @@
   --z-panel-overlay: 100;  /* in-panel popovers (topbar, attach menu, rail) */
   --z-dropdown: 1000;      /* free-floating dropdowns / menus */
   --z-image-overlay: 1100; /* image preview / edit modals */
-  --z-notification: 1200;  /* toasts / notification center */
-  --z-confirm-dialog: 1300; /* app modals — must sit above toasts */
+  --z-confirm-dialog: 1200; /* app modals (settings / confirm overlay) */
+  --z-notification: 1300;  /* toasts — above modals: transient feedback fired from a
+                              dialog (e.g. model-config validation) must stay readable,
+                              else the dialog mask hides it entirely (dogfood R4
+                              residue a: toast invisible under settings dialog on
+                              short windows); toast clicks also land on the toast
+                              instead of leaking to the overlay beneath */
   --z-command-palette: 1400;
   --z-context-menu: 1500;  /* above modals (right-click inside a dialog) */
   --z-tooltip: 1600;       /* always on top */

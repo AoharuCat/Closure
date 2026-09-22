@@ -23,6 +23,8 @@ describe('preload security surface', () => {
       'agyTextAgentStatus',
       'applyAgentFieldPatch',
       'applyAuthorProfileNote',
+      // C3.2 W2 多套预设：任务档预设四通道（taskPresets:list/save/apply/delete）。
+      'applyTaskPreset',
       'canaryProbeVision',
       // 拆书链：章标派生状态读 + 失败章重取（closureChain 两 invoke）。
       'chapterDerivationStatus',
@@ -74,6 +76,7 @@ describe('preload security surface', () => {
       'deleteProject',
       'deleteProjectFile',
       'deleteTask',
+      'deleteTaskPreset',
       'docxToHtml',
       'docxToMarkdown',
       'downloadUpdate',
@@ -108,6 +111,8 @@ describe('preload security surface', () => {
       'importFonts',
       // Story 10.1 Wave D：材料库管理面。
       'importMaterials',
+      // E10.4 W1：在线解析生态（URL 直贴导入——shell handler W1 占位、W2 落实现）。
+      'importOnlineMaterial',
       'importWallpaper',
       'installUpdate',
       'isKeyEncryptionAvailable',
@@ -117,6 +122,8 @@ describe('preload security surface', () => {
       'lintClassify',
       'lintModelProbe',
       'lintScanFull',
+      // W4（09-21-subagent-bg-decouple）：后台任务注册表只读查询（`agent:bg-tasks`）。
+      'listAgentBgTasks',
       'listAgentContinuations',
       'listAgentSessions',
       'listAgentSkills',
@@ -129,6 +136,7 @@ describe('preload security surface', () => {
       'listRegisteredProjects',
       'listRemoteModels',
       'listSkillPackages',
+      'listTaskPresets',
       'listTasks',
       'loadModelConfig',
       'loadProjectDocument',
@@ -185,7 +193,10 @@ describe('preload security surface', () => {
       'saveModelConfig',
       'saveProjectMeta',
       'saveResearchConfig',
+      'saveTaskPreset',
       'saveUserPreferences',
+      // E10.4 W1：在线解析生态（关键词发现——shell handler W1 占位、W2 落实现）。
+      'searchOnlineSources',
       'searchProject',
       'setAgentSessionBehaviorMode',
       'setAgentSessionMode',

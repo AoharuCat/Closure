@@ -1,7 +1,7 @@
 import { useAppStore } from '../../shared/store/appStore';
 import { useI18n } from '../../shared/i18n/useI18n';
 import { Collapsible } from '../../shared/components/Collapsible';
-import { toolPresentation, toolLabel, toolSummary } from './toolMeta';
+import { toolPresentation, toolLabel, toolSummary, isToolErrorOutput } from './toolMeta';
 
 type Props = {
   result: { toolId?: string; toolName?: string; output?: string; metadata?: unknown };
@@ -22,9 +22,10 @@ export function AgentToolCard({ result, bridge }: Props) {
       : [];
 
   // A failed tool surfaces its error as a result whose output starts with
-  // "Error:" (see agent loop / tool handlers). Reflect that instead of always
-  // showing a green check, so a failure isn't mistaken for success.
-  const isError = typeof result.output === 'string' && /^\s*error\b/i.test(result.output);
+  // "Error:" (lane-shared convention — see isToolErrorOutput). Reflect that
+  // instead of always showing a green check, so a failure isn't mistaken for
+  // success.
+  const isError = isToolErrorOutput(result.output);
 
   const toolId = result.toolName ?? result.toolId ?? '';
   const { icon } = toolPresentation(toolId);

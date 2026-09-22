@@ -1187,9 +1187,12 @@ function initSchema(db: Database.Database): void {
   //
   // CR-18 NULL 语义：五个 token 列全 NULLable——「计数器未上报」落 NULL、「上报 0」落 0，
   // 二者不混淆；聚合 SUM 对 NULL 天然跳过（空集 COALESCE→0）。task_type/lane/session_key/
-  // first_delta_ms/失败行 error 列同理 NULL = 缺席。新表首建即全列（IF NOT EXISTS）——旧库
-  // zero-touch、零内省 ALTER 需求（无 fallback_trace 列：回退环在网关层、协议层 wrapper 永远
-  // 看不到 fallbackTrace，无写入方的死列不留——2026-09-12 复核拍板；call_id 归 C3.1 届时 ALTER）。
+  // first_delta_ms/失败行 error 列同理 NULL = 缺席（CR-18 v2：失败/被弃 attempt 的已知消耗
+  // 如实入账，未知才 ABSENT——措辞单源在 model-protocols usageSink GenerationCallRecord）。
+  // 新表首建即全列（IF NOT EXISTS）；C3.1（09-20）三新列（call_id/session_id/image_count）
+  // 走「CREATE 全列 + 存量库内省 ALTER」双路径（迁移段见表块后）。无 fallback_trace 列：
+  // 回退环在网关层、协议层 wrapper 永远看不到 fallbackTrace，无写入方的死列不留——2026-09-12
+  // 复核拍板。
   db.exec(`
     CREATE TABLE IF NOT EXISTS closure_llm_log (
       id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1209,6 +1212,12 @@ function initSchema(db: Database.Database): void {
       thinking_tokens    INTEGER,                -- agy driver 唯一来源
       cache_read_tokens  INTEGER,                -- agy driver 唯一来源
       total_tokens       INTEGER,                -- 缺席不由 input+output 合成
+      -- C3.1（09-20）三新列（写入方同 task 同批落地：call_id = 网关回退环外生成 +
+      -- driver attempt 收集器；session_id = wire request.sessionId 三跳；image_count =
+      -- image wrapper n??1——design §3.2）：
+      call_id        TEXT,                       -- 逻辑调用分组 id（回退环/driver 多 attempt 全行共享）
+      session_id     TEXT,                       -- 逻辑会话 id（generateText 族；NULL = 调用方未标）
+      image_count    INTEGER,                    -- 生图张数（仅生图行非 NULL；NULL = 非生图行）
       latency_ms     INTEGER NOT NULL,
       first_delta_ms INTEGER                      -- 流式首 delta 耗时；非流式/无 delta NULL
     );
@@ -1219,4 +1228,13 @@ function initSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_closure_llm_log_task_ts
       ON closure_llm_log (task_type, ts DESC);
   `);
+
+  // C3.1（09-20）存量库三新列内省 ALTER（新库首建已含全列，内省命中即跳过——两条路径 DDL
+  // 同形不漂移）。旧行三列 NULL = 缺席（零回填，CR-18）；不加新索引（聚合 SQL 不涉新列，
+  // C3.5 per-chapter 面到时按 demonstrated query 再议——design §3.2）。
+  const llmLogCols = db.pragma('table_info(closure_llm_log)') as { name: string }[];
+  const llmLogColNames = new Set(llmLogCols.map((c) => c.name));
+  if (!llmLogColNames.has('call_id')) db.exec('ALTER TABLE closure_llm_log ADD COLUMN call_id TEXT');
+  if (!llmLogColNames.has('session_id')) db.exec('ALTER TABLE closure_llm_log ADD COLUMN session_id TEXT');
+  if (!llmLogColNames.has('image_count')) db.exec('ALTER TABLE closure_llm_log ADD COLUMN image_count INTEGER');
 }

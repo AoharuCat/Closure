@@ -44,6 +44,8 @@ import { outlineUpdateWithQualityGates } from './outline-quality-gates';
 import { skillTool } from './skill';
 import { skillResourceListTool, skillResourceReadTool } from './skill_resource';
 import { spawnAgentTool } from './spawn_agent';
+import { spawnAgentBgTool } from './spawn_agent_bg';
+import { bgTaskCancelTool, bgTaskResultTool, bgTasksStatusTool } from './bg-task-tools';
 import { writeChapterTool } from './write-chapter';
 import { diagnoseImpactsTool } from './diagnose-impacts';
 import { dispatchResearcherTool } from './dispatch-researcher';
@@ -133,6 +135,15 @@ export function registerBuiltinTools() {
 
   // Subagents — spawn focused child sessions for specialized tasks
   registry.register(spawnAgentTool);
+
+  // 09-21-subagent-bg-decouple W1（design §1.2）：后台子 agent 派发族（spawn_agent_bg 立返句柄 +
+  // status/result/cancel 三配套）。mirror spawn_agent 的 local-tool-with-runtime 模式；classifyTool
+  // 默认 'read'（编排/查询/取消记账，不产 patch 不进 WRITE/DIFF——mirror spawn_agent 零 toolPolicy 登记）。
+  // 同步 spawn_agent 字节级零改动（D1：新工具而非加参）。
+  registry.register(spawnAgentBgTool);
+  registry.register(bgTasksStatusTool);
+  registry.register(bgTaskResultTool);
+  registry.register(bgTaskCancelTool);
 
   // Story 4.0: leader chapter-chain dispatch (local tool). Triggers the write-
   // chapter subgraph (brief-compiler → draft-writer → storySync → multi-review →

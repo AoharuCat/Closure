@@ -38,6 +38,12 @@ export type RerankDeps = {
   resolveModel?: () => ResolvedModel | null;
   /** Score `docs` against `query` -> per-doc relevance (aligned to input order). Defaults to a rerank wrapper. */
   rerank?: (model: ResolvedModel, query: string, docs: string[]) => Promise<number[]>;
+  /**
+   * C3.1 计量台账：调用方标签透传（'kb-rerank' / 'craft-rerank'）——本模块被 searchClosure
+   * 与 searchCraft 双消费，物理点（defaultRerank）读透传值不硬编码，ledger byTask 才能把
+   * KB 检索与 craft 检索的 rerank 成本分开。缺省 undefined = 未标注（NULL 组）。
+   */
+  taskType?: string;
 };
 
 /**
@@ -47,16 +53,19 @@ export type RerankDeps = {
  * defaultEmbed): a hung rerank endpoint must not stall a `query_story` /
  * `query_craft` call. The timeout rejection lands in rerankCandidates' try/catch
  * (logs + degrades to RRF top-k). 30s is generous for a single rerank batch.
+ *
+ * C3.1：taskType 经 ctx 透传给协议层 rerank wrapper（调用方标签，物理点不硬编码）。
  */
 async function defaultRerank(
   model: ResolvedModel,
   query: string,
   docs: string[],
+  taskType: string | undefined,
 ): Promise<number[]> {
   const res = await rerank(
     model,
     { query, documents: docs },
-    { signal: AbortSignal.timeout(30_000) },
+    { signal: AbortSignal.timeout(30_000), taskType },
   );
   return res.scores;
 }
@@ -115,7 +124,7 @@ export async function rerankCandidates<T extends {
   if (!query.trim()) return hits.slice(0, k);
 
   const resolveModel = deps?.resolveModel ?? resolveRerankModel;
-  const rerankFn = deps?.rerank ?? defaultRerank;
+  const rerankFn = deps?.rerank ?? ((model, query, docs) => defaultRerank(model, query, docs, deps?.taskType));
 
   let model: ResolvedModel | null;
   try {

@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { ipcMain } from 'electron';
 import type {
   GenerateEmbeddingPayload,
@@ -33,6 +34,7 @@ import {
   rerank,
   ProtocolTimeoutError,
   classifyGenerationFailure,
+  CircuitOpenError,
   FallbackChainExhaustedError,
 } from '@orison/model-protocols';
 import type { FallbackAttemptRecord } from '@orison/model-protocols';
@@ -40,6 +42,15 @@ import type { GenerationDelta } from '@orison/model-protocols';
 import { readModelConfigFromDisk } from './configIpc';
 import { resolveModelInfoWithDefaults } from '@orison/shared-contracts';
 import { resolveImageParts } from './agentImageParts';
+import {
+  verdictFor,
+  recordFailureFor,
+  recordSuccessFor,
+  BREAKER_COOLDOWN_MS,
+  BREAKER_THRESHOLD,
+  BREAKER_WINDOW_MS,
+} from './circuitBreaker';
+import type { BreakerFailureTransition, BreakerVerdict } from './circuitBreaker';
 import { getLogger } from '../logger';
 
 const logger = getLogger();
@@ -438,6 +449,74 @@ export function _resetAntigravityCliUsedForTest(): void {
   antigravityCliUsed = false;
 }
 
+// ── C3.2 W1：网关层熔断（per-(keyId, modelId)，design §1）──
+//
+// 状态机与进程内态归 circuitBreaker.ts（纯函数族 + 薄 Map 层）；本文件只做三件事：
+// 回退环条目前置门（open → 跳条目）、直通快径前置门（open → 快败 CircuitOpenError）、
+// attempt 成败回写（eligible 失败计数 / 成功关断）。判据单源 = classifyGenerationFailure
+// eligible 族；config 跳家与 producedDelta 直抛不计数（本地确定性失败 / 内容已流出的
+// interrupted 语义——都不是 provider 健康信号）。
+//
+// CR-5（c3-2 CR 批）：三调用各包降级守卫（mirror 预算门 R4 降级哲学——熔断器自身故障
+// 不得杀生成）：verdict 异常按 closed 放行、record 异常跳过计数，logger.warn 留痕。
+
+/** verdict 降级守卫：熔断判定异常 → 按放行（closed）处理 + warn。 */
+function breakerVerdictSafe(keyId: string, modelId: string): BreakerVerdict {
+  try {
+    return verdictFor(keyId, modelId);
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err), keyId, modelId },
+      'circuit breaker verdict threw — treating as closed (call proceeds)',
+    );
+    return { kind: 'closed' };
+  }
+}
+
+/** 失败回写降级守卫：记数异常 → 跳过计数（'counted' 无迁移日志）+ warn。 */
+function recordFailureSafe(keyId: string, modelId: string): BreakerFailureTransition {
+  try {
+    return recordFailureFor(keyId, modelId).transition;
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err), keyId, modelId },
+      'circuit breaker failure record threw — failure not counted',
+    );
+    return 'counted';
+  }
+}
+
+/** 成功回写降级守卫：关断异常 → 跳过（保持原态）+ warn。 */
+function recordSuccessSafe(keyId: string, modelId: string): void {
+  try {
+    recordSuccessFor(keyId, modelId);
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err), keyId, modelId },
+      'circuit breaker success record threw — state unchanged',
+    );
+  }
+}
+
+/**
+ * C3.2 W1：熔断状态迁移 warn（design §1.3）——open（阈值触发）与 half-open 探针失败
+ * 重开各一条结构化日志（keyId/modelId/冷却参数）；'counted'（closed 态滚动计数）无状态
+ * 迁移，零日志。
+ */
+function logBreakerTransition(keyId: string, modelId: string, transition: BreakerFailureTransition): void {
+  if (transition === 'opened') {
+    logger.warn(
+      { keyId, modelId, windowMs: BREAKER_WINDOW_MS, threshold: BREAKER_THRESHOLD, cooldownMs: BREAKER_COOLDOWN_MS },
+      'circuit breaker OPEN — rolling-window eligible failures reached threshold',
+    );
+  } else if (transition === 'reopened') {
+    logger.warn(
+      { keyId, modelId, cooldownMs: BREAKER_COOLDOWN_MS },
+      'circuit breaker half-open probe failed — REOPENED for another cooldown',
+    );
+  }
+}
+
 // ── 09-12 子2 fallback chains（design §4）：网关层回退环 ──
 
 /**
@@ -511,11 +590,16 @@ async function resolveAttemptRequest(
  * ONE non-streaming attempt's execution (lane normalization + CLI ceiling
  * exemption + CR-34 background ceiling) — the extracted pre-fallback body,
  * byte-identical semantics, re-run per attempt with the attempt's own ceiling.
+ *
+ * C3.1 计量台账：`callId` 由网关 handler 回退环外生成、每 attempt 原样透传——回退环
+ * 推进（跨模型多 attempt）在 ledger 侧共享同一 call_id 分组；undefined = 非网关调用方
+ * （缺省入口 wrapper 自生成，单 attempt 行自成一组）。
  */
 async function executeNonStreamingAttempt(
   resolved: ResolvedModel,
   request: TextGenerationRequest,
   signal: AbortSignal | undefined,
+  callId: string | undefined,
 ): Promise<TextGenerationResponse> {
   // dogfood R2 #7：request.lane → ProtocolCallContext.lane（undefined = interactive 语义）；
   // CR-35：lane 先过 safeParse 归一（枚举外值回落 undefined + 一次性 warn）。
@@ -524,19 +608,52 @@ async function executeNonStreamingAttempt(
   // 兜底 belt，是唯一时长闸（design §3.3）。signal 原样直通（不套 ceiling 包装）。
   const lane = normalizeRequestLane(request?.lane);
   if (lane !== 'background' || resolved.protocol === 'antigravity-cli') {
-    return generateText(resolved, request, { signal, lane });
+    return generateText(resolved, request, { signal, lane, callId });
   }
   // CR-34（#50 关严）：非流式 background 路径套 600s 硬上限。每 attempt 各自有界
   //（09-12 子2 design §4 权衡——最坏 N×600s，链是用户显式配的兜底）。
   const ceilingSignal = signalWithCeiling(signal, BACKGROUND_NONSTREAM_CEILING_MS);
   try {
-    return await generateText(resolved, request, { signal: ceilingSignal, lane });
+    return await generateText(resolved, request, { signal: ceilingSignal, lane, callId });
   } catch (err) {
     // CR-33 同序保护：调用方主动取消优先于超时映射（先查原始 signal，再判上限是否到点）。
     if (signal?.aborted) throw err;
     if (ceilingSignal.aborted) {
       throw new ProtocolTimeoutError(
         `background non-streaming generation exceeded its ${BACKGROUND_NONSTREAM_CEILING_MS / 1_000}s total ceiling`,
+      );
+    }
+    throw err;
+  }
+}
+
+/**
+ * C3.2 W1：无链直通快径的熔断包装（design §1.2）——这是「零默认链快径字节级现行为」的
+ * **显式豁免点**：快径纪律保护的是「无链 = 不引入环机械」，熔断快败是 deliberate 行为
+ * 变更（坏 provider 不再每次烧满超时），错误本体（CircuitOpenError，含模型名/剩余冷却秒）
+ * 清晰可辨。语义：primary open → 不发起请求快败；half-open → 本次即探针放行；成功关断；
+ * eligible 失败计数后**原样重抛**（record 不改错误本体——无链路径现状是直抛）。
+ */
+async function executeFastPathAttempt(
+  resolved: ResolvedModel,
+  request: TextGenerationRequest,
+  run: () => Promise<TextGenerationResponse>,
+): Promise<TextGenerationResponse> {
+  const breakerVerdict = breakerVerdictSafe(resolved.keyId, resolved.modelId);
+  if (breakerVerdict.kind === 'open') {
+    throw new CircuitOpenError(resolved.keyId, resolved.modelId, breakerVerdict.cooldownLeftMs);
+  }
+  try {
+    const response = await run();
+    recordSuccessSafe(resolved.keyId, resolved.modelId);
+    return response;
+  } catch (err) {
+    const classification = classifyGenerationFailure(err);
+    if (classification.eligible) {
+      logBreakerTransition(
+        resolved.keyId,
+        resolved.modelId,
+        recordFailureSafe(resolved.keyId, resolved.modelId),
       );
     }
     throw err;
@@ -610,6 +727,29 @@ async function runFallbackLoop(
       );
       continue;
     }
+    // 1.5 C3.2 W1 熔断条目前置门：键 = RESOLVED 身份（复核 must-fix#2——auto-pick 主指派
+    //     下请求 ref 是 {default,default} 哨兵，按请求身份记键则永不相交，熔断静默失效）。
+    //     open → 跳过该条目（trace `circuit-open:` + 既有 model-fallback 事件族 = 运行期
+    //     可见白捡）；half-open → 本次即探针放行。门在 config 跳家分支之后、CR-15 CLI 旗
+    //     之前——被跳条目未发起任何调用，不得置 CLI-usage 旗。链尽（含全部条目被跳）照旧
+    //     环尾抛 FallbackChainExhaustedError（trace 含 circuit-open 行）。
+    const breakerVerdict = breakerVerdictSafe(resolved.keyId, resolved.modelId);
+    if (breakerVerdict.kind === 'open') {
+      const reason = `circuit-open: cooldown ${Math.ceil(breakerVerdict.cooldownLeftMs / 1000)}s left`;
+      trace.push({ keyId: resolved.keyId, modelId: resolved.modelId, reason });
+      logger.warn(
+        { keyId: resolved.keyId, modelId: resolved.modelId, reason, attempt: index + 1 },
+        'fallback chain: circuit open, skipping to next entry',
+      );
+      announceFallbackSwitch(
+        onFallback,
+        { keyId: resolved.keyId, modelId: resolved.modelId },
+        next ? { keyId: next.ref.keyId, modelId: next.ref.modelId } : undefined,
+        reason,
+        index,
+      );
+      continue;
+    }
     if (resolved.protocol === 'antigravity-cli') antigravityCliUsed = true; // CR-15 quit 守卫旗
 
     // 2. Request overwrite — built from the ORIGINAL payload every attempt
@@ -674,6 +814,8 @@ async function runFallbackLoop(
       // Success — annotate the RESOLVED identity (the request ref is the
       // {default,default} sentinel under auto-pick) + the trace when a
       // fallback actually happened (two-state .min(1)).
+      // C3.2 W1：成功回写关断（open 期成功 = 半开探针通过；closed 态 = no-op 等价）。
+      recordSuccessSafe(resolved.keyId, resolved.modelId);
       return {
         ...response,
         modelRef: { keyId: resolved.keyId, modelId: resolved.modelId },
@@ -684,6 +826,13 @@ async function runFallbackLoop(
     } catch (err) {
       const classification = classifyGenerationFailure(err);
       if (!classification.eligible || producedDelta) throw err;
+      // C3.2 W1：eligible 失败回写熔断（closed 计数 / half-open 探针失败重开）——
+      // config 跳家与 producedDelta 直抛不经过此处（见上方分支，均非 provider 健康信号）。
+      logBreakerTransition(
+        resolved.keyId,
+        resolved.modelId,
+        recordFailureSafe(resolved.keyId, resolved.modelId),
+      );
       // Eligible failure → record the per-model reason + announce the switch.
       trace.push({ keyId: resolved.keyId, modelId: resolved.modelId, reason: classification.reason });
       announceFallbackSwitch(
@@ -701,15 +850,21 @@ async function runFallbackLoop(
 }
 
 export async function handleGenerateText(payload: GenerateTextPayload, signal?: AbortSignal, onFallback?: (event: FallbackSwitchEvent) => void): Promise<TextGenerationResponse> {
+  // ── C3.1 计量台账：callId 回退环**外**恰生成一次——本 handler 的全部 attempt（含
+  // 链推进的跨模型重试）共享同一 call_id（ledger 跨行分组「一次逻辑调用」）。无链快径
+  // 同样携带（单 attempt 行自成一组，生成点统一不分支）。
+  const callId = randomUUID();
   // ── 09-12 子2 fallback chains（design §4）：零默认链快径 ──
   // payload.fallbacks 缺席 → 单模型直通，字节级现行为（无环机械、无响应注记、resolveModel
   // 原样直抛）。链只可能来自用户 sidecar 显式配置（零注入拍板）。
   if (!payload.fallbacks || payload.fallbacks.length === 0) {
     const { resolved, request } = await resolveAttemptRequest(payload.ref, payload.request, payload.request?.messages, signal);
-    return executeNonStreamingAttempt(resolved, request, signal);
+    // C3.2 W1：快径熔断包装（primary open → 快败 CircuitOpenError；成败回写熔断态）。
+    return executeFastPathAttempt(resolved, request, () =>
+      executeNonStreamingAttempt(resolved, request, signal, callId));
   }
   return runFallbackLoop(payload, signal, onFallback, undefined, (resolved, request) =>
-    executeNonStreamingAttempt(resolved, request, signal));
+    executeNonStreamingAttempt(resolved, request, signal, callId));
 }
 
 /**
@@ -741,6 +896,9 @@ export async function handleGenerateTextStream(
   onDelta: (d: GenerationDelta) => void,
   onFallback?: (event: FallbackSwitchEvent) => void,
 ): Promise<TextGenerationResponse> {
+  // C3.1 计量台账：callId 回退环**外**恰生成一次（mirror handleGenerateText）——链推进
+  // 的每 attempt 与 streamingDisabled 短路的非流式 attempt 共享同一 call_id。
+  const callId = randomUUID();
   // 09-12 子3 §3 ⑩：SSE 烂网关保险丝——键级 streamingDisabled 短路回既有非流式路径
   //（onDelta 丢弃、终帧直达；复用 executeNonStreamingAttempt = lane 归一 / CLI 豁免 /
   // CR-34 background 600s 顶全部同语义）。本函数是流式唯一 shell 入口（agentIpc
@@ -748,24 +906,28 @@ export async function handleGenerateTextStream(
   //（回退家在别的键上时保留流式——per-key 语义，非 per-request）。
   if (!payload.fallbacks || payload.fallbacks.length === 0) {
     const { resolved, request } = await resolveAttemptRequest(payload.ref, payload.request, payload.request?.messages, signal);
-    if (resolved.streamingDisabled) {
-      return executeNonStreamingAttempt(resolved, request, signal);
-    }
-    return generateTextStream(
-      resolved,
-      request,
-      { signal, lane: normalizeRequestLane(request?.lane) },
-      onDelta,
-    );
+    // C3.2 W1：快径熔断包装（mirror 非流式 sibling——open 快败 / 成败回写；streamingDisabled
+    // 短路的非流式 attempt 同在包装内，熔断语义一致）。
+    return executeFastPathAttempt(resolved, request, () => {
+      if (resolved.streamingDisabled) {
+        return executeNonStreamingAttempt(resolved, request, signal, callId);
+      }
+      return generateTextStream(
+        resolved,
+        request,
+        { signal, lane: normalizeRequestLane(request?.lane), callId },
+        onDelta,
+      );
+    });
   }
   return runFallbackLoop(payload, signal, onFallback, onDelta, (resolved, request, attemptOnDelta) => {
     if (resolved.streamingDisabled) {
-      return executeNonStreamingAttempt(resolved, request, signal);
+      return executeNonStreamingAttempt(resolved, request, signal, callId);
     }
     return generateTextStream(
       resolved,
       request,
-      { signal, lane: normalizeRequestLane(request?.lane) },
+      { signal, lane: normalizeRequestLane(request?.lane), callId },
       // 非 undefined 断言：streaming handler 的 onDelta 是必填参数 → 环内 tracked
       // 包装器每 attempt 必在（类型上 executeAttempt 形参可 undefined 是非流式共用所致）。
       attemptOnDelta!,
@@ -775,15 +937,23 @@ export async function handleGenerateTextStream(
 
 export async function handleGenerateImage(payload: GenerateImagePayload, signal?: AbortSignal): Promise<ImageGenerationResponse> {
   const resolved = resolveModel(payload.ref);
-  return generateImage(resolved, payload.request, { signal });
+  // C3.1 计量台账：taskType 走 ctx 通道（image wrapper 落列）——网关是生图唯一调用面，
+  // 'image-gen' 标签在此单点标注（token 列端点无信号如实全 NULL，image_count = n ?? 1）。
+  // CR-6 复核：callId 同在回退环外恰生成一次（mirror 文本两 handler 的不变式——生图
+  // 通道无环，单逻辑调用单行自成一组，但生成职责归网关与 text 面一致，不留给 wrapper
+  // 缺省自生成分叉）。
+  return generateImage(resolved, payload.request, { signal, taskType: 'image-gen', callId: randomUUID() });
 }
 
 export async function handleGenerateEmbedding(payload: GenerateEmbeddingPayload, signal?: AbortSignal): Promise<EmbeddingResponse> {
   const resolved = resolveModel(payload.ref);
-  return generateEmbeddings(resolved, payload.request, { signal });
+  // C3.1 复核 CR-5：渲染前门两通道补描述性标签（此前 task_type NULL——调用方未知组）。
+  // KB/检索面调用方在 shell main 直调时各自标注（'kb-query-embed' 等）；这两 handler
+  // 是 renderer 直发的 embed/rerank 通道——标签防未来 UI 消费者把 NULL 归因行落库。
+  return generateEmbeddings(resolved, payload.request, { signal, taskType: 'renderer-embed' });
 }
 
 export async function handleRerank(payload: RerankPayload, signal?: AbortSignal): Promise<RerankResponse> {
   const resolved = resolveModel(payload.ref);
-  return rerank(resolved, payload.request, { signal });
+  return rerank(resolved, payload.request, { signal, taskType: 'renderer-rerank' }); // CR-5：同 handleGenerateEmbedding
 }

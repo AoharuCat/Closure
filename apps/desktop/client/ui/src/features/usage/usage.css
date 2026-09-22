@@ -427,3 +427,135 @@
   color: var(--on-surface-variant);
   line-height: 1.45;
 }
+
+/* ── 月度预算（C3.2 W3：软警硬拦）── */
+
+/* 区块容器：标题 + 状态条 + 双线输入 + hint 纵排。 */
+.usage-budget {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3xs);
+}
+
+/* 状态行容器（chip + 本月已用 + 双线进度 + 截断守卫文案），data-state 驱动警示态。 */
+.usage-budget-status {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3xs);
+  padding: var(--space-2xs) var(--space-xs);
+  border: 1px solid var(--outline-variant);
+  border-radius: var(--radius-2xs);
+  background: var(--surface-container-lowest);
+}
+
+/* data-state=soft/hard 时边框转对应警示色（硬线 > 软线优先级由 JSX 渲染序保证——
+ * state 单值即最严态）。 */
+.usage-budget-status[data-state='soft'] {
+  border-color: var(--warning);
+}
+
+.usage-budget-status[data-state='hard'] {
+  border-color: var(--error);
+}
+
+.usage-budget-status-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2xs);
+  flex-wrap: wrap;
+}
+
+/* 状态 chip（ok = success 配色对 / soft = warning / hard = error——mirror
+ * .usage-status-chip 的既有 chip 语汇与配色对纪律）。 */
+.usage-budget-chip {
+  display: inline-block;
+  padding: 0.05rem var(--space-2xs);
+  border-radius: var(--radius-pill);
+  font-size: var(--text-2xs);
+  line-height: 1.5;
+  white-space: nowrap;
+  font-weight: 500;
+}
+
+.usage-budget-chip.is-ok {
+  color: var(--success);
+  background: var(--diff-add-bg);
+}
+
+.usage-budget-chip.is-soft {
+  color: var(--warning);
+  background: var(--warning-bg);
+}
+
+.usage-budget-chip.is-hard {
+  color: var(--error);
+  background: var(--error-bg);
+}
+
+.usage-budget-spent {
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+  color: var(--on-surface);
+}
+
+/* 单线进度：label + 条 + spent/cap 金额三段横排；条 = 轨道最低面 + 填充 accent，
+ * 过线填充转警示色（soft 线 warning / hard 线 error 由 is-crossed 只在 hard 线标红、
+ * soft 线过线走 warning——填充色由外层 line 的 data-crossed-kind 区分）。 */
+.usage-budget-line {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2xs);
+}
+
+.usage-budget-line-label {
+  min-width: 3.5rem;
+  font-size: var(--text-xs);
+  color: var(--on-surface-variant);
+}
+
+.usage-budget-bar {
+  flex: 1;
+  min-width: 6rem;
+  height: 6px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-container-high);
+  overflow: hidden;
+}
+
+.usage-budget-bar-fill {
+  display: block;
+  height: 100%;
+  border-radius: var(--radius-pill);
+  background: var(--accent);
+  transition: width var(--duration-fast) ease;
+}
+
+.usage-budget-line[data-crossed='soft'] .usage-budget-bar-fill {
+  background: var(--warning);
+}
+
+.usage-budget-line[data-crossed='hard'] .usage-budget-bar-fill {
+  background: var(--error);
+}
+
+.usage-budget-line-amount {
+  font-size: var(--text-2xs);
+  font-variant-numeric: tabular-nums;
+  color: var(--on-surface-variant);
+  white-space: nowrap;
+}
+
+/* 截断守卫文案（保留窗短于本月已过天数——月累计仅覆盖近 N 天）：warning 色小字，
+ * role=status 常显不静默。 */
+.usage-budget-truncated {
+  font-size: var(--text-2xs);
+  color: var(--warning);
+}
+
+/* 双线输入行（两字段横排 + 跨字段 warn；输入框复用 retention 既有语汇）。 */
+.usage-budget-fields {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  flex-wrap: wrap;
+}

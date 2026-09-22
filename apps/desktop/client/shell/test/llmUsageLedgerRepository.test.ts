@@ -225,3 +225,87 @@ describe.skipIf(!sqliteUsable)('llmUsageLedgerRepository (09-12 usage-panel W1)'
     expect(() => insertUsageLog(rec({}))).not.toThrow();
   });
 });
+
+// ── C3.1（09-20）三新列迁移（call_id/session_id/image_count，design §3.2）──────────
+// 旧行迁移幸存三列 NULL + 新行三列 round-trip + 迁移幂等（内省守卫——无守卫的裸 ALTER
+// 在二次启动必抛 duplicate column）。新列读面走 SQL 直读（recentUsageLogs 的列清单属
+// W4 M3 三触点面，W1 不动）。
+describe.skipIf(!sqliteUsable)('closure_llm_log C3.1 三列迁移（call_id/session_id/image_count）', () => {
+  beforeAll(() => {
+    clean();
+    mkdirSync(path.join(TEST_HOME, '.orison', 'data'), { recursive: true });
+    // 模拟 09-12 旧库：无三新列的旧形态表 + 一条旧行。raw Database 直开，先 close 释放
+    // 句柄（WAL/Windows 文件锁纪律）再交 getDb() 走 initSchema 迁移路径。
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const Database = require('better-sqlite3');
+    const raw = new Database(path.join(TEST_HOME, '.orison', 'data', 'projects.db'));
+    raw.exec(`
+      CREATE TABLE closure_llm_log (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts            INTEGER NOT NULL,
+        protocol      TEXT NOT NULL,
+        key_id        TEXT NOT NULL,
+        model_id      TEXT NOT NULL,
+        task_type     TEXT,
+        lane          TEXT,
+        session_key   TEXT,
+        stream        INTEGER NOT NULL DEFAULT 0,
+        success       INTEGER NOT NULL CHECK(success IN (0,1)),
+        error_kind    TEXT,
+        error_message TEXT,
+        input_tokens       INTEGER,
+        output_tokens      INTEGER,
+        thinking_tokens    INTEGER,
+        cache_read_tokens  INTEGER,
+        total_tokens       INTEGER,
+        latency_ms     INTEGER NOT NULL,
+        first_delta_ms INTEGER
+      );
+    `);
+    raw.prepare(
+      `INSERT INTO closure_llm_log (ts, protocol, key_id, model_id, task_type, stream, success, input_tokens, total_tokens, latency_ms)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(NOW, 'openai-compatible', 'legacy', 'model-legacy', 'writer-draft', 0, 1, 11, 17, 90);
+    raw.close();
+    getDb(); // CREATE IF NOT EXISTS no-op → 内省 ALTER 三列
+  });
+  afterAll(clean);
+
+  it('旧行迁移幸存 + 三新列 NULL（零回填，缺席 ≠ 0）', () => {
+    const rows = recentUsageLogs(10);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.keyId).toBe('legacy');
+    expect(rows[0]!.taskType).toBe('writer-draft');
+    expect(rows[0]!.inputTokens).toBe(11);
+    const migrated = getDb()
+      .prepare('SELECT call_id, session_id, image_count FROM closure_llm_log WHERE key_id = ?')
+      .get('legacy') as { call_id: string | null; session_id: string | null; image_count: number | null };
+    expect(migrated.call_id).toBeNull();
+    expect(migrated.session_id).toBeNull();
+    expect(migrated.image_count).toBeNull();
+  });
+
+  it('新行三列 round-trip：INSERT 落列 → SQL 读回；ABSENT 字段落 NULL 非 0', () => {
+    clearLedger();
+    insertUsageLog(rec({ keyId: 'k-new', callId: 'call-1', sessionId: 'sess-1' }));
+    insertUsageLog(rec({ keyId: 'k-img', callId: 'call-2', imageCount: 3 }));
+    insertUsageLog(rec({ keyId: 'k-bare' })); // 三新字段全 ABSENT
+
+    const rows = getDb()
+      .prepare(
+        `SELECT key_id AS keyId, call_id AS callId, session_id AS sessionId, image_count AS imageCount
+           FROM closure_llm_log ORDER BY id`,
+      )
+      .all() as Array<{ keyId: string; callId: string | null; sessionId: string | null; imageCount: number | null }>;
+    expect(rows).toHaveLength(3);
+    expect(rows[0]).toMatchObject({ keyId: 'k-new', callId: 'call-1', sessionId: 'sess-1', imageCount: null });
+    expect(rows[1]).toMatchObject({ keyId: 'k-img', callId: 'call-2', sessionId: null, imageCount: 3 });
+    expect(rows[2]).toMatchObject({ keyId: 'k-bare', callId: null, sessionId: null, imageCount: null });
+  });
+
+  it('迁移幂等：closeDb → getDb 二次启动不重复 ALTER（内省守卫）且数据幸存', () => {
+    closeDb();
+    expect(() => getDb()).not.toThrow();
+    expect(recentUsageLogs(10).map((r) => r.keyId).sort()).toEqual(['k-bare', 'k-img', 'k-new']);
+  });
+});

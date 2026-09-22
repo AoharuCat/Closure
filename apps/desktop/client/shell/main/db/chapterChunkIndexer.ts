@@ -96,7 +96,8 @@ export type ChapterReindexDeps = {
 
 /** 缺省批量 embed：单次 generateEmbeddings 调用，embeddings 按 input 序返回（zip by index）。 */
 async function defaultEmbedBatch(model: ResolvedModel, texts: string[]): Promise<number[][]> {
-  const res = await generateEmbeddings(model, { input: texts }, { signal: AbortSignal.timeout(60_000) });
+  // C3.1 计量台账：章块批量重嵌标签（8.3 批量重嵌大消耗面的可分账标签；批量调用 = 一行如实）。
+  const res = await generateEmbeddings(model, { input: texts }, { signal: AbortSignal.timeout(60_000), taskType: 'chapter-chunk-embed' });
   return res.embeddings;
 }
 

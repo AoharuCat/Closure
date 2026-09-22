@@ -8,6 +8,8 @@ import { normalizeProjectPathForCompare, sameProjectPath } from './projectRunBus
 import { useToastStore } from './toastStore';
 import { translate } from '../i18n/useI18n';
 import { WRITE_TOOLS, type PendingDiff, type PendingToolConfirm } from './agentDiffSlice';
+// W4（09-21-subagent-bg-decouple）：toast role 人话化（toolMeta 纯映射——无 store 依赖不成环）。
+import { roleLabel } from '../../features/agent-panel/toolMeta';
 import { bufferStreamDelta, bufferChildStreamDelta, childTagPrefix, discardChildStartedPlaceholder, ensureChildStartedPlaceholder, purgeSessionStreams, settleStreamPlaceholder } from './agentStreamBuffer';
 import { applyChainDelta, applyChainModelFallback, applyChainNodeDone, chainNodeLabel, finalizeChainRun, CHAIN_RUN_SENTINEL_NODE_ID, type ChainRunState } from './chainStreamBuffer';
 // 09-13 子3 W2（design §2.2）：写作页运行时间线 + escalate findings 路由（chainTimeline 模块
@@ -47,8 +49,17 @@ type StreamEventApi = {
   onAgentStreamEvent: (callback: (event: unknown) => void) => () => void;
 };
 
-/** 主进程 `agent:stream-event` 载荷：RuntimeEventPayload + sessionId + projectPath（S2 增补）。 */
-export type AgentStreamWireEvent = AgentStreamEvent & { sessionId?: string; projectPath?: string };
+/**
+ * 主进程 `agent:stream-event` 载荷：RuntimeEventPayload + sessionId + projectPath（S2 增补）。
+ * W3（09-21-subagent-bg-decouple）additive `sessionRole`：onRuntimeEvent 泵路径附带会话角色
+ * （'child' = bg 子会话专属通道事件——同步子代理事件冒泡进 leader 流不经此泵）。消费者 W4 接：
+ * isProjectRunActive 口径排除（bg 会话不进「项目有活跃 run」）+ 子会话检视图路由。
+ */
+export type AgentStreamWireEvent = AgentStreamEvent & {
+  sessionId?: string;
+  projectPath?: string;
+  sessionRole?: 'primary' | 'child' | 'fork';
+};
 
 export type AgentRunPhase = 'running' | 'idle' | 'error';
 
@@ -60,6 +71,13 @@ export type AgentRunState = {
   projectPath?: string;
   /** 后台活动摘要（child 事件 `source:role` / 链节点名）——徽标「谁在跑」。 */
   activity?: string;
+  /**
+   * W4（09-21-subagent-bg-decouple）：会话角色——bg 子会话专属通道事件（wire `sessionRole`
+   * = 'child'）登记时写入。isProjectRunActive 口径排除的数据源（bg 子会话不进「项目有活跃
+   * run」，输入面/生成闸语义绑 leader——W3 移交项①）。undefined = leader/legacy（照进口径，
+   * 零回归）。
+   */
+  sessionRole?: 'primary' | 'child' | 'fork';
   updatedAt: number;
 };
 
@@ -67,7 +85,18 @@ export type AgentRunStatePatch = {
   phase?: AgentRunPhase;
   projectPath?: string;
   activity?: string;
+  sessionRole?: 'primary' | 'child' | 'fork';
 };
+
+/**
+ * CR-09-20-dogfood-1（小残留 b 二次修）：per-session run 终态正向观测——error 事件 →
+ * 'error'；UI stop/abort 请求（agentSessionSlice.cancelAgent）→ 'aborted'；done 事件且
+ * 无先行 abort/error 标记 → 'ok'（不覆写已置标记——abort 回合的 done 不携 error）；send
+ * 重置（键删除 = null）。消费方：AgentMessages 桥警示条结局收敛（settledOk）。
+ * 动机：旧判定读视图级 `error === null`——切走切回（switchAgentSession 清 error 而通知
+ * 残留）与 abort 回合（done 不写 error）都会误标「本轮已成功收场」。
+ */
+export type AgentRunOutcome = 'ok' | 'error' | 'aborted';
 
 /**
  * 09-12 子2 fallback chains（design §8②）：一次模型切换的 per-session 通知（cap
@@ -110,6 +139,35 @@ export type BridgeNotice = {
 };
 
 export const BRIDGE_NOTICE_CAP = 5;
+
+// ── W4（09-21-subagent-bg-decouple）：后台任务条状态面 ──
+
+/** 后台任务状态（mirror agent 包 BgTaskStatus；aborted = 用户主动取消，UI 标「已取消」）。 */
+export type AgentBgTaskStatus = 'running' | 'completed' | 'failed' | 'aborted' | 'interrupted';
+
+/**
+ * 后台任务条单条目（键 = childSessionId——taskId 在 child lane 事件先到、spawn 工具结果/
+ * bg-update 未到前未知，child sid 是全生命周期稳定键）。写入方 = 本 dispatcher（child lane
+ * 事件 / spawn_agent_bg 工具结果 metadata / bg-update 终态）+ agentSessionSlice.loadAgentBgTasks
+ * （`agent:bg-tasks` hydrate——重启后 interrupted 如实呈现）。
+ */
+export type AgentBgTaskView = {
+  taskId: string | null;
+  childSessionId: string;
+  parentSessionId: string | null;
+  role: string;
+  projectPath?: string;
+  status: AgentBgTaskStatus;
+  notify: 'toast' | 'wake' | 'silent';
+  digest?: string;
+  error?: string;
+  startedAt: number;
+  updatedAt: number;
+};
+
+export type AgentBgTaskPatch = Partial<Omit<AgentBgTaskView, 'childSessionId'>> & {
+  childSessionId: string;
+};
 
 /**
  * 09-12 子5 R6（design §11）：leader 会话上下文窗口占用快照（context-usage 事件的
@@ -159,6 +217,12 @@ export type AgentDispatchState = {
    */
   bridgeNoticesBySession?: Record<string, BridgeNotice[]>;
   /**
+   * CR-09-20-dogfood-1：per-session run 终态正向观测（写入方本模块 done/error case +
+   * agentSessionSlice.cancelAgent 置 'aborted'；send 重置 + deleteAgentSession 清）。
+   * 可选面——最小测试 store 可缺省（缺省 = 不追踪，事件不炸，mirror bridgeNoticesBySession）。
+   */
+  runOutcomeBySession?: Record<string, AgentRunOutcome>;
+  /**
    * 09-12 子5 R6（design §11）：per-session 上下文占用 last 值（写入方本模块
    * 'context-usage' case）。可选面——最小测试 store 可缺省（缺省 = 不写，事件不炸）。
    * 随 deleteAgentSession 清（agentSessionSlice，mirror activeModelBySession）。
@@ -176,6 +240,13 @@ export type AgentDispatchState = {
    * chapterReviewSlice resume IPC fallback）。可选面同上。
    */
   escalateFindingsBySession?: Record<string, EscalateFindingsEntry>;
+  /**
+   * W4（09-21-subagent-bg-decouple）：后台任务条（键 = childSessionId）。写入方本 dispatcher
+   * （child lane 事件 / spawn_agent_bg 工具结果 metadata / bg-update 终态）+ slice 的
+   * loadAgentBgTasks hydrate。可选面——最小测试 store 可缺省（缺省 = 条目不写，事件不炸，
+   * mirror bridgeNoticesBySession 守卫形态）。随项目重置 / deleteAgentSession（父或子）清。
+   */
+  bgTasksByChildSession?: Record<string, AgentBgTaskView>;
   setPendingToolConfirm: (sessionId: string, value: PendingToolConfirm | null) => void;
   pushPendingDiff: (sessionId: string, diff: PendingDiff) => void;
   setPausedReview: (sessionId: string, meta: ChapterReviewMetadata | null) => void;
@@ -217,6 +288,20 @@ const sessionDeltaActivity = new Map<string, { count: number; lastAt: number }>(
  *（徽标/组组件只消费视图会话的组）。键 = childTagPrefix（source:role:depth）。
  */
 const childGroupLastEventAt = new Map<string, number>();
+
+/**
+ * W4（09-21-subagent-bg-decouple）：分组前缀 tag → childSessionId（组卡钻取入口的映射暴露
+ * ——childSessionId 此前只在 dispatcher 占位逻辑里）。**仅缺席写入（CR-12）**：同 tag 双派发
+ * 时 last-wins 会把所有组卡钻取都指向最近一次子会话（误钻取）——首派发者占位后不再覆盖。
+ * 同步子会话完成后 memory evict 但 jsonl/meta 在盘——钻取视图 fetch 对账照常工作（空流/部分
+ * 流，best-effort 面）。键随 __clearAgentEventTracks 清。
+ */
+const childTagSessionIds = new Map<string, string>();
+
+/** tag → 最近一次派发的 childSessionId（无记录 = 该组尚未收到 child 事件，不显钻取钮）。 */
+export function getChildSessionIdForTag(tag: string): string | undefined {
+  return childTagSessionIds.get(tag);
+}
 
 /**
  * 组级活跃迟滞窗：覆盖 child turn 间隙（工具执行 + 下一轮 generate 首 token 前的
@@ -281,6 +366,11 @@ export function rememberDeletedSession(sessionId: string): void {
   deletedSessionIds.add(sessionId);
 }
 
+/** tombstone 查询（CR-11：检视返回键 / 回父导航防切进已删会话的死胡同——fetch 会报错）。 */
+export function isSessionDeleted(sessionId: string): boolean {
+  return deletedSessionIds.has(sessionId);
+}
+
 /** dogfood T1 CR-T1-033：会话消亡时修剪模块级追踪 Map（UUID 键纯慢泄漏）。 */
 export function forgetSessionTrack(sessionId: string): void {
   sessionProjectPaths.delete(sessionId);
@@ -290,12 +380,13 @@ export function forgetSessionTrack(sessionId: string): void {
 }
 
 /** 测试 helper：清模块级追踪（sessionProjectPaths / sessionModes / delta 活性 / child 组
- * 活性 / tombstone）。 */
+ * 活性 / tag→childSessionId / tombstone）。 */
 export function __clearAgentEventTracks(): void {
   sessionProjectPaths.clear();
   sessionModes.clear();
   sessionDeltaActivity.clear();
   childGroupLastEventAt.clear();
+  childTagSessionIds.clear();
   deletedSessionIds.clear();
 }
 
@@ -396,6 +487,152 @@ function anchorChainRun<S extends AgentDispatchState>(
 }
 
 /**
+ * W4（09-21-subagent-bg-decouple）：后台任务条条目 upsert（merge 语义——child lane 事件先到
+ * 建 running 条目〔无 taskId〕，spawn 工具结果 metadata / bg-update 依次补全；hydrate 覆盖
+ * 盘面权威值）。可选面守卫：store 无该字段（最小测试 store）跳写不炸。
+ */
+function upsertBgTaskEntry<S extends AgentDispatchState>(
+  store: AgentDispatchStore<S>,
+  patch: AgentBgTaskPatch,
+): void {
+  if (store.getState().bgTasksByChildSession === undefined) return;
+  const prev = store.getState().bgTasksByChildSession?.[patch.childSessionId];
+  // 值等跳写（mirror setAgentRunState 的 delta 频率防护）：bg child lane 事件是 delta 级高频——
+  // 每事件 upsert 不变 material 字段时不得产生 store 写（r7「勿每 delta 一次 set」）。updatedAt
+  // 不参与判定（running 条目的耗时在渲染侧按 Date.now() 计，不依赖逐事件刷新）。
+  if (
+    prev
+    && (patch.taskId ?? prev.taskId) === prev.taskId
+    && (patch.role ?? prev.role) === prev.role
+    && (patch.status ?? prev.status) === prev.status
+    && (patch.notify ?? prev.notify) === prev.notify
+    && (patch.digest ?? prev.digest) === prev.digest
+    && (patch.error ?? prev.error) === prev.error
+    && (patch.projectPath ?? prev.projectPath) === prev.projectPath
+  ) return;
+  writeState(store, (s) => {
+    const current = s.bgTasksByChildSession?.[patch.childSessionId];
+    const now = Date.now();
+    const next: AgentBgTaskView = {
+      ...patch,
+      taskId: patch.taskId ?? current?.taskId ?? null,
+      parentSessionId: patch.parentSessionId ?? current?.parentSessionId ?? null,
+      role: patch.role ?? current?.role ?? '',
+      status: patch.status ?? current?.status ?? 'running',
+      notify: patch.notify ?? current?.notify ?? 'toast',
+      ...(patch.projectPath !== undefined ? { projectPath: patch.projectPath } : current?.projectPath !== undefined ? { projectPath: current.projectPath } : {}),
+      ...(patch.digest !== undefined ? { digest: patch.digest } : current?.digest !== undefined ? { digest: current.digest } : {}),
+      ...(patch.error !== undefined ? { error: patch.error } : current?.error !== undefined ? { error: current.error } : {}),
+      startedAt: patch.startedAt ?? current?.startedAt ?? now,
+      updatedAt: now,
+    };
+    return { bgTasksByChildSession: { ...(s.bgTasksByChildSession ?? {}), [patch.childSessionId]: next } };
+  });
+}
+
+/**
+ * W4（09-21-subagent-bg-decouple §5）：bg 子会话专属通道事件处理（wire `sessionRole='child'`
+ * ——外层 sessionId 即 child 自身 sid，shell 泵附带双键）。
+ *
+ * - 两分支共通：run 态登记（phase running + sessionRole 'child'——isProjectRunActive 口径
+ *   排除的数据源，W3 移交项①）+ 后台任务条 running 条目 upsert + delta 活性计数。
+ * - 活跃检视图（用户切进该 child 会话）：inner 事件**原生路由**（mirror leader 分支形态、
+ *   无 tag 前缀——child 自身落盘 jsonl 无前缀，实时流与 catch-up fetch 同形，F2/F4「渲染
+ *   与订阅零改」的兑现点）。started 占位不建（检视图起点信号由 run 态 activity 承载，
+ *   catch-up fetch 补历史——tag 占位会把 child 自身流错装进组卡）。
+ */
+function handleBgChildLaneEvent<S extends AgentDispatchState>(
+  store: AgentDispatchStore<S>,
+  event: AgentStreamWireEvent & { type: 'child' },
+): void {
+  const sid = event.sessionId;
+  if (!sid) return; // wire 缺 sessionId（不应发生——handleAgentStreamEvent 顶部同款守卫）
+  const { source, role, event: inner } = event.data;
+  const state = store.getState();
+  const isActiveView =
+    sid === state.agentSessionId
+    && (event.projectPath === undefined || sameProjectPath(event.projectPath, state.currentProject?.path));
+
+  state.setAgentRunState(sid, {
+    phase: 'running',
+    sessionRole: 'child',
+    activity: `${source}:${role}`,
+    ...(event.projectPath !== undefined ? { projectPath: event.projectPath } : {}),
+  });
+  // CR-9：条目必须带项目归属（projectPath 缺席 = 通配所有项目可见）——载荷缺 projectPath 时
+  // 回落 store 既有的 session→project 映射；两处皆无则不建条目（防 wildcard 跨项目误现）。
+  const entryProjectPath = event.projectPath ?? getSessionProject(sid);
+  if (entryProjectPath !== undefined) {
+    upsertBgTaskEntry(store, {
+      childSessionId: sid,
+      role,
+      status: 'running',
+      projectPath: entryProjectPath,
+    });
+  }
+
+  if (inner.type === 'delta') {
+    // mirror leader delta 分支：活性计数不进 store（徽标「仍在跑」）。
+    const prev = sessionDeltaActivity.get(sid);
+    sessionDeltaActivity.set(sid, { count: (prev?.count ?? 0) + 1, lastAt: Date.now() });
+  }
+  if (!isActiveView) return;
+
+  switch (inner.type) {
+    case 'assistant':
+      // 终帧同 id 整条替换（mirror leader assistant 分支——无 tag 前缀的原生 content）。
+      settleStreamPlaceholder(store, sid, {
+        id: inner.data.id,
+        role: 'assistant',
+        content: inner.data.content ?? '',
+        toolCalls: inner.data.toolCalls as AgentMessage['toolCalls'],
+        ...(inner.data.reasoning !== undefined ? { reasoning: inner.data.reasoning } : {}),
+        createdAt: Date.now(),
+      });
+      return;
+    case 'tool':
+      // native 路由（origin 缺省——无 `${role} 子代理` 标注；field_patch/审核面路由照常，
+      // 键控落 child sid 自己的槽）。
+      handleToolEvent(store, sid, true, { type: 'tool', data: inner.data });
+      return;
+    case 'delta':
+      // mirror leader 正文流式轨（首条建占位 + 250ms flush；切走切回 CR-T1-037 重建逻辑复用）。
+      bufferStreamDelta(
+        store,
+        sid,
+        inner.data.messageId,
+        inner.data.channel,
+        inner.data.delta,
+        inner.data.toolName,
+      );
+      return;
+    case 'started':
+      // 起点信号在检视图由 run 态承载（不建 tag 占位——见函数头注）。
+      return;
+    case 'model-fallback': {
+      // mirror 同步 child 分支：通知面带子代理角色标签（scopeLabel），chip 不翻。
+      if (store.getState().modelFallbackNotices === undefined) return;
+      const notice: ModelFallbackNotice = {
+        id: randomUUID(),
+        from: inner.data.from,
+        to: inner.data.to,
+        reason: inner.data.reason,
+        attempt: inner.data.attempt,
+        at: Date.now(),
+        scopeLabel: role,
+      };
+      writeState(store, (s) => ({
+        modelFallbackNotices: {
+          ...(s.modelFallbackNotices ?? {}),
+          [sid]: [...(s.modelFallbackNotices?.[sid] ?? []), notice].slice(-MODEL_FALLBACK_NOTICE_CAP),
+        },
+      }));
+      return;
+    }
+  }
+}
+
+/**
  * 单事件分发。导出供测试直接驱动（路由测试不经 preload 订阅面）。
  * 纯同步、无自有异步——对账 fetch 走 fire-and-forget（与旧 send 回调一致）。
  */
@@ -456,6 +693,18 @@ export function handleAgentStreamEvent<S extends AgentDispatchState>(store: Agen
     case 'child': {
       const { source, role, depth, sessionId: childSessionId, event: inner } = event.data;
       const tag = childTagPrefix({ source, role, depth });
+      // W4（09-21-subagent-bg-decouple §5）：bg 子会话专属通道分流——wire `sessionRole='child'`
+      // 的事件经 shell onRuntimeEvent 泵广播，外层 sessionId 即 child 自身 sid（同步冒泡路径
+      // 外层 sid 恒为 leader，二者互斥）。检视图活跃时原生路由（无 tag 前缀——child 自身流/
+      // 落盘 jsonl 同形，F2 渲染零改），非活跃时只记 run 态（徽标 + 后台任务条 running 条目）。
+      if (event.sessionRole === 'child') {
+        handleBgChildLaneEvent(store, event);
+        return;
+      }
+      // W4：tag → childSessionId 映射登记（组卡钻取入口数据源；同步路径同样可钻——子会话
+      // jsonl/meta 在盘，fetch 对账 best-effort）。仅缺席写入（CR-12）：同 tag 双派发 last-wins
+      // 会把全部组卡钻取误指向最近子会话。
+      if (!childTagSessionIds.has(tag)) childTagSessionIds.set(tag, childSessionId);
       // dogfood R2 #18-A：child tool 事件复用 leader tool 路由（handleToolEvent）——子代理按
       // 指令调 outline_update 等写工具，shell handler 产的 field_patch envelope（metadata）随
       // child 通道冒泡（makeChildOnMessage 透传完整 toolResults），旧实现只 append 组内消息
@@ -676,6 +925,17 @@ export function handleAgentStreamEvent<S extends AgentDispatchState>(store: Agen
       return;
     }
     case 'done': {
+      // CR-09-20-dogfood-1：run 终态正向观测——done 且无先行 abort/error 标记 → 'ok'。
+      // 不覆写已置标记：abort 回合的 done 不携 error，覆写即把中止误标成功（旧视图级
+      // error 读法的失真面之一）。后台会话照写（键控槽，切回可见）；已置标记时零写入。
+      if (store.getState().runOutcomeBySession !== undefined) {
+        const prev = store.getState().runOutcomeBySession?.[sid];
+        if (prev !== 'aborted' && prev !== 'error') {
+          writeState(store, (s) => ({
+            runOutcomeBySession: { ...(s.runOutcomeBySession ?? {}), [sid]: 'ok' },
+          }));
+        }
+      }
       // dogfood T1 Stage 4（design §6.1 兜底）：清残余流式占位（打回丢弃的废稿等不到终帧）；
       // 移除后与后端消息数出现长度差 → 下方对账 fetch 权威替换。
       purgeSessionStreams(store, sid);
@@ -728,6 +988,12 @@ export function handleAgentStreamEvent<S extends AgentDispatchState>(store: Agen
       return;
     }
     case 'error': {
+      // CR-09-20-dogfood-1：run 终态正向观测——error 事件 → 'error'（后台会话照写）。
+      if (store.getState().runOutcomeBySession !== undefined) {
+        writeState(store, (s) => ({
+          runOutcomeBySession: { ...(s.runOutcomeBySession ?? {}), [sid]: 'error' },
+        }));
+      }
       // dogfood T1 Stage 4：同 done 兜底清残余流式占位/缓冲（错误终态后不再有终帧）。
       purgeSessionStreams(store, sid);
       // dogfood T1 Stage 6：链 run 兜底标失败（哨兵帧未到即流错误）。
@@ -821,6 +1087,52 @@ export function handleAgentStreamEvent<S extends AgentDispatchState>(store: Agen
       applyTimelineTool(store, sid, event.data);
       return;
     }
+    case 'bg-update': {
+      // W4（09-21-subagent-bg-decouple / W2 §3.1）：后台任务终态事件（taskId 即 dedupeKey，
+      // 任务终态恰一次）。外层 sessionId = 派发方 parent sid（载荷自描述）；条目键仍取
+      // data.childSessionId（全生命周期稳定键，见 AgentBgTaskView 注）。载荷类型镜像单源
+      // = api/agent.ts AgentStreamEvent 'bg-update' 变体（mirror agent 包 types.ts）。
+      const data = event.data;
+      // CR-10：子会话已删（tombstone）→ 短路不重建条目/不复活 run 态（僵尸卡防复建）。父已删
+      // 场景由本函数顶部 tombstone 整体丢弃覆盖（外层 sid 即父）。
+      if (deletedSessionIds.has(data.childSessionId)) return;
+      upsertBgTaskEntry(store, {
+        childSessionId: data.childSessionId,
+        taskId: data.taskId,
+        role: data.role,
+        status: data.status,
+        notify: data.notify,
+        digest: data.digest,
+        // CR-14：startedAt 消费——首知即终态场景（child lane 事件丢失/迟到）耗时显示不塌缩 ~0s。
+        startedAt: data.startedAt,
+        ...(data.error !== undefined ? { error: data.error } : {}),
+        ...(event.projectPath !== undefined ? { projectPath: event.projectPath } : {}),
+      });
+      // 子会话 run 态归位 + 残余占位/缓冲清（检视图 spinner 收 + 打字机轨收敛——bg 子 run
+      // 无 leader 式 done/error 事件，终态信号唯一来源即本事件）。
+      store.getState().setAgentRunState(data.childSessionId, {
+        phase: data.status === 'failed' ? 'error' : 'idle',
+        activity: undefined,
+        ...(event.projectPath !== undefined ? { projectPath: event.projectPath } : {}),
+      });
+      purgeSessionStreams(store, data.childSessionId);
+      // toast 裁量（W4 item 6）：仅 toast 通道的 completed/failed 出通知——aborted 是用户
+      // 主动取消（不打扰）；wake 有唤醒汇报面、silent 只记账（R3 三通道呈现分域）。
+      // role 过 roleLabel 译人话（词表外回落原文 id；toolMeta 纯映射无 store 依赖，不成环）。
+      if (data.notify === 'toast' && (data.status === 'completed' || data.status === 'failed')) {
+        const locale = store.getState().resolvedLocale ?? 'zh-CN';
+        useToastStore.getState().showToast(
+          translate(
+            locale,
+            data.status === 'completed' ? 'agent.bgTaskCompletedToast' : 'agent.bgTaskFailedToast',
+            { role: roleLabel(data.role, (key) => translate(locale, key)) },
+          ),
+          data.status === 'failed' ? 'warning' : 'info',
+          5000,
+        );
+      }
+      return;
+    }
     default:
       return;
   }
@@ -852,10 +1164,38 @@ function handleToolEvent<S extends AgentDispatchState>(
   store: AgentDispatchStore<S>,
   sid: string,
   isActiveView: boolean,
-  event: Extract<AgentStreamEvent, { type: 'tool' }>,
+  event: AgentStreamWireEvent & { type: 'tool' },
   origin?: ToolEventOrigin,
 ): void {
   const results = event.data.results as ToolResultShape[];
+
+  // W4（09-21-subagent-bg-decouple）：spawn_agent_bg 工具结果 → 后台任务条 running 条目
+  // upsert（taskId/role/notify 权威源——child lane 事件先到时在此补全 taskId/parent）。
+  // 与 isActiveView 无关：后台 leader 会话派发的 bg 任务同样入条（键控面，切回再现）。
+  for (const result of results) {
+    const bgMeta = result.metadata as
+      | { taskId?: unknown; childSessionId?: unknown; role?: unknown; status?: unknown; notify?: unknown }
+      | undefined;
+    if (
+      !bgMeta
+      || typeof bgMeta.taskId !== 'string'
+      || typeof bgMeta.childSessionId !== 'string'
+      || bgMeta.status !== 'running'
+    ) continue;
+    // CR-9：spawn 工具事件先行时常无 projectPath → 回落 store session→project 映射（remember
+    // SessionProject 在事件顶部分支已记）；两处皆无则不建 wildcard 条目（跨项目可见 = 误现）。
+    const projectPath = event.projectPath ?? getSessionProject(sid);
+    if (projectPath === undefined) continue;
+    upsertBgTaskEntry(store, {
+      childSessionId: bgMeta.childSessionId,
+      taskId: bgMeta.taskId,
+      ...(typeof bgMeta.role === 'string' ? { role: bgMeta.role } : {}),
+      parentSessionId: sid,
+      status: 'running',
+      notify: bgMeta.notify === 'wake' || bgMeta.notify === 'silent' ? bgMeta.notify : 'toast',
+      projectPath,
+    });
+  }
 
   // 消息面：仅活跃视图（后台会话消息切回 fetch 对账）。
   if (isActiveView) {

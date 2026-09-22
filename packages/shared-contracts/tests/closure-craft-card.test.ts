@@ -196,6 +196,24 @@ describe('craftTeachingSchema — Wikidata statement 形态', () => {
     delete bad.stale;
     expect(() => craftTeachingSchema.parse(bad)).toThrow();
   });
+
+  // ── E10.4（task 09-20）W1：来源三级 additive（mirror originKind 形态）──
+
+  it('originTier 缺省合法（旧行零迁移——unspecified 材料蒸馏透传为 absent，非显式值）', () => {
+    const parsed = craftTeachingSchema.parse(SAMPLE_TEACHING);
+    expect(parsed.originTier).toBeUndefined();
+  });
+
+  it('originTier 三值全合法（original/community/criticism——来源材料 tier ∈ 三值才透传）', () => {
+    for (const originTier of ['original', 'community', 'criticism'] as const) {
+      expect(() => craftTeachingSchema.parse({ ...SAMPLE_TEACHING, originTier })).not.toThrow();
+    }
+  });
+
+  it('originTier 越枚举拒（unspecified/fanfiction 均不入讲法级——absent 表达）', () => {
+    expect(() => craftTeachingSchema.parse({ ...SAMPLE_TEACHING, originTier: 'unspecified' })).toThrow();
+    expect(() => craftTeachingSchema.parse({ ...SAMPLE_TEACHING, originTier: 'fanfiction' })).toThrow();
+  });
 });
 
 // ── 手艺卡（W1.1：状态机字段 + teachings min(1) 无锚即丢不变量）──

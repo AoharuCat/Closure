@@ -211,6 +211,14 @@ describe('antigravityCli agents — 正文共享块（字面同源）', () => {
     // ——协议措辞家族第三站点，改文案三处同步）。
     expect(body).toContain('present_result');
     expect(body).toContain('awaiting_intent_confirmation');
+    // R12 残留措辞（F16 同族）：呈现纪律句的「正文」承重词限定为「呈现性回复文字（讨论/
+    // 说明/评审等，不含章节正文/改稿产物）」——旧措辞「呈现给用户看的正文」可被模型后向
+    // 推导出「章节正文写在对话里」的旧授权（与通道分工句拆台），禁回；与 bridgeExecutor.ts
+    // BRIDGE_TOOL_DESCRIPTION_OVERRIDES.present_result 同句基线（措辞家族两站点同步改）。
+    expect(body).toContain(
+      '呈现给用户看的呈现性回复文字（讨论/说明/评审等，不含章节正文/改稿产物）写在调用 present_result 的同一条消息里',
+    );
+    expect(body).not.toContain('呈现给用户看的正文');
     // 块序：人设 → 网文纪律 → 桥车道块。
     expect(body.indexOf(SHARED_PERSONA_BLOCK)).toBeLessThan(
       body.indexOf(SHARED_WEBNOVEL_DISCIPLINE_BLOCK),

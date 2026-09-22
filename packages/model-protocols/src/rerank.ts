@@ -5,6 +5,11 @@ import type {
 } from '@orison/shared-contracts';
 import { normalizeBaseUrl, postJson, getInsecureDispatcher } from './http';
 import { withRetry } from './retry';
+// C3.1：失败行分类单源复用子2 判据（rerank 在 errors↔generate 既有 documented cycle
+// 环外——errors 的 import 闭包不含 rerank，本边不成环）。
+import { classifyGenerationFailure } from './errors';
+// C3.1：计量 wrapper 共享宿（usageSink 零项目模块运行时依赖——引它不进任何环）。
+import { withEntryUsageMetering } from './usageSink';
 import type { ProtocolCallContext } from './types';
 
 // ── Rerank (direct HTTP POST /rerank) ──
@@ -48,6 +53,21 @@ type RerankApiResponse = {
 };
 
 export async function rerank(
+  model: ResolvedModel,
+  request: RerankRequest,
+  ctx?: ProtocolCallContext,
+): Promise<RerankResponse> {
+  // C3.1：计量 wrapper（design §1）——usage {promptTokens,totalTokens} 有则记、
+  // outputTokens 端点不报恒 ABSENT（CR-18）。taskType 走 ctx 通道、物理点读 ctx 不
+  // 硬编码（'kb-rerank' / 'craft-rerank' 由调用方闭包透传，M2 修正）。
+  return withEntryUsageMetering(
+    { model, ctx, usageOf: (r) => r.usage },
+    (err) => classifyGenerationFailure(err).kind,
+    () => rerankViaHttp(model, request, ctx),
+  );
+}
+
+async function rerankViaHttp(
   model: ResolvedModel,
   request: RerankRequest,
   ctx?: ProtocolCallContext,

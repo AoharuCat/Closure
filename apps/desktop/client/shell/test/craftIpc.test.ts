@@ -222,6 +222,7 @@ function mkMaterialRow(over: Partial<Material> = {}): Material {
       lang: null,
       originDate: null,
       description: null,
+      url: null,
     },
     quality: {
       ok: true,
@@ -677,6 +678,48 @@ describe.skipIf(!sqliteUsable)('craftIpc W5 九通道（真跑 db——ABI 门�
     expect(appended?.originKind).toBe('decon_instance'); // 10.2 教程卡上并排拆书讲法（溯源可见）
     expect(appended?.bookTitle).toBe('拆书来源小说');
     expect(appended?.evidence?.anchors).toHaveLength(1);
+  });
+
+  // ── E10.4 W3：来源三级经并排裁决成卡透传不丢（mirror originKind AC4 语义完整性）──
+
+  it('merge-review-resolve independent：newClaim.originTier 随讲法落新卡', async () => {
+    const base = mkReview('mrev-0000000000d1');
+    insertCraftMergeReview({
+      ...base,
+      newClaim: { ...base.newClaim, quote: '批评来源引文：回报节奏的批评视角', originTier: 'criticism' },
+    });
+    const res = await handlers.mergeReviewResolve({ reviewId: 'mrev-0000000000d1', action: 'independent' });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.createdCardId).toBeDefined();
+    const teaching = getCraftCard(res.createdCardId!)?.teachings[0];
+    expect(teaching?.originTier).toBe('criticism'); // 裁决路径不丢（人审页三色 tier 徽章消费）
+  });
+
+  it('merge-review-resolve merge：newClaim.originTier 挂既有卡不丢 + 旧行（absent）零迁移', async () => {
+    const base = mkReview('mrev-0000000000d2');
+    insertCraftMergeReview({
+      ...base,
+      newClaim: { ...base.newClaim, quote: '社区来源引文：先抑后扬的社区共识表述', originTier: 'community' },
+    });
+    const res = await handlers.mergeReviewResolve({ reviewId: 'mrev-0000000000d2', action: 'merge' });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    const appended = getCraftCard(CARD_A)!.teachings.at(-1)!;
+    expect(appended.originTier).toBe('community');
+
+    // 旧行零迁移：无 originTier 的 review 裁决后讲法同样无键（非 undefined 哨兵）。
+    // quote 换新——teachingId 幂等键（materialId+hash+quote）不与前面用例碰撞（真追加非 no-op）。
+    const legacy = mkReview('mrev-0000000000d3');
+    insertCraftMergeReview({
+      ...legacy,
+      newClaim: { ...legacy.newClaim, quote: '旧行引文：无来源三级的并排候选' },
+    });
+    const res3 = await handlers.mergeReviewResolve({ reviewId: 'mrev-0000000000d3', action: 'merge' });
+    expect(res3.ok).toBe(true);
+    const appended3 = getCraftCard(CARD_A)!.teachings.at(-1)!;
+    expect(appended3.originTier).toBeUndefined();
+    expect('originTier' in appended3).toBe(false);
   });
 
   // ── craft:term-list / craft:term-approve / craft:term-merge ──

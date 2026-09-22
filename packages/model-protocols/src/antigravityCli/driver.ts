@@ -14,8 +14,10 @@ import {
   ProtocolHttpError,
   ProtocolSchemaError,
   ProtocolTimeoutError,
+  classifyGenerationFailure,
   isContextOverflowError,
 } from '../errors';
+import type { AttemptMeteringRecord } from '../usageSink';
 import { buildCliArgs, printTimeoutForLane, PRINT_TIMEOUT_GRACE_MS } from './args';
 import {
   buildStdinLine,
@@ -98,10 +100,27 @@ export function isCliEmptySuccessError(err: unknown): boolean {
   return err instanceof Error && (err as Error & { cliEmptySuccess?: boolean }).cliEmptySuccess === true;
 }
 
-/** 挂空 SUCCESS 内部标记（对错误对象自身的附加位，不改写任何既有字段）。 */
-function tagCliEmptySuccess(err: Error): Error {
+/**
+ * 挂空 SUCCESS 内部标记（对错误对象自身的附加位，不改写任何既有字段）。C3.1：attempt
+ * 计量 usage 旁挂同点——wrapper 失败行（M1）与空 SUCCESS 重试发射点读它。usage 未知
+ *（undefined）不挂——「已知则记」（CR-18 v2），绝不伪造。
+ */
+function tagCliEmptySuccess(err: Error, attemptUsage: GenerationUsage | undefined): Error {
   (err as Error & { cliEmptySuccess?: boolean }).cliEmptySuccess = true;
+  if (attemptUsage !== undefined) {
+    (err as Error & { cliAttemptUsage?: GenerationUsage }).cliAttemptUsage = attemptUsage;
+  }
   return err;
+}
+
+/**
+ * 计量读缝（C3.1 M1，generate.ts wrapper 失败行 + driver 重试发射点消费）：错误对象
+ * 旁挂的 attempt usage——已知名则记、未知 undefined（CR-18 v2「未知才 ABSENT」）。
+ */
+export function readCliAttemptUsage(err: unknown): GenerationUsage | undefined {
+  return err instanceof Error
+    ? (err as Error & { cliAttemptUsage?: GenerationUsage }).cliAttemptUsage
+    : undefined;
 }
 
 function isQuotaError(text: string): boolean {
@@ -288,7 +307,10 @@ async function runTurnOnSession(
           const err = classifyCliError(outcome.message, excerpt);
           // 空 SUCCESS 挂重试标记（仅纯空收尾——stderr 认证信号命中即凭据问题，重试无意义）。
           if (outcome.status === 'EMPTY' && !isAuthError(`${outcome.message}\n${excerpt}`)) {
-            tagCliEmptySuccess(err);
+            // C3.1（m5 修正）：attempt usage 旁挂取 acc.* 计数器域——EMPTY 走 error 形态
+            // outcome（CliTurnOutcome 的 error variant 不携带 usage/sawStepUsage），计数器
+            // 在 accumulator 在场；未知（sawStepUsage false）不挂——「已知则记」CR-18 v2。
+            tagCliEmptySuccess(err, acc.sawStepUsage ? mapCliUsage(acc.stepUsageSum) : undefined);
           }
           // WAITING/RUNNING/INVALID（等待权限/卡运行/非法态）→ 会话不可信，作废。
           //（EMPTY 不作废：重试请求 = 零尾段 → 镜像分歧 → 自动冷重启，无需显式杀。）
@@ -730,20 +752,49 @@ export function createAntigravityCliDriver(
         return runTurnOnSession(session, segments, hashes, turnOpts, deps.setTimer);
       };
 
+      // C3.1 attempt 上抛（design §4）：经 ctx.onMeteringAttempt 交入口收集器统一
+      // dispatch（driver 不直接 dispatch——发射面单点）。best-effort：收集器抛错不阻
+      // turn 主流程（warn 经 deps 单缝观测）。
+      const emitAttempt = (rec: AttemptMeteringRecord): void => {
+        const emit = ctx?.onMeteringAttempt;
+        if (emit === undefined) return;
+        try {
+          emit(rec);
+        } catch (err) {
+          deps.warn?.(
+            `[antigravity-cli] metering attempt collector threw (ignored; turn result unaffected): ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      };
+
       // 空 SUCCESS 单次重试：整 turn 恰重试一次，会话车道与 oneshot 同过此缝（最小公共缝）。
       // 重试对同一会话句柄再跑一轮——首轮已提交镜像 → 零尾段分歧 → 自动冷重启，即同 spec
       // 全新尝试。第二次仍空（或首轮是认证等不可重试终因）→ 原样上抛，调用方错误面零变化。
       // 记账跨降级重跑共享（恰一次语义覆盖整个 generateText 调用）。
       let retriedEmptySuccess = false;
-      const runTurnWithEmptyRetry = (session: AgyTurnSession): Promise<TurnRunResult> =>
-        runTurn(session).catch((err) => {
+      const runTurnWithEmptyRetry = (session: AgyTurnSession): Promise<TurnRunResult> => {
+        // C3.1 m1：attempt 计时（发射点各记起止——attempt 行 latencyMs 必填不悬空）。
+        const attemptStartedAt = Date.now();
+        return runTurn(session).catch((err) => {
           if (!isCliEmptySuccessError(err) || retriedEmptySuccess) throw err;
           retriedEmptySuccess = true;
+          // C3.1 attempt 级记账（design §4 时序①）：重试**前**发射 attempt1 失败行——
+          // usage 读错误旁挂（tagCliEmptySuccess 同点挂，计数器在场已知则记）。attempt2
+          // 由入口 wrapper 正常落行 → 合计恰两行、共享 callId。
+          const attemptUsage = readCliAttemptUsage(err);
+          emitAttempt({
+            success: false,
+            errorKind: 'cli-empty-success',
+            errorMessage: err instanceof Error ? err.message : String(err),
+            ...(attemptUsage !== undefined ? { usage: attemptUsage } : {}),
+            latencyMs: Date.now() - attemptStartedAt,
+          });
           deps.warn?.(
             `[antigravity-cli] turn ended SUCCESS with no text — retrying the whole turn once (fresh attempt) key=${model.keyId} model=${model.modelId}`,
           );
           return runTurn(session);
         });
+      };
 
       const runOnce = (runSpec: CliSpawnSpec): Promise<TurnRunResult> =>
         sessionKeyIdText !== undefined
@@ -755,7 +806,10 @@ export function createAntigravityCliDriver(
             )
           : pool.runOneshot(runSpec, ctx?.signal, runTurnWithEmptyRetry);
 
+      // C3.1 m1：attempt1 计时（降级重跑发射点的被弃行 latencyMs 源）。
+      const firstAttemptStartedAt = Date.now();
       let result = await runOnce(spec);
+      const firstAttemptMs = Date.now() - firstAttemptStartedAt;
       if (agentName !== undefined && sawToolStep) {
         // ── 行为级降级带（09-19 白名单 W3/R3，design 权衡 8）──挂 agent 的 turn 出现内置
         // 工具 step ⇒ 恰一次以无 agent spec 重跑本 turn：会话车道下镜像「已发」比对判零尾
@@ -777,17 +831,42 @@ export function createAntigravityCliDriver(
         deps.warn?.(
           `[antigravity-cli] text agent '${agentName}' lane produced a built-in tool step (a tool step is not evidence the agent failed to load — the declarative agent narrows, but does not zero, agy's built-in tool face) — retrying this turn without --agent (once); session stays on the no-agent lane key=${model.keyId} model=${model.modelId}`,
         );
+        // C3.1 m1：attempt2 计时起点（重跑发射点用）。
+        const rerunStartedAt = Date.now();
         try {
-          result = await runOnce({
+          const rerunResult = await runOnce({
             executable: model.cliExecutable,
             args: buildCliArgs({ model: model.modelId, lane, thinking: effectiveRequest.thinking }),
           });
+          // C3.1 attempt 级记账（design §4 时序②——**替换确认后**发射）：attempt2 成功，
+          // 首试结果被弃，其已知消耗如实入账（成功被弃行：errorKind/errorMessage ABSENT）。
+          // attempt2 由入口 wrapper 正常落行。
+          emitAttempt({
+            success: true,
+            ...(result.usage !== undefined ? { usage: result.usage } : {}),
+            latencyMs: firstAttemptMs,
+          });
+          result = rerunResult;
         } catch (err) {
           // CR-4：降级重跑失败不把首试成功结果变整 turn 拒绝（mirror bridgeTurn CR-5
           // 打回重跑失败先例——接受首轮结果 + 警告）。abort 族照常上抛：用户中断不是
           // 可吞失败（createCliAbortError 归一 name='AbortError'）。
           const abortLike = (err instanceof Error && err.name === 'AbortError') || ctx?.signal?.aborted === true;
-          if (abortLike) throw err;
+          if (abortLike) throw err; // C3.1（m2 defer）：abort 族如实不记——零发射上抛
+          // C3.1 attempt 级记账（design §4 时序②）：attempt2 失败行发射（errorKind 走
+          // classifyGenerationFailure 同族词表）。attempt1 是最终行、由入口 wrapper 正常
+          // 落行，**不**在此发射——防把 attempt1 记两遍（首试结果被采用为最终 response，
+          // wrapper 最终行即 attempt1）。
+          const attemptUsage = readCliAttemptUsage(err);
+          emitAttempt({
+            success: false,
+            // 空 SUCCESS（重试已耗尽）保持专属词——classifyGenerationFailure 对它只给
+            // 'server'，丢空 SUCCESS 语义；非空失败照常走分类同族词表。
+            errorKind: isCliEmptySuccessError(err) ? 'cli-empty-success' : classifyGenerationFailure(err).kind,
+            errorMessage: err instanceof Error ? err.message : String(err),
+            ...(attemptUsage !== undefined ? { usage: attemptUsage } : {}),
+            latencyMs: Date.now() - rerunStartedAt,
+          });
           deps.warn?.(
             `[antigravity-cli] degradation rerun without --agent failed (${err instanceof Error ? err.message : String(err)}) — keeping the first-pass result key=${model.keyId} model=${model.modelId}`,
           );

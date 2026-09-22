@@ -227,7 +227,8 @@ export interface CraftDistillDeps {
 }
 
 async function defaultEmbedOne(model: ResolvedModel, text: string): Promise<number[]> {
-  const res = await generateEmbeddings(model, { input: [text] }, { signal: AbortSignal.timeout(30_000) });
+  // C3.1 计量台账：蒸馏管线去重/claim 向量 embed 标签（拆书·蒸馏族按调用方标，design §9.3）。
+  const res = await generateEmbeddings(model, { input: [text] }, { signal: AbortSignal.timeout(30_000), taskType: 'distill-embed' });
   return res.embeddings[0] ?? [];
 }
 
@@ -1075,6 +1076,11 @@ async function runDistillMaterial(
    */
   const batchVectors: Array<{ cardId: string; vector: number[] }> = [];
   const scheduledBatchCards = new Map<string, CraftCard>();
+  // E10.4 W3：来源三级透传（additive，absent = unspecified/旧行零迁移——mirror originKind 形态）。
+  // 来源材料 provenance.tier ∈ {original, community, criticism} 随讲法与 merge-review newClaim
+  // 落库（人审页三色 tier 徽章消费）；unspecified 材料键不出现（二态纪律——非 undefined 哨兵）。
+  const originTier =
+    material.provenance.tier === 'unspecified' ? undefined : material.provenance.tier;
   for (const entry of claimEntries) {
     const { item, anchor, teachingId } = entry.anchored;
     const condensed = item.condensed;
@@ -1136,6 +1142,8 @@ async function runDistillMaterial(
       anchor,
       rank: 'normal' as const,
       stale: false,
+      // E10.4 W3：来源三级随讲法落库（新建卡 / auto 档 append 同源——teachingBase 单点）。
+      ...(originTier !== undefined ? { originTier } : {}),
     };
     if (best !== null && existingCondensed !== null && best.similarity >= DEDUP_AUTO_SIMILARITY) {
       // 冲突判定（review-judge 档）：语义相反 → dispute 标记 + 讲法 note（R4——分歧不裁决）。
@@ -1177,6 +1185,9 @@ async function runDistillMaterial(
           termId: entry.termId,
           tags: item.tags,
           confidence: entry.confidence,
+          // E10.4 W3：来源三级随 newClaim 落库（裁决成卡时经 craftIpc teachingFromNewClaim
+          // 透传进 teaching——mirror originKind AC4 语义完整性先例）。
+          ...(originTier !== undefined ? { originTier } : {}),
         },
         existingCardId: best.cardId,
         similarity: clamp01(best.similarity),

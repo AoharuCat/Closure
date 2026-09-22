@@ -1585,6 +1585,37 @@ describe('taskType additive on generation request (09-12 usage-panel)', () => {
   });
 });
 
+// ── C3.1 计量台账 W3：sessionId additive（三跳第一跳——wire schema transform 单源）──
+
+describe('sessionId additive on generation request (C3.1 usage ledger)', () => {
+  const baseRequest = {
+    model: 'm',
+    messages: [{ role: 'user', content: 'hi' }],
+  };
+
+  it('旧载荷（无 sessionId）解析不变，字段 ABSENT', () => {
+    const parsed = textGenerationRequestSchema.parse(baseRequest);
+    expect(parsed.sessionId).toBeUndefined();
+  });
+
+  it('在场值直通（网关 wire → 协议入口归一落 ctx 落列）', () => {
+    const parsed = textGenerationRequestSchema.parse({ ...baseRequest, sessionId: 'sess-leader-1' });
+    expect(parsed.sessionId).toBe('sess-leader-1');
+  });
+
+  it("'' 归一为 ABSENT（CR-13 两态纪律——手拼 body 漏空串不被拒）", () => {
+    const parsed = textGenerationRequestSchema.parse({ ...baseRequest, sessionId: '' });
+    expect(parsed.sessionId).toBeUndefined();
+  });
+
+  it('whitespace-only 归一为 ABSENT + 有值落 trim 后形态（C3.1 复核 CR-7）', () => {
+    const ws = textGenerationRequestSchema.parse({ ...baseRequest, sessionId: '   ' });
+    expect(ws.sessionId).toBeUndefined();
+    const padded = textGenerationRequestSchema.parse({ ...baseRequest, sessionId: '  sess-pad  ' });
+    expect(padded.sessionId).toBe('sess-pad');
+  });
+});
+
 // ── 09-12 system stabilization C 批（W_c1）：cacheControl additive（zod 单源第一跳
 // ——IPC parse 面据此放行；payload 经 generateTextPayloadSchema 在 shell 侧 zod
 // parse，默认 strip 未知键——不进 schema 的字段会被静默剥掉，穿透断言钉死这一点）。──

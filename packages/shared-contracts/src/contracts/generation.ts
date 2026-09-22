@@ -188,6 +188,29 @@ export const textGenerationRequestSchema = z.object({
     .optional()
     .transform((v) => (v === undefined || v.length === 0 ? undefined : v)),
   /**
+   * Session id (C3.1 usage ledger): identifies the LOGICAL session this call
+   * belongs to, threaded three hops (wire schema → agent body assembly →
+   * protocol entry ctx normalization) mirroring `taskType`, so the ledger can
+   * attribute cost per session (dialogue lane carries the leader session id;
+   * chain/bridge lanes aggregate via `sessionKey` — dual-key query). Absent =
+   * caller did not label (ledger column NULL). Two-state discipline mirrors
+   * taskType (CR-13): '' from a hand-built body normalizes to ABSENT, never
+   * hard-rejected. CR-7 (C3.1 review): normalization trims first — a
+   * whitespace-only value also normalizes to ABSENT, and a padded value lands
+   * trimmed (the ledger column never stores stray whitespace). Purely
+   * additive; payloads without it parse unchanged.
+   * Ledger-side failure-row token discipline is CR-18 v2 ("unknown then
+   * ABSENT" — known usage on failed/abandoned attempts is recorded as-is,
+   * never fabricated).
+   */
+  sessionId: z
+    .string()
+    .optional()
+    .transform((v) => {
+      const trimmed = v?.trim();
+      return trimmed !== undefined && trimmed.length > 0 ? trimmed : undefined;
+    }),
+  /**
    * Prompt-cache breakpoint flag (09-12 system stabilization, C batch / C3.4):
    * request-level directive for the protocol layer to attach explicit
    * Anthropic-style `cache_control: {type:'ephemeral'}` breakpoints — the

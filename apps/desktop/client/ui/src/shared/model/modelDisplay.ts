@@ -26,6 +26,10 @@ export function fallbackKindLabelKey(reason: string): string {
     case 'server': return 'agent.fallbackKindServer';
     case 'network': return 'agent.fallbackKindNetwork';
     case 'config': return 'agent.fallbackKindConfig';
+    // CR-10（c3-2 CR 批）：熔断跳家（trace/事件 reason 前缀 `circuit-open:`）与预算
+    // 硬线（classifyGenerationFailure 新 kind）两回退 kind 补齐人话标签。
+    case 'circuit-open': return 'agent.fallbackKindCircuitOpen';
+    case 'budget': return 'agent.fallbackKindBudget';
     default: return '';
   }
 }

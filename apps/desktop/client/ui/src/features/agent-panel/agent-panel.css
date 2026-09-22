@@ -4108,6 +4108,28 @@
   opacity: 0.8;
 }
 
+/* 小残留 b（dogfood R4）：回合成功收场后过程警示条随结局收敛——整组降淡 + 尾部结局
+   标注行（成功色）。文案如实（事件时点为真，历史条目保留不删）；运行中/失败结局不加
+   收敛类（维持警示强度），无标注行。 */
+.agent-bridge-notices--settled-ok .agent-bridge-notice {
+  opacity: 0.6;
+}
+
+.agent-bridge-notice-outcome {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.25rem 0.5rem;
+  font-size: var(--text-xs, 12px);
+  color: var(--success);
+  line-height: 1.4;
+}
+
+.agent-bridge-notice-outcome .material-symbols-outlined {
+  font-size: 14px;
+  flex-shrink: 0;
+}
+
 /* 「桥」徽标：工具卡头（AgentToolCard）与工具参数流指示（live badge 内 chip）共用
    词汇——中性小 pill（chip-bg/chip-text），标注「本次调用经 MCP 工具桥执行」。 */
 .agent-tool-card-bridge-badge,
@@ -4220,4 +4242,200 @@
 .agent-context-usage.is-redline .agent-context-usage-label {
   color: var(--error, #e5484d);
   font-weight: 600;
+}
+
+/* ── W4（09-21-subagent-bg-decouple）：后台任务条（四态卡，不进消息流的独立呈现面）── */
+.agent-bg-task-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 6px 12px 0;
+}
+
+.agent-bg-task-card {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 3px 8px;
+  border-radius: var(--radius-md, 8px);
+  background: var(--surface-variant, rgba(0, 0, 0, 0.05));
+  font-size: 0.78rem;
+  color: var(--on-surface, inherit);
+  border: 1px solid transparent;
+}
+
+/* CR-20：任务条渲染帽溢出注记（「还有 N 条较早记录」——与卡同排、弱化色）。 */
+.agent-bg-task-overflow {
+  align-self: center;
+  font-size: 0.72rem;
+  color: var(--outline);
+  white-space: nowrap;
+  padding: 0 2px;
+}
+
+.agent-bg-task-card.is-current-view {
+  border-color: var(--accent);
+}
+
+.agent-bg-task-icon {
+  font-size: 0.9rem;
+  color: var(--outline);
+}
+.agent-bg-task-icon--spin {
+  animation: agent-spin 1.2s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .agent-bg-task-icon--spin {
+    animation: none;
+  }
+}
+
+.agent-bg-task-role {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 16ch;
+}
+
+.agent-bg-task-status {
+  white-space: nowrap;
+  color: var(--outline);
+}
+.agent-bg-task-card--running .agent-bg-task-status { color: var(--accent); }
+.agent-bg-task-card--completed .agent-bg-task-status { color: var(--success, #2e7d32); }
+.agent-bg-task-card--failed .agent-bg-task-status,
+.agent-bg-task-card--interrupted .agent-bg-task-status { color: var(--error, #e5484d); }
+
+.agent-bg-task-elapsed {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  color: var(--outline);
+}
+
+.agent-bg-task-cancel,
+.agent-bg-task-inspect {
+  display: inline-flex;
+  align-items: center;
+  border: none;
+  background: transparent;
+  color: var(--outline);
+  cursor: pointer;
+  padding: 0;
+  border-radius: var(--radius-sm, 4px);
+}
+.agent-bg-task-cancel .material-symbols-outlined,
+.agent-bg-task-inspect .material-symbols-outlined {
+  font-size: 0.95rem;
+}
+.agent-bg-task-cancel:hover { color: var(--error, #e5484d); }
+.agent-bg-task-inspect:hover { color: var(--accent); }
+
+/* ── W4：子会话检视图头部（role/状态/耗时 + 返回键）── */
+.agent-child-inspect-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  font-size: 0.78rem;
+  background: var(--surface-variant, rgba(0, 0, 0, 0.05));
+  border-bottom: 1px solid var(--outline-variant, rgba(0, 0, 0, 0.08));
+  color: var(--outline);
+}
+.agent-child-inspect-header .material-symbols-outlined {
+  font-size: 0.95rem;
+}
+.agent-child-inspect-label {
+  font-weight: 600;
+  color: var(--on-surface, inherit);
+}
+.agent-child-inspect-role {
+  font-weight: 600;
+  color: var(--accent);
+}
+.agent-child-inspect-status {
+  white-space: nowrap;
+}
+.agent-child-inspect-elapsed {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.agent-child-inspect-back {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: none;
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 0.78rem;
+  padding: 2px 6px;
+  border-radius: var(--radius-sm, 4px);
+}
+.agent-child-inspect-back .material-symbols-outlined {
+  font-size: 0.9rem;
+}
+.agent-child-inspect-back:hover {
+  background: var(--surface-variant, rgba(0, 0, 0, 0.08));
+}
+
+/* ── W4：输入面只读横幅（检视态替代输入框）── */
+.agent-input-area--readonly {
+  gap: 0;
+}
+.agent-input-readonly-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 12px;
+  padding: 8px 12px;
+  border-radius: var(--radius-md, 8px);
+  background: var(--surface-variant, rgba(0, 0, 0, 0.05));
+  color: var(--outline);
+  font-size: 0.8rem;
+}
+.agent-input-readonly-banner .material-symbols-outlined {
+  font-size: 1rem;
+  color: var(--accent);
+}
+.agent-input-readonly-text {
+  flex: 1;
+}
+.agent-input-readonly-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: none;
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 0.8rem;
+  padding: 3px 8px;
+  border-radius: var(--radius-sm, 4px);
+}
+.agent-input-readonly-back .material-symbols-outlined {
+  font-size: 0.9rem;
+}
+.agent-input-readonly-back:hover {
+  background: var(--surface-variant, rgba(0, 0, 0, 0.08));
+}
+
+/* ── W4：组卡钻取钮（ChildExecutionGroup 头部）── */
+.agent-child-group-inspect {
+  display: inline-flex;
+  align-items: center;
+  border: none;
+  background: transparent;
+  color: var(--outline);
+  cursor: pointer;
+  padding: 0 2px;
+  border-radius: var(--radius-sm, 4px);
+}
+.agent-child-group-inspect .material-symbols-outlined {
+  font-size: 0.9rem;
+}
+.agent-child-group-inspect:hover {
+  color: var(--accent);
 }

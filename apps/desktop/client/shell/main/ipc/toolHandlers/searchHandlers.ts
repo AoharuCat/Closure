@@ -25,7 +25,12 @@ import type { SearchConfig } from '@orison/shared-contracts';
 import { DEFAULT_SEARCH_CONFIG } from '@orison/shared-contracts';
 import { getLogger } from '../../logger';
 import { EngineGate, LruTtlCache, createSearchResultCache } from '../../research/netGuard';
-import type { EngineFailureReason, EngineFetcher, SearchHit } from '../../research/searchEngines';
+import type {
+  EngineAdapter,
+  EngineFailureReason,
+  EngineFetcher,
+  SearchHit,
+} from '../../research/searchEngines';
 import { buildEngineAdapters, probeSearxngLocalhost, readSearchConfig } from '../../research/searchConfig';
 import { runSearchChain, type SearchChainOutcome } from '../../research/searchChain';
 import type { ToolHandler } from './types';
@@ -84,9 +89,10 @@ export function coerceSearchParams(params: Record<string, unknown>): { query?: s
   return { query, limit };
 }
 
-// ── Handler ──
+// ── Search core（E10.4 W2 自 handler 提取的复用缝——web_search 与 materials:search-online
+//    两消费站；gate/cache 共用模块级单例，同 query 跨通道命中同一缓存）──
 
-export interface WebSearchHandlerDeps {
+export interface WebSearchCoreDeps {
   /** Config loader (default: sidecar readSearchConfig, never throws). */
   loadConfig?: () => SearchConfig;
   /** localhost SearXNG probe (default: probeSearxngLocalhost). */
@@ -99,9 +105,55 @@ export interface WebSearchHandlerDeps {
   cache?: LruTtlCache<SearchChainOutcome>;
 }
 
-export function createWebSearchHandler(deps: WebSearchHandlerDeps = {}): ToolHandler {
+export interface WebSearchCoreResult {
+  outcome: SearchChainOutcome;
+  /** Built adapter chain（handler 的 empty-chain 分支消费；search-online 不消费）。 */
+  adapters: EngineAdapter[];
+}
+
+/**
+ * web_search 核心：配置读取（读失败回落默认配置）→ localhost SearXNG 探针（探针失败 =
+ * miss，从不报错）→ 引擎链执行（first-hit-wins + 全败 friendly failures）。never-throws
+ * （链自身吞错——R8）。
+ */
+export async function runWebSearchCore(
+  query: string,
+  signal: AbortSignal,
+  deps: WebSearchCoreDeps = {},
+): Promise<WebSearchCoreResult> {
   const loadConfig = deps.loadConfig ?? readSearchConfig;
-  const probe = deps.probe ?? ((signal: AbortSignal) => probeSearxngLocalhost({ signal }));
+  const probe = deps.probe ?? ((probeSignal: AbortSignal) => probeSearxngLocalhost({ signal: probeSignal }));
+  const gate = deps.gate ?? defaultSearchGate;
+  const cache = deps.cache ?? defaultSearchCache;
+
+  let config: SearchConfig;
+  try {
+    config = loadConfig();
+  } catch {
+    config = { ...DEFAULT_SEARCH_CONFIG };
+  }
+
+  // Probe the local SearXNG before building the chain — 'searxng-local'
+  // only materializes on a hit (probe failure = miss, never an error).
+  let probeHit = false;
+  if (config.searxngLocalhostProbe !== false) {
+    try {
+      probeHit = await probe(signal);
+    } catch {
+      probeHit = false;
+    }
+  }
+
+  const adapters = buildEngineAdapters(config, { probeHit, fetcher: deps.fetcher });
+  const outcome = await runSearchChain(query, config, { adapters, gate, cache, signal });
+  return { outcome, adapters };
+}
+
+// ── Handler ──
+
+export type WebSearchHandlerDeps = WebSearchCoreDeps;
+
+export function createWebSearchHandler(deps: WebSearchHandlerDeps = {}): ToolHandler {
   const gate = deps.gate ?? defaultSearchGate;
   const cache = deps.cache ?? defaultSearchCache;
 
@@ -118,25 +170,7 @@ export function createWebSearchHandler(deps: WebSearchHandlerDeps = {}): ToolHan
     const limit = coerced.limit ?? DEFAULT_LIMIT;
 
     try {
-      let config: SearchConfig;
-      try {
-        config = loadConfig();
-      } catch {
-        config = { ...DEFAULT_SEARCH_CONFIG };
-      }
-
-      // Probe the local SearXNG before building the chain — 'searxng-local'
-      // only materializes on a hit (probe failure = miss, never an error).
-      let probeHit = false;
-      if (config.searxngLocalhostProbe !== false) {
-        try {
-          probeHit = await probe(abort);
-        } catch {
-          probeHit = false;
-        }
-      }
-
-      const adapters = buildEngineAdapters(config, { probeHit, fetcher: deps.fetcher });
+      const { outcome, adapters } = await runWebSearchCore(query, abort, { ...deps, gate, cache });
       if (adapters.length === 0) {
         return {
           title: `web_search: ${query.slice(0, 40)}`,
@@ -145,8 +179,6 @@ export function createWebSearchHandler(deps: WebSearchHandlerDeps = {}): ToolHan
           metadata: { count: 0, hits: [], failures: [], engines: [] },
         };
       }
-
-      const outcome = await runSearchChain(query, config, { adapters, gate, cache, signal: abort });
       const hits = outcome.hits.slice(0, limit);
 
       let output: string;

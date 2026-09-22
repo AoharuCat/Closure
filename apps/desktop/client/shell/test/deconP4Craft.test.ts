@@ -163,6 +163,7 @@ function mkMaterial(chapters: Material['chapters'] = FIXTURE.chapters, derived: 
       lang: null,
       originDate: null,
       description: null,
+      url: null,
     },
     quality: {
       ok: true,

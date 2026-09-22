@@ -19,7 +19,40 @@ import { registerProjectMetaIpc } from './projectMetaIpc';
 import { deleteProject, duplicateProject, renameProject } from './projectLifecycle';
 import { withProjectLock } from '../fs/projectWriteLock';
 import { loadVerifiedProjectDocument } from './projectIdentity';
+// 09-21-subagent-bg-decouple W3（design §2 / prd R6）：项目关闭/删除级联杀——该项目名下全部
+// running 后台子 agent abort（能力面单源在 agent 包 BgTaskRegistry，shell 只挂接生命周期钩子）。
+import { cancelBgTasksForProject, getBgTaskRegistry } from '@orison/desktop-agent';
 import { getLogger } from '../logger';
+
+const logger = getLogger();
+
+/**
+ * W3：项目关闭/切换级联的项目路径记忆。`project:watch`（项目打开）时登记、`project:unwatch`
+ * （项目关闭/切换）时消费并清空——unwatch 通道零参数（关的是「当前活跃项目」），路径在
+ * watch 侧已知。app 退出不经此路径（进程死 → 重启对账标 interrupted，design D6）。
+ * CR-8 改 Set：project:watch 连续两次（切换未先 unwatch / 重复 watch）不再覆写丢前项目锚
+ * ——unwatch 消费全部并清，级联取消面不因覆写漏项目。
+ */
+const watchedProjectDirs = new Set<string>();
+
+/** CR-13：有界等待项目后台任务全部终态（cancel 只发 abort 信号，终态经 outcome 链异步回写）。
+ * 轮询注册表直到无 running 或超时——超时继续删（abort 已发出，剩余写入窗口可接受；删除主链路
+ * 不被悬挂 runLoop 无限阻塞）。 */
+async function waitForBgTasksSettled(projectPath: string, timeoutMs = 2000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const running = getBgTaskRegistry().listByProject(projectPath).filter((r) => r.status === 'running');
+    if (running.length === 0) return;
+    if (Date.now() >= deadline) {
+      logger.warn(
+        { projectPath, stillRunning: running.length },
+        'project:delete: bg tasks not settled within bounded wait → proceeding with deletion (abort signal already sent)',
+      );
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
 
 export function registerProjectIpc() {
   const projectsRoot = getProjectsRoot();
@@ -120,12 +153,23 @@ export function registerProjectIpc() {
   });
 
   ipcMain.handle('project:delete', async (_, projectPath: string) => {
+    // W3 级联：删项目先杀其后台子 agent（防 bg 子 run 向将删目录续写）——取消数记日志不阻塞删除。
+    const cancelled = cancelBgTasksForProject(projectPath);
+    if (cancelled > 0) {
+      logger.info({ projectPath, cancelled }, 'project:delete cascaded bg task cancellation');
+      // CR-13：cancel 是异步 abort 信号，立即 trash 会与仍在收尾写盘的子 runLoop 竞态（部分
+      // 落盘写进将删目录/写一半被回收）。有界 await 终态收敛（waitForBgTasksSettled）再删。
+      await waitForBgTasksSettled(projectPath);
+    }
     return deleteProject(projectPath, (target) => shell.trashItem(target));
   });
 
   /* ── Filesystem watcher (auto-refresh on external changes) ── */
   ipcMain.handle('project:watch', async (_, projectDir: string) => {
     watchProject(projectDir);
+    // W3：登记活跃项目路径——project:unwatch 的 bg 级联消费（unwatch 零参数，路径在此已知）。
+    // CR-8：Set 登记（连续 watch 不覆写丢前项目锚）。
+    watchedProjectDirs.add(projectDir);
     // Story 2.7: also watch project.yaml for asset_cards edits (dedicated watcher
     // — NOT projectWatcher, whose self-write suppression would swallow the app's
     // own field-sync saves). Started alongside watchProject so both share the
@@ -214,6 +258,16 @@ export function registerProjectIpc() {
   });
 
   ipcMain.handle('project:unwatch', async () => {
+    // W3 级联（design §2「项目关闭/切换 → listByProject 全 abort」）：项目关闭/切换时杀
+    // 该项目名下全部 running 后台子 agent——取消数记日志不阻塞关闭。CR-8：消费全部 watch
+    // 登记并清（连续 watch 不再因覆写丢前项目锚）。
+    for (const watchedDir of [...watchedProjectDirs]) {
+      const cancelled = cancelBgTasksForProject(watchedDir);
+      if (cancelled > 0) {
+        logger.info({ projectPath: watchedDir, cancelled }, 'project:unwatch cascaded bg task cancellation');
+      }
+      watchedProjectDirs.delete(watchedDir);
+    }
     unwatchProject();
     // Story 2.7: stop the asset_cards watcher on project close/switch so no fs
     // watcher / debounce timer outlives the active project (mirror unwatchProject).

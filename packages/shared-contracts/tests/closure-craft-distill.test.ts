@@ -317,6 +317,28 @@ describe('craftMergeReviewSchema — 并排对比任务', () => {
       ),
     ).toThrow();
   });
+
+  it('newClaim originTier additive（E10.4——来源材料三级经 merge 裁决不丢）：缺省合法 / 三值 parse / 越枚举拒', () => {
+    // 缺省 = 旧行零迁移（unspecified 材料蒸馏透传为 absent——doc_claim 原语义不含 tier）。
+    const baseline = craftMergeReviewSchema.parse(sampleReview());
+    expect(baseline.newClaim.originTier).toBeUndefined();
+    // 在场 = 批评/社区/原作来源讲法完整载荷（resolve 成卡时透传进 teaching——mirror originKind AC4）。
+    const tieredClaim = {
+      ...(sampleReview().newClaim as Record<string, unknown>),
+      originTier: 'criticism',
+    };
+    const parsed = craftMergeReviewSchema.parse(sampleReview({ newClaim: tieredClaim }));
+    expect(parsed.newClaim.originTier).toBe('criticism');
+    for (const originTier of ['original', 'community'] as const) {
+      expect(() =>
+        craftMergeReviewSchema.parse(sampleReview({ newClaim: { ...tieredClaim, originTier } })),
+      ).not.toThrow();
+    }
+    // 越枚举拒（unspecified 不入讲法级——absent 表达）。
+    expect(() =>
+      craftMergeReviewSchema.parse(sampleReview({ newClaim: { ...tieredClaim, originTier: 'unspecified' } })),
+    ).toThrow();
+  });
 });
 
 // ── IPC 契约 parse（W1.5）──

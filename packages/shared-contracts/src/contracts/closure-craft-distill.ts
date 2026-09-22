@@ -237,6 +237,12 @@ export const craftMergeReviewSchema = z.object({
      */
     originKind: z.enum(['doc_claim', 'decon_instance']).optional(),
     bookTitle: z.string().nullable().optional(),
+    /**
+     * 来源三级（E10.4 additive，mirror craftTeachingSchema.originTier——newClaim 是未落卡
+     * 的完整讲法载荷，resolve 成卡〔merge 挂讲法 / independent 建卡〕时透传不丢；absent =
+     * 旧行零迁移 / unspecified 材料蒸馏语义）。
+     */
+    originTier: z.enum(['original', 'community', 'criticism']).optional(),
     /** 呼应证据族（同上 additive——craftTeachingEvidenceSchema 同形状单源）。 */
     evidence: craftTeachingEvidenceSchema.optional(),
   }),

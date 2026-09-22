@@ -197,6 +197,13 @@ export const craftTeachingSchema = z.object({
   /** 拆书来源书名（decon_instance = 材料显示名；doc_claim 缺省；nullable = 材料未命名）。 */
   bookTitle: z.string().nullable().optional(),
   /**
+   * 来源三级（E10.4 additive，absent = 旧行零迁移——mirror originKind 形态）：来源材料
+   * provenance.tier ∈ {original, community, criticism} 时蒸馏/merge 透传；unspecified 材料
+   * 透传为 absent（doc_claim 原语义不含 tier）。人审页讲法行三色 tier 徽章消费；卡列表/
+   * 检索面零改动（tier 是讲法级不是卡级）。
+   */
+  originTier: z.enum(['original', 'community', 'criticism']).optional(),
+  /**
    * 呼应证据族（E10.3b additive——过度归因防线 R7 的落卡面；absent = 旧行〔教程主张无
    * 呼应证据语义〕）。anchors ≥1（回收点/对照物/重复调度——与 anchor 主锚同基同形）；
    * level：`strong` = ≥2 锚或回收点已验 / `weak` = 单锚未验；derivedHash = 拆解时派生

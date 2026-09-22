@@ -1506,7 +1506,8 @@ interface AssembleInput {
 
 /**
  * Material 装配（provenance 摄取期缺省：medium='other'/tier='unspecified'/作者族 null——
- * UI 后补，F-05；E10.2a：字幕格式 medium 默认 'video'、description 摄取期 null 同型后补）。
+ * UI 后补，F-05；E10.2a：字幕格式 medium 默认 'video'、description 摄取期 null 同型后补；
+ * E10.4：url 摄取期 null——在线拉取通道经 provenanceOverrides 预填，本地文件恒 null）。
  * status：llm-fallback 挂起（零章界）→ low-confidence（F-09——章界与检索解耦，Wave C 对
  * 零章材料全文单伪章照索引）；其余成功路径 → ready。
  */
@@ -1530,6 +1531,7 @@ function assembleMaterial(input: AssembleInput): Material {
       lang: null,
       originDate: null,
       description: null,
+      url: null,
     },
     quality: {
       ok: !(input.scanned || input.nonUtf8),

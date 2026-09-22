@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { ChangeEvent } from 'react';
 import type {
   ModelConfig,
@@ -8,11 +8,22 @@ import type {
   SlotAssignment,
   SlotFallbackEntry,
   TaskModelSlot,
+  TaskPresetMutationResult,
+  TaskPresetSummary,
   ThinkingKind,
   UnifiedLevel,
 } from '@orison/shared-contracts';
 import { resolveModelInfo, THINKING_PROFILES, validateCustom } from '@orison/shared-contracts';
 import { listNovelTextModelRefs } from '../../shared/model/novelModel';
+import { useAppStore } from '../../shared/store/appStore';
+import { useAgyBridgeStore } from '../../shared/store/agyBridgeStore';
+import {
+  applyTaskPreset,
+  deleteTaskPreset,
+  listTaskPresets,
+  saveTaskPreset,
+} from '../../shared/api/taskPresets';
+import { DeleteConfirmDialog } from './DeleteConfirmDialog';
 
 /**
  * 模型分工三段（dogfood 2026-08-21 拍板：从模型配置页迁入 Agent 页）——模型配置页
@@ -22,11 +33,17 @@ import { listNovelTextModelRefs } from '../../shared/model/novelModel';
  * - 向量模型 + 重排模型（KB 索引与检索 sidecar 指派，VS1 / Story 2.1）
  *
  * 自包含：props 只需 t + modelConfig + setModelConfig（SettingsDialog 处已有全部接线）。
+ * U7（dogfood R4）：唯一例外读 = agyBridgeStore 的桥授权态（CLI 徽标两态文案用）——
+ * 模块级 store 直读，不经 props。
+ * C3.2 W2：reloadConfig 可选——预设 apply/delete 由 shell 整组改写 task-models.yaml，
+ * 渲染端须经 config:load-model 重读（不能走 setModelConfig 回写：save 面 strip 掉
+ * activePreset 会把刚落的标记立刻洗掉）。
  */
 type Props = {
   t: (key: string, vars?: Record<string, string | number>) => string;
   modelConfig: ModelConfig;
   setModelConfig: (config: ModelConfig) => Promise<void>;
+  reloadConfig?: () => Promise<void>;
 };
 
 type EnabledModelOption = {
@@ -77,16 +94,20 @@ const TASK_MODEL_SLOT_DEFS: ReadonlyArray<{
 function buildTaskModelOptions(
   config: ModelConfig,
   t: (key: string, vars?: Record<string, string | number>) => string,
+  bridgeAuthorized: boolean,
 ): Array<{ value: string; label: string }> {
   // Enabled TEXT models only — these slots steer writing-pipeline generation.
   // 09-12 agy provider W4：CLI（antigravity-cli）text 模型一并指派（生成经 gateway
-  // resolveModel 分派协议层 CLI 驱动），选项带形态标识——指派时即知该形态无 Closure
-  // 工具面（协议层剥离），而非事后查 driver warn。
+  // resolveModel 分派协议层 CLI 驱动），选项带形态标识——指派时即知该形态的工具面形态，
+  // 而非事后查 driver warn。U7（dogfood R4）：徽标按桥授权态分两态——桥已授权（同意态
+  // ok）时 CLI 模型经 MCP 工具桥具备 Closure 写作工具面（工具在模型自己的回合里执行），
+  // 「无工具调用」原文与模型配置页桥小节「工具在模型自己的回合里执行」正对打架；未授权/
+  // 缺席态维持原文（无工具面属实——协议层剥离仍在）。
   return listNovelTextModelRefs(config.keys, { includeCli: true }).map((opt) => ({
     value: `${opt.ref.keyId}::${opt.ref.modelId}`,
     label:
       opt.protocol === 'antigravity-cli'
-        ? `${opt.label} · ${t('settings.cliNoToolsBadge')}`
+        ? `${opt.label} · ${t(bridgeAuthorized ? 'settings.cliBridgeToolsBadge' : 'settings.cliNoToolsBadge')}`
         : opt.label,
   }));
 }
@@ -299,11 +320,203 @@ function SidecarModelPicker({
   );
 }
 
-export function ModelAssignmentSections({ t, modelConfig, setModelConfig }: Props) {
+// ── C3.2 W2 多套预设：档位段顶预设条（design §2.3）────────────────────────────
+// 当前态 chip（预设名/自定义）+ 切换 select + 存为 inline 输入 + per-预设删除（确认
+// 对话）。apply/delete 改写的是 shell 侧 task-models.yaml 整组，成功后经 reloadConfig
+// （= store 的 loadModelConfig，只读回不回写）刷新；save 只新增预设档，刷新列表即可。
+
+/** 模式 A 错误码 → i18n 提示键（稳定机器码不得做展示以外的 === 消费）。 */
+const PRESET_ERROR_KEYS: Record<string, string> = {
+  'invalid-name': 'settings.presetInvalidName',
+  'not-found': 'settings.presetNotFound',
+  'no-slots': 'settings.presetNoSlots',
+  'operation-failed': 'settings.presetFailed',
+};
+
+function TaskPresetBar({
+  t,
+  activePreset,
+  reloadConfig,
+}: {
+  t: (key: string, vars?: Record<string, string | number>) => string;
+  activePreset: string | undefined;
+  reloadConfig?: () => Promise<void>;
+}) {
+  const [presets, setPresets] = useState<TaskPresetSummary[]>([]);
+  const [nameDraft, setNameDraft] = useState('');
+  const [overwriteArmed, setOverwriteArmed] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<TaskPresetSummary | null>(null);
+
+  function refreshPresets() {
+    // C3.2 W2：桥访问经 shared/api/taskPresets 收口（boundary rule——features 不直碰桥）。
+    void listTaskPresets().then((list) => setPresets(list ?? []));
+  }
+
+  useEffect(() => {
+    refreshPresets();
+  }, []);
+
+  /** 成功后的统一收尾：可选配置重读 + 预设列表刷新 + 清错误/覆盖臂章。 */
+  async function afterMutation(reload: boolean) {
+    setError(null);
+    setOverwriteArmed(false);
+    if (reload) await reloadConfig?.();
+    refreshPresets();
+  }
+
+  function toError(result: TaskPresetMutationResult): string | null {
+    return result.ok ? null : (t(PRESET_ERROR_KEYS[result.error] ?? 'settings.presetFailed'));
+  }
+
+  async function onApply(name: string) {
+    if (!name) return;
+    const result = await applyTaskPreset(name);
+    if (!result) return;
+    if (!result.ok) {
+      setError(toError(result));
+      return;
+    }
+    await afterMutation(true);
+  }
+
+  async function onSave() {
+    const name = nameDraft.trim();
+    if (!name) return;
+    // 同名覆盖的 UI 侧确认：两段式按钮（第一次点只亮确认提示，第二次才落）。
+    // CR-4: case-insensitive compare — the name IS the file name on a
+    // case-insensitive filesystem (NTFS/APFS), so `foo` would silently overwrite
+    // `Foo.yaml` without the confirmation if compared strictly.
+    if (presets.some((p) => p.name.toLowerCase() === name.toLowerCase()) && !overwriteArmed) {
+      setOverwriteArmed(true);
+      return;
+    }
+    const result = await saveTaskPreset(name);
+    if (!result) return;
+    if (!result.ok) {
+      setError(toError(result));
+      setOverwriteArmed(false);
+      return;
+    }
+    setNameDraft('');
+    await afterMutation(false);
+  }
+
+  async function onDeleteConfirmed() {
+    const target = deleteTarget;
+    setDeleteTarget(null);
+    if (!target) return;
+    const result = await deleteTaskPreset(target.name);
+    if (!result) return;
+    if (!result.ok) {
+      setError(toError(result));
+      return;
+    }
+    // 删的是活动档时 shell 已清标记——重读让 chip 回「自定义」。
+    await afterMutation(activePreset === target.name);
+  }
+
+  return (
+    <div className="model-preset-bar">
+      <span className="model-preset-chip">
+        {t('settings.presetCurrent')}
+        {activePreset ? ` ${activePreset}` : ` ${t('settings.presetCustom')}`}
+      </span>
+      <label className="form-field-input-row model-preset-apply">
+        <span className="form-field-input-label">{t('settings.presetApplyLabel')}</span>
+        <select
+          className="form-field-input"
+          value=""
+          onChange={(event) => {
+            void onApply(event.target.value);
+          }}
+        >
+          <option value="">{presets.length > 0 ? t('settings.presetApplyPick') : t('settings.presetEmpty')}</option>
+          {presets.map((p) => (
+            <option key={p.name} value={p.name}>
+              {p.name}（{p.slotCount}）
+            </option>
+          ))}
+        </select>
+      </label>
+      <label className="form-field-input-row model-preset-save">
+        <span className="form-field-input-label">{t('settings.presetSaveAs')}</span>
+        <input
+          type="text"
+          className="form-field-input"
+          value={nameDraft}
+          placeholder={t('settings.presetNamePlaceholder')}
+          onChange={(event) => {
+            setNameDraft(event.target.value);
+            setOverwriteArmed(false);
+          }}
+        />
+        <button
+          type="button"
+          className="model-preset-save-button"
+          disabled={!nameDraft.trim()}
+          onClick={() => {
+            void onSave();
+          }}
+        >
+          {overwriteArmed ? t('settings.presetOverwriteConfirm') : t('settings.presetSaveAction')}
+        </button>
+      </label>
+      {presets.length > 0 ? (
+        <div className="model-preset-list">
+          {presets.map((p) => (
+            <span key={p.name} className="model-preset-item">
+              <span className="model-preset-item-name">
+                {activePreset === p.name ? `● ${p.name}` : p.name}
+              </span>
+              <button
+                type="button"
+                className="model-preset-item-delete"
+                title={t('settings.presetDeleteLabel')}
+                aria-label={`${t('settings.presetDeleteLabel')}: ${p.name}`}
+                onClick={() => setDeleteTarget(p)}
+              >
+                <span className="material-symbols-outlined" aria-hidden="true">close</span>
+              </button>
+            </span>
+          ))}
+        </div>
+      ) : null}
+      {error ? <p className="model-task-slot-meta is-invalid">{error}</p> : null}
+      <DeleteConfirmDialog
+        open={deleteTarget !== null}
+        title={t('settings.presetDeleteConfirmTitle', { name: deleteTarget?.name ?? '' })}
+        description={t('settings.presetDeleteConfirmDesc')}
+        confirmLabel={t('settings.presetDeleteConfirmAction')}
+        cancelLabel={t('settings.presetCancel')}
+        onConfirm={() => {
+          void onDeleteConfirmed();
+        }}
+        onCancel={() => setDeleteTarget(null)}
+      />
+    </div>
+  );
+}
+
+export function ModelAssignmentSections({ t, modelConfig, setModelConfig, reloadConfig }: Props) {
+  // CR-15: reloadConfig 缺省兜底——props 未传的宿主（SettingsDialog 四调用方之外的
+  // 挂载面）里 apply/delete 后经 store 自给刷新，不再静默陈旧；props 传入者优先
+  // （既有用例零改——传了 reloadConfig 的走原路径）。store.loadModelConfig 只读回
+  // 不回写，桥缺席时为 no-op（settingsSlice 判空面）。
+  const reloadAfterMutation = reloadConfig ?? (() => useAppStore.getState().loadModelConfig());
+
   // Task-model routing (C3.2): per-stage model designation. Options are the
   // enabled text models; "Auto" empties the slot so the generation gateway
   // auto-picks (the pre-routing behavior, identical to an unset config).
-  const taskModelOptions = buildTaskModelOptions(modelConfig, t);
+  // U7：CLI 形态徽标按桥授权态分两态（判定源 = 既有桥状态面 store——App 启动 /
+  // 同意对话框 / 模型页桥小节的写路径都经它回显）；挂载即拉一次（mirror
+  // AgyBridgeSection「挂载即拉，shell 每次现读」语义），store 缺席时静默维持原快照。
+  const bridgeAuthorized = useAgyBridgeStore((s) => s.status?.state === 'ok');
+  const refreshBridgeStatus = useAgyBridgeStore((s) => s.refreshStatus);
+  useEffect(() => {
+    void refreshBridgeStatus();
+  }, [refreshBridgeStatus]);
+  const taskModelOptions = buildTaskModelOptions(modelConfig, t, bridgeAuthorized);
 
   // thinking adapters task：custom 档的**草稿**态（per-slot + per-回退条目——条目键
   // `${slot}::fb::${index}`）。选中「自定义…」时先入草稿、select 停在 custom，直到
@@ -898,6 +1111,9 @@ export function ModelAssignmentSections({ t, modelConfig, setModelConfig }: Prop
         {/* CR-011: what "Auto" means for the un-configured surface (incl. the
             generic sub-agents dispatched by the workbench, which take no slot). */}
         <p className="model-embedding-preset-hint">{t('settings.taskModelsAutoHint')}</p>
+        {/* C3.2 W2 多套预设条（design §2.3）：段顶——当前态 chip + 切换 + 存为 + 删除。
+            CR-15：reloadConfig 走 props 优先 / store 兜底的有效面。 */}
+        <TaskPresetBar t={t} activePreset={modelConfig.activePreset} reloadConfig={reloadAfterMutation} />
         {taskModelOptions.length > 0 || hasTaskDesignations ? (
           TASK_MODEL_SLOT_DEFS.map(({ slot, labelKey, descKey }) => {
             const stale = staleTaskOption(slot);

@@ -71,6 +71,8 @@ import {
   CONTEXT_SUMMARY_TASK_TYPE,
   MAX_SPAWN_DEPTH,
   SpawnDepthExceededError,
+  type BgNotifyChannel,
+  type BgTaskHandle,
   type ChainNodeDonePauseKind,
   type ChainStreamEvent,
   type ChainToolEventData,
@@ -86,6 +88,8 @@ import {
   type StreamDeltaData,
   type ToolDefinition,
 } from '../types';
+// 09-21-subagent-bg-decouple W1（design §1/§2）：后台任务注册表（spawn_agent_bg 登记面）+ 删会话级联杀。
+import { cancelBgTasksForParent, cancelBgTasksForChildSession, getBgTaskRegistry } from './bgTasks';
 
 export interface CreateSessionInput {
   agentName: string;
@@ -281,6 +285,64 @@ export function renderChainCompletedEventMessage(payload: ChainCompletedEventPay
   ].join('\n');
 }
 
+// ── 09-21-subagent-bg-decouple W2（design §3.2）：bg_completed_event 消息正文 ──
+//
+// wake 通道合成事件回注（notifyLeaderEvent bg 分支产）。单条 / 聚合（队列溢出 coalesce）两形态，
+// 指令段 + 事实段两块 mirror renderChainCompletedEventMessage（导出纯函数 = 测试锚点先例）。
+
+/** bg 完成事件的结构化事实（wake 回注 + 队列聚合渲染共用；digest = registry promptDigest 同源）。 */
+export interface BgCompletedEventInfo {
+  taskId: string;
+  role: string;
+  childSessionId: string;
+  /** 派发 prompt 首 120 字（registry promptDigest 同源——渲染只做折行规整，无二次截断）。 */
+  digest: string;
+  /** 仅 failed 携带（如实转达失败原因）。 */
+  error?: string;
+}
+
+/**
+ * digest → 单行摘要（折行/连续空白规整防破坏逐条列表格式）。无长度截断（CR-18 死码删除）：
+ * 源头 registry promptDigest 已 120 字帽（BgTaskRecord.promptDigest），此处再截不可达。
+ */
+function renderBgDigestLine(digest: string): string {
+  return digest.replace(/\s+/g, ' ').trim();
+}
+
+/** 单条 bg 完成事件正文（纯函数测试锚点）。 */
+export function renderBgCompletedEventMessage(info: BgCompletedEventInfo): string {
+  const facts: string[] = [
+    `- 子代理：${info.role}（taskId: ${info.taskId}）`,
+    `- 派发摘要：${renderBgDigestLine(info.digest)}`,
+  ];
+  if (info.error !== undefined) {
+    facts.push(`- 结果状态：失败——${info.error}`);
+  }
+  return [
+    '[后台任务完成事件 · 系统回注] 你此前派发的后台子代理已完成。本条是系统事件，不是作者发言。',
+    `请先用 bg_task_result(taskId="${info.taskId}") 领取完整结果，然后用自己的话向作者简要汇报，最后 present_result 收尾。不要机械复述下面的数据，也不要重新派发同一任务。`,
+    '',
+    '完成事实：',
+    ...facts,
+  ].join('\n');
+}
+
+/** 聚合 bg 完成事件正文（wake 队列溢出 coalesce 的合并通知——纯函数测试锚点）。 */
+export function renderBgCompletedAggregateEventMessage(infos: readonly BgCompletedEventInfo[]): string {
+  const facts = infos.map((info) => {
+    const errorSuffix = info.error !== undefined ? `（失败——${info.error}）` : '';
+    return `- 子代理：${info.role}（taskId: ${info.taskId}）：${renderBgDigestLine(info.digest)}${errorSuffix}`;
+  });
+  const taskIds = infos.map((info) => `"${info.taskId}"`).join('、');
+  return [
+    '[后台任务完成事件 · 系统回注] 你派发的多个后台子代理已完成（多条结果合并为一条通知）。本条是系统事件，不是作者发言。',
+    `请逐条用 bg_task_result(taskId=...) 领取结果（本批 taskId：${taskIds}）并合并向作者简要汇报（全量状态可先 bg_tasks_status 查看），最后 present_result 收尾。不要机械复述下面的数据。`,
+    '',
+    `完成事实（共 ${infos.length} 条合并）：`,
+    ...facts,
+  ].join('\n');
+}
+
 // ── dogfood T1 Stage 6（design §4 / r1 坑「redo/loopNodes 重跑时 delta 双开」）：链节点流式轮次计数 ──
 //
 // chain-delta 事件的 `seq` = 该 (parentSessionId, nodeId) 的流式轮次计数（每 run 首条 delta 时 +1，
@@ -451,6 +513,30 @@ export interface WorkflowRuntime {
   resolveConfirmation(sessionId: string, callId: string, approved: boolean): ConfirmationResolution;
   dispatchSubagent(input: SubagentDispatchInput): Promise<SubagentDispatchOutput>;
   runSubagent(parentSessionId: string, role: string, prompt: string, options?: SkillExecutorInvokeOptions): Promise<{ content: string }>;
+  /**
+   * 09-21-subagent-bg-decouple（design §1.2 / R1）：后台子 agent 派发入口——spawn_agent_bg 工具经
+   * ctx.skillExecutor.runSubagentBackground 到此。经 BgTaskRegistry.dispatchBg（容量帽 + 登记 + 落盘
+   * 镜像）→ SubagentRuntime.dispatchBackground（同一条 child runLoop 路径：createChildSession +
+   * narrowPermission + runChildAgent；不 await、finally 豁免 evict、子 run 走自身 sessionId 的
+   * beginRun 生命周期、独立 AbortController 不透传 leader ctx.abort）。**立即同步返句柄**（不等首
+   * LLM 帧——起点可见由 runChildAgent 的 started 事件兜底，经 runtime 事件泵广播）。
+   *
+   * 🔑 与 runSubagent 的差异（design §5）：child 事件**不接 caller 的 emitChildEvent**（leader turn
+   * 的 sendEvent 便车随 turn 结束而亡），改接 `onRuntimeEvent` 运行时级广播泵（载荷带自身 child sid，
+   * shell agentIpc 广播 agent:stream-event）。child 消息落盘走 runChildAgent 的 persistChildMessages
+   * （bg 路径 onMessage 双写——检视图 fetch 对账 + 重启可追前提，D9/P2）。
+   *
+   * @param options.spawnDepth 入口 spawnDepth（leader→子 agent depth+1，深度闸照用）。
+   * @param options.notify 结果送达通道（缺省 'toast'；消费面在 W2）。
+   * @returns BgTaskHandle（taskId / childSessionId / role / status:'running'）。
+   * @throws BgCapacityError 同项目在跑后台任务达 MAX_BG_PER_PROJECT（工具层转响亮拒绝文案）。
+   */
+  runSubagentBackground(
+    parentSessionId: string,
+    role: string,
+    prompt: string,
+    options?: { spawnDepth?: number; notify?: BgNotifyChannel },
+  ): BgTaskHandle;
   /**
    * Story 4.5：派发 leader 侧工具子 agent（yaml 契约驱动，design §3.3 / D1-b / implement.md WP3a）。
    *
@@ -683,6 +769,37 @@ export interface WorkflowRuntime {
    * @returns true = 报告轮完整跑完；false = 守卫 no-op / 丢弃 / 报告轮失败。
    */
   notifyLeaderChainCompleted(sessionId: string, payload: ChainCompletedEventPayload): Promise<boolean>;
+  /**
+   * 09-21-subagent-bg-decouple W2（design §3.2）：泛化系统事件回注入口。notifyLeaderChainCompleted
+   * 的公共核（守卫①② + streamMessage 派流 + 失败 catch 共用）；chain 形态（kind='chain_completed_event'）
+   * 守卫/行为字节级同旧路径（per-session 最近 dedupeKey 幂等 + leader running → **drop 不排队**——
+   * dogfood R2 #93 拍板保留）；bg 形态（kind='bg_completed_event'）改**排队语义**：
+   *
+   * - dedupeKey（=taskId）幂等标记**前置**（至多一次——排队/即时两路同样；报告轮失败不重试，同 chain）。
+   * - leader 在跑（session.status / runState 快照 running）→ 入 per-session pending 队列（cap
+   *   BG_WAKE_QUEUE_CAP=5），返回 true（已接受）；run 终态（sendMessage/streamMessage finally）flush
+   *   ——逐条合成 user 消息触发一轮（串行，前一轮 done 再下一轮）。
+   * - leader 空闲 → 即时合成事件触发一轮汇报。
+   * - 溢出（队满时新条目到达）→ **coalesce**：队首最老的 cap-1 条合并成一条聚合 wake（bgInfo 渲染
+   *   renderBgCompletedAggregateEventMessage——零牺牲：每条结果仍在唤醒面，只是共享一轮）。
+   *   🔴 不采「降级最旧」（CR 反哺 09-22 ①）：FIFO 队首是最久等待的结果，牺牲它 = 等待惩罚反模式；
+   *   「降级最新」亦不采（打破 FIFO 到达序语义需额外论证）。论证详见 enqueueBgWake 注释。
+   *
+   * 守卫矩阵同 chain（会话不在 / child 角色 → 静默 no-op 返 false；报告轮失败内部 catch 返 false）。
+   *
+   * @param input.bgInfo bg 形态专用：聚合 wake 渲染源（队列条目结构化事实；缺省条目不可聚合）。
+   * @returns true = 报告轮完整跑完（即时路径）或已入队（排队路径）；false = 守卫 no-op / 丢弃 / 报告轮失败。
+   */
+  notifyLeaderEvent(
+    sessionId: string,
+    input: {
+      kind: 'chain_completed_event' | 'bg_completed_event';
+      userContent: string;
+      dedupeKey: string;
+      bgInfo?: BgCompletedEventInfo;
+      logMeta?: Record<string, unknown>;
+    },
+  ): Promise<boolean>;
 }
 
 // UTF-8 BOM——project.yaml / 章节 md 读入统一前置剥（runBackfill / reExtractChapter 等多读入点共用单常量）。
@@ -754,6 +871,208 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions = {}): Wor
   const artifactStore = options.artifactStore ?? new InMemoryArtifactStore();
   // dogfood R2 #93：notifyLeaderChainCompleted 幂等记账（sessionId → 最近已回注 runId）。
   const notifiedChainRunIds = new Map<string, string>();
+  // 09-21-subagent-bg-decouple（design §5）：bg 子 agent 事件泵单源捕获——runSubagentBackground 的
+  // 方法参数叫 options（spawnDepth/notify），会遮蔽本闭包 options，须先落局部量再在方法内用。
+  const runtimeEventPump = options.onRuntimeEvent;
+
+  // ── 09-21-subagent-bg-decouple W2（design §3.2）：bg wake 排队面 ──
+  //
+  // notifyLeaderEvent bg 形态的 pending 队列 + run 终态 flush 串行链。进程内（runtime 实例级）——
+  // 后台任务本就不跨重启（registry 对账标 interrupted），队列随实例消亡语义一致。
+
+  /** per-session wake 队列容量（design §3.2 cap 5）。 */
+  const BG_WAKE_QUEUE_CAP = 5;
+
+  /** 队列条目：结构化事实（聚合渲染源）+ 即时渲染正文缓存（入队时按单条渲染）。 */
+  interface BgWakeEntry {
+    infos: BgCompletedEventInfo[];
+    /** flush 时的 user 侧输入（单条 = renderBgCompletedEventMessage；聚合条目 = aggregate 渲染产物）。 */
+    userContent: string;
+  }
+
+  /** bg dedupeKey（=taskId）幂等记账——标记前置（至多一次，同 chain「标记在尝试前置」语义）。 */
+  const notifiedBgTaskIds = new Set<string>();
+  const bgWakeQueues = new Map<string, BgWakeEntry[]>();
+  /** flush 串行链（sessionId → 尾 promise）：逐条「前一轮 done 再下一轮」+ 防并发 drain。 */
+  const bgWakeFlushChain = new Map<string, Promise<void>>();
+
+  /**
+   * 溢出 coalesce（CR 反哺 09-22 ① 定谳）：新条目到达而队满时，把队首最老的 cap-1 条合并成一条
+   * 聚合 wake，新到条目保持独立尾位。
+   *
+   * 论证（三候选定谳记录，防回退）：
+   * - ❌「降级最旧」（原 design 文案）：FIFO 队首是最早完成、最久等待的结果，把它踢出唤醒通道 =
+   *   等待惩罚（越早完成越被静默化），反模式。
+   * - ❌「降级最新」：牺牲的是等得最短的条目（损失最小），但语义从 FIFO 变「保旧弃新」的栈形，
+   *   到达序不再对应服务序——需要额外论证才敢破 FIFO，且对用户预期（先完成先汇报）同样反直觉。
+   * - ✅「coalesce 同 parent 合并」：零牺牲——每条结果仍在唤醒面（聚合消息逐条列出 role/taskId/
+   *   摘要 + 指路 bg_task_result），只是共享一轮汇报；FIFO 服务序不变（聚合条目在队首，最久等待者
+   *   最先被服务）；粒度变粗只发生在溢出这种罕见态，正常路径仍逐条一轮。与摘要段「≤3 条 + 溢出行」
+   *   的既有口径同族（design §3.1）。
+   */
+  function coalesceBgWakeOverflow(queue: BgWakeEntry[]): BgWakeEntry[] {
+    const mergeCount = queue.length - 1; // 保队尾最新为独立条目
+    if (mergeCount < 2) return queue; // cap < 2 时不可达（防御——cap=5 恒走合并路径）
+    const mergedInfos = queue.slice(0, mergeCount).flatMap((entry) => entry.infos);
+    const aggregateUserContent =
+      mergedInfos.length > 0
+        ? renderBgCompletedAggregateEventMessage(mergedInfos)
+        : queue.slice(0, mergeCount).map((entry) => entry.userContent).join('\n\n'); // 防御：无结构化事实的条目按正文拼接
+    return [{ infos: mergedInfos, userContent: aggregateUserContent }, ...queue.slice(mergeCount)];
+  }
+
+  /** 入队（调用方已过幂等守卫）；队满先 coalesce 再 push。 */
+  function enqueueBgWake(sessionId: string, info: BgCompletedEventInfo, userContent: string): void {
+    let queue = bgWakeQueues.get(sessionId) ?? [];
+    if (queue.length >= BG_WAKE_QUEUE_CAP) {
+      const coalesced = coalesceBgWakeOverflow(queue);
+      logger.warn(
+        { sessionId, before: queue.length, after: coalesced.length, mergedInfos: coalesced[0]?.infos.length ?? 0 },
+        'bg wake queue overflow → coalesced oldest entries into one aggregate wake (CR 反哺 09-22 ①)',
+      );
+      queue = coalesced;
+    }
+    queue.push({ infos: [info], userContent });
+    bgWakeQueues.set(sessionId, queue);
+  }
+
+  /**
+   * run 终态 flush（sendMessage/streamMessage finally 调用，fire-and-forget）：挂到串行链尾 drain。
+   * 队列空 = 零开销（drain 首查即返）。
+   */
+  function scheduleBgWakeFlush(sessionId: string): void {
+    const prev = bgWakeFlushChain.get(sessionId) ?? Promise.resolve();
+    const job = prev.then(() => drainBgWakeQueue(sessionId));
+    bgWakeFlushChain.set(sessionId, job);
+    // drain 内部不抛（runLeaderEventTurn 全 catch；getSession 不抛）——防御兜底防 unhandled。
+    void job.catch((err: unknown) => {
+      logger.warn(
+        { sessionId, err: err instanceof Error ? err.message : String(err) },
+        'bg wake flush chain failed (defensive)',
+      );
+    });
+    void job.then(
+      () => {
+        if (bgWakeFlushChain.get(sessionId) === job) bgWakeFlushChain.delete(sessionId);
+      },
+      () => {
+        if (bgWakeFlushChain.get(sessionId) === job) bgWakeFlushChain.delete(sessionId);
+      },
+    );
+  }
+
+  /** 串行 drain：逐条触发汇报轮（完整跑完再取下一条）；leader 被占/会话已删即让路或弃队。
+   * **at-least-once（CR-1）**：回抱成功才出队确认；回抱失败重入队尾（事件不丢），单次 drain
+   * 对每条至多尝试一遍（一轮全失败即停，余量留给下次 run 终态 flush 重试——防持久失败时的
+   * 紧循环烧轮；失败面有摘要段 + toast 双兜底，重试是尽力语义非硬保证）。已知代价：失败尝试
+   * 的合成事件消息已 append 进会话流（streamMessage 先 append 后跑），重试再 append 一次——
+   * 重复事件消息 = at-least-once 的既定代价（第二条汇报对已领取结果幂等，无丢失面）。 */
+  async function drainBgWakeQueue(sessionId: string): Promise<void> {
+    let failedAttempts = 0;
+    for (;;) {
+      const queue = bgWakeQueues.get(sessionId);
+      if (!queue || queue.length === 0) {
+        bgWakeQueues.delete(sessionId);
+        return;
+      }
+      const session = getSession(sessionId);
+      if (!session) {
+        // 会话已删（级联杀已 abort 其后台任务）→ 队列随之弃（无回注面）。
+        bgWakeQueues.delete(sessionId);
+        logger.info({ sessionId, dropped: queue.length }, 'bg wake flush: session gone → drop pending queue');
+        return;
+      }
+      // 防插队：flush 期间用户开新轮 → 让路（余量留队列，该轮终态 finally 再 flush）。
+      if (session.status === 'running' || runState.getSnapshot(sessionId)?.status === 'running') return;
+      // 单轮全败短路：本轮对每条都已尝试且无一成功 → 停（条目留队，下次 flush 重试）。
+      if (failedAttempts >= queue.length) {
+        logger.warn(
+          { sessionId, pending: queue.length },
+          'bg wake flush: one full pass failed → stop (entries stay queued for next flush, CR-1 at-least-once)',
+        );
+        return;
+      }
+      const entry = queue[0]!;
+      logger.info(
+        { sessionId, taskIds: entry.infos.map((info) => info.taskId) },
+        'bg wake flush: triggering leader report turn for queued bg event',
+      );
+      const delivered = await runLeaderEventTurn(sessionId, {
+        kind: 'bg_completed_event',
+        userContent: entry.userContent,
+        logMeta: { taskIds: entry.infos.map((info) => info.taskId), queued: true },
+      });
+      // await 期间新 bg 事件可入队（数组可能被 enqueue/coalesce 换新）——重取新引用按条目身份操作。
+      const fresh = bgWakeQueues.get(sessionId);
+      if (delivered) {
+        if (fresh) {
+          const idx = fresh.indexOf(entry);
+          if (idx >= 0) fresh.splice(idx, 1);
+          if (fresh.length === 0) bgWakeQueues.delete(sessionId);
+        }
+        failedAttempts = 0; // 有进展——剩余条目各享一遍完整尝试
+      } else {
+        if (fresh) {
+          const idx = fresh.indexOf(entry);
+          if (idx >= 0) {
+            fresh.splice(idx, 1);
+            fresh.push(entry); // 重入队尾（FIFO 服务序保持，最久等待者仍优先）
+          }
+        }
+        failedAttempts++;
+      }
+    }
+  }
+
+  /**
+   * 公共核（W2 泛化抽取）：系统事件消息入流 + 触发一轮 leader 汇报——复用 streamMessage 全套
+   * leader 车道（dialogue 档模型路由 / 压缩 / 工具策略 / 流事件）。chain 与 bg 两形态共用；
+   * 守卫（幂等 / running 处置）由各形态分支自持，此处只做「派流 + 失败 catch」。
+   * abort = 新建 controller（无外部取消面；用户 abort 走 agent:abort-run → runState.abortRun
+   * 同样命中本 run）。事件经 onRuntimeEvent 广播（shell 接线 agent:stream-event——活跃视图实时
+   * 呈现 / 后台会话切回 fetch 对账，UI 零改）。报告轮失败不向调用方抛（fire-and-forget 语义），
+   * session 状态已由 streamMessage 记 error。
+   */
+  async function runLeaderEventTurn(
+    sessionId: string,
+    input: { kind: 'chain_completed_event' | 'bg_completed_event'; userContent: string; logMeta?: Record<string, unknown> },
+  ): Promise<boolean> {
+    return (await runLeaderEventTurnDetailed(sessionId, input)).delivered;
+  }
+
+  /**
+   * runLeaderEventTurn 的判别变体（CR-1）：额外区分「leader 被占」失败（SessionRunAlreadyActive
+   * ——空闲检查与 streamMessage beginRun 之间的竞窗，报告轮未开跑）与普通失败。bg 空闲路据此
+   * 决定是否回队重试（at-least-once）；chain 路经布尔包装保持既有返回契约。
+   */
+  async function runLeaderEventTurnDetailed(
+    sessionId: string,
+    input: { kind: 'chain_completed_event' | 'bg_completed_event'; userContent: string; logMeta?: Record<string, unknown> },
+  ): Promise<{ delivered: boolean; leaderBusy: boolean }> {
+    try {
+      await runtime.streamMessage({
+        sessionId,
+        content: input.userContent,
+        abortSignal: new AbortController().signal,
+        sendEvent: (event) => runtimeEventPump?.(sessionId, event),
+        messageKind: input.kind,
+      });
+      return { delivered: true, leaderBusy: false };
+    } catch (err) {
+      const leaderBusy = err instanceof SessionRunAlreadyActiveError;
+      logger.warn(
+        {
+          sessionId,
+          kind: input.kind,
+          ...(input.logMeta ?? {}),
+          leaderBusy,
+          err: err instanceof Error ? err.message : String(err),
+        },
+        'notifyLeaderEvent: leader report turn failed (deliverable already available to UI via its own channel)',
+      );
+      return { delivered: false, leaderBusy };
+    }
+  }
 
   const runChildAgent = async (
     childSession: SessionState,
@@ -764,6 +1083,13 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions = {}): Wor
       spawnDepth: number;
       emitChildEvent?: (event: ChildStreamEvent) => void;
       source: 'subagent' | 'skill';
+      /**
+       * 09-21-subagent-bg-decouple（D9/P2，bg 路径专用）：child 消息落盘双写开关。true 时
+       * child 的 onMessage 在 emit ChildStreamEvent 之外同步 addMessage（appendMessageToFile 落
+       * child 自身 jsonl）+ 初始 user prompt 也入 child 会话——检视图 fetch 对账与重启可追的前提。
+       * 同步 child 路径（spawn_agent / yaml 派发 / skill 执行）**不传**：消息只进父流（现状零回归）。
+       */
+      persistChildMessages?: boolean;
     },
   ): Promise<{ content: string }> => {
     if (options.spawnDepth > MAX_SPAWN_DEPTH) {
@@ -782,7 +1108,18 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions = {}): Wor
       ? `You are the **${role}** agent.${agentDefinition.description ? ` ${agentDefinition.description}` : ''}`
       : `You are acting as the **${role}** subagent. Complete the task focused, then return your final answer.`;
     const enrichedPrompt = `${roleHeader}\n\n${taskPrompt}`;
-    const childOnMessage = makeChildOnMessage(options.source, role, childSession.id, options.spawnDepth, options.emitChildEvent);
+    // bg 路径（persistChildMessages）：初始 user prompt 先入 child 会话（runLoop 的 baseMessages
+    // 不经 onMessage，双写需显式落）；loop 返回值只含新消息，无双写。
+    const initialUserMessage: SessionMessage = {
+      id: randomUUID(),
+      role: 'user',
+      content: enrichedPrompt,
+      createdAt: Date.now(),
+    };
+    if (options.persistChildMessages) {
+      addMessage(childSession.id, initialUserMessage);
+    }
+    const childOnMessage = makeChildOnMessage(options.source, role, childSession.id, options.spawnDepth, options.emitChildEvent, options.persistChildMessages);
     // dogfood T1 Stage 2（design §3.1）：child delta 发射——与 childOnMessage 同款分组元数据，
     // 内事件为 delta 变体。无 emit 通道 → undefined（loop 不开流，非流式零回归）。
     const childEmitDelta = makeChildOnDelta(options.source, role, childSession.id, options.spawnDepth, options.emitChildEvent);
@@ -791,12 +1128,7 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions = {}): Wor
     const messages = await runLoop({
       sessionId: childSession.id,
       projectPath: childSession.projectPath,
-      messages: [{
-        id: randomUUID(),
-        role: 'user',
-        content: enrichedPrompt,
-        createdAt: Date.now(),
-      }],
+      messages: [initialUserMessage],
       systemPrompt,
       tools: agentDefinition?.allowedTools?.length
         ? registry.all().filter(t => agentDefinition.allowedTools!.includes(t.id))
@@ -1071,6 +1403,19 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions = {}): Wor
     runState.setChainSnapshot(sessionId, snapshot);
   };
 
+  // 09-21-subagent-bg-decouple：惰性构造抽 ensureSubagents（dispatchSubagent / runSubagentBackground
+  // 共用同一实例）；注入 runState（D2：子 run 生命周期走 child 自身 sessionId）。
+  const ensureSubagents = (): SubagentRuntime => {
+    if (!subagents) {
+      subagents = createSubagentRuntime({
+        runtime,
+        narrowPermission: () => permission,
+        runState,
+      });
+    }
+    return subagents;
+  };
+
   const runtime: WorkflowRuntime = {
     createSession(input) {
       return createSession({
@@ -1132,6 +1477,12 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions = {}): Wor
 
     deleteSession(id, projectPath) {
       if (!getSession(id) && projectPath) loadSession(id, projectPath);
+      // 09-21-subagent-bg-decouple（design §2 级联杀）：删 leader 会话 → 其后台子 agent 全部 abort
+      // （先杀后删——防子 runLoop 在父会话删除后仍跑/仍写）。终态回写走 outcome 链（registry settle）。
+      // CR-5 补面：被删会话可能本身是某后台任务的「子会话」（agent:delete-session 直指 child sid
+      // ——检视图删除入口）——按 childSessionId 匹配 cancel，防删了子会话其后台 run 仍跑。
+      cancelBgTasksForParent(id);
+      cancelBgTasksForChildSession(id);
       // BMad CR-T1-056：会话删除（paused 链滞留持有者）→ 释放该项目活动链守卫（防项目永久链锁）。
       releaseActiveChainGuardForSession(id);
       return deleteSession(id);
@@ -1183,14 +1534,10 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions = {}): Wor
       return permission.resolvePending(sessionId, callId, approved);
     },
 
+    // 09-21-subagent-bg-decouple：惰性构造抽 ensureSubagents（dispatchSubagent / runSubagentBackground
+    // 共用同一实例）；注入 runState（D2 子 run 生命周期走 child 自身 sessionId）。
     async dispatchSubagent(input) {
-      if (!subagents) {
-        subagents = createSubagentRuntime({
-          runtime,
-          narrowPermission: () => permission,
-        });
-      }
-      return subagents.dispatch(input);
+      return ensureSubagents().dispatch(input);
     },
 
     async runSubagent(parentSessionId, role, prompt, options) {
@@ -1211,6 +1558,85 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions = {}): Wor
         },
       });
       return { content: dispatched.result.content };
+    },
+
+    // 09-21-subagent-bg-decouple（design §1.2）：后台派发——注册表先行（容量帽 + 登记 + running 行落盘），
+    // start 回调内 dispatchBackground 起飞（同步返 handle，childSessionId 回填注册表记录）。
+    runSubagentBackground(parentSessionId, role, prompt, options) {
+      const parentSession = getSession(parentSessionId);
+      if (!parentSession) {
+        throw new Error(`session "${parentSessionId}" not found`);
+      }
+      const spawnDepth = (options?.spawnDepth ?? 0) + 1;
+      const notify: BgNotifyChannel = options?.notify ?? 'toast';
+      const projectPath = parentSession.projectPath;
+      return getBgTaskRegistry().dispatchBg({
+        parentSessionId,
+        projectPath,
+        role,
+        prompt,
+        notify,
+        start: ({ signal, taskId }) => {
+          const handle = ensureSubagents().dispatchBackground({
+            parentSessionId,
+            role,
+            prompt,
+            signal,
+            complete: async ({ session: childSession, prompt: taskPrompt, role: childRole, signal: runSignal }) => {
+              return runChildAgent(childSession, childRole, taskPrompt, {
+                // runSignal = runState.beginRun 返回信号（store 链）——agent:abort-run(childSid) 与
+                // registry.cancel（外部链）两条路都经它停 child runLoop（subagent.ts 🔑 注释）。
+                abort: runSignal,
+                spawnDepth,
+                // 🔑 事件不接 leader turn 的 emitChildEvent（turn 可能已收尾）——接 onRuntimeEvent
+                // 运行时级广播泵（design §5），载荷带自身 child sid（shell agentIpc 补 projectPath）。
+                emitChildEvent: (event) => runtimeEventPump?.(childSession.id, { type: 'child', data: event }),
+                persistChildMessages: true,
+                source: 'subagent',
+              });
+            },
+          });
+          // W2（design §3.1 / §3.2 / R3）：任务终态两路送达——
+          // ① `bg-update` 事件（任意通道任意终态都发；notify 随载荷携带，UI 呈现裁量在消费面）。
+          // ② wake 通道（仅 notify='wake' 且终态 completed/failed——aborted 是用户主动取消，无唤醒
+          //    语义）：经 notifyLeaderEvent 排队/即时回注 leader。taskId 即 dedupeKey（幂等）。
+          // outcome 永不 reject（dispatchBackground 契约）；防御 catch 防协议破坏挂 unhandled。
+          void handle.outcome.then((outcome) => {
+            const info: BgCompletedEventInfo = {
+              taskId,
+              role,
+              childSessionId: handle.childSessionId,
+              digest: prompt.slice(0, 120),
+              ...(outcome.status === 'failed' && outcome.error ? { error: outcome.error } : {}),
+            };
+            // CR-14：载荷补 startedAt（registry 行值）——UI 首知即终态场景（child lane 事件丢失/
+            // 迟到）耗时显示不塌缩为 ~0s。settle 先于本回调（同 promise 的注册序），行必在；
+            // Date.now() 兜底仅防协议破坏。
+            const startedAt = getBgTaskRegistry().get(taskId)?.startedAt ?? Date.now();
+            runtimeEventPump?.(parentSessionId, {
+              type: 'bg-update',
+              data: { ...info, status: outcome.status, notify, startedAt },
+            });
+            if (notify === 'wake' && (outcome.status === 'completed' || outcome.status === 'failed')) {
+              void runtime
+                .notifyLeaderEvent(parentSessionId, {
+                  kind: 'bg_completed_event',
+                  userContent: renderBgCompletedEventMessage(info),
+                  dedupeKey: taskId,
+                  bgInfo: info,
+                  logMeta: { taskId, role },
+                })
+                .catch((err: unknown) => {
+                  logger.warn(
+                    { sessionId: parentSessionId, taskId, err: err instanceof Error ? err.message : String(err) },
+                    'bg wake notify failed (defensive)',
+                  );
+                });
+            }
+          });
+          return { childSessionId: handle.childSessionId, outcome: handle.outcome };
+        },
+      });
     },
 
     // Story 4.5：派发 leader 侧工具子 agent（yaml 契约驱动，design §3.3 / implement.md WP3a）。
@@ -2777,6 +3203,10 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions = {}): Wor
           runState.failRun(input.sessionId, errMsg);
         }
         throw err;
+      } finally {
+        // 09-21-subagent-bg-decouple W2（design §3.2）：run 终态 flush bg wake 队列（fire-and-forget
+        // ——串行链防并发轮；队列空 = 零开销首查即返）。completed / aborted / error 三终态都 flush。
+        scheduleBgWakeFlush(input.sessionId);
       }
     },
 
@@ -2922,6 +3352,9 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions = {}): Wor
             tools: runConfig.tools,
             // CR-12：单次构造的桥会话工具面（tools.json 内容 + face hash 池键派生源）。
             face: buildBridgeFaceEntries(runConfig.tools, session.permissionMode),
+            // C3.1 W2b：桥 turn 计量行任务标签（装配点逐点标注——本车道恒 dialogue 桥；
+            // 未来链桥车道装配点标 'bridge-chain'，mirror taskType 逐点装配模式）。
+            taskType: 'bridge-dialogue',
             modelRef: dialogueModelRef,
             thinking: dialogueThinking,
             // D9 池键基：dialogue 车道稳定键（bridgePoolSessionKey 加 ｜bridge｜face: 后缀）。
@@ -3036,6 +3469,10 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions = {}): Wor
           });
         }
         throw err;
+      } finally {
+        // 09-21-subagent-bg-decouple W2（design §3.2）：run 终态 flush bg wake 队列（mirror
+        // sendMessage 同款——completed / aborted / error 三终态都 flush；fire-and-forget）。
+        scheduleBgWakeFlush(input.sessionId);
       }
     },
 
@@ -3043,60 +3480,111 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions = {}): Wor
     // WorkflowRuntime.notifyLeaderChainCompleted 注释）。幂等记账 = runtime 实例级闭包 Map
     // （sessionId → 最近已回注 runId）——单 runtime 单例进程内语义等同模块级，且随实例消亡
     // 自然重置（测试免 __reset helper）。
+    //
+    // 09-21-subagent-bg-decouple W2：实现薄化为 notifyLeaderEvent chain 分支的适配器——守卫矩阵
+    // （①会话在 ②非 child ③同 runId 幂等 ④running → drop）与标记时序（标记在尝试前置、报告轮
+    // 失败不重试）在泛化入口内逐条保持，行为字节级同旧实现（既有测试 = 回归锚）。
     async notifyLeaderChainCompleted(sessionId: string, payload: ChainCompletedEventPayload): Promise<boolean> {
-      // 守卫①：会话不存在（内存 LRU 无——notify 面向活跃 leader 会话，shell resume handler
-      // 此前 getSession(sessionId, projectPath) 已把会话载入 LRU）/ 已删除 → 静默 no-op。
+      return runtime.notifyLeaderEvent(sessionId, {
+        kind: 'chain_completed_event',
+        userContent: renderChainCompletedEventMessage(payload),
+        dedupeKey: payload.runId,
+        logMeta: {
+          runId: payload.runId,
+          route: payload.routeDecision,
+          persisted: payload.chapterPersisted === true,
+        },
+      });
+    },
+
+    // 09-21-subagent-bg-decouple W2（design §3.2）：泛化系统事件回注（接口契约详上）。chain 分支
+    // 守卫矩阵字节级保持 dogfood R2 #93 拍板；bg 分支排队（enqueue + run 终态 flush 串行）。
+    async notifyLeaderEvent(sessionId, input) {
+      // 守卫①：会话不存在 → 静默 no-op。
       const session = getSession(sessionId);
       if (!session) {
-        logger.info({ sessionId }, 'notifyLeaderChainCompleted: session not found → no-op');
+        logger.info({ sessionId, kind: input.kind }, 'notifyLeaderEvent: session not found → no-op');
         return false;
       }
       // 守卫②：子代理会话非 leader 对话——回注面不存在。
       if (session.sessionRole === 'child') {
-        logger.info({ sessionId }, 'notifyLeaderChainCompleted: child session → no-op');
-        return false;
-      }
-      // 守卫③：同一 runId 不重复回注（幂等；标记在尝试前置——至多一次语义，报告轮失败也不重试）。
-      if (notifiedChainRunIds.get(sessionId) === payload.runId) {
-        logger.info({ sessionId, runId: payload.runId }, 'notifyLeaderChainCompleted: runId already notified → no-op');
-        return false;
-      }
-      // 守卫④：leader 正在跑 → 丢弃（设计拍板取最低成本项：不排队——resume summary 已有 UI
-      // toast 通道兜底，总结报告非硬约束）。runState active 一并查（beginRun 后 status 可能未及写）。
-      if (session.status === 'running' || runState.getSnapshot(sessionId)?.status === 'running') {
-        logger.warn(
-          { sessionId, runId: payload.runId },
-          'notifyLeaderChainCompleted: leader session running → drop (design: no queueing)',
-        );
+        logger.info({ sessionId, kind: input.kind }, 'notifyLeaderEvent: child session → no-op');
         return false;
       }
 
-      notifiedChainRunIds.set(sessionId, payload.runId);
-      logger.info(
-        { sessionId, runId: payload.runId, route: payload.routeDecision, persisted: payload.chapterPersisted === true },
-        'notifyLeaderChainCompleted: appending chain_completed_event + triggering leader report turn',
-      );
-      try {
-        // 复用 streamMessage 全套 leader 车道（dialogue 档模型路由 / 压缩 / 工具策略 / 流事件）。
-        // abort = 新建 controller（无外部取消面；用户 abort 走 agent:abort-run → runState.abortRun
-        // 同样命中本 run）。事件经 onRuntimeEvent 广播（shell 接线 agent:stream-event，活跃视图
-        // 实时呈现 / 后台会话切回 fetch 对账——UI 零改）。
-        await runtime.streamMessage({
-          sessionId,
-          content: renderChainCompletedEventMessage(payload),
-          abortSignal: new AbortController().signal,
-          sendEvent: (event) => options.onRuntimeEvent?.(sessionId, event),
-          messageKind: 'chain_completed_event',
-        });
-        return true;
-      } catch (err) {
-        // 报告轮失败不向调用方抛（fire-and-forget）；session 状态已由 streamMessage 记 error。
-        logger.warn(
-          { sessionId, runId: payload.runId, err: err instanceof Error ? err.message : String(err) },
-          'notifyLeaderChainCompleted: leader report turn failed (summary already returned to UI via resume path)',
+      if (input.kind === 'chain_completed_event') {
+        // ── chain 形态：drop-if-running 字节级保持（dogfood R2 #93 拍板——resume summary 已有
+        // UI toast 通道兜底，总结报告非硬约束；不排队）。──
+        // 守卫③：同 runId 不重复回注（幂等；per-session 最近 dedupeKey——旧 Map 语义原样）。
+        if (notifiedChainRunIds.get(sessionId) === input.dedupeKey) {
+          logger.info(
+            { sessionId, runId: input.dedupeKey },
+            'notifyLeaderEvent: chain runId already notified → no-op',
+          );
+          return false;
+        }
+        // 守卫④：leader 正在跑 → 丢弃。runState active 一并查（beginRun 后 status 可能未及写）。
+        if (session.status === 'running' || runState.getSnapshot(sessionId)?.status === 'running') {
+          logger.warn(
+            { sessionId, runId: input.dedupeKey },
+            'notifyLeaderEvent: chain event while leader running → drop (design: no queueing, preserved byte-level)',
+          );
+          return false;
+        }
+        notifiedChainRunIds.set(sessionId, input.dedupeKey);
+        logger.info(
+          { sessionId, runId: input.dedupeKey, ...(input.logMeta ?? {}) },
+          'notifyLeaderEvent: appending chain_completed_event + triggering leader report turn',
         );
+        return runLeaderEventTurn(sessionId, input);
+      }
+
+      // ── bg 形态（design §3.2）：排队语义。──
+      // 幂等：dedupeKey（=taskId）标记**前置**——排队 / 即时两路同样至多一次（报告轮失败不重试，
+      // mirror chain「标记在尝试前置」）。
+      if (notifiedBgTaskIds.has(input.dedupeKey)) {
+        logger.info({ sessionId, taskId: input.dedupeKey }, 'notifyLeaderEvent: bg dedupeKey already notified → no-op');
         return false;
       }
+      notifiedBgTaskIds.add(input.dedupeKey);
+      if (session.status === 'running' || runState.getSnapshot(sessionId)?.status === 'running') {
+        if (!input.bgInfo) {
+          // 队列条目须可聚合（V1 队列只收 bg 事件，bgInfo 恒带）——防御：缺 bgInfo 时按 drop 处理
+          // （与 chain 同成本取向），不存不可渲染条目。
+          logger.warn(
+            { sessionId, taskId: input.dedupeKey },
+            'notifyLeaderEvent: bg event without bgInfo while leader running → drop (defensive)',
+          );
+          return false;
+        }
+        enqueueBgWake(sessionId, input.bgInfo, input.userContent);
+        logger.info(
+          { sessionId, taskId: input.dedupeKey, queued: bgWakeQueues.get(sessionId)?.length ?? 0 },
+          'notifyLeaderEvent: leader running → bg event queued (flush at run terminal)',
+        );
+        return true;
+      }
+      logger.info(
+        { sessionId, taskId: input.dedupeKey, ...(input.logMeta ?? {}) },
+        'notifyLeaderEvent: appending bg_completed_event + triggering leader report turn (idle immediate)',
+      );
+      // ── 空闲即时回注（CR-1 at-least-once）：报告轮撞上竞窗开启的 leader run
+      //（SessionRunAlreadyActiveError——检查与 beginRun 之间）→ 认事件回队（队列即 at-least-once
+      // 载体）。幂等标记保持不动：回队走 enqueueBgWake 直入（不经 notifyLeaderEvent 的标记检查），
+      // 本 taskId 的 outcome 链只发一次 notifyLeaderEvent——无双发面；标记保留反而防未来重复事件
+      // 再进队。回队后补一次 flush 调度：竞窗胜者还在跑 → drain 让路、其终态 finally 再 flush；
+      // 胜者已收尾 → 本调度即刻 drain。
+      const result = await runLeaderEventTurnDetailed(sessionId, input);
+      if (result.delivered) return true;
+      if (result.leaderBusy && input.bgInfo) {
+        enqueueBgWake(sessionId, input.bgInfo, input.userContent);
+        scheduleBgWakeFlush(sessionId);
+        logger.warn(
+          { sessionId, taskId: input.dedupeKey },
+          'notifyLeaderEvent: idle report turn raced a leader run → re-enqueued (CR-1 at-least-once)',
+        );
+      }
+      return false;
     },
   };
 
@@ -3352,6 +3840,61 @@ async function loadStructureIssuesForLeader(projectPath: string): Promise<{ top:
   const severityRank = { error: 0, warning: 1, info: 2 } as const;
   collapsed.sort((a, b) => severityRank[a.severity] - severityRank[b.severity]);
   return { top: collapsed.slice(0, 5), total: collapsed.length };
+}
+
+// ── 09-21-subagent-bg-decouple W2（design §3.1 / R3）：后台任务未领取结果摘要段 loader ──
+//
+// leader 注入段先例族新成员（mirror 结构 issues / stale / open decisions 族：纯代码判定 + 三态防御 +
+// turn 级注入）。toast 通道的结果送达面：completed 未领取任务在 leader 下一 turn 的状态注记里列出
+//（claim 语义 = bg_task_result 调用，领取后条目消失 → 快照变化 → hash 门自然重发剩余列表）。
+
+/** 摘要段逐条上限（design §3.1「总段 ≤3 条 + 溢出行」）。 */
+const BG_PENDING_RESULTS_TOP = 3;
+
+export interface BgPendingResultInfo {
+  taskId: string;
+  role: string;
+  childSessionId: string;
+  /** 派发 prompt 首 120 字（registry promptDigest 同源——渲染只做折行规整，无二次截断〔CR-18〕）。 */
+  digest: string;
+  /** 完成时间（updatedAt；列表按完成序 FIFO——最早完成先列）。 */
+  completedAt: number;
+}
+
+/**
+ * 读 leader 名下待领取的后台任务结果（三态防御）：
+ * - 零待取 → null（段缺省——零噪音，mirror openDecisions「no 态静默」）；
+ * - 读失败（registry 异常）→ null（段缺省 + warn 留痕——摘要段是增益面，故障不破 turn）；
+ * - 有待取 → { top ≤3 条按完成序, total }（溢出行由渲染层标「前 N / 共 M」mirror Edge-002）。
+ *
+ * 通道口径：只列 notify='toast' 任务——摘要段是 toast 通道的送达面（design §3.1 归属）；wake 有
+ * 自己的事件回注轮（§3.2），silent「只记账不通知」（§3.3）。两通道未消费的结果仍可经
+ * bg_tasks_status 全量枚举（不因不进摘要段而不可达）。
+ */
+function loadBgPendingResultsForLeader(parentSessionId: string): { top: BgPendingResultInfo[]; total: number } | null {
+  try {
+    const pending = getBgTaskRegistry()
+      .listByParent(parentSessionId)
+      .filter((record) => record.status === 'completed' && record.claimed !== true && record.notify === 'toast')
+      .sort((a, b) => a.updatedAt - b.updatedAt);
+    if (pending.length === 0) return null;
+    return {
+      top: pending.slice(0, BG_PENDING_RESULTS_TOP).map((record) => ({
+        taskId: record.taskId,
+        role: record.role,
+        childSessionId: record.childSessionId,
+        digest: record.promptDigest,
+        completedAt: record.updatedAt,
+      })),
+      total: pending.length,
+    };
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err), parentSessionId },
+      'loadBgPendingResultsForLeader: registry read failed → segment omitted',
+    );
+    return null;
+  }
 }
 
 // Story 3.4 Phase 3.1：读 project.yaml 的 field_metadata 跑纯代码 stale 检测，产 stale 字段清单供
@@ -3941,6 +4484,9 @@ async function appendSessionStateNote(session: SessionState): Promise<void> {
   const pipelineStage = await loadPipelineStageForLeader(session.projectPath);
   const authorProfile = await loadAuthorProfileForLeader();
   const mentionSignals = await loadMentionSignalsForLeader(session.projectPath);
+  // 09-21-subagent-bg-decouple W2（design §3.1）：后台任务未领取结果（toast 通道送达面；三态防御
+  // ——null = 零待取/读失败 → 段缺省）。turn 级注入随状态注记走（hash 门：待取集变化才重发）。
+  const bgPendingResults = loadBgPendingResultsForLeader(session.id);
 
   const snapshot = buildSessionStateSnapshot({
     session,
@@ -3958,6 +4504,7 @@ async function appendSessionStateNote(session: SessionState): Promise<void> {
     pipelineStage: pipelineStage ?? undefined,
     authorProfile,
     mentionSignals,
+    bgPendingResults: bgPendingResults ?? undefined,
   });
 
   // CR-P4（09-13 CR 批）：快照内容过滤 session_state 标签字面量——防项目数据/作者档案内嵌
@@ -4069,7 +4616,10 @@ function buildInteractionCapabilitySegment(session: SessionState): string {
   // dogfood R2 #8（2026-08-25）：B 案已落——present_result 标记 terminal，工具结果落盘后
   // runLoop 直接结束（无后续模型轮）。prompt 措辞随之从「之前的那条消息里说完」改为
   // 「同一条消息里说完」（调用即终局，没有后续消息可用）。
-  lines.push(`present_result 是「收尾」工具：一轮至多调用一次，且必须是本轮最后一个动作——它是终局调用，调用后本轮立即结束，不会再有后续消息。呈现给用户看的正文（该问的问题、该留的钩子）必须写在调用 present_result 的同一条消息里，不要指望调用后再补。尤其禁止调用后追加「等你回复」之类的碎片消息。`);
+  // 「呈现性回复文字」限定（09-20 R12 残留措辞统一，F16 同族）：本行经 systemPrompt 基座
+  // 同时进 HTTP 与桥两车道（G5 定谳），旧承重词「正文」在桥车道与 R12 限定句直接拆台——
+  // 措辞家族四处同步（agents.ts / bridgeExecutor.ts 覆写 / present-result.ts 描述 / 本行）。
+  lines.push(`present_result 是「收尾」工具：一轮至多调用一次，且必须是本轮最后一个动作——它是终局调用，调用后本轮立即结束，不会再有后续消息。呈现给用户看的呈现性回复文字（讨论/说明/评审等，该问的问题、该留的钩子——不含章节正文/改稿产物）必须写在调用 present_result 的同一条消息里，不要指望调用后再补。尤其禁止调用后追加「等你回复」之类的碎片消息。`);
 
   // Autonomy cadence governs execution (skipped in pure-discuss turns).
   if (behaviorMode !== 'discuss') {
@@ -4211,6 +4761,11 @@ function buildSessionStateSnapshot(
      * BMad CR-007：silent = 无项目/未注册常态零注入；degraded = 有项目查询失败降级行）。
      */
     mentionSignals?: MentionSignalsSegment;
+    /**
+     * 09-21-subagent-bg-decouple W2（design §3.1）：后台任务未领取结果（loadBgPendingResultsForLeader
+     * 产；undefined = 零待取 / 读失败降级——段缺省零注入）。
+     */
+    bgPendingResults?: { top: readonly BgPendingResultInfo[]; total: number };
   },
 ): string {
   const {
@@ -4229,6 +4784,7 @@ function buildSessionStateSnapshot(
     pipelineStage,
     authorProfile,
     mentionSignals,
+    bgPendingResults,
   } = input;
   const permissionMode = session.permissionMode ?? 'suggest';  const lines: string[] = ['## Session State (Closure 工作台)'];
   // 雷达三态（mirror 弧覆盖四态的结构：数据坏/degraded 优先如实告知，非静默）。
@@ -4416,6 +4972,25 @@ function buildSessionStateSnapshot(
     lines.push(`出场账对拍信号：暂不可用（出场账查询失败或工具未注册），本轮不提供对拍信号。`);
   }
   // silent（无 projectPath / 项目未注册——BMad CR-007）：常态非降级，零注入零噪音。
+
+  // ── 09-21-subagent-bg-decouple W2（design §3.1 / R3）：后台任务未领取结果摘要段 ──
+  // 三态：undefined（零待取/读失败）→ 段缺省；有待取 → ≤3 条 + 溢出行「前 N/共 M」mirror Edge-002。
+  // claim（bg_task_result 调用）后条目消失 → 快照变化 → appendSessionStateNote hash 门自然重发剩余
+  // 列表（未变化 turn 不重发——既有幂等门承载，不新增机制）。范式判据：待取枚举 = 纯代码记账；
+  // 要不要消费/怎么转述 = leader LLM。
+  if (bgPendingResults) {
+    const itemLines = bgPendingResults.top.map(
+      (task) => `  · ${task.role}（taskId: ${task.taskId}）：${renderBgDigestLine(task.digest)}`,
+    );
+    const countLabel =
+      bgPendingResults.total > bgPendingResults.top.length
+        ? `（此处列最早 ${bgPendingResults.top.length} 条 / 共 ${bgPendingResults.total} 条；其余用 bg_tasks_status 查）`
+        : '';
+    lines.push(
+      `后台任务待领取（spawn_agent_bg 的已完成结果，纯代码盘点）${countLabel}。需要转述给作者时用 bg_task_result(taskId=...) 取完整内容后组织成自己的话；领取后不再重复列出：`,
+    );
+    lines.push(itemLines.join('\n'));
+  }
 
   if (openDecisions && openDecisions.length > 0) {
     const decisionLines = openDecisions.map(
@@ -4714,8 +5289,14 @@ function makeChildOnMessage(
   sessionId: string,
   depth: number,
   emit?: (event: ChildStreamEvent) => void,
+  /**
+   * 09-21-subagent-bg-decouple（D9/P2）：bg 路径双写开关——true 时 assistant/tool 消息在 emit 之外
+   * 同步 addMessage（appendMessageToFile 落 child 自身 jsonl；现状 child jsonl 恒空，检视图 fetch
+   * 对账 + 重启可追的前提）。同步 child 路径不传（消息本就进父流，零回归）。
+   */
+  persistToSession?: boolean,
 ): ((msg: SessionMessage) => void) | undefined {
-  if (!emit) return undefined;
+  if (!emit && !persistToSession) return undefined;
   return (msg) => {
     let inner: ChildInnerEvent | undefined;
     if (msg.role === 'assistant') {
@@ -4740,7 +5321,14 @@ function makeChildOnMessage(
       };
     }
     if (!inner) return;
-    emit({ source, role, sessionId, depth, event: inner });
+    // bg 双写（D9）：与 emit 并行的落盘线——addMessage 同时推内存 session.messages + append child
+    // jsonl（引用同源，mirror stampBatchOnMessage 的 mutate-sharing 姿态）。先落盘后 emit。
+    if (persistToSession) {
+      addMessage(sessionId, msg);
+    }
+    if (emit) {
+      emit({ source, role, sessionId, depth, event: inner });
+    }
   };
 }
 

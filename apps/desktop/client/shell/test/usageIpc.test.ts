@@ -18,6 +18,7 @@ const configMocks = vi.hoisted(() => ({
   modelConfig: { keys: [] } as ModelConfig,
   preferences: {} as Partial<UserPreferencesConfig>,
   clearShouldThrow: false,
+  prefsShouldThrow: false,
 }));
 
 // home 单源 = os.homedir()：与 electron getPath mock 同一 TEST_HOME——真 ~/.orison 零触碰。
@@ -34,7 +35,10 @@ vi.mock('electron', () => ({
 // configIpc 只 mock 本文件消费的两个读面（usageIpc 依赖面仅此二者）。
 vi.mock('../main/ipc/configIpc', () => ({
   readModelConfigFromDisk: () => configMocks.modelConfig,
-  readUserPreferencesFromDisk: () => configMocks.preferences,
+  readUserPreferencesFromDisk: () => {
+    if (configMocks.prefsShouldThrow) throw new Error('prefs boom');
+    return configMocks.preferences;
+  },
 }));
 
 // repository 包装 clearLedger（失败注入——模式 A catch 分支）；其余真跑 throwaway db。
@@ -53,12 +57,18 @@ vi.mock('../main/db/llmUsageLedgerRepository', async (importOriginal) => {
 
 import { closeDb, getDb } from '../main/db/index';
 import { clearLedger, insertUsageLog, recentUsageLogs } from '../main/db/llmUsageLedgerRepository';
+import { checkBudgetGate, setBudgetGate } from '@orison/model-protocols';
 import {
   USAGE_RECENT_LIMIT,
+  buildBudgetStatus,
   buildUsageOverview,
   foldModelRows,
   foldWindowTotals,
+  installBudgetGateProduction,
+  isMonthWindowTruncated,
   localMidnightMs,
+  localMonthStartMs,
+  monthSpentCny,
   registerUsageIpc,
   usageWindowBoundaries,
 } from '../main/ipc/usageIpc';
@@ -121,6 +131,7 @@ describe.skipIf(!sqliteUsable)('usageIpc（09-12 usage-panel W3）', () => {
     configMocks.modelConfig = { keys: [] };
     configMocks.preferences = {};
     configMocks.clearShouldThrow = false;
+    configMocks.prefsShouldThrow = false;
   });
 
   // ── 窗口边界纯函数（本地时区自然日单源）──
@@ -453,5 +464,154 @@ describe.skipIf(!sqliteUsable)('usageIpc（09-12 usage-panel W3）', () => {
     expect(after.total.totalTokens).toBe(0); // 空窗 = 真零 0（CR-2 与「有调用未上报」的 null 区分）
     expect(after.byModel).toEqual([]);
     expect(after.byTask).toEqual([]);
+  });
+
+  // ── C3.2 W3 月度预算：月界 / 截断守卫 / 月累计 / budget 状态 / gate 装配 ──
+
+  /** 单价 k-priced/m-priced = input 1/1M 的配置（¥ 矩阵复用）。 */
+  function withPricing() {
+    configMocks.modelConfig = {
+      keys: [
+        {
+          id: 'k-priced',
+          name: 'Priced',
+          protocol: 'openai-compatible',
+          models: [
+            {
+              id: 'm-priced',
+              alias: 'P',
+              capability: 'text' as const,
+              enabled: true,
+              pricing: { inputPerMillion: 1 },
+            },
+          ],
+        },
+      ],
+    };
+  }
+
+  describe('C3.2 W3 月度预算', () => {
+    /** 合成「now」：本地 2026-09-20 12:00（本月第 20 天——不依赖真实钟面，全天可跑）。 */
+    const NOW = new Date(2026, 8, 20, 12, 0, 0).getTime();
+
+    // CR-8：installBudgetGateProduction 装的是协议层模块级 gate——用例收尾卸载，
+    // 防闭包（引用本文件 mock 的偏好读面）泄漏到同文件后续用例。
+    afterAll(() => setBudgetGate(undefined));
+
+    it('localMonthStartMs：本地自然月一日零点（月中/月界当天/月末深夜/跨年一月）', () => {
+      expect(localMonthStartMs(NOW)).toBe(new Date(2026, 8, 1, 0, 0, 0, 0).getTime());
+      // 月界当天零点即月界（恒等）；月界当天任意时刻同样归一日。
+      expect(localMonthStartMs(new Date(2026, 8, 1, 17, 33).getTime())).toBe(new Date(2026, 8, 1, 0, 0, 0, 0).getTime());
+      // 月末 23:59 → 本月一日（跨月边界）。
+      expect(localMonthStartMs(new Date(2026, 8, 30, 23, 59).getTime())).toBe(new Date(2026, 8, 1, 0, 0, 0, 0).getTime());
+      // 跨年：次年一月 → 一月一日（年份归位）。
+      expect(localMonthStartMs(new Date(2027, 0, 15, 8, 0).getTime())).toBe(new Date(2027, 0, 1, 0, 0, 0, 0).getTime());
+    });
+
+    it('isMonthWindowTruncated：retention 裁剪口（mirror prune 同式）晚于月界才截断；= 边界不截断', () => {
+      // 90 天窗覆盖整月 → 不截断；30 天窗裁剪口 8-21 早于月界 9-1 → 不截断。
+      expect(isMonthWindowTruncated(90, NOW)).toBe(false);
+      expect(isMonthWindowTruncated(30, NOW)).toBe(false);
+      // 7 天窗裁剪口 9-13 12:00 晚于月界 9-1 → 截断（月初至 9-13 的行已删——假低）。
+      expect(isMonthWindowTruncated(7, NOW)).toBe(true);
+      // 边界：裁剪口恰等于月界（19.5 天前 = 9-1 00:00）→ 不截断（ts >= monthStart 全行在窗）。
+      expect(isMonthWindowTruncated(19.5, NOW)).toBe(false);
+      // 带外 retention clamp 单源（3 → 7）同判定。
+      expect(isMonthWindowTruncated(3, NOW)).toBe(true);
+    });
+
+    it('monthSpentCny：月窗行组 ¥ 求和 + 上月行不进 + 无价行不计入（无价即不可估）', () => {
+      withPricing();
+      insertUsageLog(rec({ ts: new Date(2026, 7, 15).getTime(), keyId: 'k-priced', modelId: 'm-priced', inputTokens: 5_000_000, totalTokens: 5_000_000 })); // 上月
+      insertUsageLog(rec({ ts: new Date(2026, 8, 10).getTime(), keyId: 'k-priced', modelId: 'm-priced', inputTokens: 2_000_000, totalTokens: 2_000_000 })); // 月窗 2 元
+      insertUsageLog(rec({ ts: new Date(2026, 8, 11).getTime(), keyId: 'k-bare', modelId: 'm-bare', inputTokens: 9_000_000, totalTokens: 9_000_000 })); // 无价
+      expect(monthSpentCny(NOW)).toBe(2);
+    });
+
+    it('buildBudgetStatus：无配置 undefined + soft/hard 三态（hard 优先）+ 仅软线合法 + 病态 soft>hard 钳平', () => {
+      withPricing();
+      insertUsageLog(rec({ ts: new Date(2026, 8, 10).getTime(), keyId: 'k-priced', modelId: 'm-priced', inputTokens: 2_000_000, totalTokens: 2_000_000 })); // spent = 2
+      // 无双线配置 → undefined（旧渲染端零崩的 ABSENT 形态）。
+      expect(buildBudgetStatus(NOW)).toBeUndefined();
+      // spent 2：过软线 1.5 不过硬线 20 → soft。
+      configMocks.preferences = { budgetSoftCny: 1.5, budgetHardCny: 20 };
+      let status = buildBudgetStatus(NOW)!;
+      expect(status.state).toBe('soft');
+      expect(status.softCny).toBe(1.5);
+      expect(status.hardCny).toBe(20);
+      expect(status.monthSpentCny).toBe(2);
+      expect(status.windowTruncated).toBeUndefined(); // retention 缺省 90 覆盖整月
+      // spent ≥ hard → hard（同刻过双线只报最严态）。
+      configMocks.preferences = { budgetSoftCny: 1.5, budgetHardCny: 2 };
+      expect(buildBudgetStatus(NOW)!.state).toBe('hard');
+      // 双线皆未过 → ok。
+      configMocks.preferences = { budgetSoftCny: 5, budgetHardCny: 20 };
+      expect(buildBudgetStatus(NOW)!.state).toBe('ok');
+      // 仅软线（无 hard）合法。
+      configMocks.preferences = { budgetSoftCny: 1.5 };
+      status = buildBudgetStatus(NOW)!;
+      expect(status.state).toBe('soft');
+      expect('hardCny' in status).toBe(false);
+      // 病态 soft>hard（手改直读绕过 readUserPreferences 的防御面）→ 以 hard 为准钳平。
+      configMocks.preferences = { budgetSoftCny: 30, budgetHardCny: 2 };
+      status = buildBudgetStatus(NOW)!;
+      expect(status.softCny).toBe(2);
+      expect(status.hardCny).toBe(2);
+      expect(status.state).toBe('hard');
+    });
+
+    it('buildBudgetStatus：保留窗 × 月窗截断守卫——windowTruncated 标注（gate 与面板同源判定，不静默）', () => {
+      withPricing();
+      insertUsageLog(rec({ ts: new Date(2026, 8, 10).getTime(), keyId: 'k-priced', modelId: 'm-priced', inputTokens: 2_000_000, totalTokens: 2_000_000 }));
+      configMocks.preferences = { budgetHardCny: 20, usageRetentionDays: 7 };
+      expect(buildBudgetStatus(NOW)!.windowTruncated).toBe(true); // 裁剪口 9-13 > 月界 9-1
+      configMocks.preferences = { budgetHardCny: 20, usageRetentionDays: 90 };
+      expect('windowTruncated' in buildBudgetStatus(NOW)!).toBe(false); // 条件展开——不截断键不在
+    });
+
+    it('buildBudgetStatus：偏好读失败 = 不设（undefined——gate 侧同款放行语义）', () => {
+      configMocks.prefsShouldThrow = true;
+      expect(buildBudgetStatus(NOW)).toBeUndefined();
+    });
+
+    it('installBudgetGateProduction：hard 有值查月累计比对 + 闭包现读偏好即时生效 + 读失败降级放行', () => {
+      withPricing();
+      // CR-2：gate 闭包内部用真实 Date.now()（无 DI 缝）——插入行必须落在**真实当月**
+      // 窗内才会被 monthSpentCny 计入。曾钉 2026-09-20 固定日期 = 十月起的定时炸弹；
+      // ts=Date.now() 恒在当下月窗内（usageByKeyModelSince 只按 ts >= 月界收行）。
+      insertUsageLog(rec({ ts: Date.now(), keyId: 'k-priced', modelId: 'm-priced', inputTokens: 25_000_000, totalTokens: 25_000_000 }));
+      configMocks.preferences = { budgetHardCny: 20 };
+      installBudgetGateProduction();
+      // spent 25 ≥ hard 20 → 拦截（verdict 原样透传给协议层 checkBudgetGate）。
+      expect(checkBudgetGate()).toEqual({ allowed: false, spentCny: 25, hardCapCny: 20 });
+      // 上限调大即时生效（闭包 per-call 现读——mirror taskModelRouting fresh read）。
+      configMocks.preferences = { budgetHardCny: 30 };
+      expect(checkBudgetGate()).toEqual({ allowed: true });
+      // 仅软线：gate 只认 hard（soft 只警不拦）。
+      configMocks.preferences = { budgetSoftCny: 1 };
+      expect(checkBudgetGate()).toEqual({ allowed: true });
+      configMocks.preferences = { budgetHardCny: 20 };
+      clearLedger();
+      expect(checkBudgetGate()).toEqual({ allowed: true });
+      // 偏好读失败 → gate 降级放行 + warn（best-effort——gate 故障不得杀生成）。
+      configMocks.prefsShouldThrow = true;
+      expect(checkBudgetGate()).toEqual({ allowed: true });
+    });
+
+    it('overview additive：month 窗就位 + 无配置 budget 键 ABSENT（旧渲染端零崩）+ 有配置 budget 就位', () => {
+      const now = Date.now();
+      const today = localMidnightMs(now);
+      withPricing();
+      insertUsageLog(rec({ ts: today, keyId: 'k-priced', modelId: 'm-priced', inputTokens: 2_000_000, totalTokens: 2_000_000 }));
+      const bare = buildUsageOverview();
+      expect(bare.month.calls).toBe(1);
+      expect(bare.month.estimatedCost).toBe(2);
+      expect('budget' in bare).toBe(false);
+      configMocks.preferences = { budgetSoftCny: 1.5, budgetHardCny: 20 };
+      const withBudget = buildUsageOverview();
+      expect(withBudget.budget).toBeDefined();
+      expect(withBudget.budget!.state).toBe('soft');
+      expect(withBudget.budget!.monthSpentCny).toBe(2);
+    });
   });
 });

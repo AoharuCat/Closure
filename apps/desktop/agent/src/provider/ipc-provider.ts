@@ -129,6 +129,8 @@ export interface GenerateTextRequest {
     sessionKey?: string;
     /** 09-12 usage-panel：任务档位/流程标签透传（undefined = 未标注；'' 已在拼装侧归一）。 */
     taskType?: string;
+    /** C3.1 计量台账：会话 id 三跳第二跳（undefined = 调用方未标注；'' 已在拼装侧归一）。 */
+    sessionId?: string;
     /** C 批（09-12 稳定化 / C3.4）：prompt-cache 断点开关透传（undefined = 缺省零行为，不占位）。 */
     cacheControl?: boolean;
     tools?: unknown[];
@@ -209,6 +211,15 @@ let _generateText: GenerateTextFn | undefined;
 
 export function setGenerateTextFn(fn: GenerateTextFn) {
   _generateText = fn;
+}
+
+/**
+ * 测试缝：复位 generateText 注入 seam（C3.1 复核 CR-10——装了 seam 的测试文件 afterAll
+ * 复位，防模块级单例跨文件泄漏到断言「未初始化」态的用例；mirror bridgeExecutor
+ * __clearBridgeSeamsForTest 形态）。复位后 generate() 走既有 not-initialized 守卫。
+ */
+export function __clearGenerateTextSeamForTest(): void {
+  _generateText = undefined;
 }
 
 /**
@@ -440,6 +451,12 @@ export async function generate(
       sessionKey: opts.sessionKey || undefined,
       // 09-12 usage-panel：任务档位/流程标签透传——'' 同归一为缺席（两态纪律同上）。
       taskType: opts.taskType || undefined,
+      // C3.1 计量台账：会话 id 三跳第二跳（wire schema textGenerationRequestSchema.sessionId
+      // → 此处 → 协议入口 withLedgerCallContext 归一落 ctx）——ledger 按逻辑会话归因成本
+      //（dialogue 车道带 leader 会话 id；链/桥车道靠既有 sessionKey 承载，dual-key 查询）。
+      // CR-7 复核：trim 后判空——'' 与 whitespace-only 同归缺席（两态纪律同 taskType），
+      // 有效值落 trim 后形态；undefined = 调用方未标注（ABSENT 组）。
+      sessionId: opts.sessionId?.trim() || undefined,
       // C 批（09-12 稳定化 / C3.4）：prompt-cache 断点开关透传——三面同步的 agent 缝面
       //（另两面：wire schema textGenerationRequestSchema.cacheControl + buildAnthropicBody
       // 消费）。=== true 才占位（undefined/false 序列化自然缺席 = 缺省 wire body 零变化）。

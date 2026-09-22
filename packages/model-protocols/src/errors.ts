@@ -11,6 +11,11 @@
 // generate.ts never touches this module's exports at module-evaluation time,
 // so both load orders resolve cleanly.
 import { isAbortLikeError, isDeltaCallbackError, findTimeoutError, errorMessage } from './generate';
+// C3.2 W3：BudgetExceededError 物理落位 budgetGate.ts（零 import 模块——本文件与
+// usageSink.ts 两消费链都挂得住，不再加深 errors↔generate 既有环）；此处转出保持
+// 「错误类从 errors.ts 出口」的调用方视角。
+import { BudgetExceededError } from './budgetGate';
+export { BudgetExceededError, budgetExceededMessage } from './budgetGate';
 
 export class ProtocolHttpError extends Error {
   readonly status: number;
@@ -116,6 +121,29 @@ export class ProtocolNotImplementedError extends Error {
   }
 }
 
+/**
+ * C3.2 W1 circuit breaker: raised by the gateway BEFORE any request is made when
+ * the per-(keyId, modelId) breaker is open — a LOCAL liveness verdict derived from
+ * recent consecutive eligible failures, not a provider response. Classified
+ * 'circuit-open' / ineligible: the refusal was issued by the breaker itself for
+ * THIS identity, so no other model rescues it and the chain must not burn on it —
+ * the caller waits out the cooldown (the message carries the remaining seconds).
+ */
+export class CircuitOpenError extends Error {
+  readonly keyId: string;
+  readonly modelId: string;
+  readonly cooldownLeftMs: number;
+  constructor(keyId: string, modelId: string, cooldownLeftMs: number) {
+    super(
+      `[${keyId}/${modelId}] circuit open, cooldown ${Math.ceil(cooldownLeftMs / 1000)}s left — retry later or check the provider`,
+    );
+    this.name = 'CircuitOpenError';
+    this.keyId = keyId;
+    this.modelId = modelId;
+    this.cooldownLeftMs = cooldownLeftMs;
+  }
+}
+
 // ── 09-12 子2 fallback chains：失败分类器 + 链尽错误 ──
 
 /** Failure family for {@link classifyGenerationFailure} (design §3 table). */
@@ -129,6 +157,8 @@ export type FallbackFailureKind =
   // fallback-INELIGIBLE families — request-intrinsic or already-visible failures
   | 'overflow'   // context-window overflow — runLoop compaction is the remedy (never burn the chain)
   | 'schema'     // ProtocolSchemaError / ProtocolCapabilityError / ProtocolNotImplementedError (request/config malformation; agy invalid model lands here via 子1)
+  | 'circuit-open' // CircuitOpenError — the gateway's own breaker refused the call locally; cooldown wait is the remedy (never burn the chain)
+  | 'budget'     // BudgetExceededError — monthly hard-cap refusal issued locally before any request; account-level, no model rescues it (never burn the chain)
   | 'interrupted'// StreamInterruptedError — content already flowed, "never retried" red line
   | 'abort'      // user cancellation — not a failure
   | 'program'    // onDelta consumer throw (generate.ts WeakSet tagging)
@@ -220,6 +250,15 @@ export function classifyGenerationFailure(err: unknown): GenerationFailureClassi
   ) {
     return classification('schema', false, err);
   }
+  // Circuit-breaker refusal (C3.2 W1): a LOCAL verdict the gateway issued before
+  // any request went out — never a provider health signal, so it never feeds the
+  // breaker either; it is simply never eligible (waiting out the cooldown is the
+  // only remedy).
+  if (err instanceof CircuitOpenError) return classification('circuit-open', false, err);
+  // Monthly-budget refusal (C3.2 W3): another LOCAL verdict issued before any request
+  // went out — account-level, so switching models cannot rescue it and the chain must
+  // not burn (the blocked call has already been ledgered as a 'budget' failure row).
+  if (err instanceof BudgetExceededError) return classification('budget', false, err);
   // Timeouts (direct or wrapped in a cause chain by the AI SDK) — per-model
   // liveness facts, eligible on BOTH lanes (open item A verdict: each attempt
   // stays individually bounded, the no-unbounded-wait red line holds).

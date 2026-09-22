@@ -26,7 +26,7 @@ import { SettingMdPatchCard, extractSettingMdPatch, isSettingMdPatchResolved } f
 // mirror setting_md 先例——机器级档案文件非 creative field，不进 WRITE_TOOLS/PatchReview）。
 import { AuthorProfilePatchCard, extractAuthorProfilePatch, isAuthorProfilePatchResolved } from './AuthorProfilePatchCard';
 import { Collapsible } from '../../shared/components/Collapsible';
-import { toolPresentation, toolLabel, roleLabel, parseChildTag } from './toolMeta';
+import { toolPresentation, toolLabel, roleLabel, parseChildTag, isToolErrorOutput } from './toolMeta';
 // 子4 W6：「桥」徽标——本会话对话车道经桥运行（childTag 消费侧排除——桥只接 leader）。
 import { useAgyBridgeLaneActive } from './useAgyBridgeLane';
 import { useTypewriter } from './useTypewriter';
@@ -504,7 +504,13 @@ function AgentMessageItemImpl({ message, isLatest, canTruncateFrom, onTruncateFr
       // 不在 WRITE_TOOLS（专用分流），非 envelope 结果（autoApply 档已直落）天然落 stepResults
       // 呈现 output 摘要，无需专门分支。
       else if (extractAuthorProfilePatch(r.metadata)) authorProfileResults.push(r);
-      else if (WRITE_TOOLS.includes(r.toolName ?? r.toolId ?? '')) diffResults.push(r);
+      // 09-20 F17 W4（design §5 / AC4 / G3=F18）：失败调用（Error 前缀 tool 结果——
+      // runLoop 与桥 persistToolCallPair 同形约定，见 isToolErrorOutput）不得进 DiffCard。
+      // DiffCard 对无 pending diff 的结果呈「✓ 已应用（auto）」/「✓ 已处理（suggest）」
+      // 误导壳——真机实证：桥车道 write_chapter 抛 Unknown tool、零产出，卡片却显
+      // 「✓ 已应用」。失败结果落 stepResults → AgentToolCard 失败态（⚠ + 错误类 +
+      // 展开可读错误原文），与 HTTP 车道工具卡失败呈现同构。
+      else if (WRITE_TOOLS.includes(r.toolName ?? r.toolId ?? '') && !isToolErrorOutput(r.output)) diffResults.push(r);
       else stepResults.push(r);
     }
     const childTagOnTool = parseChildTag(message.content ?? '');

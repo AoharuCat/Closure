@@ -130,6 +130,14 @@ describe('Story 2.2 — 设定深化引导段 + coverage 三态段注入', { tim
       expect(seg).toContain('save_craft_doc');
       // 收尾契约。
       expect(seg).toContain('present_result');
+      // R12 家族措辞守门（09-20 F17，F16 同族）：present_result 收尾句的「呈现性回复文字」
+      // 限定——本行经 systemPrompt 基座同时进 HTTP 与桥两车道（G5 定谳），旧承重词「正文」
+      // 在桥车道与 R12 限定句直接拆台，禁回。措辞家族四处同步（agents.ts / bridgeExecutor
+      // 覆写 / present-result.ts 描述 / 本段）。
+      expect(seg).toContain(
+        '呈现给用户看的呈现性回复文字（讨论/说明/评审等，该问的问题、该留的钩子——不含章节正文/改稿产物）必须写在调用 present_result 的同一条消息里',
+      );
+      expect(seg).not.toContain('呈现给用户看的正文');
     });
   });
 

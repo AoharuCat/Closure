@@ -126,6 +126,21 @@ export function toolPresentation(toolId: string): ToolPresentation {
   return TOOL_META[toolId] ?? FALLBACK;
 }
 
+/**
+ * 失败工具调用的呈现判据（两车道共同约定，单源谓词）：runLoop 派发段与桥车道
+ * persistToolCallPair（bridgeExecutor.ts）把执行失败/闸拒绝合成 **`Error: <message>`
+ * 前缀**的 tool 结果输出（loop.ts 三处同形）。UI 据此派生失败态——AgentToolCard 的
+ * ⚠ + 错误类、AgentMessageItem 的 WRITE_TOOLS 渲染路由（失败结果拒进 DiffCard，防
+ * 「✓ 已应用」误导壳，dogfood R4 F18）。消费点勿重写正则。
+ *
+ * 判据刻意收窄为**前缀**形态（词边界）：中文「失败/错误」中缀命中的宽松判定
+ * （batchMeta.isErrorOutput 的 CR-019 面）不适用于此——写作产出 output 常含这类
+ * 词的小说正文（「主角失败了…」），中缀误判会把成功的 suggest 档审阅卡误路由走。
+ */
+export function isToolErrorOutput(output: unknown): boolean {
+  return typeof output === 'string' && /^\s*error\b/i.test(output);
+}
+
 /** Friendly tool name: translated label, or the raw id when unmapped. */
 export function toolLabel(toolId: string, t: (key: string) => string): string {
   const meta = TOOL_META[toolId];

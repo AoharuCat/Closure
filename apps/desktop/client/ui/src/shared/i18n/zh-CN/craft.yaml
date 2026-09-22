@@ -105,6 +105,11 @@ craft:
     # 教程主张（默认/absent）不显示徽章。
     originDecon: "拆书实例《{book}》"
     originDeconNoTitle: "拆书实例"
+    # 来源三级徽章（E10.4 W3 additive）：讲法 originTier 三色（原作 muted / 社区 info 蓝 /
+    # 批评 amber）——材料 provenance.tier 透传；unspecified/旧行（absent）不显示。
+    tierOriginal: "原作"
+    tierCommunity: "社区"
+    tierCriticism: "批评"
     staleHint: "来源材料已变更/校对/删除——引文快照仍有效，锚点可能漂移"
     anchorJump: "打开原文定位"
     anchorHint: "段落 {para} · 字符 {chars}（材料派生 .md 基面）"

@@ -4,6 +4,7 @@
 import git from 'isomorphic-git';
 import fs from 'node:fs';
 import { assertSafePath } from '../pathGuard';
+import { withProjectLock } from '../../fs/projectWriteLock';
 import { notifyUI } from '../toolNotify';
 import type { ToolHandler } from './types';
 
@@ -39,23 +40,33 @@ export const gitLogHandler: ToolHandler = async ({ params, projectDir }) => {
   };
 };
 
+// 09-21-subagent-bg-decouple W3 硬闸补漏（write-safety-anchors.md §5）：commit 是 await 点
+// 读（HEAD）-写（ref）序列，零锁时两并发 commit 后写覆盖 ref → 先者 commit 孤儿化（既有
+// 暴露面 = leader 步内 Promise.all 双工具；bg 车道把它扩为跨 run 窗口）。包 withProjectLock
+// 与 project.yaml 写同队列串行。死锁安全：handleToolExecute 全仓仅 agentIpc.ts:439 /
+// agyBridge.ts:698 两调用点，均不在任何 withProjectLock 回调内；agent 侧 git_commit 调用
+//（write-chapter.ts 经 registry.get）不持 shell 锁。gitIpc 侧 commitProjectCreateNode /
+// createNode 不可同包（projectMetaIpc.ts:209/250 已在锁内调用——锁不可重入会死锁）。
 export const gitCommitHandler: ToolHandler = async ({ params, projectDir }) => {
   const { message, author } = params as { message: string; author?: { name: string; email: string } };
   assertSafePath(projectDir);
   const root = await git.findRoot({ fs, filepath: projectDir });
 
-  const matrix = await git.statusMatrix({ fs, dir: root });
-  for (const [filepath, , workdir] of matrix) {
-    if (workdir !== 1) {
-      await git.add({ fs, dir: root, filepath });
+  let oid = '';
+  await withProjectLock(projectDir, async () => {
+    const matrix = await git.statusMatrix({ fs, dir: root });
+    for (const [filepath, , workdir] of matrix) {
+      if (workdir !== 1) {
+        await git.add({ fs, dir: root, filepath });
+      }
     }
-  }
 
-  const oid = await git.commit({
-    fs,
-    dir: root,
-    message,
-    author: author ?? { name: 'Closure Agent', email: 'agent@closure.local' },
+    oid = await git.commit({
+      fs,
+      dir: root,
+      message,
+      author: author ?? { name: 'Closure Agent', email: 'agent@closure.local' },
+    });
   });
 
   notifyUI({ type: 'git:changed', projectPath: projectDir });

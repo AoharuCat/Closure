@@ -87,6 +87,11 @@ export type UsageRecentCall = {
   latencyMs: number;
   /** 流式首 delta 耗时；非流式/无 delta NULL。 */
   firstDeltaMs: number | null;
+  /**
+   * C3.1（D1 拍板）：生图张数（`request.n ?? 1`）——仅生图行有值；非生图行 NULL
+   * （图像 API 无 token 信号，张数是该行唯一可如实记的量纲——CR-18 缺席 ≠ 0 同族）。
+   */
+  imageCount: number | null;
 };
 
 /** `usage:overview` 单载荷（W3 IPC 通道契约；窗口边界 JS 本地时区算好传入查询）。 */
@@ -95,11 +100,35 @@ export type UsageOverview = {
   last7d: UsageWindowTotals;
   /** 累计 = 保留窗内累计（prune 后历史不可恢复，UI 文案如实标注）。 */
   total: UsageWindowTotals;
+  /** 本地自然月窗合计（C3.2 W3 additive——与 budget.monthSpentCny 同管线同源）。 */
+  month: UsageWindowTotals;
+  /**
+   * 月度预算状态（C3.2 W3 additive）：双线全未配置 → 键 ABSENT（旧渲染端零崩）。
+   * ¥ 口径 = 估算值（无价行不计，恒「仅供参考」）。
+   */
+  budget?: BudgetStatus;
   /** 近 7 日窗（含今日，design §3 开放项 ③）。 */
   byModel: UsageModelBreakdown[];
   byTask: UsageTaskBreakdown[];
   recent: UsageRecentCall[];
   retentionDays: number;
+};
+
+/** 月度预算三态（C3.2 W3）：软线只警不拦；硬线拦新调用。 */
+export type BudgetState = 'ok' | 'soft' | 'hard';
+
+/**
+ * `usage:overview.budget` 载荷（C3.2 W3）。softCny/hardCny 条件展开（ABSENT ≠ 未设的
+ * 0——线不设就是键不在）；windowTruncated 条件展开 = 保留窗短于本月已过天数，月累计只
+ * 覆盖保留窗（假低——拦截可能偏松），UI 文案如实「仅覆盖近 N 天」不静默（gate 与面板
+ * 同源判定：shell usageIpc isMonthWindowTruncated）。
+ */
+export type BudgetStatus = {
+  softCny?: number;
+  hardCny?: number;
+  state: BudgetState;
+  monthSpentCny: number;
+  windowTruncated?: boolean;
 };
 
 // ── ¥ 估算纯函数（design §3 计价式）──────────────────────────────────────────

@@ -16,6 +16,7 @@ import {
   USAGE_RETENTION_DAYS_MAX,
   USAGE_RETENTION_DAYS_MIN,
   clampUsageRetentionDays,
+  type BudgetStatus,
   type UsageOverview,
   type UsageRecentCall,
   type UsageWindowTotals,
@@ -24,6 +25,7 @@ import {
   fetchUsageOverview,
   clearUsage,
   openExternalLink,
+  saveBudgetCaps,
   saveUsageRetentionDays,
 } from '../../shared/api/usagePanel';
 import { useToastStore } from '../../shared/store/toastStore';
@@ -178,6 +180,250 @@ function openExternal(url: string): void {
   openExternalLink(url);
 }
 
+// ── 预算区（C3.2 W3：软警硬拦）──
+
+/**
+ * 过线一次性通知（渲染端最小形态）：localStorage 键 `budgetNotified:<YYYY-MM>:<state>:<cap>`
+ * ——月切（月份段变）或阈值改（cap 值进键）自动重置；每线每月至多一次。同一载荷双线
+ * 皆过时只报当前最严态（soft 线或已在早前载荷提醒过，或由面板状态常显——双 toast 噪声）。
+ * localStorage 不可用（隐私模式等）→ 静默跳过（通知是 best-effort 面）。
+ */
+export function notifyBudgetOnce(
+  budget: BudgetStatus,
+  t: Props['t'],
+  showToast: (message: string, level?: 'info' | 'success' | 'error') => void,
+): void {
+  if (budget.state === 'ok') return;
+  const cap = budget.state === 'hard' ? budget.hardCny : budget.softCny;
+  const d = new Date();
+  const monthKey = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+  const key = `budgetNotified:${monthKey}:${budget.state}:${cap ?? ''}`;
+  try {
+    if (window.localStorage.getItem(key) !== null) return;
+    window.localStorage.setItem(key, '1');
+  } catch {
+    return;
+  }
+  showToast(
+    budget.state === 'hard'
+      ? t('usagePanel.budgetHardToast', { amount: formatCost(budget.monthSpentCny) })
+      : t('usagePanel.budgetSoftToast', { amount: formatCost(budget.monthSpentCny) }),
+    budget.state === 'hard' ? 'error' : 'info',
+  );
+}
+
+/** 单线进度条（spent/cap 比例填充；过线填充转警示色——soft 线 warning / hard 线 error，
+ * 由 data-crossed 区分；状态文字色语义在 chip 同态）。 */
+function BudgetBar({ t, label, kind, cap, spent, crossed }: {
+  t: Props['t'];
+  label: string;
+  kind: 'soft' | 'hard';
+  cap: number;
+  spent: number;
+  crossed: boolean;
+}) {
+  const pct = Math.max(0, Math.min(100, (spent / cap) * 100));
+  return (
+    <div className="usage-budget-line" data-testid="usage-budget-line" data-crossed={crossed ? kind : undefined}>
+      <span className="usage-budget-line-label">{label}</span>
+      <span className="usage-budget-bar">
+        <span className="usage-budget-bar-fill" style={{ width: `${pct}%` }} />
+      </span>
+      <span className="usage-budget-line-amount">
+        {t('usagePanel.budgetOf', { spent: formatCost(spent), cap: formatCost(cap) })}
+      </span>
+    </div>
+  );
+}
+
+/**
+ * 双线输入（blur 落盘，mirror RetentionField 草稿/回声抑制/失败回滚纪律）：空 = 清线
+ * （键不设）；soft > hard 响亮拒写（内联 warn 常显 + 不提交——shell save handler
+ * validateBudgetCapsForSave 拒写是绕过表单面的兜底）；非法数字回显不落盘。
+ * CR-13：0/负数同样内联拒——shell clamp 侧把非正数当「未设」静默清线，「硬线全拦」
+ * 的意图会无声变「无执行」，必须在表单面拦下。
+ */
+function BudgetCapsFields({ t, soft, hard, onSaved }: {
+  t: Props['t'];
+  soft: number | undefined;
+  hard: number | undefined;
+  onSaved: () => void;
+}) {
+  const showToast = useToastStore((s) => s.showToast);
+  const [softDraft, setSoftDraft] = useState(soft === undefined ? '' : String(soft));
+  const [hardDraft, setHardDraft] = useState(hard === undefined ? '' : String(hard));
+  const [saving, setSaving] = useState(false);
+  const focusedRef = useRef(false);
+  const lastSyncedRef = useRef({ soft, hard });
+
+  useEffect(() => {
+    if (focusedRef.current) return;
+    if (soft !== lastSyncedRef.current.soft || hard !== lastSyncedRef.current.hard) {
+      lastSyncedRef.current = { soft, hard };
+      setSoftDraft(soft === undefined ? '' : String(soft));
+      setHardDraft(hard === undefined ? '' : String(hard));
+    }
+  }, [soft, hard]);
+
+  const softEmpty = softDraft.trim() === '';
+  const hardEmpty = hardDraft.trim() === '';
+  const parsedSoft = softEmpty ? undefined : Number(softDraft);
+  const parsedHard = hardEmpty ? undefined : Number(hardDraft);
+  const invalid = (softEmpty ? false : !Number.isFinite(parsedSoft)) ||
+    (hardEmpty ? false : !Number.isFinite(parsedHard));
+  const nonPositive = (!softEmpty && parsedSoft !== undefined && parsedSoft <= 0) ||
+    (!hardEmpty && parsedHard !== undefined && parsedHard <= 0);
+  const crossViolation =
+    parsedSoft !== undefined && parsedHard !== undefined && parsedSoft > parsedHard;
+
+  function draftOf(v: number | undefined): string {
+    return v === undefined ? '' : String(v);
+  }
+
+  async function commit() {
+    focusedRef.current = false;
+    if (invalid || nonPositive) {
+      // 非法数字 / 0·负数 → 回存量显示不落盘（RetentionField 同款；CR-13 拒 0/负——
+      // 落盘面会把它 clamp 成「未设」，静默清掉用户刚设的线）。
+      setSoftDraft(draftOf(soft));
+      setHardDraft(draftOf(hard));
+      return;
+    }
+    if (crossViolation) return; // 响亮拒写：warn 已内联常显，改到合法再保存。
+    // 金额两位小数归一（元——分位精度与 ¥ 口径一致）。
+    const nextSoft = parsedSoft !== undefined ? Math.round(parsedSoft * 100) / 100 : undefined;
+    const nextHard = parsedHard !== undefined ? Math.round(parsedHard * 100) / 100 : undefined;
+    if (nextSoft === lastSyncedRef.current.soft && nextHard === lastSyncedRef.current.hard) return;
+    setSaving(true);
+    const saved = await saveBudgetCaps(nextSoft, nextHard);
+    setSaving(false);
+    if (saved === null) {
+      showToast(t('usagePanel.budgetSaveFailed'), 'error');
+      return;
+    }
+    lastSyncedRef.current = { soft: nextSoft, hard: nextHard };
+    onSaved();
+  }
+
+  return (
+    <div className="usage-budget-fields">
+      <span className="usage-retention-field">
+        <label className="usage-retention-label" htmlFor="usage-budget-soft-input">
+          {t('usagePanel.budgetSoftLabel')}
+        </label>
+        <input
+          id="usage-budget-soft-input"
+          type="number"
+          className="usage-retention-input"
+          min={0}
+          step={1}
+          value={softDraft}
+          disabled={saving}
+          onChange={(e) => setSoftDraft(e.target.value)}
+          onFocus={() => {
+            focusedRef.current = true;
+          }}
+          onBlur={() => void commit()}
+        />
+        <span className="usage-retention-unit">{t('usagePanel.budgetUnit')}</span>
+      </span>
+      <span className="usage-retention-field">
+        <label className="usage-retention-label" htmlFor="usage-budget-hard-input">
+          {t('usagePanel.budgetHardLabel')}
+        </label>
+        <input
+          id="usage-budget-hard-input"
+          type="number"
+          className="usage-retention-input"
+          min={0}
+          step={1}
+          value={hardDraft}
+          disabled={saving}
+          onChange={(e) => setHardDraft(e.target.value)}
+          onFocus={() => {
+            focusedRef.current = true;
+          }}
+          onBlur={() => void commit()}
+        />
+        <span className="usage-retention-unit">{t('usagePanel.budgetUnit')}</span>
+      </span>
+      {invalid ? (
+        <span className="usage-retention-warn" role="status">
+          {t('usagePanel.budgetInvalidWarn')}
+        </span>
+      ) : nonPositive ? (
+        // CR-13：非正数先于 soft>hard 判定显示（非正值本身必拒——修掉它才轮到跨字段校验）。
+        <span className="usage-retention-warn" role="status">
+          {t('usagePanel.budgetPositiveWarn')}
+        </span>
+      ) : crossViolation ? (
+        <span className="usage-retention-warn" role="alert">
+          {t('usagePanel.budgetSoftRangeWarn')}
+        </span>
+      ) : null}
+    </div>
+  );
+}
+
+/** 预算区块：状态 chip（状态色）+ 本月已用 + 双线进度 + 截断守卫文案 + 双线输入。 */
+export function BudgetSection({ t, budget, onCapsSaved }: {
+  t: Props['t'];
+  budget: BudgetStatus | undefined;
+  onCapsSaved: () => void;
+}) {
+  const stateLabel = budget === undefined
+    ? null
+    : budget.state === 'hard'
+      ? t('usagePanel.budgetStateHard')
+      : budget.state === 'soft'
+        ? t('usagePanel.budgetStateSoft')
+        : t('usagePanel.budgetStateOk');
+  return (
+    <section className="usage-budget" aria-label={t('usagePanel.budget')} data-testid="usage-budget-section">
+      <h3 className="settings-page-title">{t('usagePanel.budget')}</h3>
+      {budget === undefined ? (
+        <p className="usage-hint">{t('usagePanel.budgetNotSet')}</p>
+      ) : (
+        <div className="usage-budget-status" data-state={budget.state}>
+          <span className="usage-budget-status-row">
+            <span className={`usage-budget-chip is-${budget.state}`}>{stateLabel}</span>
+            <span className="usage-budget-spent">
+              {t('usagePanel.budgetMonthSpent', { amount: formatCost(budget.monthSpentCny) })}
+            </span>
+          </span>
+          {budget.softCny !== undefined ? (
+            <BudgetBar
+              t={t}
+              label={t('usagePanel.budgetSoftLine')}
+              kind="soft"
+              cap={budget.softCny}
+              spent={budget.monthSpentCny}
+              crossed={budget.state !== 'ok'}
+            />
+          ) : null}
+          {budget.hardCny !== undefined ? (
+            <BudgetBar
+              t={t}
+              label={t('usagePanel.budgetHardLine')}
+              kind="hard"
+              cap={budget.hardCny}
+              spent={budget.monthSpentCny}
+              crossed={budget.state === 'hard'}
+            />
+          ) : null}
+          {budget.windowTruncated ? (
+            <span className="usage-budget-truncated" role="status">
+              {t('usagePanel.budgetTruncatedNote')}
+            </span>
+          ) : null}
+        </div>
+      )}
+      <BudgetCapsFields t={t} soft={budget?.softCny} hard={budget?.hardCny} onSaved={onCapsSaved} />
+      <p className="usage-hint">{t('usagePanel.budgetHint')}</p>
+    </section>
+  );
+}
+
 // ── 治理区：保留天数输入 ──
 
 /** 保留天数可编辑输入。number = 键盘类（schema-driven-forms Pattern 2）——change 只进
@@ -311,6 +557,11 @@ export function UsageSettingsPage({ t }: Props) {
     void load();
   }, [load]);
 
+  // C3.2 W3：过线一次性通知（键含月份段 + cap 值——月切/阈值改自动重置；见 helper 注记）。
+  useEffect(() => {
+    if (overview?.budget) notifyBudgetOnce(overview.budget, t, showToast);
+  }, [overview, t, showToast]);
+
   async function onClear() {
     const confirmed = await requestConfirm({
       title: t('usagePanel.clearConfirmTitle'),
@@ -400,6 +651,9 @@ export function UsageSettingsPage({ t }: Props) {
           windowNote={t('usagePanel.totalRetentionNote')}
         />
       </section>
+
+      {/* ①′ 月度预算（C3.2 W3：软警硬拦——配置面 + 状态条；空台账也渲染，先设线后用量合法） */}
+      <BudgetSection t={t} budget={overview.budget} onCapsSaved={() => void load()} />
 
       {isEmpty ? (
         <p className="usage-empty">
@@ -541,6 +795,13 @@ export function UsageSettingsPage({ t }: Props) {
                         >
                           {row.modelId}
                         </span>
+                        {/* C3.1 M3：生图张数（有值才显示——非生图行 NULL 不渲染；
+                            token 列该行如实全「—」，张数是唯一量纲）。 */}
+                        {row.imageCount !== null ? (
+                          <span className="usage-model-sub">
+                            {t('usagePanel.imageCount', { n: row.imageCount })}
+                          </span>
+                        ) : null}
                       </td>
                       <td>
                         {row.taskType === null ? (

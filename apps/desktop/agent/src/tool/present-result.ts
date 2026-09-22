@@ -24,7 +24,11 @@ export const presentResultTool = defineTool({
   id: 'present_result',
   description:
     'Closure 工作台收尾声明（plan/discuss 模式必用）。每次你向用户呈现结果、停下来等回应前，必须调用此工具声明这次停下的性质。' +
-    '**呈现给用户看的正文必须写在调用本工具的同一条消息里**——本工具是终局调用，调用后本次运行立即结束，没有机会再补一条消息。' +
+    // 「呈现性回复文字」限定（09-20 R12 残留措辞统一，F16 同族）：旧承重词「正文」可被模型
+    // 后向推导出「章节正文写在对话里」的授权（与写章工具的分工拆台）。措辞家族四处同步：
+    // agents.ts 桥 agent body / bridgeExecutor.ts present_result 覆写 / 本描述（HTTP 车道
+    // 工具面——桥车道有覆写不读此处）/ workflow.ts interaction 能力段（两车道 system 基座）。
+    '**呈现给用户看的呈现性回复文字（讨论/说明/评审等，不含章节正文/改稿产物）必须写在调用本工具的同一条消息里**——本工具是终局调用，调用后本次运行立即结束，没有机会再补一条消息。' +
     'awaiting_intent_confirmation=true 表示你在复述理解/方案等用户回应；' +
     'false 表示你已完成本轮（如回答了问题、执行了任务），正常停下不等确认。',
   parameters: z.object({

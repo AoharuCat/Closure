@@ -3,6 +3,7 @@ import type {
   AgentBehaviorMode,
   GenerationLane,
   GenerationMessage,
+  ModelProtocol,
   ThinkingControl,
 } from '@orison/shared-contracts';
 import { zodToJsonSchema } from 'zod-to-json-schema';
@@ -23,10 +24,13 @@ import { logger } from '../logger';
 //
 // 循环控制权反转面：一个「桥 turn」内 agy 自主多步循环（工具经 MCP server novel-writing
 // 在 agy 侧闭环），Closure 只见 turn 边界。本模块 owns：
-//   - 桥工具面策展（design §7 分层表：Tier 1 MVP + Tier 2 diff 家族——W5 入面）；
-//   - 面装配 = 策展 ∩ 当轮 filterToolsForPolicy 结果（同 toolPolicy 模块——第一层门；
-//     agy 侧预授权是第二层，方向不可写反）∩ 注册面（策展表本身只收 shell 可执行 id，
-//     结构性排除 spawn_agent/skill 等进程内 ctx 本地工具——非黑名单枚举）；
+//   - 桥工具面策展（09-20 W2 对等反转：registry 全集 − 排除表——Tier1/Tier2 首发策展
+//     分层保留为文档，对等扩面件单列 BRIDGE_TOOL_FACE_PARITY）；
+//   - 面装配 = 面常量 ∩ 当轮 filterToolsForPolicy 结果（同 toolPolicy 模块——第一层门；
+//     agy 侧预授权是第二层，方向不可写反）。本地工具（write_chapter / dispatch_* /
+//     spawn_agent 等）经进程内执行器可达（shell executeBridgeToolCall 分派），不再结构性
+//     排除；唯 skill 族因 confirm_required UI 回路缺失缓入面（BRIDGE_TOOL_FACE_EXCLUSIONS
+//     ——逐件文档化理由，非黑名单枚举）；
 //   - 持久化同构映射（design §5.6）：管道调用记录（live，result 回来即落）→ 标准
 //     SessionMessage 对（assistant.toolCalls + tool.toolResults）+ 终文 assistant 消息
 //     ——与 runLoop 产物同构，后续轮次（切回 HTTP 模型/压缩/summarizer）零特殊处理；
@@ -42,9 +46,28 @@ import { logger } from '../logger';
 // （design §6 边界：generate.ts 两分派点零改动）。本包零 model-protocols 依赖（seam 类型
 // 本地声明，mirror GenerationDelta 先例；shell 侧实现按本包导出类型编译钉死 seam 不漂移）。
 
-// ── 工具面策展（design §7）──
+// ── 工具面策展（09-20 W2 对等反转：registry 全集 − 排除表；design §2）──
 
-/** Tier 1（MVP）：桥原生收尾 + 写章派发 + 只读十件主体 + 通用只读件 + 研究两件。 */
+/**
+ * 排除表（语义反转后的唯一策展面）：registry 全集里不上桥面的件，逐件文档化理由
+ * （= design §7 差异表 / AC3 对拍基线的代码侧单源——新增排除必须先有文档化理由）。
+ * 漂移护栏：bridgeExecutor.test.ts 钉死「BRIDGE_TOOL_FACE = registerBuiltinTools 全注册
+ * id 集 − 本表」——新增注册件不更新面/排除表即红，逼一次显式决策。
+ */
+export const BRIDGE_TOOL_FACE_EXCLUSIONS: readonly string[] = [
+  // skill 族三件：skill VM 的 requestConfirmation → confirm_required UI 回路在桥侧无对应
+  // 面（BridgeExecutorOptions 无 emitConfirmation），接入须先建 confirm 回路（defer 另批）；
+  // 且 shell 侧同名 `skill` handler 是只读文件实现（非 skill VM 执行）——同名不同义，不上面。
+  'skill',
+  'skill_resource_list',
+  'skill_resource_read',
+];
+
+/**
+ * Tier 1（首发策展层）：桥原生收尾 + 写章派发 + 只读十件主体 + 通用只读件 + 研究两件。
+ * W2 语义反转后成员不变——作为 85 件全量面的分层文档保留（条目注释里的 F4b/F8 历史
+ * 锚点仍有效）。
+ */
 export const BRIDGE_TOOL_FACE_TIER1: readonly string[] = [
   'present_result',
   'write_chapter',
@@ -89,7 +112,85 @@ export const BRIDGE_TOOL_FACE_TIER2: readonly string[] = [
 ];
 
 /**
- * 全量桥面（Tier 1 + Tier 2）。read_file 入面（F4b）时与 agy 内置同名读文件工具并存，
+ * 对等扩面件（W2 语义反转新增，62 件）：Tier1/Tier2 之外的 registry 全集件——代理 48
+ * （shell handler 全在场，入面即通）+ 本地 14（经进程内执行器执行）。与 HTTP 车道 leader
+ * 的 registry.all() 面对齐（R2「不缩水」）；描述沿用 registry 原描述（同文即对等，
+ * design §2——覆写仍走 BRIDGE_TOOL_DESCRIPTION_OVERRIDES，本批零新增）。顺序 =
+ * builtin.ts 注册序（漂移护栏按集合对拍，顺序非契约）。
+ */
+export const BRIDGE_TOOL_FACE_PARITY: readonly string[] = [
+  // 代理件 48。
+  'write_file',
+  'memory_query',
+  'generate_image',
+  'edit_image',
+  'chapter_write',
+  'story_decisions_update',
+  'project_meta',
+  'list_stale_fields',
+  'dismiss_stale_fields',
+  'catalog_entries',
+  'get_entry',
+  'query_mentions',
+  'query_craft',
+  'query_world_state',
+  'query_world_slice',
+  'find_world_refs',
+  'write_world_events',
+  'amend_world_state',
+  'build_world_snapshot',
+  'materialize_chapter_summary',
+  'record_episode_mentions',
+  'degrade_episode_mentions',
+  'query_cognition',
+  'info_release_map_read',
+  'query_arc',
+  'arc_ledger_update',
+  'record_arc_audit',
+  'growth_curve_update',
+  'pacing_curve_update',
+  'emotion_curve_update',
+  'episode_outlines_update',
+  'creative_brief_update',
+  'creative_preferences_update',
+  'author_profile_update',
+  'feedback_ledger_write',
+  'feedback_ledger_read',
+  'git_status',
+  'git_log',
+  'git_commit',
+  'git_diff',
+  'wiki_read',
+  'web_fetch',
+  'render_page',
+  'parse_document',
+  'analyze_image',
+  'save_craft_doc',
+  'story_sync_apply',
+  'request_style_input',
+  // 本地件 14（dispatch_* 规划员/研究员/文风师外派 + 批量四件 + 涟漪诊断 + 通用子代理
+  // ——L1 leader 的核心编排面，此前结构性不可达即 F17 主缺口。09-21-subagent-bg-decouple
+  // W1 增后台派发族四件：spawn_agent_bg 立返句柄 + status/result/cancel 配套——桥车道
+  // leader 同样得「你去查，我继续聊」能力；工具经进程内执行器分派，skillExecutor 已绑定）。
+  'spawn_agent',
+  'spawn_agent_bg',
+  'bg_tasks_status',
+  'bg_task_result',
+  'bg_task_cancel',
+  'diagnose_impacts',
+  'start_batch',
+  'batch_status',
+  'end_batch',
+  'set_participation_gear',
+  'dispatch_researcher',
+  'dispatch_story_planner',
+  'dispatch_episode_planner',
+  'dispatch_style_analyzer',
+];
+
+/**
+ * 全量桥面（Tier 1 + Tier 2 + 对等扩面 = registry 全集 − 排除表，89 件；W2 语义反转）。
+ * read_file 入面（F4b）时与 agy 内置同名读文件工具并存，
  * 曾靠描述归属句 + 桥指令硬禁令双面消歧（MCP 派发器 ServerName+ToolName 本就分命名
  * 空间，技术上无冲突）。09-19 白名单落地后桥 spawn 恒挂声明式 agent，消歧文案随 W5
  * 瘦身移除（CR-21 收口：不改名）。
@@ -102,7 +203,11 @@ export const BRIDGE_TOOL_FACE_TIER2: readonly string[] = [
  * 状态**无因果关系**。故本面策展是给模型铺正路，不是「同名词机制性不存在」的兜底。
  * 证据：task 09-19-agy-toolface-fix-batch research/f8-builtin-tool-stream-signal.md §4/§5。
  */
-export const BRIDGE_TOOL_FACE: readonly string[] = [...BRIDGE_TOOL_FACE_TIER1, ...BRIDGE_TOOL_FACE_TIER2];
+export const BRIDGE_TOOL_FACE: readonly string[] = [
+  ...BRIDGE_TOOL_FACE_TIER1,
+  ...BRIDGE_TOOL_FACE_TIER2,
+  ...BRIDGE_TOOL_FACE_PARITY,
+];
 
 /**
  * 工具描述写作域措辞改写（w0-findings §8 基线——剥离工作台/产品名/实现词，保持真实
@@ -113,7 +218,11 @@ export const BRIDGE_TOOL_DESCRIPTION_OVERRIDES: Readonly<Record<string, string>>
   present_result:
     '呈现结果并声明本轮结束。每次你向用户呈现结果、停下来等回应前，必须调用此工具声明这次停下的性质：' +
     '等待用户确认（awaiting_intent_confirmation=true）或本轮已完成（false）。' +
-    '呈现给用户看的正文必须写在调用本工具的同一条消息里。',
+    // 「呈现性回复文字」限定（09-20 R12 残留措辞，F16 同族）：旧承重词「正文」可被模型
+    // 后向推导出「章节正文写在对话里」的旧授权。措辞家族四处同步（agents.ts 桥 agent
+    // body / 本覆写 / present-result.ts 工具描述 / workflow.ts interaction 能力段〔后两处
+    // HTTP 车道可见，09-20 check 阶段统一〕），改文案四处同改。
+    '呈现给用户看的呈现性回复文字（讨论/说明/评审等，不含章节正文/改稿产物）必须写在调用本工具的同一条消息里。',
   write_chapter:
     '为指定章节触发完整写作流程：编译写作简报 → 生成初稿 → 同步故事档案 → 五维审核 → 定稿路线判定与修订闭环。' +
     '只回摘要（标题/字数/判定结论）。写作简报传本章目标/参数/信息控制/节奏/禁写/情绪目标。',
@@ -268,6 +377,7 @@ export function setAgyBridgeModeResolver(fn: AgyBridgeModeResolver): void {
 export function __clearBridgeSeamsForTest(): void {
   _bridgeTurn = undefined;
   _modeResolver = undefined;
+  _bridgeUsageSink = undefined;
 }
 
 /** 测试缝：探针已注入的 turn fn（shell wiring 测试钉死 agentIpc 装配行——删除接线即红）。 */
@@ -278,6 +388,138 @@ export function __getAgyBridgeTurnFnForTest(): AgyBridgeTurnFn | undefined {
 /** 测试缝：探针已注入的模式判定 resolver（同上）。 */
 export function __getAgyBridgeModeResolverForTest(): AgyBridgeModeResolver | undefined {
   return _modeResolver;
+}
+
+// ── C3.1 W2b：桥 turn 计量发射缝（mirror setGenerateTextFn 注入先例；shell
+// installUsageMeteringProduction 同点装配 dispatchGenerationCallRecord 适配——B1
+// 桥车道第 4 计量面：桥 turn 完全绕开协议层 wrapper，计量经本缝上抛落同一张账）──
+
+/**
+ * 一次桥 turn 的计量记录。结构镜像 model-protocols `GenerationCallRecord`——本包零
+ * model-protocols 依赖（mirror GenerationDelta 本地声明先例），shell 装配点把本型直传
+ * `dispatchGenerationCallRecord`，结构类型化在装配行编译钉死不漂移（缺字段/类型漂移
+ * shell typecheck 即红）。
+ *
+ * CR-18 两态纪律同族：桥 turn 结果自带 usage（成功在场）——已知则记，未知键 ABSENT
+ * （≠0）；totalTokens 缺席不由 input+output 合成。lane 键本缝不产（executor 无 lane
+ * 输入，照实 ABSENT）——桥车道归因键 = sessionKey（design m3 双键口径：per-chapter
+ * 聚合 session_id ∪ session_key 并查）。
+ */
+export interface BridgeUsageRecord {
+  ts: number;
+  /** 桥行恒 'antigravity-cli'（桥 turn = agy CLI 运行时）。 */
+  protocol: ModelProtocol;
+  keyId: string;
+  modelId: string;
+  /** 装配点标注（'bridge-dialogue' / 未来链桥 'bridge-chain'）；未标 = ABSENT。 */
+  taskType?: string;
+  /** agy 会话键（如 `dialogue:<id>`）——桥车道归因键。 */
+  sessionKey?: string;
+  /** 桥会话身份（假宿归属 + 注册表键）。 */
+  sessionId?: string;
+  /** 逻辑调用 id——每 turn 一枚（settle 点生成；桥 turn 单 attempt 行自成一组）。 */
+  callId?: string;
+  stream: boolean;
+  success: boolean;
+  /** mirror classifyGenerationFailure 词表（abort/auth/quota/timeout/server/other…）；成功行 ABSENT。 */
+  errorKind?: string;
+  /** 错误摘要（≤500 字符截断——error_message 列口径同族）；成功行 ABSENT。 */
+  errorMessage?: string;
+  inputTokens?: number;
+  outputTokens?: number;
+  thinkingTokens?: number;
+  cacheReadTokens?: number;
+  totalTokens?: number;
+  latencyMs: number;
+}
+
+export type BridgeUsageSink = (record: BridgeUsageRecord) => void;
+
+/** 模块级缺省未装配——未装时零发射零行为（mirror setGenerationUsageSink 缺省 no-op）。 */
+let _bridgeUsageSink: BridgeUsageSink | undefined;
+
+/**
+ * 装配/卸载桥 turn 计量 sink（shell `installUsageMeteringProduction` 一次装配——全仓
+ * 唯一装配点；测试传 undefined 还原）。发射 best-effort 在发射点兜底（sink 抛错不阻
+ * 桥 turn——mirror CR-8 消费者异常隔离纪律）。
+ */
+export function setBridgeUsageSink(sink: BridgeUsageSink | undefined): void {
+  _bridgeUsageSink = sink;
+}
+
+/** 测试缝：探针已注入的计量 sink（shell wiring 测试钉死 usageIpc 装配行——删除接线即红）。 */
+export function __getBridgeUsageSinkForTest(): BridgeUsageSink | undefined {
+  return _bridgeUsageSink;
+}
+
+/** 失败行错误摘要上限（error_message 列口径——mirror model-protocols LEDGER_ERROR_MESSAGE_CHAR_CAP）。 */
+const BRIDGE_LEDGER_ERROR_MESSAGE_CHAR_CAP = 500;
+
+function truncateForBridgeLedger(value: string): string {
+  return value.length > BRIDGE_LEDGER_ERROR_MESSAGE_CHAR_CAP
+    ? value.slice(0, BRIDGE_LEDGER_ERROR_MESSAGE_CHAR_CAP)
+    : value;
+}
+
+/**
+ * 桥 turn 失败分类（mirror model-protocols classifyGenerationFailure 词表——本包零
+ * model-protocols 依赖，按协议层归一错误契约 duck-type：ProtocolHttpError.status 是
+ * 全包统一归一面；abort 判据与 catch 臂 isAbortLike 同源 + 信号状态兜底〔CR-3 同形——
+ * kill 级联下 502 先于 abort listener settle 时按 abort 语义归类的镜像〕）。
+ * C3.1 复核 CR-3：非 HTTP 形态补 timeout（ProtocolTimeoutError name duck 判）/
+ * network（TypeError / cause 链保守判）两族；词表外仍归 'other' 保守直记。
+ */
+function classifyBridgeTurnError(err: unknown, aborted: boolean): string {
+  if (aborted || isAbortLike(err)) return 'abort';
+  const status = (err as { status?: unknown } | null)?.status;
+  if (typeof status === 'number') {
+    if (status === 401 || status === 403) return 'auth';
+    if (status === 429 || status === 402) return 'quota';
+    if (status === 408) return 'timeout';
+    if (status >= 500) return 'server';
+    return 'other';
+  }
+  // CR-3（C3.1 复核）：mirror 词表补 timeout / network 两族（此前落 'other'——词表
+  // 子集非 mirror）。零 model-protocols import 约束不变：timeout 按 name duck 判
+  //（ProtocolTimeoutError 形态），network 走保守形态判（见下）。都不命中 → 'other'
+  // 保守兜底保留（词表外不猜）。
+  if (err instanceof Error && err.name === 'ProtocolTimeoutError') return 'timeout';
+  if (isBridgeNetworkFamilyError(err)) return 'network';
+  return 'other';
+}
+
+/**
+ * network 保守判（CR-3，mirror model-protocols errors.ts isNetworkFamilyError 判据但
+ * 零 import）：fetch 层传输失败形态 = TypeError（'fetch failed'），真实系统调用码嵌在
+ * cause 链（undici 连接超时名 ConnectTimeoutError）——本体或 cause 链（深度帽 5，
+ * mirror findTimeoutError）上命中 TypeError / ConnectTimeoutError / 传输签名任一即
+ * network。签名族与协议层 NETWORK_ERROR_SIGNATURES 同词表（字面量镜像，跨包零依赖
+ * 前提下以测试守门对齐）。
+ */
+const BRIDGE_NETWORK_ERROR_SIGNATURES = /fetch failed|ECONNREFUSED|ETIMEDOUT|ECONNRESET|EPROTO|EAI_AGAIN|connect timeout/i;
+
+function isBridgeNetworkFamilyError(err: unknown): boolean {
+  let current: unknown = err;
+  for (let depth = 0; current instanceof Error && depth < 5; depth += 1) {
+    if (current instanceof TypeError || current.name === 'ConnectTimeoutError') return true;
+    if (BRIDGE_NETWORK_ERROR_SIGNATURES.test(current.message)) return true;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+/** 桥 turn usage → ledger token 字段（条件展开——ABSENT 键不出现，两态纪律）。 */
+function bridgeUsageTokenFields(usage: BridgeTurnOutcome['usage']): Pick<
+  BridgeUsageRecord,
+  'inputTokens' | 'outputTokens' | 'thinkingTokens' | 'cacheReadTokens' | 'totalTokens'
+> {
+  return {
+    ...(usage?.promptTokens !== undefined ? { inputTokens: usage.promptTokens } : {}),
+    ...(usage?.completionTokens !== undefined ? { outputTokens: usage.completionTokens } : {}),
+    ...(usage?.thinkingTokens !== undefined ? { thinkingTokens: usage.thinkingTokens } : {}),
+    ...(usage?.cacheReadTokens !== undefined ? { cacheReadTokens: usage.cacheReadTokens } : {}),
+    ...(usage?.totalTokens !== undefined ? { totalTokens: usage.totalTokens } : {}),
+  };
 }
 
 // ── 工具面装配（纯函数）──
@@ -412,6 +654,12 @@ export interface BridgeExecutorOptions {
   sessionKey: string;
   permissionMode: SessionPermissionMode | undefined;
   behaviorMode: AgentBehaviorMode | undefined;
+  /**
+   * C3.1 W2b：桥 turn 计量行任务标签——装配点逐点标注（mirror taskType 装配模式）：
+   * dialogue 车道 'bridge-dialogue'（workflow.ts 装配行）；未来链桥车道装配点标
+   * 'bridge-chain'。undefined = 未标注（ledger task_type NULL 组——自由值词表同族）。
+   */
+  taskType?: string;
   abort: AbortSignal;
   onMessage: (msg: SessionMessage) => void;
   /**
@@ -448,6 +696,25 @@ export async function runBridgeExecutor(opts: BridgeExecutorOptions): Promise<Se
   const result: SessionMessage[] = [];
   const assistantId = randomUUID();
   let streamedText = '';
+  // C3.1 W2b：桥 turn 计量（每 turn 恰一行——成功/失败各一；callId 每 turn 一枚，
+  // latencyMs 由本发射点计时补齐——m1 必填不悬空）。best-effort：sink 抛错只记日志，
+  // 绝不改变 turn 结果/错误语义（mirror CR-8 消费者异常隔离 + 计量降级 hook 哲学）。
+  const meteringStartedAt = Date.now();
+  const meteringCallId = randomUUID();
+  // CR-2（C3.1 复核）：executor 有 emitDelta 流式路径——桥行 stream 按**实际流式路径**
+  // 落值（emitDelta/onDelta 在场即流式），不恒标非流（对话装配点带 delta 通道、测试
+  // 直调形态不带——两态照实）。
+  const meteringStream = opts.emitDelta !== undefined;
+  const emitBridgeUsage = (record: BridgeUsageRecord): void => {
+    try {
+      _bridgeUsageSink?.(record);
+    } catch (err) {
+      logger.warn(
+        { err: err instanceof Error ? err.message : String(err) },
+        'bridgeExecutor: bridge usage sink threw (best-effort metering; turn unaffected)',
+      );
+    }
+  };
   const emitDelta = opts.emitDelta;
   const onDelta = emitDelta
     ? (d: GenerationDelta): void => {
@@ -556,10 +823,13 @@ export async function runBridgeExecutor(opts: BridgeExecutorOptions): Promise<Se
   const baseMessages = [...opts.messages];
   // CR-12：face 单次构造——车道判定处（workflow）注入优先；缺省现算（测试直调形态）。
   const face = opts.face ?? buildBridgeFaceEntries(opts.tools, opts.permissionMode);
+  // C3.1 W2b：计量行 modelRef 与 turn 请求同源（default 哨兵口径一致——modelRef 缺省时
+  // 两处同落 default/default，防两套缺省漂移）。
+  const turnModelRef = opts.modelRef ?? { keyId: 'default', modelId: 'default' };
   let outcome: BridgeTurnOutcome;
   try {
     outcome = await _bridgeTurn({
-      modelRef: opts.modelRef ?? { keyId: 'default', modelId: 'default' },
+      modelRef: turnModelRef,
       thinking: opts.thinking,
       system: opts.systemPrompt,
       messages: sessionMessagesToWire(baseMessages),
@@ -575,7 +845,39 @@ export async function runBridgeExecutor(opts: BridgeExecutorOptions): Promise<Se
       onToolCall: persistToolCallPair,
       signal: opts.abort,
     });
+    // C3.1 W2b：成功行——usage 从桥 turn 结果如实映射（已知则记，ABSENT 键不出现）。
+    emitBridgeUsage({
+      ts: meteringStartedAt,
+      protocol: 'antigravity-cli',
+      keyId: turnModelRef.keyId,
+      modelId: turnModelRef.modelId,
+      ...(opts.taskType !== undefined ? { taskType: opts.taskType } : {}),
+      sessionKey: opts.sessionKey,
+      sessionId: opts.sessionId,
+      callId: meteringCallId,
+      stream: meteringStream,
+      success: true,
+      ...bridgeUsageTokenFields(outcome.usage),
+      latencyMs: Date.now() - meteringStartedAt,
+    });
   } catch (err) {
+    // C3.1 W2b：失败行——usage 未知如实 ABSENT（abort 族同门——CR-18 v2「未知才
+    // ABSENT」；abort 不记已知消耗与协议层 attempt 记账 m2 defer 同口径）。
+    emitBridgeUsage({
+      ts: meteringStartedAt,
+      protocol: 'antigravity-cli',
+      keyId: turnModelRef.keyId,
+      modelId: turnModelRef.modelId,
+      ...(opts.taskType !== undefined ? { taskType: opts.taskType } : {}),
+      sessionKey: opts.sessionKey,
+      sessionId: opts.sessionId,
+      callId: meteringCallId,
+      stream: meteringStream,
+      success: false,
+      errorKind: classifyBridgeTurnError(err, opts.abort.aborted),
+      errorMessage: truncateForBridgeLedger(err instanceof Error ? err.message : String(err)),
+      latencyMs: Date.now() - meteringStartedAt,
+    });
     // CR-3（子4 CR 批）：abort 竞态按**信号状态**归类而非仅错误形态——kill 级联下
     // exit-observer 的 502 可能先于 abort listener settle（非 AbortError 形态 + signal
     // 已断 = 用户中断），按 abort 语义落 aborted_partial，不得当 infra 错误丢已流文本。

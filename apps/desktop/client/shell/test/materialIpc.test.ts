@@ -65,10 +65,22 @@ vi.mock('../main/ipc/modelGatewayIpc', () => ({
     throw new Error('resolveModel should not be called');
   },
 }));
+// E10.4 W2：在线拉取/搜索核心 partial mock（纯函数面保真；网络半由用例注入 stub 结果）。
+const fetchOnlinePageAsMarkdownMock = vi.hoisted(() => vi.fn());
+const searchOnlineSourcesCoreMock = vi.hoisted(() => vi.fn());
+vi.mock('../main/ipc/toolHandlers/onlineMaterial', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../main/ipc/toolHandlers/onlineMaterial')>();
+  return {
+    ...actual,
+    fetchOnlinePageAsMarkdown: fetchOnlinePageAsMarkdownMock,
+    searchOnlineSourcesCore: searchOnlineSourcesCoreMock,
+  };
+});
 
 import { createMaterialIpcHandlers, registerMaterialIpc } from '../main/ipc/materialIpc';
 import { sendMaterialChanged } from '../main/ipc/materialNotify';
 import { getMaterialRow, registerMaterial } from '../main/db/materialIndexer';
+import { onlineStemForUrl, onlineTruncationNote } from '../main/ipc/toolHandlers/onlineMaterial';
 import { closeDb, getDb } from '../main/db/index';
 import { ensureProject, getProject } from '../main/db/projectRepository';
 import { allowPath } from '../main/ipc/pathGuard';
@@ -635,5 +647,252 @@ describe.skipIf(!sqliteUsable)('materialIpc handlers (Story 10.1 Wave D)', () =>
   it('registerMaterialIpc 注册零抛（ipcMain mock 收七个通道）', () => {
     expect(() => registerMaterialIpc()).not.toThrow();
     expect(typeof sendMaterialChanged).toBe('function');
+  });
+
+  // ── E10.4 W2：materials:import-online / materials:search-online ──
+
+  describe('E10.4 在线导入与关键词发现（W2）', () => {
+    const WIKI_URL = 'https://zh.moegirl.org.cn/明日方舟';
+
+    /** 在线抽取成功 fixture（onlineMaterial.fetchOnlinePageAsMarkdown 的 partial mock 返回值）。 */
+    function extractionFixture(overrides: Record<string, unknown> = {}) {
+      return {
+        ok: true as const,
+        content: chapteredNovel(3),
+        truncated: false,
+        originalChars: chapteredNovel(3).length,
+        title: '明日方舟',
+        finalUrl: WIKI_URL,
+        author: null,
+        originDate: null,
+        ...overrides,
+      };
+    }
+
+    function globalChunkRowCount(materialId: string): number {
+      return (
+        getDb()
+          .prepare(
+            "SELECT COUNT(*) AS n FROM closure_craft_entry WHERE source_kind='material_chunk' AND craft_id LIKE ? ESCAPE '\\'",
+          )
+          .get(`mat:${materialId}.ch%`) as { n: number }
+      ).n;
+    }
+
+    beforeEach(() => {
+      fetchOnlinePageAsMarkdownMock.mockReset();
+      searchOnlineSourcesCoreMock.mockReset();
+    });
+
+    it('快乐路径（全局车道，community-wiki）：落盘 materials/online/ + provenance 预填 + 双车道 chunk + 广播', async () => {
+      fetchOnlinePageAsMarkdownMock.mockResolvedValue(extractionFixture());
+      const res = await handlers.importOnlineMaterial({ url: WIKI_URL, scope: 'global', category: 'community-wiki' });
+      expect(res.ok).toBe(true);
+      if (!res.ok) return;
+      const fileName = res.sourcePath; // 全局车道 sourcePath 恒等车道内相对路径
+      expect(fileName).toMatch(/^online\/明日方舟-[0-9a-f]{8}\.md$/);
+      expect(res.outcome).toBe('registered');
+      expect(res.truncated).toBe(false);
+      expect(res.name).toBe('明日方舟');
+
+      // 落盘：原件（抽取文本即原件）+ 派生 .md（分章标记）。
+      expect(existsSync(path.join(GLOBAL_MATERIALS, res.sourcePath))).toBe(true);
+      expect(existsSync(path.join(GLOBAL_MATERIALS, '.derived', 'online', path.basename(res.sourcePath)))).toBe(true);
+
+      // 登记行：provenance 预填（P2 seam）+ 页面标题显示名。
+      const row = getMaterialRow(res.materialId)!;
+      expect(row).not.toBeNull();
+      expect(row!.provenance.medium).toBe('wiki');
+      expect(row!.provenance.tier).toBe('community');
+      expect(row!.provenance.via).toBe('web-fetch');
+      expect(row!.provenance.url).toBe(WIKI_URL);
+      expect(row!.name).toBe('明日方舟');
+      expect(row!.status).toBe('ready');
+
+      // 全局车道 chunk 行（query_craft 检索面——AC1 消费断言）。
+      expect(globalChunkRowCount(res.materialId)).toBeGreaterThan(0);
+
+      expect(notifySpy).toHaveBeenCalledWith(
+        expect.objectContaining({ scope: 'global', projectId: null, materialId: res.materialId, reason: 'imported' }),
+      );
+    });
+
+    it('同 URL 重导：内容未变 → reused 幂等（AC4）；内容变更 → reingest 语义且行刷新', async () => {
+      fetchOnlinePageAsMarkdownMock.mockResolvedValue(extractionFixture());
+      const first = await handlers.importOnlineMaterial({ url: WIKI_URL, scope: 'global', category: 'community-wiki' });
+      expect(first.ok).toBe(true);
+      if (!first.ok) return;
+      const hashBefore = getMaterialRow(first.materialId)!.contentHash;
+
+      // 内容未变 → reused（幂等 skip，不重复烧登记）。
+      const again = await handlers.importOnlineMaterial({ url: WIKI_URL, scope: 'global', category: 'community-wiki' });
+      expect(again).toMatchObject({ ok: true, outcome: 'reused', materialId: first.materialId });
+      // CR-15：reused 如实广播（'reingested' 对未变内容语义误导；additive enum，UI refresh-only）。
+      expect(notifySpy).toHaveBeenCalledWith(
+        expect.objectContaining({ materialId: first.materialId, reason: 'reused' }),
+      );
+      expect(getMaterialRow(first.materialId)!.contentHash).toBe(hashBefore);
+
+      // 内容变更 → registered（reingest 语义）：派生与 hash 刷新，行仍单条。
+      fetchOnlinePageAsMarkdownMock.mockResolvedValue(extractionFixture({ content: chapteredNovel(5), title: '明日方舟' }));
+      const changed = await handlers.importOnlineMaterial({ url: WIKI_URL, scope: 'global', category: 'community-wiki' });
+      expect(changed).toMatchObject({ ok: true, outcome: 'registered', materialId: first.materialId });
+      expect(getMaterialRow(first.materialId)!.contentHash).not.toBe(hashBefore);
+      expect(getMaterialRow(first.materialId)!.chapters).toHaveLength(5);
+      const listed = await handlers.listMaterials({ scope: 'global' });
+      expect(listed.filter((m) => m.materialId === first.materialId)).toHaveLength(1);
+    });
+
+    it('类别→medium/tier 映射矩阵（R3 四档，各 URL 独立材料行）', async () => {
+      const cases: Array<{ category: string; url: string; medium: string; tier: string }> = [
+        { category: 'community-wiki', url: 'https://zh.moegirl.org.cn/阿米娅', medium: 'wiki', tier: 'community' },
+        { category: 'criticism', url: 'https://example.com/review/arknights', medium: 'criticism', tier: 'criticism' },
+        { category: 'author-interview', url: 'https://example.com/interview/writer', medium: 'interview', tier: 'original' },
+        { category: 'other', url: 'https://example.com/misc/page', medium: 'other', tier: 'unspecified' },
+      ];
+      for (const c of cases) {
+        fetchOnlinePageAsMarkdownMock.mockResolvedValue(
+          extractionFixture({ finalUrl: c.url, title: '页面标题' }),
+        );
+        const res = await handlers.importOnlineMaterial({ url: c.url, scope: 'global', category: c.category });
+        expect(res.ok).toBe(true);
+        if (!res.ok) continue;
+        const row = getMaterialRow(res.materialId)!;
+        expect(row!.provenance.medium).toBe(c.medium);
+        expect(row!.provenance.tier).toBe(c.tier);
+      }
+    });
+
+    it('长页截断如实（W2 接线半）：IPC 行 truncated + quality.parseNotes 截断注记 + author/originDate 预填', async () => {
+      // 抽取半（truncated 标记/尾注内容/元数据提取）归 onlineMaterial.test.ts；本用例钉
+      // IPC 登记半的 extraParseNotes 与 provenanceOverrides 条件展开接线（author/originDate
+      // 取到才写的 spread 分支——快乐路径 author:null 只盖缺席侧）。
+      fetchOnlinePageAsMarkdownMock.mockResolvedValue(extractionFixture({
+        truncated: true,
+        originalChars: 450_000,
+        author: '考据作者',
+        originDate: '2024-05-01',
+      }));
+      const res = await handlers.importOnlineMaterial({ url: WIKI_URL, scope: 'global', category: 'community-wiki' });
+      expect(res.ok).toBe(true);
+      if (!res.ok) return;
+      expect(res.truncated).toBe(true);
+      const row = getMaterialRow(res.materialId)!;
+      expect(row).not.toBeNull();
+      // extraParseNotes 单源注记落 quality.parseNotes（截断 parseNote 持久面之一——后续
+      // 重解析按解析面重建会冲掉，best-effort 面已注记于 seam 注释）。
+      expect(row!.quality.parseNotes).toContain(onlineTruncationNote(450_000));
+      expect(row!.provenance.author).toBe('考据作者');
+      expect(row!.provenance.originDate).toBe('2024-05-01');
+    });
+
+    it('P2 竞态 belt：watcher 式默认 provenance 重登记不清预填（COALESCE 半）', async () => {
+      fetchOnlinePageAsMarkdownMock.mockResolvedValue(extractionFixture());
+      const res = await handlers.importOnlineMaterial({ url: WIKI_URL, scope: 'global', category: 'community-wiki' });
+      expect(res.ok).toBe(true);
+      if (!res.ok) return;
+      // 模拟 watcher 对落盘事件的晚到 registerMaterial（无 overrides——默认 provenance 产物）。
+      // CR-17 据实钉死（判定链 materialIngest :1214-1233）：登记行已在（首登完成）+ 原件未变
+      // + 派生 .md 往返稳定 → REUSE 裁决 outcome='reused' 单一确定；'registered' 臂需要内容
+      // 变更或派生人工编辑（reingest-skipped-manual 折叠进 registered），本场景两者皆无。
+      const watcherLike = await registerMaterial({ scope: 'global' }, res.sourcePath);
+      expect(watcherLike.outcome).toBe('reused');
+      const row = getMaterialRow(res.materialId)!;
+      // 预填保留（tier/medium/url 非 null 既有值 COALESCE 优先；标题名策展防清）。
+      expect(row!.provenance.tier).toBe('community');
+      expect(row!.provenance.medium).toBe('wiki');
+      expect(row!.provenance.url).toBe(WIKI_URL);
+      expect(row!.name).toBe('明日方舟');
+      // via 是管线事实字段（恒取本轮解析路径）——watcher 重解析按设计落本轮值，非预填流失。
+      expect(row!.provenance.via).not.toBe('web-fetch');
+    });
+
+    it('sha8 撞库加宽（CR-4）：stem 已占且登记行 provenance.url 异源 → hash 加宽派生异 stem', async () => {
+      const collideUrl = 'https://example.com/collide-target';
+      fetchOnlinePageAsMarkdownMock.mockResolvedValue(extractionFixture({ finalUrl: collideUrl }));
+      // 预置：stem8 已被另一页占（模拟真 sha8 撞库/同 stem 异页）——文件在、登记行 url 异源。
+      const stem8 = onlineStemForUrl(collideUrl);
+      mkdirSync(path.join(GLOBAL_MATERIALS, 'online'), { recursive: true });
+      writeFileSync(path.join(GLOBAL_MATERIALS, 'online', `${stem8}.md`), chapteredNovel(3), 'utf-8');
+      const prior = await registerMaterial({ scope: 'global' }, `online/${stem8}.md`, {
+        provenanceOverrides: { url: 'https://other.example/elsewhere' },
+      });
+      expect(prior.outcome).toBe('registered');
+
+      const res = await handlers.importOnlineMaterial({ url: collideUrl, scope: 'global', category: 'other' });
+      expect(res.ok).toBe(true);
+      if (!res.ok) return;
+      // 加宽：stem12（异 stem 异 materialId——不覆写先登页）。
+      expect(res.sourcePath).toMatch(/^online\/.+-[0-9a-f]{12}\.md$/);
+      expect(res.sourcePath).not.toBe(`online/${stem8}.md`);
+      expect(getMaterialRow(res.materialId)!.provenance.url).toBe(collideUrl);
+      // 先登页的行与文件原样保留（两条材料并存——按 sourcePath 各认一条）。
+      expect(existsSync(path.join(GLOBAL_MATERIALS, 'online', `${stem8}.md`))).toBe(true);
+      const listed = await handlers.listMaterials({ scope: 'global' });
+      expect(listed.some((m) => m.sourcePath === `online/${stem8}.md`)).toBe(true);
+      expect(listed.some((m) => m.materialId === res.materialId)).toBe(true);
+      expect(listed).toHaveLength(2);
+    });
+
+    it('stem-conflict TOCTOU 复查（CR-5）：拉取窗口内出现的异扩展占位件 → 写盘前拦下', async () => {
+      mkdirSync(path.join(GLOBAL_MATERIALS, 'online'), { recursive: true });
+      const stem = onlineStemForUrl(WIKI_URL);
+      // 拉取 stub 在 fetch 窗口内落占位件（模拟 watcher/手工在窗口内放入同 stem 异扩展件）——
+      // 先于拉取的 cheap 检查过门，写盘前复查接住。
+      fetchOnlinePageAsMarkdownMock.mockImplementation(async () => {
+        writeFileSync(path.join(GLOBAL_MATERIALS, 'online', `${stem}.txt`), '窗口内出现', 'utf-8');
+        return extractionFixture();
+      });
+      const res = await handlers.importOnlineMaterial({ url: WIKI_URL, scope: 'global', category: 'community-wiki' });
+      expect(res).toMatchObject({ ok: false, error: 'stem-conflict' });
+    });
+
+    it('失败分类：invalid-input / unregistered / 拉取半透传 / stem-conflict（先于拉取早退）', async () => {
+      // invalid-input 三形态。
+      expect(
+        await handlers.importOnlineMaterial({ scope: 'global', category: 'other' }),
+      ).toMatchObject({ ok: false, error: 'invalid-input' });
+      expect(
+        await handlers.importOnlineMaterial({ url: WIKI_URL, scope: 'global', category: 'not-a-category' }),
+      ).toMatchObject({ ok: false, error: 'invalid-input' });
+      expect(
+        await handlers.importOnlineMaterial({ url: WIKI_URL, scope: 'project', category: 'other' }),
+      ).toMatchObject({ ok: false, error: 'invalid-input' });
+
+      // unregistered：项目车道 projectId 解析不出。
+      expect(
+        await handlers.importOnlineMaterial({ url: WIKI_URL, scope: 'project', projectId: '99999', category: 'other' }),
+      ).toMatchObject({ ok: false, error: 'unregistered' });
+
+      // 拉取半失败分类透传（bad-url/fetch-failed/empty-content/oversize 来自 onlineMaterial）。
+      for (const error of ['bad-url', 'fetch-failed', 'empty-content', 'oversize'] as const) {
+        fetchOnlinePageAsMarkdownMock.mockResolvedValue({ ok: false, error, message: `${error} 说明文案` });
+        const res = await handlers.importOnlineMaterial({ url: WIKI_URL, scope: 'global', category: 'community-wiki' });
+        expect(res).toMatchObject({ ok: false, error });
+      }
+
+      // stem-conflict：online/ 内同 stem 异扩展既有件（派生 .md 镜像互覆写风险）——先于拉取早退。
+      const stem = onlineStemForUrl(WIKI_URL);
+      mkdirSync(path.join(GLOBAL_MATERIALS, 'online'), { recursive: true });
+      const conflictAbs = path.join(GLOBAL_MATERIALS, 'online', `${stem}.txt`);
+      writeFileSync(conflictAbs, '同名异扩展既有件', 'utf-8');
+      fetchOnlinePageAsMarkdownMock.mockResolvedValue(extractionFixture());
+      fetchOnlinePageAsMarkdownMock.mockClear(); // 早退断言基线（前轮失败分类用例已触达过 mock）
+      const conflict = await handlers.importOnlineMaterial({ url: WIKI_URL, scope: 'global', category: 'community-wiki' });
+      expect(conflict).toMatchObject({ ok: false, error: 'stem-conflict' });
+      // 早退：拉取核心未被触达（stem 只依赖 URL）。
+      expect(fetchOnlinePageAsMarkdownMock).not.toHaveBeenCalled();
+    });
+
+    it('materials:search-online：空 query 模式 B throw；有效入参透传合并核心', async () => {
+      await expect(handlers.searchOnlineSources({ query: '   ' })).rejects.toThrow(/query/);
+      await expect(handlers.searchOnlineSources(null)).rejects.toThrow(/query/);
+
+      const hit = { title: '明日方舟', url: WIKI_URL, snippet: '词条', source: 'wiki:moegirl-cn', categoryHint: 'community-wiki' };
+      searchOnlineSourcesCoreMock.mockResolvedValue([hit]);
+      const out = await handlers.searchOnlineSources({ query: ' 明日方舟 ', limit: 5 });
+      expect(out).toEqual([hit]);
+      expect(searchOnlineSourcesCoreMock).toHaveBeenCalledWith({ query: '明日方舟', limit: 5 });
+    });
   });
 });

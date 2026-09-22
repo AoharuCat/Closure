@@ -100,10 +100,11 @@ export interface CraftCardIndexDeps {
 }
 
 async function defaultEmbed(model: ResolvedModel, text: string): Promise<number[]> {
+  // C3.1 计量台账：craft claim 向量（craft KB 空间内索引侧）标签。
   const res = await generateEmbeddings(
     model,
     { input: [text] },
-    { signal: AbortSignal.timeout(30_000) },
+    { signal: AbortSignal.timeout(30_000), taskType: 'craft-index-embed' },
   );
   return res.embeddings[0] ?? [];
 }

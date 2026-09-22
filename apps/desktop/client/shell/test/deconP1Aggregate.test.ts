@@ -155,6 +155,7 @@ function mkMaterial(chapters: Material['chapters'] = FIXTURE.chapters): Material
       lang: null,
       originDate: null,
       description: null,
+      url: null,
     },
     quality: {
       ok: true,

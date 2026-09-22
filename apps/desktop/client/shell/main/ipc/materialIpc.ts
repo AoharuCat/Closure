@@ -31,6 +31,14 @@
  *   display 列（materialId 路径身份不变，design §3.1）——trim + 非空 + ≤
  *   MATERIAL_NAME_MAX_CHARS（shared-contracts 单源，UI maxlength 同源消费），落库后广播
  *   reason='name-updated'（列表名刷新既有事件面）。
+ * - `materials:import-online {url, scope, category, projectId?}` / `materials:search-online
+ *   {query, limit?}` → E10.4 在线解析生态（载荷契约单源 shared-contracts ipc.ts「E10.4」段）。
+ *   **W2 实现**（design §1）：import-online = research session 拉取（onlineMaterial
+ *   fetchOnlinePageAsMarkdown——MoeSkin 预解包 + htmlToMarkdown 抽取 + 2MB body cap）→
+ *   materials/online/<stem>-<sha8(url)>.md 落盘（抽取文本即原件）→ registerMaterial 管线
+ *   （P2 seam provenance 预填 medium/tier/url/via='web-fetch'）→ 失败分类六档模式 A 回报；
+ *   search-online = web/wiki 既有核心并发合并去重（零 LLM，onlineMaterial
+ *   searchOnlineSourcesCore），空 query 模式 B throw（mirror materials:list 坏参形态）。
  *
  * 🔑 update-provenance 为何**直写 UPDATE 而非 upsertMaterialRow**：upsert 的
  * preserveCuratedProvenance（F-05 COALESCE）以**既有行**值优先——重摄取不清用户策展值正是
@@ -74,12 +82,15 @@ import type {
   MaterialImportRejectedItem,
   MaterialReingestResult,
   MaterialSummary,
+  MaterialsImportOnlineResult,
   MaterialsImportResult,
   MaterialProvenancePatchInput,
   MaterialProvenancePatchResult,
   MaterialUpdateNameResult,
+  OnlineSourceHit,
 } from '@orison/shared-contracts';
-import { MATERIAL_DESCRIPTION_MAX_CHARS, MATERIAL_NAME_MAX_CHARS, materialProvenanceSchema } from '@orison/shared-contracts';
+import { MATERIAL_DESCRIPTION_MAX_CHARS, MATERIAL_NAME_MAX_CHARS, MATERIAL_ONLINE_CATEGORIES, materialProvenanceSchema } from '@orison/shared-contracts';
+import type { MaterialOnlineCategory } from '@orison/shared-contracts';
 import { assertSafePath } from './pathGuard';
 import { snapshotToLocalHistory } from '../fs/localHistory';
 import { getLogger } from '../logger';
@@ -89,7 +100,19 @@ import {
   MATERIAL_ALLOWED_EXTENSIONS,
   MATERIAL_IMPORT_MAX_BATCH,
   MATERIAL_MAX_FILE_BYTES,
+  materialIdFor,
+  materialSourcePath,
 } from './toolHandlers/materialIngest';
+import {
+  ONLINE_SOURCE_DIR,
+  ONLINE_STEM_HASH_WIDTHS,
+  categoryToProvenanceDefaults,
+  fetchOnlinePageAsMarkdown,
+  onlineFileNameFor,
+  onlineStemForUrl,
+  onlineTruncationNote,
+  searchOnlineSourcesCore,
+} from './toolHandlers/onlineMaterial';
 import {
   deleteMaterialRows,
   derivedRelPathForMaterial,
@@ -140,6 +163,25 @@ function coerceMaterialIdInput(raw: unknown): { materialId?: string } {
   if (raw === null || typeof raw !== 'object') return {};
   const { materialId } = raw as { materialId?: unknown };
   return { materialId: typeof materialId === 'string' && materialId.trim() ? materialId.trim() : undefined };
+}
+
+/** `materials:import-online` 入参归一（url/scope/category 三必填收窄；projectId 可选）。 */
+function coerceOnlineImportInput(
+  raw: unknown,
+): { url: string; scope: 'project' | 'global'; category: MaterialOnlineCategory; projectId?: string } | null {
+  if (raw === null || typeof raw !== 'object') return null;
+  const source = raw as Record<string, unknown>;
+  const url = typeof source.url === 'string' && source.url.trim() ? source.url.trim() : null;
+  if (url === null) return null;
+  const scope = source.scope === 'project' || source.scope === 'global' ? source.scope : null;
+  if (scope === null) return null;
+  const category = (MATERIAL_ONLINE_CATEGORIES as readonly string[]).includes(source.category as string)
+    ? (source.category as MaterialOnlineCategory)
+    : null;
+  if (category === null) return null;
+  const projectId =
+    typeof source.projectId === 'string' && source.projectId.trim() ? source.projectId.trim() : undefined;
+  return { url, scope, category, ...(projectId !== undefined ? { projectId } : {}) };
 }
 
 // ── 车道解析（登记行/入参两入口共用）──
@@ -330,6 +372,10 @@ export interface MaterialIpcHandlers {
   importMaterials(rawInput: unknown): Promise<MaterialsImportResult>;
   updateProvenance(rawInput: unknown): Promise<MaterialProvenancePatchResult>;
   updateName(rawInput: unknown): Promise<MaterialUpdateNameResult>;
+  /** E10.4 W2：在线拉取导入（拉取/落盘/登记 + 失败分类六档，design §1.1）。 */
+  importOnlineMaterial(rawInput: unknown): Promise<MaterialsImportOnlineResult>;
+  /** E10.4 W2：关键词发现（web+wiki 并发合并去重，零 LLM，design §1.2）。 */
+  searchOnlineSources(rawInput: unknown): Promise<OnlineSourceHit[]>;
 }
 
 export interface MaterialIpcDeps {
@@ -796,12 +842,179 @@ export function createMaterialIpcHandlers(deps: MaterialIpcDeps = {}): MaterialI
       }
       return { ok: true, material: refreshed };
     },
+
+    /**
+     * `materials:import-online`——E10.4 W2（design §1.1）：research session 拉取 + MoeSkin
+     * template 预解包 + htmlToMarkdown 抽取（onlineMaterial.fetchOnlinePageAsMarkdown——
+     * bad-url/fetch-failed/empty-content/oversize 四档拉取半分类）→ 类别→medium/tier 映射 →
+     * `materials/online/<stem>-<sha-n(url)>.md` 落盘（抽取文本即原件，P3 stem 规则；sha 宽度
+     * 8→12→16 撞库加宽见下）→ registerMaterial 管线（P2 seam provenanceOverrides：medium/
+     * tier/url/via='web-fetch'/author/originDate 预填 + nameOverride 页面标题 + 截断
+     * extraParseNotes）→ 模式 A 六档失败分类回报 + 同 URL 幂等（stem 稳定 = 路径身份；
+     * content 未变 reused / 变更 reingest，AC4）。失败分类 stem-conflict/ingest-failed 两档
+     * 属登记半。批量面注记（CR-12）：本通道单 URL 逐条，批量 ≤ MATERIAL_ONLINE_IMPORT_MAX_BATCH
+     * （20）由 UI 以 shared 常量执行拦截。
+     */
+    async importOnlineMaterial(rawInput: unknown): Promise<MaterialsImportOnlineResult> {
+      const input = coerceOnlineImportInput(rawInput);
+      if (input === null) {
+        return { ok: false, error: 'invalid-input', message: '需要 url、scope（project|global）与 category（四档类别）' };
+      }
+      if (input.scope === 'project' && input.projectId === undefined) {
+        return { ok: false, error: 'invalid-input', message: '项目车道需要 projectId' };
+      }
+      const resolved =
+        input.scope === 'global'
+          ? resolveGlobalLane()
+          : input.projectId !== undefined
+            ? resolveProjectLane(input.projectId)
+            : null;
+      if (resolved === null) {
+        return { ok: false, error: 'unregistered', message: '项目车道需要有效 projectId（注册库可解析）' };
+      }
+      const onlineDir = path.join(resolved.materialsRoot, ONLINE_SOURCE_DIR);
+
+      // P3 stem 规则：`<URL 末段 sanitize 截 64>-<sha-n(归一 url)>`——同 URL stem 稳定（幂等
+      // 路径身份），异 URL 同标题词条不派生同 stem（同 stem 第二条会以 reingest 语义静默覆写
+      // 第一条）。stem-conflict：online/ 目录内同 stem 异扩展（派生 .md 镜像同路径互覆写——
+      // CR-001 同族；同 stem 同扩展 .md = 幂等/reingest 路径，不落冲突档）。stem 只依赖 URL——
+      // 先于拉取判，冲突早退不烧网络。
+      if (stemConflictsInLane(onlineDir, onlineStemForUrl(input.url).toLowerCase(), '.md', new Map())) {
+        return {
+          ok: false,
+          error: 'stem-conflict',
+          message: `同名异扩展材料已存在（${ONLINE_SOURCE_DIR}/${onlineStemForUrl(input.url)}.*）——派生 .md 路径冲突`,
+        };
+      }
+
+      // 拉取半（SSRF 守卫/2MB cap/MoeSkin 解包/抽取/截断——onlineMaterial 单源）。
+      const extraction = await fetchOnlinePageAsMarkdown(input.url);
+      if (!extraction.ok) {
+        return { ok: false, error: extraction.error, message: extraction.message };
+      }
+
+      // CR-4/CR-5：落盘名解析（拉取后、写盘前——TOCTOU 复查）。宽度阶梯 8→12→16：目标
+      // `.md` 在且登记行 provenance.url 异源（真 sha 撞库/同 stem 异页）→ 加宽重试；url 同源
+      // （入参 URL 或重定向终址）→ 沿用该 stem（幂等/reingest 路径）。选定的 stem 再复查异扩
+      // 展冲突（拉取窗口内新出现的占位件在本步接住）。
+      const sameSource = (rowUrl: string | null): boolean =>
+        rowUrl === input.url || (extraction.finalUrl !== '' && rowUrl === extraction.finalUrl);
+      let fileName: string | null = null;
+      for (const width of ONLINE_STEM_HASH_WIDTHS) {
+        const candidate = onlineFileNameFor(input.url, width);
+        if (!existsSync(path.join(onlineDir, candidate))) {
+          fileName = candidate;
+          break;
+        }
+        const row = getMaterialRow(
+          materialIdFor(input.scope, materialSourcePath(input.scope, `${ONLINE_SOURCE_DIR}/${candidate}`)),
+        );
+        if (row !== null && sameSource(row.provenance.url)) {
+          fileName = candidate;
+          break;
+        }
+        // 占位件异源（或登记行已删）→ 加宽重试。
+      }
+      const chosenStem = fileName !== null ? path.basename(fileName, '.md') : null;
+      if (fileName === null || chosenStem === null) {
+        return {
+          ok: false,
+          error: 'stem-conflict',
+          message: `在线材料路径占位冲突（sha 宽度阶梯用尽）——请检查 ${ONLINE_SOURCE_DIR}/ 内同源文件`,
+        };
+      }
+      if (stemConflictsInLane(onlineDir, chosenStem.toLowerCase(), '.md', new Map())) {
+        return {
+          ok: false,
+          error: 'stem-conflict',
+          message: `同名异扩展材料已存在（${ONLINE_SOURCE_DIR}/${chosenStem}.*）——派生 .md 路径冲突`,
+        };
+      }
+      const relPath = `${ONLINE_SOURCE_DIR}/${fileName}`;
+
+      // 落盘（抽取文本即原件——D4 拍板；md 直读管线零新 parser）。
+      try {
+        mkdirSync(onlineDir, { recursive: true });
+        atomicWriteFileSync(path.join(onlineDir, fileName), extraction.content, 'utf-8');
+      } catch (err) {
+        return { ok: false, error: 'ingest-failed', message: `在线材料落盘失败：${errMsg(err)}` };
+      }
+
+      // P2 竞态防护（落盘 → 登记零 await）：写盘与 registerMaterial 入队之间无挂起点，本注册
+      // 恒先于 watcher 对该文件的 500ms debounce flush 进 per-scope 串行队列；watcher 随后的
+      // 默认 provenance 重登记经 preserveCuratedProvenance COALESCE 保留预填值——「登记先于
+      // watcher 可见」+「COALESCE 保预填」两半合起来闭环（restart 后 backfill 抢登记的残窗口
+      // 接受：用户经 UI 后补通道修复）。
+      const mapped = categoryToProvenanceDefaults(input.category);
+      let registerResult;
+      try {
+        registerResult = await registerMaterial(resolved.lane, relPath, {
+          provenanceOverrides: {
+            medium: mapped.medium,
+            tier: mapped.tier,
+            via: 'web-fetch',
+            url: extraction.finalUrl,
+            ...(extraction.author !== null ? { author: extraction.author } : {}),
+            ...(extraction.originDate !== null ? { originDate: extraction.originDate } : {}),
+          },
+          ...(extraction.truncated ? { extraParseNotes: [onlineTruncationNote(extraction.originalChars)] } : {}),
+          nameOverride: extraction.title,
+        });
+      } catch (err) {
+        getLogger().warn({ err: errMsg(err), url: input.url }, 'materials:import-online register threw');
+        return { ok: false, error: 'ingest-failed', message: `登记失败：${errMsg(err)}（文件已保留，watcher/backfill 稍后自愈登记）` };
+      }
+      if (registerResult.outcome === 'unregistered') {
+        return { ok: false, error: 'unregistered', message: '项目未注册（重开项目后 watcher 自愈登记）' };
+      }
+      if (registerResult.outcome === 'rejected') {
+        // 文件已落盘——watcher/backfill 自愈登记（mirror importMaterials failed 语义，非拒收档）。
+        return {
+          ok: false,
+          error: 'ingest-failed',
+          message: `摄取失败：${registerResult.reason ?? 'unknown'}（文件已保留，watcher/backfill 稍后自愈登记）`,
+        };
+      }
+      const materialId = registerResult.materialId;
+      if (materialId === undefined) {
+        return { ok: false, error: 'ingest-failed', message: '登记回执缺 materialId' };
+      }
+      notify({
+        scope: input.scope,
+        projectId: resolved.projectId,
+        materialId,
+        // CR-15：reused（幂等 skip）如实广播——'reingested' 对未变内容语义误导（additive
+        // enum，UI refresh-only 消费面零分支）。
+        reason: registerResult.outcome === 'reused' ? 'reused' : 'imported',
+      });
+      return {
+        ok: true,
+        materialId,
+        outcome: registerResult.outcome,
+        name: extraction.title,
+        sourcePath: materialSourcePath(input.scope, relPath),
+        truncated: extraction.truncated,
+      };
+    },
+
+    /**
+     * `materials:search-online`——E10.4 W2（design §1.2）：web_search + wiki_search 既有核心
+     * 并发合并去重（onlineMaterial.searchOnlineSourcesCore，零 LLM）；读面坏参 = 模式 B throw
+     * （mirror materials:list）。
+     */
+    async searchOnlineSources(rawInput: unknown): Promise<OnlineSourceHit[]> {
+      const source = rawInput as { query?: unknown; limit?: unknown } | null;
+      const query = typeof source?.query === 'string' ? source.query.trim() : '';
+      if (!query) throw new Error('materials:search-online 需要 query（关键词）');
+      const limit = typeof source?.limit === 'number' && Number.isFinite(source.limit) ? source.limit : undefined;
+      return searchOnlineSourcesCore({ query, ...(limit !== undefined ? { limit } : {}) });
+    },
   };
 }
 
 /**
- * 注册材料库七通道（registerAllIpc 恰调一次；同 channel 二次 ipcMain.handle 会抛错——
- * spec/shell/ipc-handlers.md 注册纪律，mirror registerInboxAttachmentIpc）。
+ * 注册材料库九通道（七既有 + E10.4 在线导入/搜索两通道；registerAllIpc 恰调一次；同 channel
+ * 二次 ipcMain.handle 会抛错——spec/shell/ipc-handlers.md 注册纪律，mirror registerInboxAttachmentIpc）。
  */
 export function registerMaterialIpc(): void {
   const handlers = createMaterialIpcHandlers();
@@ -812,4 +1025,6 @@ export function registerMaterialIpc(): void {
   ipcMain.handle('materials:import', (_e, input: unknown) => handlers.importMaterials(input));
   ipcMain.handle('materials:update-provenance', (_e, input: unknown) => handlers.updateProvenance(input));
   ipcMain.handle('materials:update-name', (_e, input: unknown) => handlers.updateName(input));
+  ipcMain.handle('materials:import-online', (_e, input: unknown) => handlers.importOnlineMaterial(input));
+  ipcMain.handle('materials:search-online', (_e, input: unknown) => handlers.searchOnlineSources(input));
 }

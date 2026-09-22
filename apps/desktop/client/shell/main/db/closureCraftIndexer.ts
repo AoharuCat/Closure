@@ -78,7 +78,8 @@ export type CraftReindexDeps = {
  * `AbortSignal.timeout` (mirror closureIndexer.defaultEmbed CR-06).
  */
 async function defaultEmbed(model: ResolvedModel, body: string): Promise<number[]> {
-  const res = await generateEmbeddings(model, { input: [body] }, { signal: AbortSignal.timeout(30_000) });
+  // C3.1 计量台账：craft KB 索引重嵌标签。
+  const res = await generateEmbeddings(model, { input: [body] }, { signal: AbortSignal.timeout(30_000), taskType: 'craft-index-embed' });
   return res.embeddings[0] ?? [];
 }
 

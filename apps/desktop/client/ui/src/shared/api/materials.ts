@@ -18,11 +18,15 @@ import type {
   MaterialProvenancePatchResult,
   MaterialReingestResult,
   MaterialsImportInput,
+  MaterialsImportOnlineInput,
+  MaterialsImportOnlineResult,
   MaterialsImportResult,
   MaterialsListInput,
+  MaterialsSearchOnlineInput,
   MaterialSummary,
   MaterialUpdateNameInput,
   MaterialUpdateNameResult,
+  OnlineSourceHit,
 } from '@orison/shared-contracts';
 
 /** 调用时取桥（勿模块级捕获——测试在 beforeEach 里装 window.orisonDesktop，晚于模块加载）。 */
@@ -81,6 +85,29 @@ export function updateMaterialName(input: MaterialUpdateNameInput): Promise<Mate
 /** 拖入 File → 绝对路径（Electron 37 无 File.path；桥收口——store 不直碰 window）。 */
 export function pathForImportFile(file: File): string {
   return window.orisonDesktop?.pathForFile?.(file) ?? '';
+}
+
+/**
+ * 在线材料导入（E10.4 W4，design §1.1）——`materials:import-online`：URL 直贴单条，
+ * research session 拉取 + 抽取 + registerMaterial 管线（shell 侧）；失败分类六档回报
+ * （模式 A，UI 分文案照 `materials.online.failureKind.*`）。
+ */
+export function importOnlineMaterial(
+  input: MaterialsImportOnlineInput,
+): Promise<MaterialsImportOnlineResult> {
+  const bridge = api();
+  if (!bridge?.importOnlineMaterial) throw new Error('desktop bridge unavailable');
+  return bridge.importOnlineMaterial(input);
+}
+
+/**
+ * 关键词发现（E10.4 W4，design §1.2）——`materials:search-online`：web_search +
+ * wiki_search 既有核心并发合并去重（零 LLM，shell 侧）；坏参（空 query）模式 B throw。
+ */
+export function searchOnlineSources(input: MaterialsSearchOnlineInput): Promise<OnlineSourceHit[]> {
+  const bridge = api();
+  if (!bridge?.searchOnlineSources) throw new Error('desktop bridge unavailable');
+  return bridge.searchOnlineSources(input);
 }
 
 /**

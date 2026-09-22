@@ -63,10 +63,11 @@ const DIM_PROBE_TEXT = 'embedding-dim-probe';
  * 30s AbortSignal.timeout，挂死端点不得挂死启动对账。
  */
 async function probeEmbeddingDim(model: ResolvedModel): Promise<number> {
+  // C3.1 计量台账：启动对账维度探测标签（探测触发的重嵌行走各 indexer 自己的标签）。
   const res = await generateEmbeddings(
     model,
     { input: [DIM_PROBE_TEXT] },
-    { signal: AbortSignal.timeout(30_000) },
+    { signal: AbortSignal.timeout(30_000), taskType: 'reconcile-embed' },
   );
   return res.embeddings[0]?.length ?? 0;
 }

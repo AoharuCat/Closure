@@ -101,6 +101,7 @@ export function createDeconChainFixture(matId: string, contentHashTail: string):
         lang: null,
         originDate: null,
         description: null,
+        url: null,
       },
       quality: {
         ok: true,

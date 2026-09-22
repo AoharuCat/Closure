@@ -44,15 +44,34 @@ import {
   _resetAntigravityCliUsedForTest,
 } from '../main/ipc/modelGatewayIpc';
 import {
+  _resetBreakerForTest,
+  _setBreakerClockForTest,
+  peekBreakerState,
+} from '../main/ipc/circuitBreaker';
+import {
   classifyCliError,
+  classifyGenerationFailure,
+  CircuitOpenError,
+  BudgetExceededError,
   FallbackChainExhaustedError,
   ProtocolContextOverflowError,
   ProtocolHttpError,
   setAntigravityCliGenerateForTest,
+  setBudgetGate,
+  setGenerationUsageSink,
 } from '@orison/model-protocols';
+import type { GenerationCallRecord } from '@orison/model-protocols';
+import { BREAKER_COOLDOWN_MS, BREAKER_THRESHOLD } from '../main/ipc/circuitBreaker';
 
 const TEST_MODEL_DIR = path.join(process.cwd(), 'test-tmp-model-gateway-fallback');
 const ORIGINAL_FETCH = globalThis.fetch;
+
+// C3.2 W1：熔断进程内态跨用例复位（must-add）——既有用例故意打 eligible 失败（429/503/
+// timeout），不复位会在套件 <60s 窗口内跨用例累计到阈值中途 open，制造顺序依赖红。
+// 顶层 beforeEach 先于各 describe 级 beforeEach 执行，全文件统一兜住。
+beforeEach(() => {
+  _resetBreakerForTest();
+});
 
 /** 双 HTTP 键配置：A/B 各自独立 baseUrl（fetch mock 按 URL 分流）+ 同款 glm 思考模型。 */
 const TWO_KEY_CONFIG: ModelConfig = {
@@ -903,5 +922,571 @@ describe('gateway fallback loop — W6 跨形态联调', () => {
       { protocol: 'antigravity-cli', hasVisionKey: false },
       { protocol: 'openai-compatible', vision: true, hasVisionKey: true },
     ]);
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// C3.1 计量台账 W3 装配：网关 callId 贯穿——callId 在回退环**外**恰生成一次，
+// 每 attempt（含跨模型回退推进 / streamingDisabled 短路）共享同一 call_id；sessionId
+// 三跳的网关面（wire 字段经环的原始载荷重建逐 attempt 不丢）。真协议层 + fetch 桩 +
+// sink 捕获（列级落库归 usageLedgerWiring 钉）。删 executeNonStreamingAttempt /
+// generateTextStream ctx 上的 callId 透传即红（接线钉法 mirror CR-001）。
+// ═════════════════════════════════════════════════════════════════════════════
+describe('gateway callId 贯穿（C3.1 W3 装配）', () => {
+  const records: GenerationCallRecord[] = [];
+
+  beforeEach(() => {
+    handle.mockReset();
+    _setModelConfigDirForTest(TEST_MODEL_DIR);
+    rmBestEffort(TEST_MODEL_DIR);
+    resolveImagePartsMock.mockImplementation(async (messages: unknown[]) => messages);
+    records.length = 0;
+    setGenerationUsageSink((r) => records.push(r));
+  });
+
+  afterEach(async () => {
+    setGenerationUsageSink(undefined);
+    _setModelConfigDirForTest(null);
+    rmBestEffort(TEST_MODEL_DIR);
+    globalThis.fetch = ORIGINAL_FETCH;
+    resolveImagePartsMock.mockReset();
+    vi.restoreAllMocks();
+  });
+
+  it('非流式回退环 A 429 → B 成功（跨模型）：恰两 attempt 行共享同一 callId、model_id 互异（AC5 证据）；sessionId 逐 attempt 到达', async () => {
+    await seedConfig();
+    const fetchMock = urlRoutingFetch({
+      'https://a.example.com/v1': () => errorResponse(429, 'rate limited'),
+      'https://b.example.com/v1': () => openAiTextResponse('from B'),
+    });
+    globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch;
+
+    const result = await handleGenerateText({
+      ref: { keyId: 'key_a', modelId: 'gpt-4o-mini' },
+      request: { model: 'gpt-4o-mini', messages: [{ role: 'user', content: 'hi' }], sessionId: 'sess-gw-1' },
+      // CR-8 复核（AC5 钉死）：链上 B 用不同 modelId——「两行同 call_id、model_id 各异」
+      // 的验收证据由此 fixture 直接承载（同模型不同键只证 key 互异，不证跨模型）。
+      fallbacks: [{ ref: { keyId: 'key_b', modelId: 'glm-5.3' } }],
+    });
+
+    expect(result.text).toBe('from B');
+    expect(records).toHaveLength(2);
+    const [attemptA, attemptB] = records;
+    expect(attemptA!.keyId).toBe('key_a');
+    expect(attemptA!.success).toBe(false);
+    expect(attemptB!.keyId).toBe('key_b');
+    expect(attemptB!.success).toBe(true);
+    // 共享 callId：一次逻辑调用（含跨模型回退推进）在 ledger 侧恰一组。
+    expect(attemptA!.callId).toBeTruthy();
+    expect(attemptA!.callId).toBe(attemptB!.callId);
+    // model_id 各异（AC5 第二半——行级可区分两 attempt 的模型身份）。
+    expect(attemptA!.modelId).toBe('gpt-4o-mini');
+    expect(attemptB!.modelId).toBe('glm-5.3');
+    // sessionId 三跳：wire 字段经环的原始载荷重建逐 attempt 不丢（模型各异、会话同源）。
+    expect(attemptA!.sessionId).toBe('sess-gw-1');
+    expect(attemptB!.sessionId).toBe('sess-gw-1');
+  });
+
+  it('流式回退环 A 503 → B SSE 成功：两行共享同一 callId（stream=true 面同样贯穿）', async () => {
+    await seedConfig(ANTH_TWO_KEY_CONFIG);
+    const fetchMock = urlRoutingFetch({
+      'https://anth-a.example.com': () => errorResponse(503, 'upstream dead'),
+      'https://anth-b.example.com': () => sseResponse(completeAnthStream('B答案')),
+    });
+    globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch;
+
+    const result = await handleGenerateTextStream(
+      {
+        ref: { keyId: 'key_a', modelId: 'claude-3-5-sonnet-latest' },
+        request: { model: 'claude-3-5-sonnet-latest', messages: [{ role: 'user', content: 'hi' }] },
+        fallbacks: [{ ref: { keyId: 'key_b', modelId: 'claude-3-5-sonnet-latest' } }],
+      },
+      undefined,
+      () => {},
+    );
+
+    expect(result.text).toBe('B答案');
+    expect(records).toHaveLength(2);
+    expect(records[0]!.callId).toBeTruthy();
+    expect(records[0]!.callId).toBe(records[1]!.callId);
+    expect(records[1]!.stream).toBe(true);
+    expect(records[1]!.success).toBe(true);
+  });
+
+  it('零默认链快径（非流式 + 流式各一逻辑调用）：每调用一行、callId 非空且互不相同', async () => {
+    // 本地双键配置（key id 去重——ANTH_TWO_KEY_CONFIG 的 key_a 与 openai 键撞 id，
+    // save-model 按 id 折叠；流式键独立命名）。流式键复用 anth-a 路由。
+    await seedConfig({
+      keys: [
+        ...TWO_KEY_CONFIG.keys,
+        {
+          id: 'key_stream',
+          name: 'A anthropic',
+          protocol: 'anthropic-compatible',
+          apiKey: 'sk-ant-a',
+          baseUrl: 'https://anth-a.example.com',
+          models: [{ id: 'claude-3-5-sonnet-latest', alias: 'Claude A', capability: 'text', enabled: true }],
+        },
+      ],
+    });
+    const fetchMock = urlRoutingFetch({
+      'https://a.example.com/v1': () => openAiTextResponse('solo'),
+      'https://anth-a.example.com': () => sseResponse(completeAnthStream('solo stream')),
+    });
+    globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch;
+
+    await handleGenerateText({
+      ref: { keyId: 'key_a', modelId: 'gpt-4o-mini' },
+      request: { model: 'gpt-4o-mini', messages: [{ role: 'user', content: 'hi' }] },
+    });
+    await handleGenerateTextStream(
+      {
+        ref: { keyId: 'key_stream', modelId: 'claude-3-5-sonnet-latest' },
+        request: { model: 'claude-3-5-sonnet-latest', messages: [{ role: 'user', content: 'hi' }] },
+      },
+      undefined,
+      () => {},
+    );
+
+    expect(records).toHaveLength(2);
+    expect(records[0]!.callId).toBeTruthy();
+    expect(records[1]!.callId).toBeTruthy();
+    expect(records[0]!.callId).not.toBe(records[1]!.callId); // 每逻辑调用恰一组
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// C3.2 W1 熔断网关接线：条目前置门（resolved 身份键，open → trace circuit-open +
+// 切换事件 + continue，含 primary）/ 直通快径快败 CircuitOpenError / attempt 成败
+// 回写（eligible 计数、成功关断、overflow·schema·producedDelta 不计数）。
+// 时钟经 _setBreakerClockForTest 注入（mirror ModelCliProbeDeps DI now() 形态），
+// 不用 fake timers——协议层快速重试的真实 sleep 与熔断窗互不干扰。
+// 纯函数族全态迁移归 circuitBreaker.test.ts。
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe('gateway circuit breaker (C3.2 W1)', () => {
+  let t = 1_000_000;
+
+  /** A 槽无链失败一次（快径 catch-classify-record-rethrow 各记 1 次 eligible 失败）。 */
+  async function failOnceNoChain(): Promise<void> {
+    t += 1_000;
+    await handleGenerateText({
+      ref: { keyId: 'key_a', modelId: 'gpt-4o-mini' },
+      request: { model: 'gpt-4o-mini', messages: [{ role: 'user', content: 'hi' }] },
+    }).catch(() => undefined);
+  }
+
+  /** 驱动 key_a/gpt-4o-mini 达阈值开断（T 次无链 eligible 失败）。 */
+  async function driveOpen(): Promise<void> {
+    for (let i = 0; i < BREAKER_THRESHOLD; i += 1) await failOnceNoChain();
+  }
+
+  function aCallsOf(fetchMock: ReturnType<typeof vi.fn>): unknown[][] {
+    return (fetchMock.mock.calls as unknown as unknown[][]).filter(([url]) =>
+      String(url).startsWith('https://a.example.com'),
+    );
+  }
+
+  beforeEach(() => {
+    handle.mockReset();
+    _setModelConfigDirForTest(TEST_MODEL_DIR);
+    rmBestEffort(TEST_MODEL_DIR);
+    resolveImagePartsMock.mockImplementation(async (messages: unknown[]) => messages);
+    t = 1_000_000;
+    _setBreakerClockForTest(() => t);
+  });
+
+  afterEach(async () => {
+    _setBreakerClockForTest(undefined);
+    _setModelConfigDirForTest(null);
+    rmBestEffort(TEST_MODEL_DIR);
+    globalThis.fetch = ORIGINAL_FETCH;
+    resolveImagePartsMock.mockReset();
+    vi.restoreAllMocks();
+  });
+
+  it(`${BREAKER_THRESHOLD} 次 eligible 失败后：链式调用跳过该条目（trace circuit-open + 切换事件，直达下一条目）`, async () => {
+    await seedConfig();
+    const fetchMock = urlRoutingFetch({
+      'https://a.example.com/v1': () => errorResponse(429, 'rate limited'),
+      'https://b.example.com/v1': () => openAiTextResponse('from B'),
+    });
+    globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch;
+
+    await driveOpen();
+    expect(peekBreakerState('key_a', 'gpt-4o-mini').openedAt).toBeDefined();
+
+    const switches: Array<{ from: { keyId: string }; to: { keyId: string }; reason: string; attempt: number }> = [];
+    const callsBefore = fetchMock.mock.calls.length;
+    const result = await handleGenerateText(
+      {
+        ref: { keyId: 'key_a', modelId: 'gpt-4o-mini' },
+        request: { model: 'gpt-4o-mini', messages: [{ role: 'user', content: 'hi' }] },
+        fallbacks: [{ ref: { keyId: 'key_b', modelId: 'gpt-4o-mini' } }],
+      },
+      undefined,
+      (event) => switches.push(event),
+    );
+
+    expect(result.text).toBe('from B');
+    expect(result.modelRef).toEqual({ keyId: 'key_b', modelId: 'gpt-4o-mini' });
+    expect(result.fallbackTrace).toEqual([
+      { keyId: 'key_a', modelId: 'gpt-4o-mini', reason: expect.stringContaining('circuit-open') },
+    ]);
+    // 复用既有 model-fallback 事件族 = 运行期可见（切换通知白捡）。
+    expect(switches).toHaveLength(1);
+    expect(switches[0]!.from).toEqual({ keyId: 'key_a', modelId: 'gpt-4o-mini' });
+    expect(switches[0]!.to).toEqual({ keyId: 'key_b', modelId: 'gpt-4o-mini' });
+    expect(switches[0]!.reason).toContain('circuit-open');
+    // A 零出站（被跳条目未发起任何请求）：出站数恰 +1（B 承接那一次）。
+    expect(fetchMock.mock.calls.length - callsBefore).toBe(1);
+  });
+
+  it('primary open 后无链直通快败 CircuitOpenError（消息含模型名 + 剩余冷却秒 + 零出站；流式同）', async () => {
+    await seedConfig();
+    const fetchMock = urlRoutingFetch({
+      'https://a.example.com/v1': () => errorResponse(429, 'rate limited'),
+      'https://b.example.com/v1': () => openAiTextResponse('from B'),
+    });
+    globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch;
+    await driveOpen();
+
+    // 换新 fetch 桩：快败必须零出站。
+    const freshMock = vi.fn(async () => openAiTextResponse('should not be reached'));
+    globalThis.fetch = freshMock as unknown as typeof globalThis.fetch;
+    t += 1_000;
+
+    const err: unknown = await handleGenerateText({
+      ref: { keyId: 'key_a', modelId: 'gpt-4o-mini' },
+      request: { model: 'gpt-4o-mini', messages: [{ role: 'user', content: 'hi' }] },
+    }).then(
+      () => { throw new Error('expected rejection'); },
+      (e: unknown) => e,
+    );
+
+    expect(err).toBeInstanceOf(CircuitOpenError);
+    expect((err as CircuitOpenError).keyId).toBe('key_a');
+    expect((err as CircuitOpenError).modelId).toBe('gpt-4o-mini');
+    expect((err as Error).message).toContain('[key_a/gpt-4o-mini]');
+    expect((err as Error).message).toMatch(/cooldown \d+s left/);
+    // 错误本体若被上游再分类 → ineligible（链不烧）。
+    expect(classifyGenerationFailure(err)).toMatchObject({ eligible: false, kind: 'circuit-open' });
+    expect(freshMock).toHaveBeenCalledTimes(0);
+
+    // 流式快径同语义（同 executeFastPathAttempt 包装）。
+    const streamErr: unknown = await handleGenerateTextStream(
+      {
+        ref: { keyId: 'key_a', modelId: 'gpt-4o-mini' },
+        request: { model: 'gpt-4o-mini', messages: [{ role: 'user', content: 'hi' }] },
+      },
+      undefined,
+      () => {},
+    ).then(
+      () => { throw new Error('expected rejection'); },
+      (e: unknown) => e,
+    );
+    expect(streamErr).toBeInstanceOf(CircuitOpenError);
+    expect(freshMock).toHaveBeenCalledTimes(0);
+  });
+
+  it('冷却期满 → half-open 探针放行；探针成功 → 关断（后续 eligible 失败回到滚动计数，不再跳条目）', async () => {
+    await seedConfig();
+    let aFail = true;
+    const fetchMock = urlRoutingFetch({
+      'https://a.example.com/v1': () =>
+        aFail ? errorResponse(429, 'rate limited') : openAiTextResponse('from A recovered'),
+      'https://b.example.com/v1': () => openAiTextResponse('from B'),
+    });
+    globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch;
+
+    await driveOpen();
+    t += BREAKER_COOLDOWN_MS + 1; // 冷却期满
+
+    aFail = false; // 探针（放行的那次调用）成功
+    const probed = await handleGenerateText({
+      ref: { keyId: 'key_a', modelId: 'gpt-4o-mini' },
+      request: { model: 'gpt-4o-mini', messages: [{ role: 'user', content: 'hi' }] },
+    });
+    expect(probed.text).toBe('from A recovered');
+    expect(probed.fallbackTrace).toBeUndefined(); // 无回退发生
+    // 探针成功 → 关断。
+    expect(peekBreakerState('key_a', 'gpt-4o-mini')).toEqual({ failures: [] });
+
+    // 关断后 eligible 失败回到 closed 滚动计数（1 < 阈值 → 下一次仍正常尝试 A，不跳）。
+    aFail = true;
+    const after = await handleGenerateText({
+      ref: { keyId: 'key_a', modelId: 'gpt-4o-mini' },
+      request: { model: 'gpt-4o-mini', messages: [{ role: 'user', content: 'hi' }] },
+      fallbacks: [{ ref: { keyId: 'key_b', modelId: 'gpt-4o-mini' } }],
+    });
+    expect(after.text).toBe('from B');
+    expect(after.fallbackTrace).toEqual([
+      { keyId: 'key_a', modelId: 'gpt-4o-mini', reason: expect.stringContaining('quota') },
+    ]);
+    expect(peekBreakerState('key_a', 'gpt-4o-mini').openedAt).toBeUndefined(); // 计数中，未开断
+    expect(peekBreakerState('key_a', 'gpt-4o-mini').failures).toHaveLength(1);
+  });
+
+  it('half-open 探针 eligible 失败 → 直接重开（不经计数；新冷却内下一次调用照跳）', async () => {
+    await seedConfig();
+    const fetchMock = urlRoutingFetch({
+      'https://a.example.com/v1': () => errorResponse(429, 'rate limited'),
+      'https://b.example.com/v1': () => openAiTextResponse('from B'),
+    });
+    globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch;
+
+    await driveOpen();
+    t += BREAKER_COOLDOWN_MS + 1; // 冷却期满 → 下一调用即探针
+
+    // 探针失败：A 被真实尝试（429），B 承接。
+    const probed = await handleGenerateText({
+      ref: { keyId: 'key_a', modelId: 'gpt-4o-mini' },
+      request: { model: 'gpt-4o-mini', messages: [{ role: 'user', content: 'hi' }] },
+      fallbacks: [{ ref: { keyId: 'key_b', modelId: 'gpt-4o-mini' } }],
+    });
+    expect(probed.modelRef).toEqual({ keyId: 'key_b', modelId: 'gpt-4o-mini' });
+    // trace 记的是探针失败本体（quota），不是 circuit-open——探针确实放行了。
+    expect(probed.fallbackTrace).toEqual([
+      { keyId: 'key_a', modelId: 'gpt-4o-mini', reason: expect.stringContaining('quota') },
+    ]);
+    // 重开：openedAt = 探针失败时刻。
+    expect(peekBreakerState('key_a', 'gpt-4o-mini').openedAt).toBe(t);
+    const aCallsAfterProbe = aCallsOf(fetchMock).length;
+    expect(aCallsAfterProbe).toBeGreaterThanOrEqual(1);
+
+    // 新冷却未满 → 下一次链式调用 A 被跳（若误回半开放行，A 会再次真实出站）。
+    t += 1_000;
+    const skipped = await handleGenerateText({
+      ref: { keyId: 'key_a', modelId: 'gpt-4o-mini' },
+      request: { model: 'gpt-4o-mini', messages: [{ role: 'user', content: 'hi' }] },
+      fallbacks: [{ ref: { keyId: 'key_b', modelId: 'gpt-4o-mini' } }],
+    });
+    expect(skipped.text).toBe('from B');
+    expect(skipped.fallbackTrace).toEqual([
+      { keyId: 'key_a', modelId: 'gpt-4o-mini', reason: expect.stringContaining('circuit-open') },
+    ]);
+    expect(aCallsOf(fetchMock)).toHaveLength(aCallsAfterProbe); // A 零新出站
+  });
+
+  it('overflow / schema(4xx other) 族不计数：4 次 eligible + 溢出 + 4xx 仍 closed，第 5 次 eligible 才开断', async () => {
+    await seedConfig();
+    let aMode: 'quota' | 'overflow' | 'badshape' = 'quota';
+    const fetchMock = urlRoutingFetch({
+      'https://a.example.com/v1': () => {
+        if (aMode === 'overflow') {
+          return errorResponse(400, "This model's maximum context length is 8192 tokens. code: context_length_exceeded");
+        }
+        if (aMode === 'badshape') return errorResponse(400, 'invalid request shape');
+        return errorResponse(429, 'rate limited');
+      },
+      'https://b.example.com/v1': () => openAiTextResponse('from B'),
+    });
+    globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch;
+
+    for (let i = 0; i < BREAKER_THRESHOLD - 1; i += 1) await failOnceNoChain();
+
+    // 溢出：直抛保标记，不计数。
+    aMode = 'overflow';
+    await expect(
+      handleGenerateText({
+        ref: { keyId: 'key_a', modelId: 'gpt-4o-mini' },
+        request: { model: 'gpt-4o-mini', messages: [{ role: 'user', content: 'hi' }] },
+      }),
+    ).rejects.toBeInstanceOf(ProtocolContextOverflowError);
+    // 请求内禀 4xx（other）：同样不计数。
+    aMode = 'badshape';
+    await expect(
+      handleGenerateText({
+        ref: { keyId: 'key_a', modelId: 'gpt-4o-mini' },
+        request: { model: 'gpt-4o-mini', messages: [{ role: 'user', content: 'hi' }] },
+      }),
+    ).rejects.satisfy((e: unknown) => e instanceof ProtocolHttpError && (e as ProtocolHttpError).status === 400);
+
+    expect(peekBreakerState('key_a', 'gpt-4o-mini').openedAt).toBeUndefined();
+    expect(peekBreakerState('key_a', 'gpt-4o-mini').failures).toHaveLength(BREAKER_THRESHOLD - 1);
+
+    // 第 5 次 eligible（quota）→ 开断；下一次链式调用跳 A。
+    aMode = 'quota';
+    await failOnceNoChain();
+    expect(peekBreakerState('key_a', 'gpt-4o-mini').openedAt).toBe(t);
+    const skipped = await handleGenerateText({
+      ref: { keyId: 'key_a', modelId: 'gpt-4o-mini' },
+      request: { model: 'gpt-4o-mini', messages: [{ role: 'user', content: 'hi' }] },
+      fallbacks: [{ ref: { keyId: 'key_b', modelId: 'gpt-4o-mini' } }],
+    });
+    expect(skipped.text).toBe('from B');
+    expect(skipped.fallbackTrace).toEqual([
+      { keyId: 'key_a', modelId: 'gpt-4o-mini', reason: expect.stringContaining('circuit-open') },
+    ]);
+  });
+
+  it('producedDelta 直抛不计数（流式）：已产 delta 的中断失败烧不 open 断路器，A 照常被尝试', async () => {
+    await seedConfig(ANTH_TWO_KEY_CONFIG);
+    // A 每次流吐一个 delta 后断流（premature close → producedDelta 门 → 原样直抛）。
+    const partialChunks = [
+      anthEvent('message_start', { message: { usage: { input_tokens: 3 } } }),
+      anthEvent('content_block_start', { index: 0, content_block: { type: 'text', text: '' } }),
+      anthEvent('content_block_delta', { index: 0, delta: { type: 'text_delta', text: 'partial' } }),
+      // message_stop deliberately absent
+    ];
+    const fetchMock = urlRoutingFetch({
+      'https://anth-a.example.com': () => sseResponse(partialChunks),
+      'https://anth-b.example.com': () => sseResponse(completeAnthStream('should not be reached')),
+    });
+    globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch;
+
+    for (let i = 0; i < BREAKER_THRESHOLD + 1; i += 1) {
+      t += 1_000;
+      await expect(
+        handleGenerateTextStream(
+          {
+            ref: { keyId: 'key_a', modelId: 'claude-3-5-sonnet-latest' },
+            request: { model: 'claude-3-5-sonnet-latest', messages: [{ role: 'user', content: 'hi' }] },
+            fallbacks: [{ ref: { keyId: 'key_b', modelId: 'claude-3-5-sonnet-latest' } }],
+          },
+          undefined,
+          () => {},
+        ),
+      ).rejects.satisfy((e: unknown) => (e as Error).name === 'StreamInterruptedError');
+    }
+
+    // 阈值 +1 次中断后仍 closed、零计数——内容已流出的失败不是 provider 健康信号。
+    expect(peekBreakerState('key_a', 'claude-3-5-sonnet-latest').openedAt).toBeUndefined();
+    expect(peekBreakerState('key_a', 'claude-3-5-sonnet-latest').failures).toHaveLength(0);
+    // A 每次都被真实尝试（未被跳；anth-a 前缀——本 describe 的 aCallsOf 过滤 openai 面）。
+    const anthACalls = (fetchMock.mock.calls as unknown as unknown[][]).filter(([url]) =>
+      String(url).startsWith('https://anth-a.example.com'),
+    );
+    expect(anthACalls.length).toBeGreaterThanOrEqual(BREAKER_THRESHOLD + 1);
+  });
+
+  it('per-(keyId, modelId) 隔离：key_a/gpt-4o-mini 开断不影响 key_b 出站（不同身份各态各记）', async () => {
+    await seedConfig();
+    const fetchMock = urlRoutingFetch({
+      'https://a.example.com/v1': () => errorResponse(429, 'rate limited'),
+      'https://b.example.com/v1': () => openAiTextResponse('from B solo'),
+    });
+    globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch;
+
+    await driveOpen();
+    expect(peekBreakerState('key_a', 'gpt-4o-mini').openedAt).toBeDefined();
+
+    // key_b 直通照常出站（B 的身份无失败记录）。
+    const solo = await handleGenerateText({
+      ref: { keyId: 'key_b', modelId: 'gpt-4o-mini' },
+      request: { model: 'gpt-4o-mini', messages: [{ role: 'user', content: 'hi' }] },
+    });
+    expect(solo.text).toBe('from B solo');
+    expect(peekBreakerState('key_b', 'gpt-4o-mini').openedAt).toBeUndefined();
+    // B 成功关断 no-op：状态键不残留失败计数。
+    expect(peekBreakerState('key_b', 'gpt-4o-mini').failures).toHaveLength(0);
+  });
+
+  it('CR-16：全条目 circuit-open → 尽链抛 FallbackChainExhaustedError 且 trace 全为 circuit-open 行（零出站）', async () => {
+    await seedConfig();
+    // 先用全败 mock 打满双身份阈值（429/503 均 eligible）。
+    const failing = urlRoutingFetch({
+      'https://a.example.com/v1': () => errorResponse(429, 'rate limited'),
+      'https://b.example.com/v1': () => errorResponse(503, 'upstream dead'),
+    });
+    globalThis.fetch = failing as unknown as typeof globalThis.fetch;
+
+    await driveOpen(); // key_a/gpt-4o-mini 开断
+    expect(peekBreakerState('key_a', 'gpt-4o-mini').openedAt).toBeDefined();
+    // key_b 同模型不同键——身份隔离，须单独打满阈值（镜像 driveOpen，键名不同）。
+    for (let i = 0; i < BREAKER_THRESHOLD; i += 1) {
+      t += 1_000;
+      await handleGenerateText({
+        ref: { keyId: 'key_b', modelId: 'gpt-4o-mini' },
+        request: { model: 'gpt-4o-mini', messages: [{ role: 'user', content: 'hi' }] },
+      }).catch(() => undefined);
+    }
+    expect(peekBreakerState('key_b', 'gpt-4o-mini').openedAt).toBeDefined();
+
+    // 换零出站桩：链式调用须全条目被跳，验证「零出站」。
+    const fetchMock = vi.fn(async () => openAiTextResponse('should not be reached'));
+    globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch;
+
+    const err: unknown = await handleGenerateText({
+      ref: { keyId: 'key_a', modelId: 'gpt-4o-mini' },
+      request: { model: 'gpt-4o-mini', messages: [{ role: 'user', content: 'hi' }] },
+      fallbacks: [{ ref: { keyId: 'key_b', modelId: 'gpt-4o-mini' } }],
+    }).then(
+      () => { throw new Error('expected rejection'); },
+      (e: unknown) => e,
+    );
+
+    // 链尽（含全部条目被跳）→ 环尾聚合错误，trace 逐条目 circuit-open 行。
+    expect(err).toBeInstanceOf(FallbackChainExhaustedError);
+    const exhausted = err as FallbackChainExhaustedError;
+    expect(exhausted.attempts.map((a) => [a.keyId, a.modelId])).toEqual([
+      ['key_a', 'gpt-4o-mini'],
+      ['key_b', 'gpt-4o-mini'],
+    ]);
+    for (const attempt of exhausted.attempts) {
+      expect(attempt.reason).toContain('circuit-open');
+    }
+    expect(exhausted.message).toContain('circuit-open');
+    // 全条目被跳——零出站。
+    expect(fetchMock).toHaveBeenCalledTimes(0);
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// C3.2 W3 预算硬线 × 回退环（CR-17，AC6 证据）：stub gate 返 blocked → 环首条目即抛
+// 不换家（'budget' ineligible——账户级问题换模型不救，链不烧）、A/B 双零出站、被拦
+// 调用如实落 budget 失败行（token NULL）。
+// ═════════════════════════════════════════════════════════════════════════════
+describe('budget gate blocked → fallback loop（CR-17 / AC6）', () => {
+  const records: GenerationCallRecord[] = [];
+
+  beforeEach(() => {
+    handle.mockReset();
+    _setModelConfigDirForTest(TEST_MODEL_DIR);
+    rmBestEffort(TEST_MODEL_DIR);
+    resolveImagePartsMock.mockImplementation(async (messages: unknown[]) => messages);
+    records.length = 0;
+    setGenerationUsageSink((r) => records.push(r));
+    setBudgetGate(() => ({ allowed: false, spentCny: 25, hardCapCny: 20 }));
+  });
+
+  afterEach(async () => {
+    setBudgetGate(undefined);
+    setGenerationUsageSink(undefined);
+    _setModelConfigDirForTest(null);
+    rmBestEffort(TEST_MODEL_DIR);
+    globalThis.fetch = ORIGINAL_FETCH;
+    resolveImagePartsMock.mockReset();
+    vi.restoreAllMocks();
+  });
+
+  it('gate 已拦：环首条目即抛 BudgetExceededError 不换家（B 零出站、链不烧）+ 恰一行 budget 失败账', async () => {
+    await seedConfig();
+    const fetchMock = urlRoutingFetch({
+      'https://a.example.com/v1': () => openAiTextResponse('blocked before request'),
+      'https://b.example.com/v1': () => openAiTextResponse('should not be reached'),
+    });
+    globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch;
+
+    const err: unknown = await handleGenerateText({
+      ref: { keyId: 'key_a', modelId: 'gpt-4o-mini' },
+      request: { model: 'gpt-4o-mini', messages: [{ role: 'user', content: 'hi' }] },
+      fallbacks: [{ ref: { keyId: 'key_b', modelId: 'gpt-4o-mini' } }],
+    }).then(
+      () => { throw new Error('expected rejection'); },
+      (e: unknown) => e,
+    );
+
+    expect(err).toBeInstanceOf(BudgetExceededError);
+    expect((err as BudgetExceededError).spentCny).toBe(25);
+    expect((err as BudgetExceededError).hardCapCny).toBe(20);
+    // A 零出站（门在请求发起前）、B 零出站（ineligible 直抛，链不推进）。
+    expect(fetchMock).not.toHaveBeenCalled();
+    // 被拦调用如实落账（失败不黑洞）：恰一行 budget 失败行，token 列全 ABSENT。
+    expect(records).toHaveLength(1);
+    expect(records[0]!.success).toBe(false);
+    expect(records[0]!.errorKind).toBe('budget');
+    expect('inputTokens' in records[0]!).toBe(false);
+    expect('totalTokens' in records[0]!).toBe(false);
   });
 });

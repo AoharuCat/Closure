@@ -115,6 +115,7 @@ function mkMaterial(derivedText: string): Material {
       lang: null,
       originDate: null,
       description: null,
+      url: null,
     },
     quality: {
       ok: true,

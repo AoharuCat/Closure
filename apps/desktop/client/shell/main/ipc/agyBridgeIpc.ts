@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { ipcMain } from 'electron';
+import { ipcMain, BrowserWindow } from 'electron';
 import os from 'node:os';
 import {
   AgyBridgeConsentRequiredError,
@@ -8,6 +8,9 @@ import {
   type AgyBridgeTurnFn,
   type BridgeTurnOutcome,
   type BridgeTurnRequest,
+  type ChainStreamEvent,
+  type ChildStreamEvent,
+  type WorkflowRuntime,
 } from '@orison/desktop-agent';
 import { runAgyBridgeTurn, BRIDGE_MCP_SERVER_NAME } from '@orison/model-protocols';
 import type {
@@ -76,6 +79,22 @@ export interface AgyBridgeProductionDeps {
    * 与 consent/管道/注册表零耦合。
    */
   homeRoot?: string | (() => string);
+  /**
+   * 09-20 F17 W0（桥车道工具对等 design §1.3）：本地执行缝 skillExecutor 取件——lazy 取
+   * agent 库 runtime 单例。生产值由 agentIpc 装配点注入（`getAgentRuntime` 在 agentIpc 内，
+   * 此处静态 import 会成 agyBridgeIpc → agentIpc 环——agentIpc → agyBridgeIpc 既有边，
+   * mirror deps.registry() 注入缝形态避环）。缺席 → 本地工具 ctx 省略 skillExecutor
+   * （工具 graceful 降级 "no runtime bound"，同 HTTP 车道 mock 语义）。测试注入 stub。
+   */
+  agentRuntime?: () => WorkflowRuntime;
+  /**
+   * 09-20 F17 W3（design §3）：chain/child 事件发送器的 webContents 句柄——发送器随
+   * `attachBridgeRecordEventSenders` 挂到桥会话记录，广播 `agent:stream-event`（mirror
+   * closureChainIpc makeChainEventSender 的窗口获取形态：懒解析，窗口重建由 getWin 兜底）。
+   * 生产值由 agentIpc 装配点注入（registerAgentIpc 的 getWin 参数）；缺席 → 发送器不挂
+   * （工具 ctx 省略事件通道，行为同现状）。测试注入 stub。
+   */
+  getWin?: () => BrowserWindow | null | undefined;
 }
 
 function depsRealHome(deps: AgyBridgeProductionDeps): string {
@@ -180,6 +199,49 @@ function isAbortLikeError(err: unknown): boolean {
   return err instanceof Error && err.name === 'AbortError';
 }
 
+// ── 09-20 F17 W3（design §3/§4-2）：桥会话记录的事件发送器 + 本地执行缝 runtime 注入 ──
+
+/**
+ * 把 chain/child 事件发送器与 skillExecutor 取件缝挂到桥会话记录上。装配落位说明
+ * （design §3「record 装配时注入——按 deps 缝就近落位」）：桥 turn 执行器（本文件
+ * createAgyBridgeTurnProduction）是 deps 与记录相遇的唯一缝——workflow 桥分支经
+ * runBridgeExecutor → 注入的 turn fn 走到这里，BridgeTurnRequest 无事件字段（协议层
+ * 契约），记录装配是认可落位。
+ *
+ * 发送器语义（mirror closureChainIpc makeChainEventSender + agentIpc sendEvent）：
+ *   - touch 桥会话 idle 续活（design §4-2）——链内事件不经管道，发送器内 touch 是
+ *     「30min 帧口径 idle 清扫误杀在途链」的第二道保险（第一道 = 本地工具执行起止 touch）；
+ *   - getWin 广播 `agent:stream-event`，载荷 {...event, sessionId, projectPath}——与
+ *     agent 车道同通道同载荷（workflow emitChainEvent → agentIpc sendEvent），写章链
+ *     进度/产物/节点卡按 record.sessionId 进 UI 时间线（键位与 HTTP 车道同），dispatch_* /
+ *     spawn_agent 的子 agent 组经 emitChildEvent 可见（dogfood R2 #3 同型缺口）。
+ * getWin 缺席 → 发送器置 undefined（工具 ctx 省略事件通道，优雅零事件——mirror
+ * makeChainEventSender 的 getWin 缺省返 undefined 形态）；agentRuntime 与窗口无关，
+ * 独立注入。
+ */
+export function attachBridgeRecordEventSenders(
+  record: BridgeSessionRecord,
+  deps: AgyBridgeProductionDeps,
+): void {
+  const getWin = deps.getWin;
+  const send = (event: ChainStreamEvent | ChildStreamEvent): void => {
+    record.lastActivityAt = Date.now(); // idle 续活（design §4-2）
+    if (getWin === undefined) return;
+    try {
+      getWin()?.webContents.send('agent:stream-event', {
+        ...event,
+        sessionId: record.sessionId,
+        projectPath: record.projectDir,
+      });
+    } catch {
+      // Window may have been closed（mirror agentIpc sendEvent / makeChainEventSender 守卫）
+    }
+  };
+  record.emitChainEvent = getWin !== undefined ? send : undefined;
+  record.emitChildEvent = getWin !== undefined ? send : undefined;
+  record.agentRuntime = deps.agentRuntime;
+}
+
 /**
  * 桥 turn 执行生产实现。consent 硬门（CR-27）三态全拦——lane resolver 的 declined 降级
  * 只是第一道；直接调 seam（未来其他调用方）也拦在门口，declined 用户选择零绕过面。
@@ -236,6 +298,12 @@ export function createAgyBridgeTurnProduction(deps: AgyBridgeProductionDeps): Ag
     // last-writer-wins 单槽，无主互斥则先退 turn 的 finally 会清掉后到 turn 的监听。
     // 每次 turn 持唯一 token；finally 只清理自己那份（owner 比对后清理）。
     const callOwner = randomUUID();
+    // 09-20 F17 W3（design §3）：chain/child 事件发送器 + 本地执行缝 runtime 挂记录——
+    // 每次 turn 重挂（幂等；deps getter 形态保持最新），本地工具（write_chapter 整链 /
+    // dispatch_* 子代理）在 turn 内经管道 call 帧执行时从记录取事件通道与 runtime。
+    if (record !== undefined) {
+      attachBridgeRecordEventSenders(record, deps);
+    }
     try {
       if (record !== undefined && listener !== undefined) {
         record.callOwner = callOwner;

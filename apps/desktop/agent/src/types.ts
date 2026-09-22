@@ -38,6 +38,42 @@ export interface SkillExecutorInvokeOptions {
   emitConfirmation?: (pending: PendingConfirmationState) => void;
 }
 
+// ── 09-21-subagent-bg-decouple（design §1.1）：后台子 agent 派发面类型 ──
+// 住 types.ts（base 层）避免 runtime/bgTasks ↔ types 循环；BgTaskRegistry 消费同型。
+
+/** spawn_agent_bg 的结果送达通道（R3 三通道；缺省 toast——chat-fatigue 防护 + 摘要段兜底不丢）。 */
+export type BgNotifyChannel = 'toast' | 'wake' | 'silent';
+
+/** spawn_agent_bg 立返句柄（<1s：登记 + child session + promise 起飞，不等首 LLM 帧）。 */
+export interface BgTaskHandle {
+  taskId: string;
+  childSessionId: string;
+  role: string;
+  status: 'running';
+}
+
+/**
+ * 09-21-subagent-bg-decouple W2（design §3.1 / R3）：后台任务终态事件载荷（`bg-update` 变体）。
+ * 任务到达终态（completed/failed/aborted）时发一次（运行中不发——起点可见由 child started 事件兜底）。
+ * `notify` 通道随载荷携带：UI 按 notify 决定呈现（toast/wake → 通知 + 任务条终态；silent → 只刷任务条
+ * 不出通知——「只记账不通知」的呈现裁量在消费面）。additive：既有消费者不认识照旧忽略；UI 消费面
+ * （后台任务条 + toast）归 W4。
+ */
+export interface BgTaskUpdateEventData {
+  taskId: string;
+  /** 子会话 id（钻取检视入口 + 计量归因键）。 */
+  childSessionId: string;
+  role: string;
+  status: 'completed' | 'failed' | 'aborted';
+  /** 派发 prompt 首 120 字（mirror registry promptDigest——通知/任务条文案用，不存全量）。 */
+  digest: string;
+  notify: BgNotifyChannel;
+  /** 派发时刻（CR-14：registry 行值）——UI 首知即终态场景耗时显示不塌缩为 ~0s。 */
+  startedAt: number;
+  /** 仅 failed 携带（错误摘要）。 */
+  error?: string;
+}
+
 export interface SkillExecutorRef {
   loadSkill?(sessionId: string, skillName: string): Promise<NormalizedSkill | undefined>;
   executeSkillByName(
@@ -78,6 +114,25 @@ export interface SkillExecutorRef {
     vars: Record<string, string>,
     options?: SkillExecutorInvokeOptions & { allowedTools?: string[] },
   ): Promise<{ content: string }>;
+  /**
+   * 09-21-subagent-bg-decouple（design §1.2 / R1）：后台子 agent 派发 seam——spawn_agent_bg 工具
+   * 经此立返句柄（不等子 agent 跑完）。与 runSubagent 同一条 child runLoop 路径（createChildSession
+   * + narrowPermission + .md 契约 allowedTools），差异：调用方不 await（结果经 BgTaskRegistry 送达）、
+   * finally 豁免 evictSession（子会话保留可检视）、子 run 走自身 sessionId 的 beginRun 生命周期
+   * （abort-run 既有通道可停）、独立 AbortController 不透传 leader turn 的 ctx.abort（design §2）。
+   *
+   * optional（mirror loadSkill?）——旧 runtime / 测试 mock 未实现时工具层 graceful 降级。
+   *
+   * @param options.spawnDepth 入口 spawnDepth（leader→子 agent depth+1，深度闸照用）。
+   * @param options.notify 结果送达通道（缺省 'toast'；消费面在 W2）。
+   * @returns BgTaskHandle（taskId / childSessionId / role / status:'running'）——同步返回。
+   */
+  runSubagentBackground?(
+    parentSessionId: string,
+    role: string,
+    prompt: string,
+    options?: { spawnDepth?: number; notify?: BgNotifyChannel },
+  ): BgTaskHandle;
   /**
    * Story 4.0：leader `write_chapter` tool 经此派发写章战术链段（design §4.7/§4.8 / implement.md 6.1）。
    * runtime（WorkflowRuntime）实现此方法（Step 5.2 已建）；leader runLoop 的 tool ctx.skillExecutor 即
@@ -605,8 +660,13 @@ export interface SessionMessage {
    * 信号快照，turn 开始 diff 追加在消息尾）。同族语义：非作者发言 + jsonl 落盘审计 + kind
    * 不进模型（messagesToPayload 只看 role/content）。区别：UI 对此 kind **静默**（不渲染
    * 普通气泡——它是给 LLM 的状态广播，非对话内容）。
+   *
+   * 09-21-subagent-bg-decouple（design §3.2，W2 消费）：'bg_completed_event' = 后台子 agent
+   * 完成（wake 通道排队 flush 后）合成事件回注——role 是 'user'（该轮 user 侧输入即此事件），
+   * kind 标记「非作者发言」（同 chain_completed_event 族：jsonl 落盘可审计 + 不进模型 payload）。
+   * W1 先扩词表（additive），生产写入点在 W2 notifyLeaderEvent bg 分支。
    */
-  kind?: 'intent_restate' | 'aborted_partial' | 'chain_completed_event' | 'session_state_note';
+  kind?: 'intent_restate' | 'aborted_partial' | 'chain_completed_event' | 'session_state_note' | 'bg_completed_event';
   /**
    * dogfood T1（#27② / design §6.3）：深度思考全文（终帧聚合值，与 delta 流独立）。
    * additive optional——旧 JSONL 无字段读回 undefined 零迁移。持久化 + 展示；
@@ -711,7 +771,11 @@ export type RuntimeEventPayload =
   // 09-12 子5 R6（design §11）：leader 会话上下文占用快照——runLoop 每步 prepareContext
   // 落定后经 onContextUsage 发射（streamMessage 装配接线 sendEvent）。additive：既有消费者
   // 不认识照旧忽略。
-  | { type: 'context-usage'; data: ContextUsageEventData };
+  | { type: 'context-usage'; data: ContextUsageEventData }
+  // 09-21-subagent-bg-decouple W2（design §3.1 / R3）：后台任务终态事件（completed/failed/aborted
+  // 任意终态各发一次；运行中不发）。经 onRuntimeEvent 泵广播（载荷带 parent leader sid，data 内
+  // 携 childSessionId）。additive：既有消费者不认识照旧忽略；UI 消费面归 W4。
+  | { type: 'bg-update'; data: BgTaskUpdateEventData };
 
 export type RuntimeStreamEvent = RuntimeEventPayload;
 

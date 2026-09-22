@@ -14,8 +14,12 @@ export type {
   // dogfood R2 #93：resume 续链完成回注 payload（shell closureChainIpc 组装后传
   // runtime.notifyLeaderChainCompleted——类型经包出口单源，防 shell 侧平行声明漂移）。
   ChainCompletedEventPayload,
+  // 09-21-subagent-bg-decouple W2：泛化系统事件回注（runtime.notifyLeaderEvent bgInfo 参数型 +
+  // bg 完成事件渲染源——mirror ChainCompletedEventPayload 出口姿态）。
+  BgCompletedEventInfo,
+  BgPendingResultInfo,
 } from './runtime/workflow';
-export type { RuntimeStreamEvent, SessionState, SessionMessage, PendingConfirmationState, ConfirmationResolution, ChainStreamEvent, ChainNodeDeltaData, ChainNodeDoneData, ChainNodeDonePauseKind, ChainNodeArtifactSummary, ChainNodeArtifactFindingRow, ChainNodeArtifactData, ChainToolEventData } from './types';
+export type { RuntimeStreamEvent, SessionState, SessionMessage, PendingConfirmationState, ConfirmationResolution, ChainStreamEvent, ChainNodeDeltaData, ChainNodeDoneData, ChainNodeDonePauseKind, ChainNodeArtifactSummary, ChainNodeArtifactFindingRow, ChainNodeArtifactData, ChainToolEventData, BgTaskUpdateEventData } from './types';
 // dogfood T1 Stage 6（链节点流式）：CHAIN_RUN_SENTINEL_NODE_ID = 链 run 级终态帧的哨兵 nodeId
 //（chain-node-done 的 data.nodeId === 本值时 status 为 run 终态）。UI / 测试消费同一单源。
 export { CHAIN_RUN_SENTINEL_NODE_ID } from './types';
@@ -29,12 +33,16 @@ export { setGenerateTextFn } from './provider/ipc-provider';
 // setAgyBridgeModeResolver，mirror setGenerateTextFn——shell agentIpc 装配，wiring 测试钉死
 // 漏装配）+ executor + 面策展常量 + 类型化征询错误。类型（BridgeTurnRequest/Outcome 等）
 // 一并导出——shell 侧实现按本包导出类型编译，seam 不漂移。
+// C3.1 W2b：桥 turn 计量发射缝（setBridgeUsageSink——shell installUsageMeteringProduction
+// 同点装配 dispatchGenerationCallRecord 适配，B1 桥车道第 4 计量面；缺省 no-op 零行为）。
 export {
   setBridgeTurnFn,
   setAgyBridgeModeResolver,
+  setBridgeUsageSink,
   __clearBridgeSeamsForTest,
   __getAgyBridgeTurnFnForTest,
   __getAgyBridgeModeResolverForTest,
+  __getBridgeUsageSinkForTest,
   runBridgeExecutor,
   resolveAgyBridgeDialogueLane,
   bridgeFaceToolIds,
@@ -58,6 +66,8 @@ export type {
   AgyBridgeConsentAskState,
   AgyBridgeConsentErrorState,
   AgyBridgeLaneDecision,
+  BridgeUsageRecord,
+  BridgeUsageSink,
 } from './agent/bridgeExecutor';
 // 子4 W4：toolPolicy 三道闸函数上根导出——shell agyBridge 基座（三道闸重建，design §5.2）
 // 由 W2 的深导入切换为根导入（语义零变化；vitest alias 同步移除）。类型一并导出。
@@ -90,7 +100,11 @@ export { setTaskSlotResolver, resolveTaskModel, assignmentThinkingControl, assig
 // 装配时现取注入 runLoop.redlinePercent。readContextPolicy 一并导出供 shell 接线测试钉注入。
 export { setContextPolicyProvider, readContextPolicy } from './runtime/contextPolicy';
 export { registerBuiltinTools } from './tool/builtin';
-export { registry } from './tool/registry';
+export { registry, getLocalToolDefinition } from './tool/registry';
+// 09-20 F17 W0（桥车道工具对等 design §1.1/§1.3）：本地工具取件 + ToolContext 组装所需的
+// 类型导出——shell agyBridge 执行缝（executeBridgeToolCall 本地分支）按包导出类型编译，
+// 桥侧构造的 ctx 与 runLoop ctx（loop.ts:497-507 八字段基准）同源不漂移。
+export type { ToolContext, ChildStreamEvent, SkillExecutorRef } from './types';
 export { loadRuntimeConfig, listSkillPackages, setPackageEnabled, setSkillEnabled } from './runtime/config';
 export type { SkillPackageInfo, SkillsConfig } from './runtime/config';
 // Story 4.3 Step 3：deriveCheckpointPolicy + CheckpointPolicy 供 shell closureChainIpc / resumeChainIpc
@@ -123,3 +137,14 @@ export type { StyleSectionKey } from './tool/style-card';
 export { getLintEngine, aggregateFullReport, type LintEngine } from './lint/lintEngine';
 export { writeLintChapterLedger, lintChapterLedgerPath } from './lint/lintLedger';
 export { projectLintReportForL2, LINT_L2_FINDING_LIMITS } from './lint/lintL2Signal';
+// 09-21-subagent-bg-decouple W1：后台任务注册表面——shell W3 接线消费（启动对账
+// getBgTaskRegistry().reconcileInterrupted / 项目级级联 cancelBgTasksForProject；mirror
+// deriveCheckpointPolicy 的 shell→agent 导出姿态：能力面单源在 agent 包，shell 只做挂接）。
+export {
+  getBgTaskRegistry,
+  cancelBgTasksForParent,
+  cancelBgTasksForProject,
+  MAX_BG_PER_PROJECT,
+  BgCapacityError,
+} from './runtime/bgTasks';
+export type { BgTaskRecord, BgTaskOutcome, BgTaskStatus } from './runtime/bgTasks';

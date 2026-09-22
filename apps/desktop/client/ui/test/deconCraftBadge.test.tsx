@@ -6,6 +6,8 @@
  *   + 书名缺省回落无书名形；教程主张（absent / doc_claim）不显徽章（10.2 既有视觉零 churn）。
  *   （CR-26：openCraftForCard 死接线已删——拆书页跳转统一走 material 级
  *   openCraftForMaterial，归 deconPage.test 手艺卡跳转区用例。）
+ * - 来源三级徽章（E10.4 W3）：originTier 三色（community/criticism/original）渲染矩阵 +
+ *   缺席不显示（unspecified/旧行零迁移，含 decon 讲法无 tier——m6）+ 与 originKind 徽章并列同位。
  *
  * mock 形态照 spec/ui/testing.md + craftPage.test.tsx 谱。
  */
@@ -153,5 +155,85 @@ describe('来源徽章（originKind additive）', () => {
       render(<CraftPage />);
     });
     expect(document.querySelector('[data-craft-origin]')).toBeNull();
+  });
+});
+
+describe('来源三级徽章（originTier additive——E10.4 W3）', () => {
+  /** 真 store 跨测试存续——每个用例先清遗留详情（不清则 loadCraftCard 守卫短路不重拉）。 */
+  function resetStore(): void {
+    useAppStore.setState({
+      currentProject: null,
+      resolvedLocale: 'zh-CN',
+      mainView: 'page',
+      activePage: 'craft',
+      agentPanelOpen: false,
+      craftCardDetailId: 'card-aaaaaaaaaaaa',
+      craftCardDetail: null,
+      craftCardDetailLoading: false,
+      craftCardDetailError: null,
+    } as any);
+  }
+
+  it('三值渲染：community/criticism/original 各显徽章 + 与 originKind 徽章并列同位', async () => {
+    getCardSpy.mockResolvedValue(
+      deconCardFixture([
+        teachingFixture({ teachingId: 'tea-tier111111111', originTier: 'community' }),
+        teachingFixture({ teachingId: 'tea-tier222222222', originTier: 'criticism' }),
+        teachingFixture({ teachingId: 'tea-tier333333333', originTier: 'original' }),
+        teachingFixture({
+          teachingId: 'tea-tier444444444',
+          originKind: 'decon_instance',
+          bookTitle: '灵气复苏',
+          originTier: 'community',
+        }),
+      ]),
+    );
+    resetStore();
+    await act(async () => {
+      render(<CraftPage />);
+    });
+    expect(
+      query('[data-craft-teaching="tea-tier111111111"] [data-craft-origin-tier="community"]').textContent,
+    ).toBe('craft.card.tierCommunity');
+    expect(
+      query('[data-craft-teaching="tea-tier222222222"] [data-craft-origin-tier="criticism"]').textContent,
+    ).toBe('craft.card.tierCriticism');
+    expect(
+      query('[data-craft-teaching="tea-tier333333333"] [data-craft-origin-tier="original"]').textContent,
+    ).toBe('craft.card.tierOriginal');
+    // CR-16 三色 class 钉死：original=muted（中性事实非成功态，不用 --ok）/ community=info /
+    // criticism=amber。
+    expect(query('[data-craft-teaching="tea-tier111111111"] [data-craft-origin-tier="community"]').className).toContain(
+      'materials-badge--info',
+    );
+    expect(query('[data-craft-teaching="tea-tier222222222"] [data-craft-origin-tier="criticism"]').className).toContain(
+      'materials-badge--amber',
+    );
+    expect(query('[data-craft-teaching="tea-tier333333333"] [data-craft-origin-tier="original"]').className).toContain(
+      'materials-badge--muted',
+    );
+    expect(query('[data-craft-teaching="tea-tier333333333"] [data-craft-origin-tier="original"]').className).not.toContain(
+      'materials-badge--ok',
+    );
+    // 并列同位：同一讲法行 originKind 徽章与 tier 徽章并存。
+    const row = query('[data-craft-teaching="tea-tier444444444"]');
+    expect(row.querySelector('[data-craft-origin="decon_instance"]')).not.toBeNull();
+    expect(row.querySelector('[data-craft-origin-tier="community"]')).not.toBeNull();
+  });
+
+  it('缺席不显示：旧行（absent）/ doc_claim / decon 讲法无 tier → 零 tier 徽章（旧行零迁移——m6）', async () => {
+    getCardSpy.mockResolvedValue(
+      deconCardFixture([
+        teachingFixture({ teachingId: 'tea-legacy2222222' }), // 旧行 absent
+        teachingFixture({ teachingId: 'tea-doc2222222222', originKind: 'doc_claim' }), // 教程主张无 tier
+        // decon 讲法无 tier（m6——拆书管线零改动，originKind 徽章已是 decon 来源标记）。
+        teachingFixture({ teachingId: 'tea-decon3333333', originKind: 'decon_instance', bookTitle: null }),
+      ]),
+    );
+    resetStore();
+    await act(async () => {
+      render(<CraftPage />);
+    });
+    expect(document.querySelector('[data-craft-origin-tier]')).toBeNull();
   });
 });

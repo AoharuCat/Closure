@@ -42,6 +42,7 @@ logs/
 !.claude/skills
 .claude/skills/*
 !.claude/skills/closure-code-review/
+!.claude/skills/daytime-runner/
 
 # ── Local working drafts (plans / reviews / specs) — not version-controlled ──
 .scratch/

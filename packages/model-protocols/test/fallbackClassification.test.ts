@@ -5,6 +5,7 @@ import type { ResolvedModel } from '@orison/shared-contracts';
 // barrel-importing suite.
 import {
   classifyGenerationFailure,
+  CircuitOpenError,
   FallbackChainExhaustedError,
   ProtocolCapabilityError,
   ProtocolContextOverflowError,
@@ -151,6 +152,17 @@ describe('classifyGenerationFailure (fallback chain, design §3)', () => {
       .toMatchObject({ eligible: false, kind: 'schema' });
     expect(classifyGenerationFailure(new ProtocolNotImplementedError('path not implemented')))
       .toMatchObject({ eligible: false, kind: 'schema' });
+  });
+
+  it('circuit-open: CircuitOpenError → ineligible（C3.2 W1：网关自判的本地拒呼，链不烧、消息带剩余冷却秒）', () => {
+    const err = new CircuitOpenError('key_a', 'gpt-4o-mini', 42_300);
+    expect(err.name).toBe('CircuitOpenError');
+    expect(err.message).toContain('[key_a/gpt-4o-mini]');
+    expect(err.message).toContain('43s left'); // Math.ceil(42.3) — 面向人的向上取整
+    expect(classifyGenerationFailure(err)).toMatchObject({ eligible: false, kind: 'circuit-open' });
+    // 即便剩余冷却读作整数秒的形态也同归类。
+    expect(classifyGenerationFailure(new CircuitOpenError('k', 'm', 60_000)))
+      .toMatchObject({ eligible: false, kind: 'circuit-open' });
   });
 
   it('program row: an onDelta consumer throw survives the streaming catch chain tagged → ineligible program', async () => {

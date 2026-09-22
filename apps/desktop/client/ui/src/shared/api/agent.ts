@@ -121,6 +121,14 @@ export type AgentSessionMeta = {
   permissionMode?: AgentMode;
   /** Story 3.1: persisted leader behavior mode (normal/discuss/plan). */
   behaviorMode?: AgentBehaviorMode;
+  /**
+   * W4（09-21-subagent-bg-decouple U6）：会话角色（IPC additive——SessionMeta 既有字段
+   * 首次透出）。'child' 行已被 shell `agent:list-sessions` 默认过滤，本字段在 UI 侧是
+   * 防御面（auto-resume 守卫消费——isPrimaryListableSession 住 projectRunBusy，见其注）。
+   */
+  sessionRole?: 'primary' | 'child' | 'fork';
+  /** W4：agent 名（链 stub parent 过滤的 UI 侧防御判据——mirror shell isListableSession）。 */
+  agentName?: string;
 };
 
 export type AgentChildStreamEvent = {
@@ -212,6 +220,26 @@ export type AgentStreamEvent =
         notice: 'sendback' | 'sendback-missed' | 'soft-denied' | 'builtin-tool-started' | 'builtin-tool-denied';
         toolName?: string;
       };
+    }
+  /**
+   * W4（09-21-subagent-bg-decouple / W2 §3.1）：后台任务终态事件——任务到达终态时发一次
+   * （外层 sessionId = 派发方 parent sid；条目键取 data.childSessionId）。notify 随载荷携带，
+   * silent 不出 toast（呈现裁量在消费面）。additive：旧消费者忽略。
+   * 载荷 mirror 单源 = agent 包 types.ts BgTaskUpdateEventData。
+   */
+  | {
+      type: 'bg-update';
+      data: {
+        taskId: string;
+        childSessionId: string;
+        role: string;
+        status: 'completed' | 'failed' | 'aborted';
+        digest: string;
+        notify: 'toast' | 'wake' | 'silent';
+        /** 派发时刻（CR-14，agent 包 types.ts 同名字段镜像）——耗时显示防 ~0s 塌缩。 */
+        startedAt: number;
+        error?: string;
+      };
     };
 
 export type AgentSkillInfo = {
@@ -273,10 +301,18 @@ export async function fetchAgentSession(sessionId: string, projectPath?: string)
     messages: RawSessionMessage[];
     permissionMode?: AgentMode;
     behaviorMode?: AgentBehaviorMode;
-    /** Story 3.5: session-persisted participation gear + balanced/hands_off options. */
+    /**
+     * Story 3.5: session-persisted participation gear + balanced/hands_off options.
+     */
     participationGear?: ParticipationGear;
     balancedAskCategories?: BalancedAskCategory[];
     trustAdjudication?: boolean;
+    /**
+     * W4（09-21-subagent-bg-decouple）：会话角色 + 父会话（SessionState 既有字段首次被
+     * renderer 消费）——检视态标记（agentViewReadonly）与返回键（child → parent）推导源。
+     */
+    sessionRole?: 'primary' | 'child' | 'fork';
+    parentId?: string;
   } | null);
   if (!session) return session;
   return { ...session, messages: (session.messages ?? []).map(mapHistoryImagesToReferences) };
@@ -333,9 +369,35 @@ export function truncateAgentSession(sessionId: string, messageId: string) {
   return api.truncateAgentSession(sessionId, messageId) as Promise<TruncateSessionResult>;
 }
 
-export async function listAgentSessions(projectPath: string) {
-  const result = await api.listAgentSessions(projectPath) as { sessions: AgentSessionMeta[] };
+export async function listAgentSessions(projectPath: string, opts?: { includeAllRoles?: boolean }) {
+  const result = await api.listAgentSessions(projectPath, opts) as { sessions: AgentSessionMeta[] };
   return result.sessions;
+}
+
+/**
+ * W4（09-21-subagent-bg-decouple）：后台任务注册表行的 UI 镜像（agent 包 BgTaskRecord 的
+ * 消费子集——UI 只读呈现，不镜像 Zod 层）。'running' 行无 result；终态行 completed 携
+ * result.content（bg_task_result 领取面在 leader 工具侧，UI 不展示全文）。
+ */
+export type AgentBgTaskRecord = {
+  taskId: string;
+  parentSessionId: string;
+  childSessionId: string;
+  role: string;
+  projectPath: string;
+  promptDigest: string;
+  status: 'running' | 'completed' | 'failed' | 'aborted' | 'interrupted';
+  startedAt: number;
+  updatedAt: number;
+  notify: 'toast' | 'wake' | 'silent';
+  result?: { content: string };
+  error?: string;
+  claimed?: boolean;
+};
+
+/** W4：后台任务注册表只读查询（`agent:bg-tasks`）——后台任务条 hydrate 数据源。 */
+export async function listAgentBgTasks(projectPath: string): Promise<{ tasks: AgentBgTaskRecord[] }> {
+  return api.listAgentBgTasks(projectPath) as Promise<{ tasks: AgentBgTaskRecord[] }>;
 }
 
 export async function listAgentSkills(projectPath: string) {
@@ -419,4 +481,9 @@ export function streamAgentMessage(
   attachments?: Attachment[],
 ): Promise<StreamAgentMessageResult> {
   return api.streamAgentMessage({ sessionId, content, attachments });
+}
+
+/** W4：后台任务取消（`agent:abort-run` 既有通道，child sid 键控）——组件经此收口（boundary rule）。 */
+export function abortAgentRun(sessionId: string): Promise<boolean> {
+  return api.abortAgentRun(sessionId);
 }

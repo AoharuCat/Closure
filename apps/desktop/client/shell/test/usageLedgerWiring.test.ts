@@ -44,6 +44,17 @@ vi.mock('electron', () => ({
 import { closeDb, getDb } from '../main/db/index';
 import { clearLedger, recentUsageLogs, usageByTaskSince } from '../main/db/llmUsageLedgerRepository';
 import { installUsageMeteringProduction, registerUsageIpc } from '../main/ipc/usageIpc';
+import { registerConfigIpc } from '../main/ipc/configIpc';
+import { handleGenerateImage } from '../main/ipc/modelGatewayIpc';
+// C3.1 W2b（B1 桥车道第 4 计量面）：真跑 agent 包桥 executor（fake bridge turn fn——
+// 零 agy / 零网络），钉 usageIpc 装配行 + 桥行落表端到端。
+import {
+  __clearBridgeSeamsForTest,
+  __getBridgeUsageSinkForTest,
+  runBridgeExecutor,
+  setBridgeTurnFn,
+} from '@orison/desktop-agent';
+import type { ModelConfig } from '@orison/shared-contracts';
 
 // better-sqlite3 ABI gate（mirror llmUsageLedgerRepository.test.ts）：plain-Node 下
 // skip 而非假红；Electron 真跑：
@@ -151,6 +162,7 @@ describe.skipIf(!sqliteUsable)('usage ledger 装配 + 行级端到端（09-12 us
   afterAll(() => {
     globalThis.fetch = ORIGINAL_FETCH;
     setGenerationUsageSink(undefined);
+    __clearBridgeSeamsForTest(); // C3.1 W2b：桥 seam（turn fn + usage sink）一并还原
     closeDb();
     rmBestEffort(TEST_HOME);
   });
@@ -242,5 +254,173 @@ describe.skipIf(!sqliteUsable)('usage ledger 装配 + 行级端到端（09-12 us
     expect(overview.recent[0]!.stream).toBe(true);
     // 空配置面（throwaway home 无模型配置）→ ¥ ABSENT。
     expect(overview.today.estimatedCost).toBeUndefined();
+  });
+
+  // ── C3.1 W3 装配扩断言：三新字段（callId/sessionId/imageCount）sink 已装时到达 record
+  // 并落库（列级断言走 SQL 直读；M3 后 UsageRecentCall 载荷亦含 imageCount——生图用例
+  // 末尾补 recent 载荷断言）。
+
+  it('C3.1：text 行 call_id + session_id 落列（ctx.callId 透传 + wire sessionId 归一 → sink 直传 → INSERT）', async () => {
+    installUsageMeteringProduction();
+    globalThis.fetch = vi.fn(async () => jsonResponse(OPENAI_COMPLETION));
+    await generateText(
+      openaiModel(),
+      { ...BASE_REQUEST, taskType: 'dialogue', sessionId: 'sess-ledger-e2e' },
+      { callId: 'call-ledger-e2e' },
+    );
+    expect(recentUsageLogs(10)).toHaveLength(1); // sink 已装、行真实落账
+    const row = getDb().prepare('SELECT call_id, session_id, task_type FROM closure_llm_log LIMIT 1').get() as {
+      call_id: string | null;
+      session_id: string | null;
+      task_type: string | null;
+    };
+    expect(row.call_id).toBe('call-ledger-e2e'); // ctx.callId 原值落列（无自生成覆盖）
+    expect(row.session_id).toBe('sess-ledger-e2e'); // wire sessionId 三跳贯通
+    expect(row.task_type).toBe('dialogue');
+  });
+
+  it('C3.1：生图经生产网关 handler（image-gen 标签）→ image_count 落列 + token 列如实全 NULL + call_id 网关生成非空（CR-6）', async () => {
+    installUsageMeteringProduction();
+    // 种子一个 image 能力模型（resolveModel 走 config:save-model 盘面——mirror fallback loop
+    // 测试的 seedConfig 形态）。
+    const imageConfig: ModelConfig = {
+      keys: [
+        {
+          id: 'k-img',
+          name: 'Image relay',
+          protocol: 'openai-compatible',
+          apiKey: 'sk-img',
+          baseUrl: 'https://img.example.com/v1',
+          models: [{ id: 'img-model', alias: 'Image', capability: 'image', enabled: true }],
+        },
+      ],
+    };
+    registerConfigIpc();
+    const saveCall = handle.mock.calls.find(([channel]) => channel === 'config:save-model');
+    await saveCall![1]({}, imageConfig);
+    globalThis.fetch = vi.fn(async () =>
+      jsonResponse({ data: [{ url: 'https://x/1.png' }, { url: 'https://x/2.png' }] }));
+
+    const res = await handleGenerateImage({
+      ref: { keyId: 'k-img', modelId: 'img-model' },
+      request: { model: 'img-model', prompt: 'a cat', n: 2 },
+    });
+    expect(res.images).toHaveLength(2); // 调用结果零变化
+
+    const row = getDb()
+      .prepare(
+        'SELECT task_type, image_count, input_tokens, output_tokens, total_tokens, call_id, success FROM closure_llm_log LIMIT 1',
+      )
+      .get() as {
+      task_type: string | null;
+      image_count: number | null;
+      input_tokens: number | null;
+      output_tokens: number | null;
+      total_tokens: number | null;
+      call_id: string | null;
+      success: number;
+    };
+    expect(row.task_type).toBe('image-gen'); // 网关 handler 单点标注（W3 接线）
+    expect(row.image_count).toBe(2); // D1 拍板：张数 = request.n ?? 1
+    expect(row.input_tokens).toBeNull(); // 图像 API 无 token 信号——如实全 NULL（CR-18）
+    expect(row.output_tokens).toBeNull();
+    expect(row.total_tokens).toBeNull();
+    expect(row.call_id).toBeTruthy(); // CR-6：网关 handler 回退环外生成 callId（mirror 文本两 handler 不变式，生成职责不在 wrapper 缺省分叉）
+    expect(row.success).toBe(1);
+
+    // C3.1 M3：张数三触点末端——recent 载荷（SELECT → rowToRecentCall →
+    // UsageRecentCall）携带 imageCount，token 列在载荷面同样 NULL。
+    const recentRow = recentUsageLogs(10)[0]!;
+    expect(recentRow.imageCount).toBe(2);
+    expect(recentRow.inputTokens).toBeNull();
+    expect(recentRow.totalTokens).toBeNull();
+  });
+
+  // ── C3.1 W2b（B1 桥车道第 4 计量面）：agent 包桥 turn settle 发射缝经本装配点落表。
+  // 真跑 runBridgeExecutor（fake bridge turn fn——零 agy / 零网络）；漏装 = 红（探针
+  // undefined——删除 installUsageMeteringProduction 内 setBridgeUsageSink 装配行即红，
+  // mirror agentIpcAgyBridgeWiring 的 CR-001 姿态）。
+
+  const BRIDGE_ABORT = new AbortController().signal;
+
+  type BridgeExecutorOpts = Parameters<typeof runBridgeExecutor>[0];
+
+  function bridgeExecutorOpts(overrides: Partial<BridgeExecutorOpts> = {}): BridgeExecutorOpts {
+    return {
+      sessionId: 'sess-bridge-e2e',
+      projectPath: 'C:/proj',
+      messages: [],
+      systemPrompt: 'SYSTEM',
+      tools: [],
+      modelRef: { keyId: 'k-cli', modelId: 'cli-model' },
+      sessionKey: 'dialogue:sess-bridge-e2e',
+      permissionMode: 'suggest',
+      behaviorMode: undefined,
+      taskType: 'bridge-dialogue',
+      abort: BRIDGE_ABORT,
+      onMessage: () => {},
+      ...overrides,
+    };
+  }
+
+  it('C3.1 W2b：桥车道装配（漏装=红探针）→ 桥 turn 成功行落表（protocol/taskType/sessionKey/sessionId/call_id/usage）', async () => {
+    installUsageMeteringProduction();
+    // 漏装 = 红：装配行删除 → 探针 undefined。
+    expect(__getBridgeUsageSinkForTest()).toBeDefined();
+    setBridgeTurnFn(async () => ({
+      text: '终文。',
+      usage: { promptTokens: 11, completionTokens: 7, totalTokens: 18 },
+      presentResultCalled: true,
+      presentResultAwaiting: false,
+      sentBack: false,
+      secondPassMissedPresentResult: false,
+      mcpSoftDenied: false,
+      bridgeToolCalls: 0,
+    }));
+    const messages = await runBridgeExecutor(bridgeExecutorOpts());
+    expect(messages.map((m) => m.role)).toEqual(['assistant']); // turn 结果零变化
+
+    const row = getDb()
+      .prepare(
+        `SELECT protocol, key_id, model_id, task_type, session_key, session_id, call_id,
+                stream, success, input_tokens, output_tokens, total_tokens, error_kind, latency_ms
+           FROM closure_llm_log`,
+      )
+      .get() as Record<string, unknown>;
+    expect(row.protocol).toBe('antigravity-cli'); // 桥行恒 CLI 协议
+    expect(row.key_id).toBe('k-cli');
+    expect(row.model_id).toBe('cli-model');
+    expect(row.task_type).toBe('bridge-dialogue'); // 装配点逐点标注（W2b 接线）
+    expect(row.session_key).toBe('dialogue:sess-bridge-e2e'); // 桥车道归因键照实
+    expect(row.session_id).toBe('sess-bridge-e2e');
+    expect(typeof row.call_id).toBe('string');
+    expect((row.call_id as string).length).toBeGreaterThan(0); // 每 turn 一枚
+    expect(row.stream).toBe(0);
+    expect(row.success).toBe(1);
+    expect(row.input_tokens).toBe(11); // usage 从桥 turn 结果如实映射
+    expect(row.output_tokens).toBe(7);
+    expect(row.total_tokens).toBe(18);
+    expect(row.error_kind).toBeNull();
+    expect(typeof row.latency_ms).toBe('number');
+  });
+
+  it('C3.1 W2b：桥 turn 失败行落表（HTTP 502 形态 → error_kind server；usage 未知 token 全 NULL）', async () => {
+    installUsageMeteringProduction();
+    setBridgeTurnFn(async () => {
+      throw Object.assign(new Error('agy bridge cycle failed'), { status: 502 });
+    });
+    await expect(runBridgeExecutor(bridgeExecutorOpts())).rejects.toThrow('agy bridge cycle failed');
+
+    const row = getDb()
+      .prepare(
+        'SELECT success, error_kind, error_message, input_tokens, total_tokens, task_type FROM closure_llm_log',
+      )
+      .get() as Record<string, unknown>;
+    expect(row.success).toBe(0);
+    expect(row.error_kind).toBe('server'); // mirror classifyGenerationFailure 词表
+    expect(row.error_message).toBe('agy bridge cycle failed');
+    expect(row.input_tokens).toBeNull(); // 失败 usage 未知 → NULL（CR-18 v2）
+    expect(row.total_tokens).toBeNull();
+    expect(row.task_type).toBe('bridge-dialogue');
   });
 });

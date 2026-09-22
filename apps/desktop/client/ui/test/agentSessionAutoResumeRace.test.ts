@@ -7,6 +7,10 @@ const apiMocks = vi.hoisted(() => ({
   deleteAgentSession: vi.fn(async () => true),
   listAgentSessions: vi.fn(),
   streamAgentMessage: vi.fn(async () => ({ status: 'completed' })),
+  // W4（09-21-subagent-bg-decouple）：slice 新增 IPC 依赖（部分 mock 工厂同步；缺导出 =
+  // 访问即抛的 vitest mock getter 假红）。isPrimaryListableSession 住 projectRunBusy（不 mock，
+  // 无需在此列）。
+  listAgentBgTasks: vi.fn(async () => ({ tasks: [] })),
 }));
 
 vi.mock('../src/shared/api/agent', () => apiMocks);

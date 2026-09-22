@@ -95,7 +95,7 @@ vi.mock('../main/ipc/agyBridge', () => ({
 }));
 vi.mock('../main/fs/agyTempSweep', () => ({ sweepStaleAgyTempSessionDirs: vi.fn() }));
 vi.mock('../main/ipc/agyBridgeIpc', () => ({ registerAgyBridgeIpc: vi.fn(), wasAgyBridgeUsed: () => false }));
-vi.mock('../main/ipc/usageIpc', () => ({ installUsageMeteringProduction: vi.fn(), registerUsageIpc: vi.fn() }));
+vi.mock('../main/ipc/usageIpc', () => ({ installUsageMeteringProduction: vi.fn(), installBudgetGateProduction: vi.fn(), registerUsageIpc: vi.fn() }));
 vi.mock('../main/db/llmUsageLedgerRepository', () => ({ pruneExpiredLedger: () => 0 }));
 vi.mock('../main/ipc/storySyncIpc', () => ({ registerStorySyncIpc: vi.fn() }));
 vi.mock('../main/ipc/taskIpc', () => ({ registerTaskIpc: vi.fn() }));

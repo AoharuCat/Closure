@@ -91,6 +91,12 @@ craft:
     # show the source book; doc claims (default/absent) show no badge.
     originDecon: "Book study: {book}"
     originDeconNoTitle: "Book study"
+    # Origin tier badge (E10.4 W3): teaching originTier in three colors (original muted /
+    # community info blue / criticism amber) — passed through from material provenance.tier;
+    # absent (unspecified/legacy rows) shows nothing.
+    tierOriginal: "Original"
+    tierCommunity: "Community"
+    tierCriticism: "Criticism"
     staleHint: "Source material changed/edited/deleted — quote snapshot remains valid, anchor may drift"
     anchorJump: "Open source at anchor"
     anchorHint: "Paragraph {para} · chars {chars} (derived .md base)"

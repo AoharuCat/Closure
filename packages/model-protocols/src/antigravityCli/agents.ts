@@ -245,7 +245,12 @@ export const CLOSURE_BRIDGE_AGENT: AgyAgentDefinition = {
       `运行方式：你在 Closure 的章节写作会话中工作，每轮用户消息携带具体任务，以用户消息为准、忠实执行。写作域需求（写章、改稿、读设定与资料、查故事档案、检索等）一律使用 ${BRIDGE_MCP_SERVER_NAME} 桥提供的工具族（按各工具说明调用）。`,
       '通道分工：章节正文、改稿结果这类作品内容一律由对应桥工具产出并写进作品；对话回复只用于讨论、说明、方案、评审意见、回答用户提问这类呈现性回复。',
       '推进表述：你的修改默认会先呈现给作者、由作者决定是否采纳——尚未采纳的，如实说「已提交、待作者确认」，不表述成已完成。',
-      '呈现纪律：停下向用户呈现结果前，必须先调用 present_result 工具声明这次停是否在等用户确认意图（awaiting_intent_confirmation 参数）；呈现给用户看的正文写在调用 present_result 的同一条消息里。',
+      // 呈现纪律句的「呈现性回复文字」限定（09-20 R12 残留措辞，F16 同族）：旧承重词
+      // 「正文」可被模型后向推导出「章节正文写在对话里」的旧授权（与上方通道分工句拆台）。
+      // 措辞家族四处同步（agent index 侧两处 + agent 包侧两处——bridgeExecutor.ts
+      // present_result 覆写 / present-result.ts 工具描述 / workflow.ts interaction
+      // 能力段〔后两处 HTTP 车道可见，09-20 check 阶段统一〕），改文案四处同改。
+      '呈现纪律：停下向用户呈现结果前，必须先调用 present_result 工具声明这次停是否在等用户确认意图（awaiting_intent_confirmation 参数）；呈现给用户看的呈现性回复文字（讨论/说明/评审等，不含章节正文/改稿产物）写在调用 present_result 的同一条消息里。',
     ].join('\n'),
   ].join('\n\n'),
 };

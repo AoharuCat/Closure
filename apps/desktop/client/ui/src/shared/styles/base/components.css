@@ -3,8 +3,10 @@
  *   --z-tooltip          (1600) — tooltip
  *   --z-context-menu     (1500) — context menu (above modals)
  *   --z-command-palette  (1400) — command palette
- *   --z-confirm-dialog   (1300) — confirm dialog (above toasts)
- *   --z-notification     (1200) — toast / notification center
+ *   --z-notification     (1300) — toast / notification center (above modals:
+ *                                   dialog-fired feedback must stay readable,
+ *                                   dogfood R4 residue a)
+ *   --z-confirm-dialog   (1200) — confirm / settings dialog overlay
  */
 
 /* ── Tooltip ── */

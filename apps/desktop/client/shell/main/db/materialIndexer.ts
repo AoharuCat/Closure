@@ -451,7 +451,9 @@ export function listMaterialRowsForLane(lane: MaterialLane): MaterialSummaryRow[
  * 〔Wave D 单行表单 / E10.2a 简介多行 + 标题〕）在重摄取时保留不清（mirror
  * worldStateRepository subject COALESCE CR-E2 + attachmentMeta derivedOf 不盲覆 CR-017）。
  * E10.2a〔F-03〕description 入列——不加则重摄取静默清掉用户后补的简介，正是该函数当年要防
- * 的事。管线事实字段（sourcePath/via/extractor/ingestedAt）恒取新值。
+ * 的事。E10.4〔P2〕url 第七字段入列——在线通道 reingest/重导入不清溯源 URL（漏加则 watcher
+ * 默认 provenance 重登记即清掉预填 url，正是该函数要防的事；本地文件材料两侧恒 null 无行为差）。
+ * 管线事实字段（sourcePath/via/extractor/ingestedAt）恒取新值。
  */
 function preserveCuratedProvenance(
   fresh: Material['provenance'],
@@ -467,6 +469,7 @@ function preserveCuratedProvenance(
     lang: old.lang ?? fresh.lang,
     originDate: old.originDate ?? fresh.originDate,
     description: old.description ?? fresh.description,
+    url: old.url ?? fresh.url,
   };
 }
 
@@ -654,6 +657,18 @@ export interface MaterialIndexerDeps {
   now?: () => Date;
   /** 绕过 content-hash skip（模型/维度迁移的 rebuild 授权路径）。 */
   force?: boolean;
+  /**
+   * E10.4 W2（P2 seam）：在线通道 provenance 预填——ingest 产物的 provenance 组装恒走缺省
+   * （medium='other'/tier='unspecified'/url=null，materialIngest 不查调用方意图），登记 upsert
+   * 前由本缝叠加（medium/tier/url/via/author/originDate）。与 preserveCuratedProvenance 的
+   * 分工：本缝改「本轮摄取产物」，COALESCE 守「既有行非空值」——重摄取时旧值（用户经 UI 后补
+   * 的策展值，或上次预填）优先于本缝预填，刻意（UI 后补 > 重导入预填）。
+   */
+  provenanceOverrides?: Partial<Material['provenance']>;
+  /** E10.4 W2：附加 parseNotes（截断标注等摄取后事实——best-effort，后续重摄取按解析面重建会冲掉；持久面 = 文件尾注 + IPC 回报行）。 */
+  extraParseNotes?: string[];
+  /** E10.4 W2：显示名覆写（页面标题——stem 是 URL 派生缺省名，标题作展示名）；既有行名策展防清照常（upsertMaterialRow name 规则）。 */
+  nameOverride?: string;
 }
 
 /** 缺省批量 embed：32 texts/批一次 generateEmbeddings 调用，结果按 input 序拼接。 */
@@ -661,7 +676,8 @@ async function defaultEmbedBatch(model: ResolvedModel, texts: string[]): Promise
   const out: number[][] = [];
   for (let i = 0; i < texts.length; i += MATERIAL_EMBED_BATCH_SIZE) {
     const slice = texts.slice(i, i + MATERIAL_EMBED_BATCH_SIZE);
-    const res = await generateEmbeddings(model, { input: slice }, { signal: AbortSignal.timeout(60_000) });
+    // C3.1 计量台账：拆书材料索引重嵌标签（每批 = 一行如实）。
+    const res = await generateEmbeddings(model, { input: slice }, { signal: AbortSignal.timeout(60_000), taskType: 'material-embed' });
     out.push(...res.embeddings);
   }
   return out;
@@ -737,6 +753,9 @@ function assembleFailedMaterial(
       // E10.2a：schema description 输出类型必含（default(null) 只豁免输入）——摄取期恒 null，
       // 与 author 三字段同型（UI 后补 + preserveCuratedProvenance 防清）。
       description: null,
+      // E10.4：url 同型（输出类型必含）——在线拉取通道经 provenanceOverrides 预填（W2），
+      // 本地文件/失败行恒 null。
+      url: null,
     },
     quality: {
       ok: false,
@@ -842,11 +861,31 @@ async function runRegisterMaterial(
     }
     return { outcome: 'rejected', reason: result.reason };
   }
-  upsertMaterialRow(result.material);
-  await runReindexMaterial(result.material.materialId, lane, deps);
+  // E10.4 W2（P2 seam）三面叠加（provenance 预填 / 显示名覆写 / 附加 notes）——都在 upsert
+  // 之前改「本轮摄取产物」，preserveCuratedProvenance 的既有值优先语义不受影响。
+  let material = result.material;
+  if (deps.provenanceOverrides !== undefined) {
+    // CR-11：显式 undefined 值过滤——spread 语义下 explicit undefined 会覆写已解析值落成
+    // undefined（Partial<> 形参面允许显式 undefined 键，条件展开调用面约定 absent ≠ 覆写）。
+    const overrides = Object.fromEntries(
+      Object.entries(deps.provenanceOverrides).filter(([, v]) => v !== undefined),
+    );
+    material = { ...material, provenance: { ...material.provenance, ...overrides } };
+  }
+  if (deps.nameOverride !== undefined && deps.nameOverride.length > 0) {
+    material = { ...material, name: deps.nameOverride };
+  }
+  if (deps.extraParseNotes !== undefined && deps.extraParseNotes.length > 0) {
+    material = {
+      ...material,
+      quality: { ...material.quality, parseNotes: [...material.quality.parseNotes, ...deps.extraParseNotes] },
+    };
+  }
+  upsertMaterialRow(material);
+  await runReindexMaterial(material.materialId, lane, deps);
   return {
     outcome: result.outcome === 'reused' ? 'reused' : 'registered',
-    materialId: result.material.materialId,
+    materialId: material.materialId,
   };
 }
 

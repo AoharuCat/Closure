@@ -92,10 +92,11 @@ export type RetrievalDeps = {
  * is available in Node 18+ / Electron.
  */
 async function defaultEmbed(model: ResolvedModel, text: string): Promise<number[]> {
+  // C3.1 计量台账：story KB 查询臂标签（与索引臂 kb-index-embed 区分——「检索 vs 重嵌」可分账）。
   const res = await generateEmbeddings(
     model,
     { input: [text] },
-    { signal: AbortSignal.timeout(30_000) },
+    { signal: AbortSignal.timeout(30_000), taskType: 'kb-query-embed' },
   );
   return res.embeddings[0] ?? [];
 }
@@ -595,6 +596,7 @@ export async function searchClosure(
     return await rerankCandidates(query, hits, k, {
       resolveModel: deps?.resolveRerankModel,
       rerank: deps?.rerank,
+      taskType: 'kb-rerank', // C3.1 计量台账：story KB 检索的 rerank 标签（craft 检索标 craft-rerank）
     });
   } catch (err) {
     // Best-effort: a sanitized FTS term should never produce a syntax error,
@@ -620,6 +622,7 @@ export async function searchClosure(
         return await rerankCandidates(query, retryHits, k, {
           resolveModel: deps?.resolveRerankModel,
           rerank: deps?.rerank,
+          taskType: 'kb-rerank',
         });
       } catch (err2) {
         getLogger().warn(

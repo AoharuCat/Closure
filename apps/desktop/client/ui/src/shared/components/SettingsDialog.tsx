@@ -32,7 +32,7 @@ const SETTINGS_PAGES: Array<{ id: SettingsPageId; icon: string; labelKey: string
 export function SettingsDialog({ onClose }: Props) {
   const {
     resolvedLocale, theme, setTheme, locale, setLocale,
-    modelConfig, setModelConfig,
+    modelConfig, setModelConfig, loadModelConfig,
     readingFontFamily, setReadingFontFamily,
     readingFontWeight, setReadingFontWeight,
     readingFontScale, setReadingFontScale,
@@ -54,7 +54,7 @@ export function SettingsDialog({ onClose }: Props) {
     resolvedLocale: s.resolvedLocale,
     theme: s.theme, setTheme: s.setTheme,
     locale: s.locale, setLocale: s.setLocale,
-    modelConfig: s.modelConfig, setModelConfig: s.setModelConfig,
+    modelConfig: s.modelConfig, setModelConfig: s.setModelConfig, loadModelConfig: s.loadModelConfig,
     readingFontFamily: s.readingFontFamily, setReadingFontFamily: s.setReadingFontFamily,
     readingFontWeight: s.readingFontWeight, setReadingFontWeight: s.setReadingFontWeight,
     readingFontScale: s.readingFontScale, setReadingFontScale: s.setReadingFontScale,
@@ -154,6 +154,7 @@ export function SettingsDialog({ onClose }: Props) {
             t={t}
             modelConfig={modelConfig}
             setModelConfig={setModelConfig}
+            reloadConfig={loadModelConfig}
           />
         );
       case 'kb-index':

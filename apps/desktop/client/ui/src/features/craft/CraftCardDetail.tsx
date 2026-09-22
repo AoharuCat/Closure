@@ -42,6 +42,18 @@ import { readFile } from '../../shared/api/filesystem';
 import { copyMaterialPath, getMaterialDetail } from '../../shared/api/materials';
 import { craftConfidenceTier, craftRankLabelKey, craftStatusBadgeKey } from './craftView';
 
+/**
+ * 来源三级徽章（E10.4 W3 additive）：讲法 originTier 三色——原作 muted（中性事实非成功态，
+ * CR-16：materials-badge--muted 与注释语义一致，不用 --ok 成功系）/ 社区 info 蓝 /
+ * 批评 amber 警示。缺席（unspecified 材料/旧行零迁移）不渲染徽章，与 originKind/bookTitle
+ * 徽章并列同位（讲法行 materials-cell 排）。
+ */
+const ORIGIN_TIER_BADGE: Record<NonNullable<CraftTeaching['originTier']>, { cls: string; labelKey: string }> = {
+  original: { cls: 'materials-badge--muted', labelKey: 'craft.card.tierOriginal' },
+  community: { cls: 'materials-badge--info', labelKey: 'craft.card.tierCommunity' },
+  criticism: { cls: 'materials-badge--amber', labelKey: 'craft.card.tierCriticism' },
+};
+
 /** 键盘字段草稿（points/scenarios/counterexamples 三列表 = textarea 每行一条 join '\n'）。 */
 type CardDraft = {
   title: string;
@@ -577,6 +589,16 @@ export function CraftCardDetail({ cardId }: { cardId: string }) {
                     {teaching.bookTitle != null && teaching.bookTitle.trim().length > 0
                       ? t('craft.card.originDecon', { book: teaching.bookTitle })
                       : t('craft.card.originDeconNoTitle')}
+                  </span>
+                )}
+                {/* 来源三级徽章（E10.4 W3 additive）：材料 provenance.tier 透传讲法——三色 +
+                    缺席不显示（unspecified/旧行零迁移），与 originKind/bookTitle 徽章并列同位。 */}
+                {teaching.originTier !== undefined && (
+                  <span
+                    className={`materials-badge ${ORIGIN_TIER_BADGE[teaching.originTier].cls}`}
+                    data-craft-origin-tier={teaching.originTier}
+                  >
+                    {t(ORIGIN_TIER_BADGE[teaching.originTier].labelKey)}
                   </span>
                 )}
                 {teaching.stale && (

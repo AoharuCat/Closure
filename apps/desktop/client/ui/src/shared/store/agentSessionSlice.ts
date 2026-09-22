@@ -57,8 +57,11 @@ import {
   rememberSessionProject,
   forgetSessionTrack,
   getSessionProject,
+  isSessionDeleted,
   type AgentRunState,
   type AgentRunStatePatch,
+  type AgentRunOutcome,
+  type AgentBgTaskView,
   type ModelFallbackNotice,
   type BridgeNotice,
   type ContextUsageSnapshot,
@@ -68,7 +71,8 @@ import { forgetChainRunBuffer } from './chainStreamBuffer';
 // 09-13 子3 W2：写作页运行时间线 + escalate findings 路由缓存（chainTimeline 模块持写入面，
 // 本 slice 只持字段 + 清理钩）。
 import { forgetChainTimeline, type ChainTimelineState, type EscalateFindingsEntry } from './chainTimeline';
-import { sameProjectPath, showRunBusyToast } from './projectRunBusy';
+import { sameProjectPath, showRunBusyToast, isPrimaryListableSession } from './projectRunBusy';
+import { listAgentBgTasks } from '../api/agent';
 
 const AGENT_MODE_KEY = 'agentMode';
 const VALID_MODES: AgentMode[] = ['readonly', 'suggest', 'auto'];
@@ -135,6 +139,9 @@ export function gearOptionsIfChanged(
 
 export type { AgentMessage, AgentSessionMeta };
 
+/** W4：interrupted 首开提示去重（每项目每次 app 运行至多一次；模块级——不随项目切换重置）。 */
+const interruptedToastShownByProject = new Set<string>();
+
 /**
  * 09-01 A3（inbox 附件上传）：上传/解析 chip 状态机相位（design §1.2 D-I）。
  * uploading（importFiles 拷入中）→ parsing（resolve 预解析/哈希中）→ ready（挂载完成，
@@ -190,6 +197,35 @@ export type AgentSessionSlice = {
 
   agentSessionId: string | null;
   agentMessages: AgentMessage[];
+  /**
+   * W4（09-21-subagent-bg-decouple §6.1 检视态）：当前视图是否为 bg 子会话（只读检视态）。
+   * switchAgentSession 从 fetch 回的 sessionRole 推导（SessionState 既有字段，renderer 此前
+   * 未消费）；newAgentSession / 切项目重置清。AgentInput 只读横幅 + sendAgentMessage 守卫
+   * （纵深防御）的判定源。
+   */
+  agentViewReadonly: boolean;
+  /** W4：当前视图会话角色（检视图顶部 role 标注；null = 无会话/草稿态）。 */
+  agentViewSessionRole: 'primary' | 'child' | 'fork' | null;
+  /**
+   * W4：检视图的父会话 id（child → parent 返回键目标；视图栈深 1——孙代 V1 不开）。
+   * 仅 agentViewSessionRole === 'child' 时有意义。
+   */
+  agentParentSessionId: string | null;
+  /** W4：返回键动作——回父会话（缺父时回落新会话草稿态）。 */
+  returnToParentSession: () => void;
+  /**
+   * W4（09-21-subagent-bg-decouple §6.2 U5）：后台任务条（键 = childSessionId；写入方
+   * agentEvents dispatcher——child lane 事件 / spawn_agent_bg 工具结果 metadata / bg-update
+   * 终态——本 slice 只持字段 + hydrate/清理）。**不注册项目重置清入 dispatcher 面**——
+   * resetAgentForProjectSwitch 显式清（项目切换后旧项目条目无渲染面）。
+   */
+  bgTasksByChildSession: Record<string, AgentBgTaskView>;
+  /**
+   * W4：后台任务注册表 hydrate（`agent:bg-tasks` IPC）——项目打开/面板挂载时拉全量行
+   * （running + 终态历史 + 重启后 interrupted 如实呈现，R7）。失败静默（事件面仍驱动条目）。
+   * interrupted 首开提示：每项目每次 app 运行至多一次 toast。
+   */
+  loadAgentBgTasks: () => Promise<void>;
   /**
    * dogfood R2 #11（findings #11⑤，2026-08-25）：跨组件直出信号——直出钮从消息正文
    * 底部挪到输入行（AgentInput），经此单调递增 tick 通知正在流式的 AgentMessageItem
@@ -292,6 +328,16 @@ export type AgentSessionSlice = {
   bridgeNoticesBySession: Record<string, BridgeNotice[]>;
 
   /**
+   * CR-09-20-dogfood-1（小残留 b 二次修）：per-session run 终态正向观测（写入方
+   * agentEvents done/error case + 本 slice cancelAgent 置 'aborted'）。sendAgentMessage
+   * 重置（键删除 = null）+ 随 deleteAgentSession 清（mirror bridgeNoticesBySession）；
+   * **不注册项目重置**（session 维度态跨项目切换存活，同族）。消费方 = AgentMessages
+   * 桥警示条结局收敛（settledOk）——run 终态正向观测，不读视图级 error（切走切回 /
+   * abort 回合均会误标成功）。
+   */
+  runOutcomeBySession: Record<string, AgentRunOutcome>;
+
+  /**
    * 09-12 子5 R6（design §11）：per-session leader 上下文占用 last 值（写入方
    * agentEvents 'context-usage' case，此 slice 只持字段）。会话重载后无事件 → 条隐藏
    *（MVP：首条消息后出现）；windowTokens null = 无窗口信息（AgentPanel 隐藏条）。
@@ -360,6 +406,10 @@ type Deps = AgentSessionSlice & {
 /**
  * r8 设计要点 2：「该项目任一会话在运行」选择器——NovelWorkbench / ChapterListPanel
  * 生成闸、ReviewFindingsCard 等 accept 闸消费（「有 run 在途勿动」语义）。
+ *
+ * W4（09-21-subagent-bg-decouple / W3 移交项①）：bg 子会话 run 态（sessionRole='child'，
+ * dispatcher bg 车道事件登记）**不进口径**——后台子 agent 与 leader 对话并存是本 task 的
+ * 目标态，子会话在场不得锁生成闸/输入面（设计 §9：isProjectRunActive 语义绑 leader）。
  */
 export function isProjectRunActive(
   s: { agentRunStates: Record<string, AgentRunState>; currentProject: { path?: string } | null },
@@ -367,7 +417,9 @@ export function isProjectRunActive(
   const projectPath = s.currentProject?.path;
   return Object.values(s.agentRunStates).some(
     // CR-T1-026：归一比较（分隔符/尾斜杠/盘符大小写漂移不再漏判/误判）。
-    (r) => r.phase === 'running' && (r.projectPath === undefined || sameProjectPath(r.projectPath, projectPath)),
+    (r) => r.phase === 'running'
+      && r.sessionRole !== 'child'
+      && (r.projectPath === undefined || sameProjectPath(r.projectPath, projectPath)),
   );
 }
 
@@ -781,6 +833,21 @@ export const createAgentSessionSlice: StateCreator<Deps, [], [], AgentSessionSli
   },
   agentSessionId: null,
   agentMessages: [],
+  // W4：检视态标记初始（无会话 = 非 readonly）。
+  agentViewReadonly: false,
+  agentViewSessionRole: null,
+  agentParentSessionId: null,
+  returnToParentSession: () => {
+    const parent = get().agentParentSessionId;
+    // CR-11：父会话已删（tombstone）→ 回落新会话草稿，不切进死会话（fetch 报错死胡同）；
+    // 切换失败（父在别端被删等竞态）同款回落（newAgentSession 顺带清 agentError 横幅）。
+    if (parent && !isSessionDeleted(parent)) {
+      void get().switchAgentSession(parent).catch(() => get().newAgentSession());
+      return;
+    }
+    void get().newAgentSession();
+  },
+  bgTasksByChildSession: {},
   // dogfood R2 #11⑤：输入行直出钮 → 流式消息拉满的跨组件信号（见类型注释）。
   streamRevealTick: 0,
   requestStreamReveal: () => set((s) => ({ streamRevealTick: s.streamRevealTick + 1 })),
@@ -802,6 +869,8 @@ export const createAgentSessionSlice: StateCreator<Deps, [], [], AgentSessionSli
   activeModelBySession: {},
   // 09-12 子4：桥运行期通知（写入方 agentEvents，此 slice 只持字段）。
   bridgeNoticesBySession: {},
+  // CR-09-20-dogfood-1：run 终态正向观测（写入方 agentEvents done/error + cancelAgent）。
+  runOutcomeBySession: {},
   // 09-12 子5 R6：上下文占用 last 值（写入方 agentEvents，此 slice 只持字段）。
   contextUsageBySession: {},
 
@@ -812,6 +881,8 @@ export const createAgentSessionSlice: StateCreator<Deps, [], [], AgentSessionSli
       phase: patch.phase ?? prev?.phase ?? 'idle',
       projectPath: 'projectPath' in patch ? patch.projectPath : prev?.projectPath,
       activity: 'activity' in patch ? patch.activity : prev?.activity,
+      // W4：bg 子会话角色登记（isProjectRunActive 口径排除数据源；patch 缺席时保留 prev）。
+      sessionRole: 'sessionRole' in patch ? patch.sessionRole : prev?.sessionRole,
       updatedAt: Date.now(),
     };
     // delta 频率防护：相位/活动/归属无变化则不写 store（r7「勿每 delta 一次 set」）。
@@ -820,6 +891,7 @@ export const createAgentSessionSlice: StateCreator<Deps, [], [], AgentSessionSli
       && prev.phase === next.phase
       && prev.activity === next.activity
       && prev.projectPath === next.projectPath
+      && prev.sessionRole === next.sessionRole
     ) return s;
     return { agentRunStates: { ...s.agentRunStates, [sessionId]: next } };
   }),
@@ -1080,10 +1152,54 @@ export const createAgentSessionSlice: StateCreator<Deps, [], [], AgentSessionSli
     return result;
   },
 
+  async loadAgentBgTasks() {
+    const projectPath = get().currentProject?.path;
+    if (!projectPath) return;
+    try {
+      const { tasks } = await listAgentBgTasks(projectPath);
+      if (!isCurrentProjectScope(projectEpoch, projectPath)) return;
+      set((s) => {
+        const next = { ...s.bgTasksByChildSession };
+        for (const t of tasks) {
+          next[t.childSessionId] = {
+            taskId: t.taskId,
+            childSessionId: t.childSessionId,
+            parentSessionId: t.parentSessionId,
+            role: t.role,
+            projectPath: t.projectPath,
+            status: t.status,
+            notify: t.notify,
+            ...(t.promptDigest ? { digest: t.promptDigest } : {}),
+            ...(t.error ? { error: t.error } : {}),
+            startedAt: t.startedAt,
+            updatedAt: t.updatedAt,
+          };
+        }
+        return { bgTasksByChildSession: next };
+      });
+      // R7「interrupted 首开提示」：重启对账标 interrupted 的任务，本项目首次 hydrate 时
+      // 提示一次（模块级 Set 按 app 运行期去重；不重复骚扰）。
+      const interruptedCount = tasks.filter((t) => t.status === 'interrupted').length;
+      if (interruptedCount > 0 && !interruptedToastShownByProject.has(projectPath)) {
+        interruptedToastShownByProject.add(projectPath);
+        const locale = (get() as unknown as { resolvedLocale?: string }).resolvedLocale ?? 'zh-CN';
+        useToastStore.getState().showToast(
+          translate(locale, 'agent.bgTaskInterruptedToast', { count: interruptedCount }),
+          'warning',
+          6000,
+        );
+      }
+    } catch {
+      /* hydrate 失败静默——bg-update 事件面仍驱动任务条 */
+    }
+  },
+
   async sendAgentMessage(content) {
     const state = get();
     const projectPath = state.currentProject?.path;
     if (!projectPath || state.activeSessionRunning) return false;
+    // W4：检视态纵深防御（AgentInput 已锁只读横幅——此处兜非通道直调）。
+    if (state.agentViewReadonly) return false;
     const epoch = projectEpoch;
     const isCurrentScope = () => isCurrentProjectScope(epoch, projectPath);
     // CR-37②：显式发送 bump 接管 token——在途自动接续（load 后待切换 / 切换 fetch 在途）弃权，
@@ -1103,20 +1219,26 @@ export const createAgentSessionSlice: StateCreator<Deps, [], [], AgentSessionSli
         const nextActive = { ...s.activeModelBySession };
         const nextBridge = { ...s.bridgeNoticesBySession };
         const nextContext = { ...s.contextUsageBySession };
+        // CR-09-20-dogfood-1：run 终态同批重置（新 run 的 outcome 从 null 起算——上轮
+        // 终态不得漏进本轮结局判定）。
+        const nextOutcome = { ...s.runOutcomeBySession };
         const hadNotices = resetSid in nextNotices;
         const hadActive = resetSid in nextActive;
         const hadBridge = resetSid in nextBridge;
         const hadContext = resetSid in nextContext;
+        const hadOutcome = resetSid in nextOutcome;
         if (hadNotices) delete nextNotices[resetSid];
         if (hadActive) delete nextActive[resetSid];
         if (hadBridge) delete nextBridge[resetSid];
         if (hadContext) delete nextContext[resetSid];
-        if (!hadNotices && !hadActive && !hadBridge && !hadContext) return {};
+        if (hadOutcome) delete nextOutcome[resetSid];
+        if (!hadNotices && !hadActive && !hadBridge && !hadContext && !hadOutcome) return {};
         return {
           ...(hadNotices ? { modelFallbackNotices: nextNotices } : {}),
           ...(hadActive ? { activeModelBySession: nextActive } : {}),
           ...(hadBridge ? { bridgeNoticesBySession: nextBridge } : {}),
           ...(hadContext ? { contextUsageBySession: nextContext } : {}),
+          ...(hadOutcome ? { runOutcomeBySession: nextOutcome } : {}),
         };
       });
     }
@@ -1134,7 +1256,10 @@ export const createAgentSessionSlice: StateCreator<Deps, [], [], AgentSessionSli
     const existingSid = state.agentSessionId;
     const busyRun = Object.values(get().agentRunStates).find(
       // CR-T1-026：归一比较（同 isProjectRunActive）。
+      // W4：bg 子会话 run 态（sessionRole='child'）不拦 leader 发送——后台子 agent 与对话
+      // 并存是目标态（mirror isProjectRunActive 口径排除，W3 移交项①）。
       (r) => r.phase === 'running'
+        && r.sessionRole !== 'child'
         && (r.projectPath === undefined || sameProjectPath(r.projectPath, projectPath))
         && r.sessionId !== existingSid,
     );
@@ -1300,6 +1425,9 @@ export const createAgentSessionSlice: StateCreator<Deps, [], [], AgentSessionSli
     const epoch = projectEpoch;
     void window.orisonDesktop.abortAgentRun(sid);
     get().setAgentRunState(sid, { phase: 'idle', activity: undefined });
+    // CR-09-20-dogfood-1：abort 请求即置 run 终态 'aborted'——随后的 done 不覆写已置
+    // 标记（done 不携 error，旧视图级 error 读法会把中止回合误标「成功收场」）。
+    set((s) => ({ runOutcomeBySession: { ...s.runOutcomeBySession, [sid]: 'aborted' } }));
     // Clear any cards tied to the aborted run. Leaving them on screen lets the
     // user resolve a confirmation against a run that no longer exists, which
     // flips activeSessionRunning back on and re-strands the spinner.
@@ -1343,6 +1471,10 @@ confirmedGear = get().agentParticipationGear;
       // 缺失守卫拦下，不把旧会话产物带进新会话输入区。
       attachmentUploadStates: {},
       sessionSwitching: false,
+      // W4：新会话退出检视态（回到 leader 草稿视图）。
+      agentViewReadonly: false,
+      agentViewSessionRole: null,
+      agentParentSessionId: null,
       // R2 #14：显式「新会话」意图 → 历史列表顶部出现草稿行（真会话建立/切换时清除）。
       draftSession: true,
     });
@@ -1391,6 +1523,11 @@ confirmedGear = get().agentParticipationGear;
       agentSessions: [],
       // R2 #14：项目重置不带草稿标记（新项目视图≠用户点了「新会话」）。
       draftSession: false,
+      // W4：检视态退出 + 后台任务条清（旧项目条目无渲染面；切回旧项目由 hydrate 重建）。
+      agentViewReadonly: false,
+      agentViewSessionRole: null,
+      agentParentSessionId: null,
+      bgTasksByChildSession: {},
     });
     // dogfood R2 #5（2026-08-25 用户拍板）：重开项目自动接续上次会话——列表非空时选中
     // 最近活跃会话（persistence ORDER BY updated_at DESC 首个），而不是空白新会话视图
@@ -1410,7 +1547,10 @@ confirmedGear = get().agentParticipationGear;
       if (resumeToken !== autoResumeToken) return;
       if (epoch !== projectEpoch || !isCurrentProjectScope(epoch, get().currentProject?.path)) return;
       if (get().agentSessionId || get().draftSession) return;
-      const latest = get().agentSessions[0];
+      // W4（W3 移交项②）：自动接续跳过 child/stub 会话——shell `agent:list-sessions` 默认
+      // 过滤已挡；客户端 isPrimaryListableSession 防御镜像（includeAllRoles 逃生口/竞态窗口
+      // 的双保险），接管目标回退到最近的用户会话。
+      const latest = get().agentSessions.find(isPrimaryListableSession);
       if (latest) await get().switchAgentSession(latest.id, { autoResume: true });
     })();
   },
@@ -1506,6 +1646,11 @@ confirmedGear = participationGear;
       // 归属登记（切回后台运行中的会话：后续事件按活跃视图路由 + mode gate 用）。
       rememberSessionProject(sessionId, projectPath);
       rememberSessionMode(sessionId, permissionMode);
+      // W4（§6.1 检视态）：会话角色 / 只读标记 / 父会话（返回键目标）——fetch 回的
+      // SessionState 既有字段首次被消费（child = bg 子会话检视态）。
+      const viewRole = session.sessionRole === 'child' || session.sessionRole === 'fork'
+        ? session.sessionRole
+        : 'primary';
       // 视图运行态 = 该会话 run 态（本 app 会话内事件驱动优先；磁盘 status 兜底——崩溃后
       // stale 'running' 由 shell D4 启动对账归位）。
       const runningFromEvents = get().agentRunStates[sessionId]?.phase === 'running';
@@ -1547,6 +1692,10 @@ confirmedGear = participationGear;
         })),
         activeSessionRunning: runningFromEvents || session.status === 'running',
         sessionSwitching: false,
+        // W4：检视态标记随切换落定。
+        agentViewReadonly: viewRole === 'child',
+        agentViewSessionRole: viewRole,
+        agentParentSessionId: viewRole === 'child' ? (session.parentId ?? null) : null,
       });
     } catch (error) {
       if (token !== sessionSwitchToken || resumeToken !== autoResumeToken || !isCurrentProjectScope(epoch, projectPath)) return;
@@ -1612,20 +1761,25 @@ confirmedGear = participationGear;
         const hadContext = sessionId in s.contextUsageBySession;
         // 09-12 子4：桥运行期通知同批清（mirror 回退通知）。
         const hadBridge = sessionId in s.bridgeNoticesBySession;
-        if (!hadNotices && !hadActive && !hadContext && !hadBridge) return s;
+        // CR-09-20-dogfood-1：run 终态同批清（防悬空条目）。
+        const hadOutcome = sessionId in s.runOutcomeBySession;
+        if (!hadNotices && !hadActive && !hadContext && !hadBridge && !hadOutcome) return s;
         const nextNotices = { ...s.modelFallbackNotices };
         const nextActive = { ...s.activeModelBySession };
         const nextContext = { ...s.contextUsageBySession };
         const nextBridge = { ...s.bridgeNoticesBySession };
+        const nextOutcome = { ...s.runOutcomeBySession };
         if (hadNotices) delete nextNotices[sessionId];
         if (hadActive) delete nextActive[sessionId];
         if (hadContext) delete nextContext[sessionId];
         if (hadBridge) delete nextBridge[sessionId];
+        if (hadOutcome) delete nextOutcome[sessionId];
         return {
           modelFallbackNotices: nextNotices,
           activeModelBySession: nextActive,
           contextUsageBySession: nextContext,
           bridgeNoticesBySession: nextBridge,
+          runOutcomeBySession: nextOutcome,
         };
       });
       set((s) => {
@@ -1645,8 +1799,28 @@ confirmedGear = participationGear;
         return { chainRunAnchorByProject: next };
       });
       if (get().agentSessionId === sessionId) {
-        set({ agentSessionId: null, agentMessages: [], activeSessionRunning: false });
+        set({
+          agentSessionId: null,
+          agentMessages: [],
+          activeSessionRunning: false,
+          // W4：视图即被删会话 → 检视态一并退出。
+          agentViewReadonly: false,
+          agentViewSessionRole: null,
+          agentParentSessionId: null,
+        });
       }
+      // W4：被删会话名下（父）或其自身（子）的后台任务条目一并清（agent 运行时级联杀
+      // cancelBgTasksForParent 已由 runtime.deleteSession 落；此处清 UI 条目防悬空卡）。
+      set((s) => {
+        const entries = Object.values(s.bgTasksByChildSession);
+        const hit = entries.some((e) => e.parentSessionId === sessionId || e.childSessionId === sessionId);
+        if (!hit) return s;
+        const next = { ...s.bgTasksByChildSession };
+        for (const e of entries) {
+          if (e.parentSessionId === sessionId || e.childSessionId === sessionId) delete next[e.childSessionId];
+        }
+        return { bgTasksByChildSession: next };
+      });
     } catch { /* ignore */ }
   },
   };

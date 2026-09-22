@@ -13,7 +13,7 @@ import type {
   TextGenerationRequest,
   TextGenerationResponse,
 } from './contracts/generation';
-import type { ModelCapability, ModelConfig, ModelProtocol } from './contracts/model';
+import type { ModelCapability, ModelConfig, ModelProtocol, TaskPresetMutationResult, TaskPresetSummary } from './contracts/model';
 import type {
   DocParserProbeResult,
   ResearchConfigSave,
@@ -139,6 +139,13 @@ export const desktopIpcSchema = z.object({
     'config:import-fonts',
     'config:import-wallpaper',
     'config:clear-wallpaper',
+    // C3.2 W2 多套预设：任务档预设四通道（machine 级 sidecar 读写，无窗口面无
+    // pathGuard 面——mirror usage 通道先例；载荷契约单源 contracts/model.ts
+    // taskPreset* 段）。
+    'taskPresets:list',
+    'taskPresets:save',
+    'taskPresets:apply',
+    'taskPresets:delete',
     'research:load-config',
     'research:save-config',
     'research:probe-doc-parser',
@@ -210,6 +217,11 @@ export const desktopIpcSchema = z.object({
     'materials:update-provenance',
     // E10.2a：材料显示名编辑（视频标题等——name 列，materialId 路径身份不变，design §3.1）。
     'materials:update-name',
+    // E10.4（task 09-20）W1：在线解析生态两通道（URL 直贴导入 + 关键词发现）。载荷契约见
+    // 下方「E10.4」段单源；shell handler W1 占位、W2 落实现（在线拉取走 research session
+    // 零新网络面——spec shell/research-network 横切不变式）；UI「在线导入」弹窗归 W4。
+    'materials:import-online',
+    'materials:search-online',
     // E10.2b Wave 1（task 09-05）：手艺卡/蒸馏管线管理面（11 invoke）。craft:distill-progress
     // 推送事件不进 enum（push 通道同 material:changed 先例，名单源 contracts/channels.ts
     // CRAFT_DISTILL_PROGRESS_CHANNEL）。OrisonDesktopApi 接口方法 + preload + shell handler
@@ -262,6 +274,10 @@ export const desktopIpcSchema = z.object({
     'agent:list-continuations',
     'agent:restore-continuation',
     'agent:abort-run',
+    // 09-21-subagent-bg-decouple W4：后台任务注册表只读查询（per-project 全量行——running +
+    // 终态历史）。UI「后台任务」条 hydrate（重启后 interrupted 如实呈现，R7）数据源；运行期
+    // 增量走 bg-update 事件（本查询只在项目打开/面板挂载时调）。
+    'agent:bg-tasks',
     'agent:compact-session',
     'agent:list-skill-packages',
     'agent:set-package-enabled',
@@ -328,6 +344,8 @@ export type {
   UsageTaskBreakdown,
   UsageRecentCall,
   UsageCostTokenInput,
+  BudgetState,
+  BudgetStatus,
 } from './contracts/usage';
 export { estimateUsageCost } from './contracts/usage';
 
@@ -907,6 +925,20 @@ export type UserPreferencesConfig = {
    * 通道（shell 读侧默认合并归位，W3 接线）。
    */
   usageRetentionDays?: number;
+
+  // ── Monthly LLM budget（C3.2 W3：软警硬拦）──
+  /**
+   * 月度 ¥ 软线：月累计（估算值，无价行不计）过线 → 面板 soft 态 + 渲染端一次性提醒；
+   * **只警不拦**。缺席 = 不设。persisted flat as `budgetSoftCny`；跨字段 soft ≤ hard 的
+   * 响亮校验落 validateBudgetCapsForSave（save handler 拒写 + UI 表单内联预检——
+   * preferences 无 zod schema 面，must-fix#4），读侧 lenient normalizeBudgetCaps 钳平。
+   */
+  budgetSoftCny?: number;
+  /**
+   * 月度 ¥ 硬线：月累计过线 → **新 LLM 调用被 BudgetExceededError 拦截**（'budget'
+   * ineligible，回退链不烧；被拦调用如实落 budget 失败行）。缺席 = 不拦。
+   */
+  budgetHardCny?: number;
 };
 
 /** Preset levels offered in Settings ▸ 外观; rendered as 85% / 100% / 115% / 130%. */
@@ -945,6 +977,58 @@ export function clampUsageRetentionDays(value: unknown): number {
     USAGE_RETENTION_DAYS_MAX,
     Math.max(USAGE_RETENTION_DAYS_MIN, value as number),
   );
+}
+
+// ── Monthly budget caps（C3.2 W3 软警硬拦——mirror clampUsageRetentionDays 位次）──
+// 缺席 = 不设 → DEFAULT_USER_PREFERENCES 不带这两键（加键零迁移：新键缺省即旧行为）。
+
+/** 手改 sanity 带上界（¥ 百万——防手滑多零放大告警/拦截面；负值/非有限 = 不设）。 */
+export const BUDGET_CNY_MAX = 1_000_000;
+
+/**
+ * 单键钳：有限正数 → min(BUDGET_CNY_MAX, v)；NaN/Infinity/非数/非正 → undefined
+ * （键不设 = lenient 读的「缺席」形态，不硬造 0——CR-18 同族）。
+ */
+export function clampBudgetCny(value: unknown): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return undefined;
+  return Math.min(BUDGET_CNY_MAX, value);
+}
+
+/** normalizeBudgetCaps 结果：条件展开两键 + 病态钳平旗（调用方据旗 warn）。 */
+export type BudgetCapsPair = {
+  softCny?: number;
+  hardCny?: number;
+  /** true = 盘面 soft > hard 已被读侧以 hard 为准钳平（病态双值不炸面板不炸 gate）。 */
+  softClampedToHard: boolean;
+};
+
+/**
+ * 跨字段钳（C3.2 W3 must-fix#4：preferences 无 zod schema，soft ≤ hard 校验落 clamp 族
+ * 纯函数非 zod refine throw）。读侧 lenient：soft > hard → 以 hard 为准（soft 钳到 hard）；
+ * 读侧调用方（shell readUserPreferences / gate 闭包）据 softClampedToHard warn。
+ */
+export function normalizeBudgetCaps(softCny: unknown, hardCny: unknown): BudgetCapsPair {
+  const hard = clampBudgetCny(hardCny);
+  const soft = clampBudgetCny(softCny);
+  if (soft !== undefined && hard !== undefined && soft > hard) {
+    return { softCny: hard, hardCny: hard, softClampedToHard: true };
+  }
+  return { softCny: soft, hardCny: hard, softClampedToHard: false };
+}
+
+/**
+ * save 侧响亮校验：soft > hard 返错误描述（shell save handler 据此拒写 + UI 表单内联
+ * 预检同用此函数——文案单源），合法返 null。线不设（undefined/非法值）不算违规。
+ * CR-6（c3-2 CR 批）：消息中文化人话——payload 经 IPC rejection 直达用户（模式 B 语义
+ * 保留：throw 拒写不上盘），开发串不留用户可见面。
+ */
+export function validateBudgetCapsForSave(softCny: unknown, hardCny: unknown): string | null {
+  const soft = clampBudgetCny(softCny);
+  const hard = clampBudgetCny(hardCny);
+  if (soft !== undefined && hard !== undefined && soft > hard) {
+    return `软线金额（¥${soft}）须不大于硬线金额（¥${hard}）`;
+  }
+  return null;
 }
 
 /** Single source of truth for user-preference defaults, shared by main + renderer. */
@@ -1206,6 +1290,18 @@ export type OrisonDesktopApi = {
   loadProjectDocument(projectDir: string): Promise<Record<string, unknown> | null>;
   loadModelConfig(): Promise<ModelConfig>;
   saveModelConfig(config: ModelConfig): Promise<void>;
+  /**
+   * C3.2 W2 多套预设（载荷契约单源 contracts/model.ts taskPreset* 段）：
+   * list = 读预设目录（坏档 warn 跳过不出现在列表）；save = 快照当前全部任务档
+   * 写 `<name>.yaml`（同名覆盖语义在 UI 侧确认）；apply = 预设整组写入
+   * task-models.yaml（既有保存路径）+ 落 activePreset 标记；delete = 删档，
+   * 删到活动档时同步清 activePreset（当前指派不动）。save/apply/delete 模式 A
+   * 类型化结果，不 throw。
+   */
+  listTaskPresets(): Promise<TaskPresetSummary[]>;
+  saveTaskPreset(input: { name: string }): Promise<TaskPresetMutationResult>;
+  applyTaskPreset(input: { name: string }): Promise<TaskPresetMutationResult>;
+  deleteTaskPreset(input: { name: string }): Promise<TaskPresetMutationResult>;
   /** Whether OS keyring encryption is available for API keys (false → plaintext on disk). */
   isKeyEncryptionAvailable(): Promise<boolean>;
   /**
@@ -1426,6 +1522,20 @@ export type OrisonDesktopApi = {
    * 函数，只移除本监听器，绝不 removeAllListeners）。
    */
   onMaterialChanged(callback: (event: MaterialChangedEvent) => void): () => void;
+  // ── E10.4（task 09-20）W1：在线解析生态（在线拉取 + 关键词发现——shell handler W1 占位、
+  //    W2 落实现；UI「在线导入」弹窗归 W4；载荷契约见下方「E10.4」段单源）──
+  /**
+   * 在线材料导入（materials:import-online——URL 直贴单条，批量由 UI 逐 URL 各调一次且
+   * ≤ MATERIAL_ONLINE_IMPORT_MAX_BATCH）：research session 拉取 + 正文抽取（抽取文本即原件）
+   * → `materials/online/<stem>-<sha8(url)>.md` 落盘 + registerMaterial 管线（provenance 预填
+   * medium/tier/url/via='web-fetch'）；失败分类六档回报（模式 A）。
+   */
+  importOnlineMaterial(input: MaterialsImportOnlineInput): Promise<MaterialsImportOnlineResult>;
+  /**
+   * 关键词发现（materials:search-online——web_search + wiki_search 既有核心并发合并去重，
+   * 零 LLM；空 query 模式 B throw）；结果行勾选后逐 URL 走 importOnlineMaterial。
+   */
+  searchOnlineSources(input: MaterialsSearchOnlineInput): Promise<OnlineSourceHit[]>;
   // ── E10.2b（task 09-05）W3：蒸馏管线面（两 invoke；card/term/merge-review 九通道三层同步
   //    归 W5 落地〔见下方 W5 段〕；craft:distill-progress 订阅面随 W5.5 UI 事件刷新接线）──
   /**
@@ -1677,7 +1787,18 @@ export type OrisonDesktopApi = {
     gear: ParticipationGear,
     options?: { balancedAskCategories?: BalancedAskCategory[]; trustAdjudication?: boolean },
   ): Promise<{ ok: boolean }>;
-  listAgentSessions(projectPath?: string): Promise<unknown>;
+  /**
+   * 列会话（09-21-subagent-bg-decouple W4 / U6 存量债）：shell 侧默认只列用户会话——
+   * child 角色与链 stub parent 过滤（检视只经钻取/后台任务条，防空壳「New conversation」行
+   * 污染列表 + 项目自动接续误接管）；`opts.includeAllRoles` 逃生口返回全量。additive
+   * optional——既有单参调用零变（默认即过滤）。
+   */
+  listAgentSessions(projectPath?: string, opts?: { includeAllRoles?: boolean }): Promise<unknown>;
+  /**
+   * 09-21-subagent-bg-decouple W4：后台任务注册表只读查询（per-project；running + 终态历史
+   * 全量行）。返 `{ tasks: BgTaskRecord-shaped[] }`。
+   */
+  listAgentBgTasks(projectPath: string): Promise<unknown>;
   deleteAgentSession(id: string, projectPath?: string): Promise<boolean>;
   /**
    * 从此截断（dogfood 2026-08-21）：丢弃 messageId 及其后全部（runtime 内存+JSONL+索引）。
@@ -1732,6 +1853,13 @@ export type OrisonDesktopApi = {
  *     为占用者（会话 id 或链租约 id `chain-run:closure:*`——后者不可跳转，UI 换文案不提供跳转钮）。
  *   - `session_run_active`：该会话自身 runState 已有活跃 run（重叠 invoke）——UI 按「已占用」
  *     处理，不 purge 流占位、不显错误横幅。
+ *
+ * 拒绝族机器串词表（09-21-subagent-bg-decouple W3 扩）：`bg_capacity|heldBy=<childSessionId>`
+ * ——bg 车道（后台子会话，shell acquireBgRun）超帽 MAX_BG_PER_PROJECT 的结构化拒绝，与
+ * leader 车道两 code 分道（bg 会话不占 leader 互斥）。**当前通道未发射，词表预留**（CR-18）：
+ * stream-message 车道不产 bg_capacity——生产拒绝面现状 = agent 包工具层 BgCapacityError
+ * （spawn_agent_bg 超帽响亮拒绝），shell 泵路径满帽仅 logger.warn 不上行；保留机器串词表供
+ * 未来 bg 车道 IPC 直驱面与 UI 文案映射对齐，消费方不得对未发射前缀做 === 分支依赖。
  */
 export type StreamAgentMessageResult =
   | { status: 'completed' | 'aborted' | 'error'; message?: string }
@@ -2136,7 +2264,8 @@ export type MaterialUpdateNameResult =
 
 /**
  * `material:changed` 推送事件载荷（shell materialNotify 全窗广播，best-effort——事件可丢，
- * 读侧兜底 = 材料页打开边沿 force 重拉）。reason：imported（批量导入逐份）/ reingested /
+ * 读侧兜底 = 材料页打开边沿 force 重拉）。reason：imported（批量导入逐份）/ reused
+ * （E10.4 在线导入幂等 skip——additive，refresh-only 消费面零分支）/ reingested /
  * deleted / provenance-updated / name-updated（E10.2a 显示名编辑——列表名刷新）/ reindexed
  * （watcher .derived 变更路由，预埋）。
  */
@@ -2145,8 +2274,128 @@ export type MaterialChangedEvent = {
   /** project 车道 registry projectId（事件过滤用；global 车道 null）。 */
   projectId?: string | null;
   materialId?: string;
-  reason: 'imported' | 'reingested' | 'deleted' | 'provenance-updated' | 'name-updated' | 'reindexed';
+  reason:
+    | 'imported'
+    | 'reused'
+    | 'reingested'
+    | 'deleted'
+    | 'provenance-updated'
+    | 'name-updated'
+    | 'reindexed';
 };
+
+/* ── E10.4（task 09-20）W1：在线解析生态 IPC 载荷契约（在线拉取 + 关键词发现）──
+ *
+ * 两 invoke 通道（`materials:import-online` / `materials:search-online`；shell handler 单源
+ * `main/ipc/materialIpc.ts`——W1 契约占位、W2 落实现，design §1）。错误模式分通道：
+ * **import-online = 模式 A**（判别联合 + 稳定 error code，不向 renderer 抛——mirror 材料管理面
+ * 拒收分类形态）；**search = 读面 plain 返回 + 空 query 模式 B throw**（mirror materials:list
+ * 坏参形态）。设计底账：research session 拉取零新网络面 / 抽取文本即原件
+ * （materials/online/<stem>-<sha8(url)>.md）/ registerMaterial 管线复用（provenance 预填
+ * medium/tier/url/via='web-fetch'）。
+ *
+ * expected_downstream_consumers:
+ * - ui 材料页「在线导入」弹窗（W4：URL 直贴 / 关键词搜索两 tab——勾选批量 = 逐 URL 各调
+ *   import-online，批量 ≤ MATERIAL_ONLINE_IMPORT_MAX_BATCH）。
+ * - 同1.1 社区源摄取执行面（canon 共识整合归同1.1 按 demonstrated consumer 设计——design §4）。 */
+
+/**
+ * 在线导入批量上限（20）。同主机串行 250 抓取 = 封禁邀请（CR-12）——批量是 **UI 勾选面**
+ * （本通道单 URL 逐条 invoke，无批参数），UI 以本常量执行拦截；契约面声明「批量 ≤ 20」
+ * 供 UI/shell 注释同源引用。
+ */
+export const MATERIAL_ONLINE_IMPORT_MAX_BATCH = 20;
+
+/**
+ * 在线抽取正文字符帽（40 万，CR-10 契约单源——shell 抽取与截断注记同源消费）。超帽长页
+ * 截断走成功行 `truncated` 标记（截断可用的长页不落 oversize 档）；帽取值让 W0 实测样本
+ * 全部无损（明日方舟 337K / 初音未来 141K / 维基 91K），只拦异常巨页（也守住 chunk/embed
+ * 管线的单材料成本上限）。
+ */
+export const ONLINE_IMPORT_MAX_TEXT_CHARS = 400_000;
+
+/**
+ * 在线来源类别（UI 类别选择四档——导入时预填可改）。类别 → medium/tier 预填映射（R3，
+ * design §1.1，映射表落 shell W2）：community-wiki→wiki/community；criticism→criticism/
+ * criticism；author-interview→interview/original（作者一手来源）；other→other/unspecified。
+ * 本词表是 UI 选择面与映射基线的单源。
+ */
+export const MATERIAL_ONLINE_CATEGORIES = ['community-wiki', 'criticism', 'author-interview', 'other'] as const;
+export type MaterialOnlineCategory = (typeof MATERIAL_ONLINE_CATEGORIES)[number];
+
+/**
+ * `materials:import-online` 失败分类六档（PRD R1 失败矩阵——UI 分文案基线，mirror
+ * MaterialImportRejectionKind 六档形态）：
+ * - `bad-url`：URL 语法/协议非法（非 http(s) 等——拉取前即可判）。
+ * - `fetch-failed`：拉取失败（网络错误 / SSRF 守卫拒〔私网/环回/file:〕/ 非 2xx / 超时）。
+ * - `empty-content`：抽取后正文近空（模板壳/JS 渲染页无可提取正文）。
+ * - `oversize`：超拉取上限不可用（2MB cap——截断可用的长页走成功行 `truncated` 标记，
+ *   不落此档）。
+ * - `stem-conflict`：派生 stem 与既有异源材料冲突（同 URL 重导走幂等/reingest，不落此档）。
+ * - `ingest-failed`：落盘/登记管线失败（分章/索引等）。
+ */
+export const MATERIAL_ONLINE_IMPORT_FAILURE_KINDS = [
+  'bad-url',
+  'fetch-failed',
+  'empty-content',
+  'oversize',
+  'stem-conflict',
+  'ingest-failed',
+] as const;
+export type MaterialOnlineImportFailureKind = (typeof MATERIAL_ONLINE_IMPORT_FAILURE_KINDS)[number];
+
+/**
+ * `materials:import-online` 入参。单 URL 逐条（UI 勾选批量 = 逐 URL 各调一次，design §1.2）；
+ * scope UI 预填默认 global（批评/访谈是全局手艺语料——同1.1 社区源可切项目车道）；
+ * scope='project' 时 projectId 必填（mirror materials:import 车道根解析）。
+ */
+export interface MaterialsImportOnlineInput {
+  url: string;
+  scope: 'project' | 'global';
+  category: MaterialOnlineCategory;
+  projectId?: string;
+}
+
+/**
+ * `materials:import-online` 结果（模式 A）。成功行 outcome 语义同 registerMaterial 回执：
+ * `reused` = 同 URL 内容未变幂等 skip（AC4）；`registered` 含首次导入与同 URL 内容变更的
+ * reingest 语义。`truncated` = 超 cap 如实截断——**持久面 = 文件尾注 + 本 flag**（quality
+ * parseNotes 的截断注记是 best-effort 面，后续重解析按解析面重建会冲掉；CR-23 措辞对齐）。
+ */
+export type MaterialsImportOnlineResult =
+  | {
+      ok: true;
+      materialId: string;
+      outcome: 'registered' | 'reused' | 'orphaned';
+      /** 材料显示名（页面标题派生，W2）。 */
+      name: string;
+      /** 车道根内相对路径（materials/online/<stem>-<sha8(url)>.md——CR-22 stem 实名）。 */
+      sourcePath: string;
+      truncated: boolean;
+    }
+  | { ok: false; error: MaterialOnlineImportFailureKind | 'invalid-input' | 'unregistered'; message?: string };
+
+/**
+ * `materials:search-online` 入参（关键词发现——web_search + wiki_search 既有核心并发合并
+ * 去重，零 LLM，design §1.2）。limit 省略 = 引擎默认（W2 定值）。
+ */
+export interface MaterialsSearchOnlineInput {
+  query: string;
+  limit?: number;
+}
+
+/**
+ * 搜索结果行（`materials:search-online` 返回行）。`source`：`'web'`（web_search 引擎链）|
+ * `` `wiki:<siteId>` ``（wiki_search 白名单站——siteId 见 wikiSites 注册表）。
+ * `categoryHint` = host 命中 wiki 注册表时的类别预填提示（community-wiki；无提示缺省）。
+ */
+export interface OnlineSourceHit {
+  title: string;
+  url: string;
+  snippet: string;
+  source: 'web' | `wiki:${string}`;
+  categoryHint?: MaterialOnlineCategory;
+}
 
 /* ── E10.2b Wave 1（task 09-05）：经验文档蒸馏管线 IPC 载荷契约（手艺卡/词表/台账管理面）──
  *

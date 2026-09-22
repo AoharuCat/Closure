@@ -55,6 +55,11 @@ const overviewFixture: UsageOverview = {
     inputTokens: 123456, outputTokens: 23456, thinkingTokens: 789, cacheReadTokens: 1024,
     totalTokens: 147625, estimatedCost: 1.5,
   },
+  month: {
+    calls: 15, failedCalls: 1,
+    inputTokens: 30000, outputTokens: 8000, thinkingTokens: 200, cacheReadTokens: 300,
+    totalTokens: 38500, estimatedCost: 0.8,
+  },
   byModel: [
     {
       keyIds: ['key-a'], modelId: 'model-pro', protocol: 'openai-compatible',
@@ -75,11 +80,20 @@ const overviewFixture: UsageOverview = {
   ],
   recent: [
     {
+      id: 3, ts: RECENT_TS + 1000, protocol: 'openai-compatible', keyId: 'k-img', modelId: 'img-model',
+      taskType: 'image-gen', sessionKey: null,
+      stream: false, success: true, errorKind: null, errorMessage: null,
+      inputTokens: null, outputTokens: null, thinkingTokens: null, cacheReadTokens: null,
+      totalTokens: null, latencyMs: 800, firstDeltaMs: null,
+      imageCount: 2,
+    },
+    {
       id: 2, ts: RECENT_TS, protocol: 'antigravity-cli', keyId: 'k1', modelId: 'agy-model',
       taskType: 'writer-draft', sessionKey: 'chain:1:writer',
       stream: true, success: true, errorKind: null, errorMessage: null,
       inputTokens: 100, outputTokens: 50, thinkingTokens: 10, cacheReadTokens: 0,
       totalTokens: 160, latencyMs: 1500, firstDeltaMs: 320,
+      imageCount: null,
     },
     {
       id: 1, ts: RECENT_TS - 1000, protocol: 'openai-compatible', keyId: 'k1', modelId: 'http-model',
@@ -87,6 +101,7 @@ const overviewFixture: UsageOverview = {
       stream: false, success: false, errorKind: 'quota', errorMessage: '402 quota exceeded',
       inputTokens: null, outputTokens: null, thinkingTokens: null, cacheReadTokens: null,
       totalTokens: null, latencyMs: 420, firstDeltaMs: null,
+      imageCount: null,
     },
   ],
   retentionDays: 90,
@@ -104,6 +119,9 @@ beforeEach(() => {
   openExternalMock = vi.fn();
   loadPrefsMock = vi.fn();
   savePrefsMock = vi.fn();
+  window.localStorage.clear();
+  // toast store 是模块级 zustand 单例——跨用例残留会污染计数断言（C3.2 W3 预算通知）。
+  useToastStore.setState({ toasts: [] });
   (window as any).orisonDesktop = {
     usageOverview: (...args: unknown[]) => usageOverviewMock(...(args as [])),
     usageClear: (...args: unknown[]) => usageClearMock(...(args as [])),
@@ -275,7 +293,20 @@ describe('UsageSettingsPage 聚合与分解（加载完成）', () => {
     expect(screen.getByTitle('402 quota exceeded').textContent).toBe('quota');
     // 成功行（流式）：耗时 1.5s + 首字 320ms。
     expect(screen.getByText((_, el) => el?.className === 'usage-table-num' && el.textContent === '1.5s · 首字 320ms')).not.toBeNull();
-    expect(screen.getByText('成功')).not.toBeNull();
+    // 生图行（id 3）加入后成功 chip 有两处——复数断言。
+    expect(screen.getAllByText('成功').length).toBe(2);
+  });
+
+  it('C3.1 M3：生图行张数 cell——imageCount 有值才显示「×N 张」；token 列如实「—」；非生图行不显示', async () => {
+    renderPage();
+    expect(await screen.findByText('img-model')).not.toBeNull();
+    const imgRow = screen.getByText('img-model').closest('tr')!;
+    expect(within(imgRow).getByText('×2 张')).not.toBeNull();
+    // 图像 API 无 token 信号：五个 token cell 全「—」（CR-18 行级形态照旧）。
+    expect(within(imgRow).getAllByTitle('未上报')).toHaveLength(5);
+    // 非生图行（imageCount NULL）不渲染张数。
+    const okRow = screen.getByText('agy-model').closest('tr')!;
+    expect(within(okRow).queryByText(/×\d+ 张/)).toBeNull();
   });
 
   it('外链组：三链接点击走 openExternal（URL 常量）+ 标注如实（不含 Antigravity / 无网页通道）', async () => {
@@ -303,7 +334,8 @@ describe('UsageSettingsPage 聚合与分解（加载完成）', () => {
   it('保留天数输入在位：初值 = overview.retentionDays；清空钮在位', async () => {
     renderPage();
     await screen.findByText('今日');
-    expect((screen.getByRole('spinbutton') as HTMLInputElement).value).toBe('90');
+    // C3.2 W3 起页面有三枚 number 输入——按 id 定位保留天数框。
+    expect((document.getElementById('usage-retention-days-input') as HTMLInputElement).value).toBe('90');
     expect(screen.getByText('天')).not.toBeNull();
     expect(screen.getByRole('button', { name: '清空全部记录' })).not.toBeNull();
   });
@@ -345,7 +377,8 @@ describe('保留天数输入（blur 落盘 / 越界钳制 / 回声抑制）', ()
   });
 
   function retentionInput(): HTMLInputElement {
-    return screen.getByRole('spinbutton') as HTMLInputElement;
+    // C3.2 W3 起页面有三枚 number 输入（保留天数 + 预算软/硬线）——按 id 定位非 role。
+    return document.getElementById('usage-retention-days-input') as HTMLInputElement;
   }
 
   it('blur 落盘：改 30 → saveUserPreferences 整对象单字段覆盖 + 重拉 overview + 回显新值', async () => {
@@ -446,11 +479,16 @@ describe('保留天数输入（blur 落盘 / 越界钳制 / 回声抑制）', ()
     rejectSave(new Error('disk full'));
     await vi.waitFor(() => expect(savePrefsMock).toHaveBeenCalledTimes(1));
     expect(retentionInput().value).toBe('45');
-    expect(
-      useToastStore.getState().toasts.some(
-        (x) => x.message === t('usagePanel.retentionSaveFailed') && x.level === 'error',
-      ),
-    ).toBe(true);
+    // C3.2 W3 注记：toast store 前不跨用例清理，本断言一直靠上一用例泄漏的同文案 toast
+    // 假绿——重置后暴露 save 拒绝链（race→finally→catch→commit）比 waitFor 首查多几个
+    // 微任务跳。waitFor 等待 toast 落店 = 用例本意（失败面 toast 如实呈现）。
+    await vi.waitFor(() =>
+      expect(
+        useToastStore.getState().toasts.some(
+          (x) => x.message === t('usagePanel.retentionSaveFailed') && x.level === 'error',
+        ),
+      ).toBe(true),
+    );
   });
 });
 
@@ -477,5 +515,162 @@ describe('纯格式化 helper（确定性，不依赖环境 locale）', () => {
     // 本地时区构造 + 本地 getter 格式化——同源无时区漂移；分钟补零。
     expect(formatTime(new Date(2026, 8, 13, 9, 5).getTime())).toBe('2026-09-13 09:05');
     expect(formatTime(new Date(2026, 0, 2, 23, 59).getTime())).toBe('2026-01-02 23:59');
+  });
+});
+
+// ── C3.2 W3 月度预算（软警硬拦）：状态条 / 截断守卫 / 过线一次性通知 / 双线输入 ──
+
+function budgetFixture(budget: import('@orison/shared-contracts').BudgetStatus): UsageOverview {
+  return { ...overviewFixture, budget };
+}
+
+function budgetInput(kind: 'soft' | 'hard'): HTMLInputElement {
+  const id = kind === 'soft' ? 'usage-budget-soft-input' : 'usage-budget-hard-input';
+  return document.getElementById(id) as HTMLInputElement;
+}
+
+describe('UsageSettingsPage 月度预算（C3.2 W3）', () => {
+  it('无配置（budget ABSENT）：未设置提示 + 双输入空 + 零通知', async () => {
+    usageOverviewMock.mockResolvedValue(overviewFixture);
+    renderPage();
+    expect(await screen.findByText(t('usagePanel.budgetNotSet'))).not.toBeNull();
+    expect(budgetInput('soft').value).toBe('');
+    expect(budgetInput('hard').value).toBe('');
+    expect(useToastStore.getState().toasts).toHaveLength(0);
+  });
+
+  it('soft 态：状态 chip + 本月已用 + 双线进度（过线填充标记）+ 输入回显', async () => {
+    usageOverviewMock.mockResolvedValue(
+      budgetFixture({ softCny: 0.5, hardCny: 2, state: 'soft', monthSpentCny: 0.8 }),
+    );
+    renderPage();
+    expect(await screen.findByText(t('usagePanel.budgetStateSoft'))).not.toBeNull();
+    expect(screen.getByText(t('usagePanel.budgetMonthSpent', { amount: '0.8' }))).not.toBeNull();
+    const lines = screen.getAllByTestId('usage-budget-line');
+    expect(lines).toHaveLength(2);
+    expect(lines[0]!.getAttribute('data-crossed')).toBe('soft'); // 软线过线
+    expect(lines[1]!.getAttribute('data-crossed')).toBeNull(); // 硬线未过
+    expect(budgetInput('soft').value).toBe('0.5');
+    expect(budgetInput('hard').value).toBe('2');
+  });
+
+  it('hard 态 + windowTruncated：截断守卫文案常显（不静默）+ 仅硬线一条进度', async () => {
+    usageOverviewMock.mockResolvedValue(
+      budgetFixture({ hardCny: 2, state: 'hard', monthSpentCny: 2.5, windowTruncated: true }),
+    );
+    renderPage();
+    expect(await screen.findByText(t('usagePanel.budgetStateHard'))).not.toBeNull();
+    expect(screen.getByText(t('usagePanel.budgetTruncatedNote'))).not.toBeNull();
+    expect(screen.getAllByTestId('usage-budget-line')).toHaveLength(1);
+  });
+
+  it('过线一次性通知：soft toast 恰一次 + localStorage 键（月份段+线别+cap）+ 重拉不重复', async () => {
+    usageOverviewMock.mockResolvedValue(
+      budgetFixture({ softCny: 0.5, state: 'soft', monthSpentCny: 0.8 }),
+    );
+    renderPage();
+    await screen.findByText(t('usagePanel.budgetStateSoft'));
+    await vi.waitFor(() =>
+      expect(
+        useToastStore
+          .getState()
+          .toasts.some(
+            (x) =>
+              x.message === t('usagePanel.budgetSoftToast', { amount: '0.8' }) && x.level === 'info',
+          ),
+      ).toBe(true),
+    );
+    const now = new Date();
+    const monthKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+    expect(window.localStorage.getItem(`budgetNotified:${monthKey}:soft:0.5`)).toBe('1');
+    // 手动刷新重拉（同态）→ 键已落位 → 不重复 toast。
+    fireEvent.click(screen.getByRole('button', { name: '刷新' }));
+    await vi.waitFor(() => expect(usageOverviewMock).toHaveBeenCalledTimes(2));
+    const softToasts = useToastStore
+      .getState()
+      .toasts.filter((x) => x.message === t('usagePanel.budgetSoftToast', { amount: '0.8' }));
+    expect(softToasts).toHaveLength(1);
+  });
+
+  it('ok 态零通知 + 双线输入 blur 落盘（读改写载荷保留原偏好键）', async () => {
+    loadPrefsMock.mockResolvedValue({ theme: 'dark', locale: 'zh-CN', usageRetentionDays: 90 });
+    usageOverviewMock.mockResolvedValue(
+      budgetFixture({ softCny: 5, hardCny: 20, state: 'ok', monthSpentCny: 0.8 }),
+    );
+    renderPage();
+    await screen.findByText(t('usagePanel.budgetStateOk'));
+    expect(useToastStore.getState().toasts).toHaveLength(0);
+    fireEvent.change(budgetInput('hard'), { target: { value: '15' } });
+    fireEvent.blur(budgetInput('hard'));
+    await vi.waitFor(() => expect(savePrefsMock).toHaveBeenCalledTimes(1));
+    const payload = savePrefsMock.mock.calls[0][0] as Record<string, unknown>;
+    expect(payload.theme).toBe('dark'); // 整对象读改写——原偏好键不丢
+    expect(payload.budgetHardCny).toBe(15);
+    expect(payload.budgetSoftCny).toBe(5);
+  });
+
+  it('soft > hard 响亮拒写：内联 warn + 不落盘；改回合法后保存成功', async () => {
+    loadPrefsMock.mockResolvedValue({ theme: 'dark', budgetSoftCny: 5, budgetHardCny: 20 });
+    usageOverviewMock.mockResolvedValue(
+      budgetFixture({ softCny: 5, hardCny: 20, state: 'ok', monthSpentCny: 0.8 }),
+    );
+    renderPage();
+    await screen.findByText(t('usagePanel.budgetStateOk'));
+    fireEvent.change(budgetInput('soft'), { target: { value: '30' } });
+    expect(screen.getByText(t('usagePanel.budgetSoftRangeWarn'))).not.toBeNull();
+    fireEvent.blur(budgetInput('soft'));
+    expect(savePrefsMock).not.toHaveBeenCalled(); // 响亮拒写（warn 常显 + 不提交）
+    fireEvent.change(budgetInput('soft'), { target: { value: '10' } });
+    fireEvent.blur(budgetInput('soft'));
+    await vi.waitFor(() => expect(savePrefsMock).toHaveBeenCalledTimes(1));
+    const payload = savePrefsMock.mock.calls[0][0] as Record<string, unknown>;
+    expect(payload.budgetSoftCny).toBe(10);
+  });
+
+  it('清线：输入留空 blur → 该线 undefined 落盘（空 = 不设，另一线不动）', async () => {
+    loadPrefsMock.mockResolvedValue({ budgetSoftCny: 5, budgetHardCny: 20 });
+    usageOverviewMock.mockResolvedValue(
+      budgetFixture({ softCny: 5, hardCny: 20, state: 'ok', monthSpentCny: 0.8 }),
+    );
+    renderPage();
+    await screen.findByText(t('usagePanel.budgetStateOk'));
+    fireEvent.change(budgetInput('hard'), { target: { value: '' } });
+    fireEvent.blur(budgetInput('hard'));
+    await vi.waitFor(() => expect(savePrefsMock).toHaveBeenCalledTimes(1));
+    const payload = savePrefsMock.mock.calls[0][0] as Record<string, unknown>;
+    expect(payload.budgetHardCny).toBeUndefined();
+    expect(payload.budgetSoftCny).toBe(5);
+  });
+
+  it('CR-13: 0/负数内联拒——warn 常显 + blur 不落盘回存量（shell clamp 面会把非正数静默清线）', async () => {
+    loadPrefsMock.mockResolvedValue({ budgetSoftCny: 5, budgetHardCny: 20 });
+    usageOverviewMock.mockResolvedValue(
+      budgetFixture({ softCny: 5, hardCny: 20, state: 'ok', monthSpentCny: 0.8 }),
+    );
+    renderPage();
+    await screen.findByText(t('usagePanel.budgetStateOk'));
+
+    // 硬线输 0：意图「全拦」会被 clamp 面变「无执行」——表单面拦下。
+    fireEvent.change(budgetInput('hard'), { target: { value: '0' } });
+    expect(screen.getByText(t('usagePanel.budgetPositiveWarn'))).not.toBeNull();
+    fireEvent.blur(budgetInput('hard'));
+    expect(savePrefsMock).not.toHaveBeenCalled();
+    // blur 回存量显示。
+    expect((budgetInput('hard') as HTMLInputElement).value).toBe('20');
+
+    // 软线输负数：同款拦截。
+    fireEvent.change(budgetInput('soft'), { target: { value: '-3' } });
+    expect(screen.getByText(t('usagePanel.budgetPositiveWarn'))).not.toBeNull();
+    fireEvent.blur(budgetInput('soft'));
+    expect(savePrefsMock).not.toHaveBeenCalled();
+    expect((budgetInput('soft') as HTMLInputElement).value).toBe('5');
+
+    // 改回正数后正常落盘。
+    fireEvent.change(budgetInput('soft'), { target: { value: '4' } });
+    expect(screen.queryByText(t('usagePanel.budgetPositiveWarn'))).toBeNull();
+    fireEvent.blur(budgetInput('soft'));
+    await vi.waitFor(() => expect(savePrefsMock).toHaveBeenCalledTimes(1));
+    const payload = savePrefsMock.mock.calls[0][0] as Record<string, unknown>;
+    expect(payload.budgetSoftCny).toBe(4);
   });
 });

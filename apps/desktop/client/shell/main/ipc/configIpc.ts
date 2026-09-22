@@ -13,9 +13,11 @@ import type {
   SlotAssignment,
   SlotFallbackEntry,
   TaskModelSlot,
+  TaskPresetMutationResult,
+  TaskPresetSummary,
   UserPreferencesConfig,
 } from '@orison/shared-contracts';
-import { parseFlatYaml, stringifyFlatYaml, modelConfigSaveSchema, taskModelSlotSchema, slotAssignmentSchema, DEFAULT_USER_PREFERENCES, DEFAULT_RESEARCH_NET_CONFIG, researchNetConfigSchema, resolveModelInfo, THINKING_PROFILES, isVectorArmDegraded, clampInterfaceScale, clampUsageRetentionDays, BLOCKED_CUSTOM_HEADER_NAMES, MODEL_DEFAULT_RANGES, MODEL_PRICING_RANGE, KEY_TIMEOUT_SECONDS_RANGE, customHeaderNameSchema, customHeaderValueSchema, flatQuoted, type FlatConfigValue } from '@orison/shared-contracts';
+import { parseFlatYaml, stringifyFlatYaml, modelConfigSaveSchema, taskModelSlotSchema, taskModelRecordSchema, slotAssignmentSchema, taskPresetNameSchema, DEFAULT_USER_PREFERENCES, DEFAULT_RESEARCH_NET_CONFIG, researchNetConfigSchema, resolveModelInfo, THINKING_PROFILES, isVectorArmDegraded, clampInterfaceScale, clampUsageRetentionDays, clampBudgetCny, normalizeBudgetCaps, validateBudgetCapsForSave, BLOCKED_CUSTOM_HEADER_NAMES, MODEL_DEFAULT_RANGES, MODEL_PRICING_RANGE, KEY_TIMEOUT_SECONDS_RANGE, customHeaderNameSchema, customHeaderValueSchema, flatQuoted, type FlatConfigValue } from '@orison/shared-contracts';
 import { atomicWriteFileSync } from '@orison/shared-contracts/fs/atomicWrite';
 import { getLogger } from '../logger';
 import { getResearchSession } from '../research/researchSession';
@@ -141,12 +143,14 @@ function readModelConfig(): ModelConfig {
   const rerankModel = readRerankModel();
   const visionModel = readVisionModel();
   const taskModels = readTaskModelSlots();
+  // C3.2 W2: applied-preset marker (undefined =「自定义」/ never applied).
+  const activePreset = readActiveTaskPreset();
   const keysDir = getKeysDir();
   if (!existsSync(keysDir)) {
     // Try migration from old profiles
     const migrated = migrateFromProfiles();
-    if (migrated) return { ...migrated, keys: healDerivedModelFields(migrated.keys), embeddingModel, rerankModel, visionModel, taskModels };
-    return { ...DEFAULT_MODEL_CONFIG, embeddingModel, rerankModel, visionModel, taskModels };
+    if (migrated) return { ...migrated, keys: healDerivedModelFields(migrated.keys), embeddingModel, rerankModel, visionModel, taskModels, activePreset };
+    return { ...DEFAULT_MODEL_CONFIG, embeddingModel, rerankModel, visionModel, taskModels, activePreset };
   }
 
   const files = readdirSync(keysDir).filter((f) => f.endsWith('.yaml'));
@@ -157,7 +161,7 @@ function readModelConfig(): ModelConfig {
     if (entry) keys.push(entry);
   }
 
-  return { keys: healDerivedModelFields(keys), embeddingModel, rerankModel, visionModel, taskModels };
+  return { keys: healDerivedModelFields(keys), embeddingModel, rerankModel, visionModel, taskModels, activePreset };
 }
 
 function redactModelConfig(config: ModelConfig): ModelConfig {
@@ -174,6 +178,9 @@ function redactModelConfig(config: ModelConfig): ModelConfig {
     // taskModels refs carry no secret either — same pass-through so the
     // settings page can display the current slot designations (C3.2).
     taskModels: config.taskModels,
+    // activePreset is a plain name string — no secret, same pass-through so the
+    // settings page can show「预设名 vs 自定义」(C3.2 W2).
+    activePreset: config.activePreset,
   };
 }
 
@@ -311,6 +318,16 @@ function getTaskModelsPath(): string {
 }
 
 /**
+ * Task-model preset dir (C3.2 W2 多套预设): one preset per file
+ * (`<name>.yaml`), mirroring the keys/ one-key-per-file convention. Preset
+ * files are machine-level sidecars — same trust domain as task-models.yaml
+ * itself, no pathGuard surface (mirror the usage channels).
+ */
+function getTaskModelPresetsDir(): string {
+  return path.join(getModelDir(), 'task-model-presets');
+}
+
+/**
  * Legal `slot.thinking` values, derived from the contract single source
  * (`slotAssignmentSchema`'s enum — note it deliberately has no `custom` member:
  * a non-empty `slot.thinkingCustom` string means level=custom). Read-side
@@ -434,22 +451,30 @@ function readSlotPolicyFields(
  */
 let taskModelsCache: { mtimeMs: number; size: number; slots: ModelConfig['taskModels'] } | undefined;
 
-export function readTaskModelSlots(): ModelConfig['taskModels'] {
+export function readTaskModelSlots(filePath: string = getTaskModelsPath()): ModelConfig['taskModels'] {
+  // C3.2 W2: the path parameter lets the preset readers reuse this same lenient
+  // reader for preset files. The mtime+size cache serves the PRIMARY sidecar
+  // only — a preset file freshly saved from the current slots can share the
+  // main file's mtime+size, so a single shared cache would serve one file's
+  // contents for the other (串档). Preset reads are rare (settings page) — they
+  // go straight to disk, cache untouched.
+  const cacheable = filePath === getTaskModelsPath();
   // stat captured outside the inner try so the failure path can cache the miss
   // keyed by the same stat (a persistently unreadable file warns once per file
   // change, not per resolve call).
   let stat: Stats | undefined;
   try {
-    const p = getTaskModelsPath();
+    const p = filePath;
     try {
       stat = statSync(p);
     } catch {
       // Missing file (never configured / cleared back to Auto) — also drops any
       // cache entry from when the file existed.
-      taskModelsCache = undefined;
+      if (cacheable) taskModelsCache = undefined;
       return undefined;
     }
     if (
+      cacheable &&
       taskModelsCache &&
       taskModelsCache.mtimeMs === stat.mtimeMs &&
       taskModelsCache.size === stat.size
@@ -538,7 +563,7 @@ export function readTaskModelSlots(): ModelConfig['taskModels'] {
       slots[slot] = assignment;
     }
     const result = Object.keys(slots).length > 0 ? slots : undefined;
-    taskModelsCache = { mtimeMs: stat.mtimeMs, size: stat.size, slots: result };
+    if (cacheable) taskModelsCache = { mtimeMs: stat.mtimeMs, size: stat.size, slots: result };
     return result;
   } catch (err) {
     // CR-005: never silent — an unreadable sidecar silently re-points every
@@ -549,14 +574,31 @@ export function readTaskModelSlots(): ModelConfig['taskModels'] {
       { err: err instanceof Error ? err.message : String(err) },
       'task-models sidecar read failed — every slot falls back to auto-pick',
     );
+    if (!cacheable) return undefined;
     if (stat) taskModelsCache = { mtimeMs: stat.mtimeMs, size: stat.size, slots: undefined };
     else taskModelsCache = undefined;
     return undefined;
   }
 }
 
-function writeTaskModels(slots: ModelConfig['taskModels']): void {
-  const p = getTaskModelsPath();
+/**
+ * Task-models sidecar writer. C3.2 W2: options object carries the two preset
+ * extensions —
+ * - `filePath`: apply writes the preset snapshot back through this same writer
+ *   (one write path = one projection = zero drift); default is the primary
+ *   sidecar. Callers MUST keep every other option at its default when targeting
+ *   a preset file (preset files never carry activePreset).
+ * - `activePreset`: the apply path's only extra key — written as a flat
+ *   `activePreset: <name>` line. The manual save path never passes it (and the
+ *   save-schema strip removes the field from renderer payloads), so any manual
+ *   slot save rewrites the file without the key = the「自定义」marker, free of
+ *   charge (explicit marker, no content comparison).
+ */
+function writeTaskModels(
+  slots: ModelConfig['taskModels'],
+  opts?: { filePath?: string; activePreset?: string },
+): void {
+  const p = opts?.filePath ?? getTaskModelsPath();
   // Mirror embedding convention: undefined — or an empty record (the UI cleared
   // every slot back to "Auto") — removes the sidecar so a reload yields
   // undefined, never a lingering stale designation.
@@ -579,6 +621,7 @@ function writeTaskModels(slots: ModelConfig['taskModels']): void {
   const dir = path.dirname(p);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   const flat: Record<string, string | number | boolean | null> = {};
+  if (opts?.activePreset) flat.activePreset = opts.activePreset;
   for (const [slot, assignment] of Object.entries(slots) as Array<[TaskModelSlot, SlotAssignment | undefined]>) {
     if (!assignment) continue;
     flat[`${slot}.keyId`] = assignment.keyId;
@@ -605,6 +648,44 @@ function writeTaskModels(slots: ModelConfig['taskModels']): void {
     }
   }
   atomicWriteFileSync(p, stringifyFlatYaml(flat), 'utf-8');
+}
+
+/**
+ * Independent `activePreset` marker reader (C3.2 W2). The slot reader above
+ * deliberately ignores every key outside the slot enum — that stays (the marker
+ * is invisible to the pre-existing reader = rollback-safe) — so the marker gets
+ * its own explicit reader. Lenient like every sidecar read: absent file /
+ * missing key / malformed value → undefined, never a throw. No cache: marker
+ * reads ride the config-load path (rare), and a fresh read can't serve a stale
+ * marker after apply/delete.
+ *
+ * CR-12: dangling-marker reconcile — a marker naming a preset file that no
+ * longer exists (hand-deleted / rolled back out-of-band) reads as UNSET + warn,
+ * not as a chip pointing at nothing.
+ */
+export function readActiveTaskPreset(): string | undefined {
+  try {
+    const p = getTaskModelsPath();
+    if (!existsSync(p)) return undefined;
+    const raw = parseFlatYaml(readFileSync(p, 'utf-8'));
+    const value = raw.activePreset;
+    if (typeof value !== 'string' || !value.trim()) return undefined;
+    const marker = value.trim();
+    if (!existsSync(taskPresetPath(marker))) {
+      getLogger().warn(
+        { marker },
+        'activePreset marker points at a missing preset file — reporting unset (dangling marker)',
+      );
+      return undefined;
+    }
+    return marker;
+  } catch (err) {
+    getLogger().warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'task-models sidecar read failed — activePreset marker unreadable',
+    );
+    return undefined;
+  }
 }
 
 /**
@@ -1136,6 +1217,16 @@ function readUserPreferences(): UserPreferencesConfig {
     const p = getUserPreferencesPath();
     if (!existsSync(p)) return { ...DEFAULT_USER_PREFERENCES };
     const raw = parseFlatYaml(readFileSync(p, 'utf-8')) as Record<string, unknown>;
+    // C3.2 W3 月度预算双键：读侧 lenient——单键非法/非正 → 键不设（缺席语义）；
+    // 跨字段 soft > hard 以 hard 为准钳平（normalizeBudgetCaps，must-fix#4：不炸面板
+    // 不炸 gate）+ warn 留痕。save 侧响亮拒写是另一道（validateBudgetCapsForSave）。
+    const budgetCaps = normalizeBudgetCaps(raw?.budgetSoftCny, raw?.budgetHardCny);
+    if (budgetCaps.softClampedToHard) {
+      getLogger().warn(
+        { budgetSoftCny: raw?.budgetSoftCny, budgetHardCny: raw?.budgetHardCny },
+        'preferences: budgetSoftCny > budgetHardCny — soft line clamped to hard on read',
+      );
+    }
     return {
       theme: typeof raw?.theme === 'string' ? raw.theme : DEFAULT_USER_PREFERENCES.theme,
       locale: typeof raw?.locale === 'string' ? raw.locale : DEFAULT_USER_PREFERENCES.locale,
@@ -1223,6 +1314,10 @@ function readUserPreferences(): UserPreferencesConfig {
       // 09-12 usage-panel R5 用量保留窗：读路径钳回合法带 [7,730]（UI 输入框约束，但
       // flat YAML 可手改）；非法/缺键回默认 90（存量文件零迁移，interfaceScale 同款）。
       usageRetentionDays: clampUsageRetentionDays(raw?.usageRetentionDays),
+      // C3.2 W3 月度预算双键：条件展开归一值（不设 = undefined——键在值缺，与既有
+      // optional 键的 readUserPreferences 显式 undefined 形态一致）。
+      budgetSoftCny: budgetCaps.softCny,
+      budgetHardCny: budgetCaps.hardCny,
     };
   } catch {
     return { ...DEFAULT_USER_PREFERENCES };
@@ -1278,6 +1373,13 @@ function writeUserPreferences(config: UserPreferencesConfig): void {
   if (typeof config.usageRetentionDays === 'number' && Number.isFinite(config.usageRetentionDays)) {
     flat.usageRetentionDays = clampUsageRetentionDays(config.usageRetentionDays);
   }
+  // C3.2 W3：月度预算双键**写时钳制**（clampBudgetCny——有限正数才落盘且钳 sanity 带；
+  // 非法值不写键，盘面保持干净可手改，mirror usageRetentionDays 先例）。soft > hard 的
+  // 响亮拒写在 save handler（validateBudgetCapsForSave 拒写）与 UI 表单内联预检两道。
+  const budgetSoftClamped = clampBudgetCny(config.budgetSoftCny);
+  if (budgetSoftClamped !== undefined) flat.budgetSoftCny = budgetSoftClamped;
+  const budgetHardClamped = clampBudgetCny(config.budgetHardCny);
+  if (budgetHardClamped !== undefined) flat.budgetHardCny = budgetHardClamped;
   atomicWriteFileSync(p, stringifyFlatYaml(flat), 'utf-8');
 }
 
@@ -1672,6 +1774,151 @@ export async function reindexAllForChangedModel(
   }
 }
 
+/* ── C3.2 W2 多套预设：taskPresets:* 四通道（list / save / apply / delete）──
+ *
+ * 存储：`~/.orison/model/task-model-presets/<name>.yaml`，一预设一档，档内形状与
+ * task-models.yaml 同构（flat `slot.*` 键——writeTaskModels 同一投影器，零第二
+ * 口径）。读侧复用 readTaskModelSlots 的容错 reader（旁路 mtime 缓存）；save =
+ * 当前指派全量快照；apply = 预设整组写回主 sidecar + 落 activePreset；delete =
+ * 删档，删到活动档时清标记（当前指派不动）。全部模式 A 类型化结果——预期内用户
+ * 失败（名字非法/档不存在/无指派可存）不 throw（spec shell/ipc-handlers 契约）。
+ */
+
+function taskPresetPath(name: string): string {
+  return path.join(getTaskModelPresetsDir(), `${name}.yaml`);
+}
+
+/** Parse + validate the preset name (zod 响亮拒绝 → 模式 A code). */
+function parsePresetName(name: unknown): string | null {
+  const parsed = taskPresetNameSchema.safeParse(name);
+  return parsed.success ? parsed.data : null;
+}
+
+function listTaskPresets(): TaskPresetSummary[] {
+  const dir = getTaskModelPresetsDir();
+  if (!existsSync(dir)) return [];
+  const presets: TaskPresetSummary[] = [];
+  for (const file of readdirSync(dir).filter((f) => f.endsWith('.yaml')).sort()) {
+    // CR-3: the stem must itself be a legal preset name — a hand-dropped file
+    // like `my.preset.yaml` can never be applied/deleted by name (zod rejects
+    // the dot), so listing it would create a dead-end UI entry. Skip + warn.
+    const stem = file.replace(/\.yaml$/, '');
+    if (!taskPresetNameSchema.safeParse(stem).success) {
+      getLogger().warn(
+        { file },
+        'task preset file name is not a legal preset name — skipped in list',
+      );
+      continue;
+    }
+    try {
+      // Same lenient reader as the primary sidecar (path param, cache bypassed).
+      // A preset whose every entry is bad normalizes to undefined → not listed
+      // (warn already logged by the reader — hand-edit friendliness, CR-005).
+      const slots = readTaskModelSlots(path.join(dir, file));
+      if (!slots) continue;
+      const assignments = Object.values(slots);
+      presets.push({
+        name: stem,
+        slotCount: assignments.length,
+        hasFallbacks: assignments.some((a) => (a?.fallbacks?.length ?? 0) > 0),
+      });
+    } catch (err) {
+      // readTaskModelSlots never throws by design — this belt keeps a future
+      // regression from turning one bad preset into a dead settings page.
+      getLogger().warn(
+        { err: err instanceof Error ? err.message : String(err), file },
+        'task preset read failed — skipped in list',
+      );
+    }
+  }
+  return presets;
+}
+
+function saveTaskPreset(input: { name: string }): TaskPresetMutationResult {
+  const name = parsePresetName(input?.name);
+  if (!name) return { ok: false, error: 'invalid-name' };
+  // Snapshot the CURRENT assignments (full fidelity: refs + thinking policy +
+  // fallback chains — writeTaskModels is the single projection, so whatever the
+  // sidecar round-trips, the preset round-trips).
+  const slots = readTaskModelSlots();
+  if (!slots || Object.keys(slots).length === 0) return { ok: false, error: 'no-slots' };
+  try {
+    writeTaskModels(slots, { filePath: taskPresetPath(name) });
+    return { ok: true };
+  } catch (err) {
+    getLogger().warn(
+      { err: err instanceof Error ? err.message : String(err), name },
+      'task preset save failed',
+    );
+    return { ok: false, error: 'operation-failed' };
+  }
+}
+
+function applyTaskPreset(input: { name: string }): TaskPresetMutationResult {
+  const name = parsePresetName(input?.name);
+  if (!name) return { ok: false, error: 'invalid-name' };
+  const presetPath = taskPresetPath(name);
+  if (!existsSync(presetPath)) return { ok: false, error: 'not-found' };
+  const slots = readTaskModelSlots(presetPath);
+  if (!slots || Object.keys(slots).length === 0) return { ok: false, error: 'not-found' };
+  try {
+    // 既有保存语义：the lenient reader only emits schema-legal shapes; the zod
+    // parse here is the loud gate (design §5 — 非法指派响亮拒绝不半套写入). A
+    // violation throws → typed operation-failed, disk untouched.
+    const validated = taskModelRecordSchema.parse(slots);
+    // Same writer as the manual save path, plus the ONLY extra key: the
+    // activePreset marker. Renderer store refreshes via config:load-model.
+    writeTaskModels(validated, { activePreset: name });
+    return { ok: true };
+  } catch (err) {
+    getLogger().warn(
+      { err: err instanceof Error ? err.message : String(err), name },
+      'task preset apply failed — task-models sidecar left untouched',
+    );
+    return { ok: false, error: 'operation-failed' };
+  }
+}
+
+function deleteTaskPreset(input: { name: string }): TaskPresetMutationResult {
+  const name = parsePresetName(input?.name);
+  if (!name) return { ok: false, error: 'invalid-name' };
+  const presetPath = taskPresetPath(name);
+  if (!existsSync(presetPath)) return { ok: false, error: 'not-found' };
+  // Capture BEFORE the rm: CR-12's dangling-marker reconcile makes a post-rm
+  // readActiveTaskPreset() report unset (the preset file is gone), which would
+  // silently skip the marker-clearing rewrite below.
+  const wasActive = readActiveTaskPreset() === name;
+  try {
+    rmSync(presetPath, { force: true });
+    // Marker linkage: deleting the ACTIVE preset clears the marker while the
+    // current assignments stay untouched — rewrite the primary sidecar from its
+    // own slots (writeTaskModels projects slots only, so the key drops; an
+    // all-auto sidecar normalizes to file removal, which also clears it).
+    if (wasActive) {
+      const slots = readTaskModelSlots();
+      if (slots) {
+        writeTaskModels(slots);
+      } else if (existsSync(getTaskModelsPath())) {
+        // CR-1: lenient-read failure — writeTaskModels(undefined) means "clear"
+        // and would DELETE the assignments file. Skip the rewrite and keep the
+        // partial success (the preset file IS gone); the marker stays as a
+        // dangling key the reader now tolerates (CR-12 reconcile).
+        getLogger().warn(
+          { name },
+          'task preset delete: sidecar read failed — activePreset marker left in place, assignments untouched',
+        );
+      }
+    }
+    return { ok: true };
+  } catch (err) {
+    getLogger().warn(
+      { err: err instanceof Error ? err.message : String(err), name },
+      'task preset delete failed',
+    );
+    return { ok: false, error: 'operation-failed' };
+  }
+}
+
 export function registerConfigIpc() {
   // The wallpaper copies live under userData/wallpaper, which is OUTSIDE
   // pathGuard's allowed roots (project root only) — the orison-file protocol's
@@ -1720,8 +1967,18 @@ export function registerConfigIpc() {
     }
   });
   ipcMain.handle('config:is-key-encryption-available', () => isApiKeyEncryptionAvailable());
+  // ── C3.2 W2 多套预设四通道（machine 级 sidecar 读写，无 pathGuard 面——
+  // mirror usage 通道先例；载荷契约单源 shared-contracts taskPreset* 段）。──
+  ipcMain.handle('taskPresets:list', () => listTaskPresets());
+  ipcMain.handle('taskPresets:save', (_, input: { name: string }) => saveTaskPreset(input));
+  ipcMain.handle('taskPresets:apply', (_, input: { name: string }) => applyTaskPreset(input));
+  ipcMain.handle('taskPresets:delete', (_, input: { name: string }) => deleteTaskPreset(input));
   ipcMain.handle('config:load-user-preferences', () => readUserPreferences());
   ipcMain.handle('config:save-user-preferences', (event, config: UserPreferencesConfig) => {
+    // C3.2 W3：预算双键跨字段响亮校验（must-fix#4：save 侧 violation 拒写——UI 表单已
+    // 内联预检，此处拦绕过表单的直发面；violation = 契约违规走模式 B 抛错，不上盘）。
+    const budgetViolation = validateBudgetCapsForSave(config.budgetSoftCny, config.budgetHardCny);
+    if (budgetViolation) throw new Error(budgetViolation);
     writeUserPreferences(config);
     // R8：界面缩放改动即时生效——落盘后对本窗口 webContents 施加 Chromium 页面级
     // 缩放（机制选型见 shared-contracts clampInterfaceScale 处注释），无需重启。

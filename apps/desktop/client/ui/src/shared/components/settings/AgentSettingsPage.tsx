@@ -15,9 +15,11 @@ type Props = {
   t: (key: string, vars?: Record<string, string | number>) => string;
   modelConfig: ModelConfig;
   setModelConfig: (config: ModelConfig) => Promise<void>;
+  /** C3.2 W2：预设 apply/delete 后的配置重读（store 的 loadModelConfig——只读回不回写）。 */
+  reloadConfig?: () => Promise<void>;
 };
 
-export function AgentSettingsPage({ t, modelConfig, setModelConfig }: Props) {
+export function AgentSettingsPage({ t, modelConfig, setModelConfig, reloadConfig }: Props) {
   return (
     <div className="settings-page">
       <div className="settings-page-header">
@@ -27,7 +29,7 @@ export function AgentSettingsPage({ t, modelConfig, setModelConfig }: Props) {
         </div>
       </div>
 
-      <ModelAssignmentSections t={t} modelConfig={modelConfig} setModelConfig={setModelConfig} />
+      <ModelAssignmentSections t={t} modelConfig={modelConfig} setModelConfig={setModelConfig} reloadConfig={reloadConfig} />
     </div>
   );
 }

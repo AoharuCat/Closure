@@ -16,9 +16,19 @@
 // 运行时启 gc：--expose-gc 对 worker_threads 的 execArgv 非法（node 直接
 // ERR_WORKER_INVALID_EXEC_ARGV），改用 v8.setFlagsFromString + vm 新上下文取回
 // （node 官方 trick，threads/forks 两池通用）。失败则静默 no-op。
-import { afterAll } from 'vitest';
+import { afterAll, afterEach } from 'vitest';
 import v8 from 'node:v8';
 import vm from 'node:vm';
+import { _resetBreakerForTest } from '../main/ipc/circuitBreaker';
+
+// CR-18（c3-2 CR 批）：熔断进程内态全局兜底复位——fallback loop 族测试故意打 eligible
+// 失败（429/503/timeout），不复位会在套件 <60s 窗内跨用例累计到阈值中途 open，制造
+// 顺序依赖红。circuitBreaker.ts 是零依赖纯模块，静态 import 不踩 setup 注释里的
+// electron/db mock 缓存坑；各测试文件自己的 per-case reset 保留（双保险），新增制造
+// eligible 失败的测试文件无需再自行接线。
+afterEach(() => {
+  _resetBreakerForTest();
+});
 
 // better-sqlite3 加载探针（dogfood R2 #101②）：Electron ABI 构建的 binding 在
 // plain-Node vitest 下加载失败 → shell 的真 db 测试套件整族 skip——此前这个

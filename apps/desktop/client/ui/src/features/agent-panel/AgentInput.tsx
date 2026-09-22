@@ -81,6 +81,10 @@ export function AgentInput() {
     projectPath,
     draftPreset,
     consumeDraft,
+    // W4（09-21-subagent-bg-decouple §6.1/F3）：检视态只读标记——bg 子会话视图锁输入面
+    //（只读横幅替代输入框；确认卡例外照挂，F3/D8）。
+    agentViewReadonly,
+    returnToParentSession,
     // dogfood R2 #11⑤（findings #11⑤）+ CR-38（dogfood R2 BMad CR）：输入行直出钮——存在
     // streaming 且 content **或 reasoning** 非空的消息时可按（think-first 纯思考期恰是最想
     // 直出的窗口；不可按即不渲染，无 disabled 残影）；点击发跨组件信号拉满流式渐进轨。
@@ -113,6 +117,8 @@ export function AgentInput() {
     projectPath: s.currentProject?.path,
     draftPreset: s.draftPreset,
     consumeDraft: s.consumeDraft,
+    agentViewReadonly: s.agentViewReadonly,
+    returnToParentSession: s.returnToParentSession,
     streamRevealAvailable: s.agentMessages.some(
       (m) => m.streaming === true && ((m.content ?? '').length > 0 || (m.reasoning ?? '').length > 0),
     ),
@@ -321,6 +327,32 @@ export function AgentInput() {
     if (imageFiles.length === 0) return;
     void uploadChatImages(imageFiles);
   };
+
+  // ── W4（09-21-subagent-bg-decouple §6.1/F3）：检视态只读分支 ──
+  // bg 子会话视图 = 自治执行单元，V1 不支持插话——输入框/档位钮整体替换为只读横幅 +
+  // 返回键（回父会话）。hooks 全在上方无条件执行（分支只裁 JSX）。确认卡例外照挂
+  //（F3：只读检视 ≠ 不能处置确认；D8 定案 V1 自动放行下通常无卡，接线保留）。
+  if (agentViewReadonly) {
+    return (
+      <div className="agent-input-area agent-input-area--readonly">
+        {hasToolConfirm && <AgentConfirmCard />}
+        {hasPassageResolve && <AgentPassageResolveCard />}
+        <div className="agent-input-readonly-banner" role="status">
+          <span className="material-symbols-outlined" aria-hidden="true">visibility</span>
+          <span className="agent-input-readonly-text">{t('agent.childViewReadonlyBanner')}</span>
+          <button
+            type="button"
+            className="agent-input-readonly-back"
+            onClick={returnToParentSession}
+            title={t('agent.childViewBack')}
+          >
+            <span className="material-symbols-outlined" aria-hidden="true">undo</span>
+            {t('agent.childViewBack')}
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="agent-input-area">

@@ -4,7 +4,7 @@ import { useAppStore } from '../../shared/store/appStore';
 import { useI18n } from '../../shared/i18n/useI18n';
 import type { AgentMessage } from '../../shared/store/agentSlice';
 import { childTagPrefix } from '../../shared/store/agentStreamBuffer';
-import { childGroupGraceRemainingMs, isChildGroupDispatchActive } from '../../shared/store/agentEvents';
+import { childGroupGraceRemainingMs, getChildSessionIdForTag, isChildGroupDispatchActive } from '../../shared/store/agentEvents';
 import { AgentMessageItem } from './AgentMessageItem';
 import { Collapsible } from '../../shared/components/Collapsible';
 import { childGroupAction, hasLivePlaceholder } from './messageGrouping';
@@ -53,6 +53,9 @@ export function ChildExecutionGroup({ source, role, depth, messages, isLatestGro
 
   // CR-T1-036：组级活跃 = live 占位 ∨（leader run 在途 ∧ 迟滞窗内有 child 事件）。
   const tag = childTagPrefix({ source, role, depth });
+  // W4（09-21-subagent-bg-decouple）：tag → childSessionId 映射（dispatcher child 分支登记）
+  // ——组卡钻取入口；无记录（该组尚未收到 child 事件）不显钮。
+  const childSessionId = getChildSessionIdForTag(tag);
   const liveActive = useMemo(() => hasLivePlaceholder(messages), [messages]);
   const dispatchActive = isChildGroupDispatchActive(tag, liveActive, activeSessionRunning);
   const active = dispatchActive;
@@ -150,6 +153,22 @@ export function ChildExecutionGroup({ source, role, depth, messages, isLatestGro
             </span>
           )}
           {depth > 1 && <span className="agent-child-group-depth">d{depth}</span>}
+          {/* W4：钻取钮（切进该子会话检视图——childSessionId 已知才显；stopPropagation 防触发
+              组折叠）。CR-19：同步子会话 jsonl 恒空（消息只进父流）→ 钻取是空会话死胡同——
+              禁用 + title 说明；后台子会话不受影响（走 BgTaskBar 任务条钻取，其自身 jsonl 落盘）。
+              检视只读语义由目标视图自身承载（agentViewReadonly → 输入面横幅）。 */}
+          {childSessionId && (
+            <button
+              type="button"
+              className="agent-child-group-inspect"
+              disabled
+              onClick={(e) => e.stopPropagation()}
+              title={t('agent.childInspectDisabled')}
+              aria-label={t('agent.childInspectDisabled')}
+            >
+              <span className="material-symbols-outlined" aria-hidden="true">open_in_new</span>
+            </button>
+          )}
           {/* 活动状态点（design §7.3）：收起态活跃时留在头部右侧；完成时转 success 一闪。 */}
           {active && !open && <span className="agent-child-group-dot" aria-hidden="true" />}
           {doneFlash && <span className="agent-child-group-dot agent-child-group-dot--done" aria-hidden="true" />}
