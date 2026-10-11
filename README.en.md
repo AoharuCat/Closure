@@ -14,7 +14,7 @@
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)
 ![Electron](https://img.shields.io/badge/Electron-37-47848F.svg)
 
-**⬇ [Download](https://github.com/AoharuCat/Closure/releases/latest)** · [📖 Docs](docs/) · [🕒 Timeline Guide](docs/guides/时间线指南.md) · [📋 Changelog](CHANGELOG.md)
+[🌐 Website](https://aoharucat.github.io/Closure/en/) · **⬇ [Download](https://github.com/AoharuCat/Closure/releases/latest)** · [📖 Docs](docs/) · [🕒 Timeline Guide](docs/guides/时间线指南.md) · [📋 Changelog](CHANGELOG.md)
 
 </div>
 
